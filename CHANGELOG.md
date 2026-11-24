@@ -7,6 +7,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Atkinson error diffusion engine with tone (luminance levels) and color
+  (nearest palette color) modes, serpentine scanning, and diffusion strength
+- Engine tone adjustments: brightness, contrast, gamma, black and white points,
+  and sharpening
+- Palettes from hex colors (`#rgb` or `#rrggbb`), ordered darkest to lightest
+- Nearest-neighbor upscaling of dither results to RGBA
+- Terminal editor: open an image (`rthid [image]`), scale 10–200%, rotate in
+  90° steps, and adjust mode, palette preset, strength, serpentine, brightness,
+  and contrast
+- `d` / `D` to reset the selected parameter / all parameters and rotation
+- Large sources are downscaled on load, and held-down keys re-dither once
+- CI on Linux x86_64 with formatting, clippy, and tests
 - Preview overview that fits the whole dither grid using Unicode sextants or
   quadrants, with aspect correction and a two-color fallback per cell ([#13])
 - Exact 1:1 preview with keyboard, page, mouse drag, and wheel/trackpad panning ([#13])
@@ -15,7 +27,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `--glyphs sextant|quadrant` to choose overview glyphs; quadrants are the
   default in macOS Terminal.app ([#13])
 - `RTHID_DEBUG_LOG` for terminal rendering diagnostics ([#13])
-- CI on Linux x86_64 and macOS arm64 ([#13])
+- CI on macOS arm64 ([#13])
 
 ### Fixed
 
