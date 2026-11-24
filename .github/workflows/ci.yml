@@ -11,7 +11,12 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Linux x86_64 and macOS arm64 keep the golden tests honest across platforms.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       # Installs the toolchain pinned in mise.toml and exposes its tasks.
