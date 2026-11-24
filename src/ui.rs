@@ -2,7 +2,7 @@ use crate::view;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, List, Paragraph};
 
 use crate::app::{App, PALETTES, PARAMS, Param};
 
@@ -74,8 +74,7 @@ impl App {
             )
             .highlight_symbol("> ")
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, panel, &mut state);
+        frame.render_stateful_widget(list, panel, &mut self.parameter_list);
         frame.render_widget(
             Paragraph::new(if self.preview_focus {
                 "Tab: focus | z: overview/1:1 | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
@@ -210,6 +209,34 @@ mod tests {
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
     }
+    #[test]
+    fn parameter_list_keeps_scroll_offset_when_moving_within_visible_rows() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(RgbaImage::new(4, 4), None);
+        let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
+        for _ in 0..6 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        assert_eq!(app.parameter_list.selected(), Some(6));
+        assert_eq!(app.parameter_list.offset(), 4);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.parameter_list.selected(), Some(5));
+        assert_eq!(app.parameter_list.offset(), 4);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for label in ["Serpentine", "Brightness", "Contrast"] {
+            assert!(text.contains(label), "missing {label}");
+        }
+    }
+
     #[test]
     fn minimap_toggle_reveals_covered_dots_without_redithering() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

@@ -57,7 +57,8 @@ any existing file at `path`. The destination directory must exist; the path
 must differ from the source image. Each dot becomes a solid square at an
 integer scale of 1–4, keeping the long side within 2048 px unless the grid
 itself is larger. Write errors appear in the status line; the next re-dither
-retries. Quit waits for the final export. No viewer is opened.
+retries. Quit waits for the final export and reports failures with a nonzero
+exit status. No viewer is opened.
 
 Example:
 

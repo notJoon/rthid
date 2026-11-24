@@ -1,10 +1,10 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
     pub rgb: [u8; 3],
     pub f: [f64; 3],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
     pub brightness: f64,
     pub contrast: f64,
@@ -27,14 +27,14 @@ impl Default for Tone {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Mode {
     #[default]
     Tone,
     Color,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     pub palette: Vec<PaletteColor>,
     pub mode: Mode,
@@ -93,8 +93,7 @@ pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, &'static str> {
 }
 
 fn to_channels(rgba: &[u8], w: usize, h: usize, tone: &Tone) -> [Vec<f32>; 3] {
-    let n = w.checked_mul(h).expect("image size overflow");
-    assert_eq!(Some(rgba.len()), n.checked_mul(4), "RGBA length mismatch");
+    let n = rgba.len() / 4;
     let mut channels = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
     let cf = 1.0 + tone.contrast;
     let span = (tone.white - tone.black).max(0.02);
@@ -142,12 +141,14 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         !palette.is_empty() && palette.len() <= 256,
         "palette must have 1 to 256 colors"
     );
+    let n = w.checked_mul(h).expect("image size overflow");
+    assert_eq!(Some(rgba.len()), n.checked_mul(4), "RGBA length mismatch");
     // One color needs no work, and tone mode would divide by zero levels.
     if palette.len() == 1 {
-        return vec![0; w * h];
+        return vec![0; n];
     }
     let mut channels = to_channels(rgba, w, h, &options.tone);
-    let mut out = vec![0; w * h];
+    let mut out = vec![0; n];
     let levels = (palette.len() - 1) as f64;
     // Tone mode diffuses error through luminance alone.
     let work = match options.mode {
@@ -271,6 +272,36 @@ mod tests {
             for (value, index) in [(0, 0), (255, 3)] {
                 let rgba = [value, value, value, 255].repeat(32);
                 assert_eq!(dither(&rgba, 8, 4, &options), vec![index; 32]);
+            }
+        }
+    }
+
+    #[test]
+    fn single_color_fills_the_grid_in_both_modes() {
+        let mut options = Options {
+            palette: make_palette(&["#123"]).unwrap(),
+            ..Options::default()
+        };
+        for mode in [Mode::Tone, Mode::Color] {
+            options.mode = mode;
+            assert_eq!(dither(&gradient(), 16, 8, &options), vec![0; 128]);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rgba_and_overflow_for_every_palette_size() {
+        for colors in [&["#000"][..], &["#000", "#fff"][..]] {
+            let options = Options {
+                palette: make_palette(colors).unwrap(),
+                ..Options::default()
+            };
+            for (rgba, w, h) in [
+                (&[][..], 2, 2),
+                (&[0; 3][..], 1, 1),
+                (&[][..], usize::MAX / 2 + 1, 2),
+                (&[][..], usize::MAX / 4 + 1, 1),
+            ] {
+                assert!(std::panic::catch_unwind(|| dither(rgba, w, h, &options)).is_err());
             }
         }
     }

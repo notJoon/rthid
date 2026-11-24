@@ -6,8 +6,6 @@ use ratatui::{
 };
 use rthid::dither::PaletteColor;
 
-const MINIMAP_DIM_FACTOR: f64 = 0.5;
-
 pub fn fit(w: u32, h: u32, area: Rect) -> (u16, u16) {
     if area.is_empty() {
         return (0, 0);
@@ -180,8 +178,7 @@ fn render_exact(
             let cell = &mut buffer[pos];
             for color in [&mut cell.fg, &mut cell.bg] {
                 if let Color::Rgb(r, g, b) = *color {
-                    let dim = |channel| (f64::from(channel) * MINIMAP_DIM_FACTOR) as u8;
-                    *color = Color::Rgb(dim(r), dim(g), dim(b));
+                    *color = Color::Rgb(r / 2, g / 2, b / 2);
                 }
             }
         }

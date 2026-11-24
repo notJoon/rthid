@@ -4,6 +4,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::widgets::ListState;
 use rthid::dither::{self, Mode, Options};
 use rthid::png::{Job, Worker};
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ pub const PARAMS: [Param; 7] = [
 ];
 
 // Everything the user edits; `Default` is what the reset keys restore.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Params {
     pub scale: i32,
     pub rotation: u8,
@@ -72,10 +73,10 @@ pub struct App {
     pub view: View,
     pub preview_focus: bool,
     pub preview_area: Rect,
-    pub last_drag: Option<(u16, u16)>,
+    last_drag: Option<(u16, u16)>,
     pub source: RgbaImage,
     pub params: Params,
-    pub selected: usize,
+    pub parameter_list: ListState,
     pub indices: Vec<u8>,
     pub dirty: bool,
     pub quit: bool,
@@ -99,7 +100,7 @@ impl App {
             last_drag: None,
             source,
             params: Params::default(),
-            selected: 0,
+            parameter_list: ListState::default().with_selected(Some(0)),
             indices: Vec::new(),
             dirty: true,
             quit: false,
@@ -179,13 +180,25 @@ impl App {
         changed
     }
 
-    pub fn poll_png(&mut self) -> bool {
+    fn poll_png(&mut self) -> bool {
         if let Some(worker) = &self.png_worker
             && let Some(error) = worker.poll()
         {
             return self.set_png_error(error);
         }
         false
+    }
+
+    pub fn finish_png(&mut self) -> std::io::Result<()> {
+        // A change and quit can arrive in the same input batch.
+        self.refresh();
+        if let Some(worker) = self.png_worker.take() {
+            self.set_png_error(worker.finish().err());
+        }
+        match &self.png_error {
+            Some(error) => Err(std::io::Error::other(error.clone())),
+            None => Ok(()),
+        }
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -247,79 +260,42 @@ impl App {
         if self.preview_focus {
             let (w, h) = self.grid_size();
             let (vw, vh) = self.view.visible(w, h, self.preview_area);
-            let page_x = vw.saturating_sub(2).max(1);
-            let page_y = vh.saturating_sub(2).max(1);
-            let handled = match key.code {
+            let page_x = i64::from(vw.saturating_sub(2).max(1));
+            let page_y = i64::from(vh.saturating_sub(2).max(1));
+            let pan = match key.code {
                 KeyCode::Char('m') => {
                     self.view.hide_minimap = !self.view.hide_minimap;
-                    true
+                    return;
                 }
                 KeyCode::Char('z') => {
                     self.view.exact = !self.view.exact;
                     self.last_drag = None;
-                    true
+                    return;
                 }
-                KeyCode::Char('H') => {
-                    if self.view.exact {
-                        self.view
-                            .pan(-i64::from(page_x), 0, w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Char('L') => {
-                    if self.view.exact {
-                        self.view.pan(i64::from(page_x), 0, w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Char('K') => {
-                    if self.view.exact {
-                        self.view
-                            .pan(0, -i64::from(page_y), w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Char('J') => {
-                    if self.view.exact {
-                        self.view.pan(0, i64::from(page_y), w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    if self.view.exact {
-                        self.view.pan(-1, 0, w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    if self.view.exact {
-                        self.view.pan(1, 0, w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if self.view.exact {
-                        self.view.pan(0, -1, w, h, self.preview_area);
-                    }
-                    true
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.view.exact {
-                        self.view.pan(0, 1, w, h, self.preview_area);
-                    }
-                    true
-                }
-                _ => false,
+                KeyCode::Char('H') => Some((-page_x, 0)),
+                KeyCode::Char('L') => Some((page_x, 0)),
+                KeyCode::Char('K') => Some((0, -page_y)),
+                KeyCode::Char('J') => Some((0, page_y)),
+                KeyCode::Left | KeyCode::Char('h') => Some((-1, 0)),
+                KeyCode::Right | KeyCode::Char('l') => Some((1, 0)),
+                KeyCode::Up | KeyCode::Char('k') => Some((0, -1)),
+                KeyCode::Down | KeyCode::Char('j') => Some((0, 1)),
+                _ => None,
             };
-            if handled {
+            if let Some((dx, dy)) = pan {
+                if self.view.exact {
+                    self.view.pan(dx, dy, w, h, self.preview_area);
+                }
                 return;
             }
         }
+        let selected = self.parameter_list.selected().unwrap_or(0);
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => self.parameter_list.select_previous(),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(PARAMS.len() - 1);
+                self.parameter_list
+                    .select(Some((selected + 1).min(PARAMS.len() - 1)));
             }
             KeyCode::Char('r') => self.rotate(1),
             KeyCode::Char('R') => self.rotate(3),
@@ -338,9 +314,10 @@ impl App {
 
     // Restores the selected parameter, or every parameter and the rotation when `all` is set.
     fn reset(&mut self, all: bool) {
+        let before = self.params.clone();
         let defaults = Params::default();
         let (p, d) = (&mut self.params, &defaults.options);
-        match PARAMS[self.selected] {
+        match PARAMS[self.parameter_list.selected().unwrap_or(0)] {
             _ if all => *p = defaults.clone(),
             Param::Scale => p.scale = defaults.scale,
             Param::Mode => p.options.mode = d.mode,
@@ -350,7 +327,7 @@ impl App {
             Param::Brightness => p.options.tone.brightness = d.tone.brightness,
             Param::Contrast => p.options.tone.contrast = d.tone.contrast,
         }
-        self.dirty = true;
+        self.dirty |= self.params != before;
     }
 
     fn adjust(&mut self, direction: i32) {
@@ -363,7 +340,7 @@ impl App {
             *value = next;
             changed
         };
-        let changed = match PARAMS[self.selected] {
+        let changed = match PARAMS[self.parameter_list.selected().unwrap_or(0)] {
             Param::Scale => {
                 let next = (p.scale + direction * 10).clamp(10, 200);
                 let changed = next != p.scale;
@@ -423,7 +400,8 @@ mod tests {
 
     fn app_at(param: Param) -> App {
         let mut app = App::new(RgbaImage::new(4, 4), None);
-        app.selected = PARAMS.iter().position(|&p| p == param).unwrap();
+        app.parameter_list
+            .select(PARAMS.iter().position(|&p| p == param));
         app
     }
 
@@ -431,11 +409,14 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Param::Scale);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.parameter_list.selected(), Some(0));
         for _ in 0..10 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(PARAMS[app.selected], Param::Contrast);
+        assert_eq!(
+            PARAMS[app.parameter_list.selected().unwrap()],
+            Param::Contrast
+        );
         assert!(!press(&mut app, KeyCode::Char('x')));
     }
 
@@ -482,18 +463,43 @@ mod tests {
         let mut app = app_at(Param::Scale);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
-        app.selected = 1;
+        app.parameter_list.select(Some(1));
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.params.options.mode, Mode::Tone));
         assert_eq!((app.params.scale, app.params.rotation), (110, 1));
-        app.selected = 2;
+        app.parameter_list.select(Some(2));
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.params;
         assert_eq!((p.scale, p.rotation, p.palette), (100, 0, 0));
         assert_eq!(p.options.palette.len(), 2);
         assert_eq!(app.indices.len(), 16);
+    }
+
+    #[test]
+    fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
+        for param in PARAMS {
+            let mut app = app_at(param);
+            assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
+            assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
+            assert!(press(&mut app, KeyCode::Left));
+            assert!(press(&mut app, KeyCode::Char('d')), "{param:?}");
+            assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
+            assert!(press(&mut app, KeyCode::Left));
+            assert!(press(&mut app, KeyCode::Char('D')), "{param:?}");
+            assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
+        }
+        let mut app = app_at(Param::Scale);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(!press(&mut app, KeyCode::Char('d')));
+        assert!(press(&mut app, KeyCode::Char('D')));
+        app.params.options.tone.gamma = 2.0;
+        assert!(press(&mut app, KeyCode::Char('D')));
+        assert_eq!(app.params.options.tone.gamma, 1.0);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.dirty);
     }
 
     #[test]
@@ -559,7 +565,7 @@ mod tests {
             assert!(!press(&mut app, key));
         }
         assert_eq!((app.view.x, app.view.y), (2, 2));
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.parameter_list.selected(), Some(0));
         for _ in 0..100 {
             press(&mut app, KeyCode::Right);
             press(&mut app, KeyCode::Down);
@@ -655,6 +661,20 @@ mod tests {
             press(&mut app, KeyCode::Char('J'));
         }
         assert_eq!((app.view.x, app.view.y), (30, 30));
+    }
+
+    #[test]
+    fn finish_png_exports_changes_queued_with_quit() {
+        let path = std::env::temp_dir().join(format!("rthid-quit-test-{}.png", std::process::id()));
+        let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
+        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert!(app.quit);
+        assert!(app.dirty);
+        app.finish_png().unwrap();
+        assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

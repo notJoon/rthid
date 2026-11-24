@@ -106,8 +106,8 @@ fn main() -> std::io::Result<()> {
         }
     };
     let mut app = App::new(source, preview_png);
-    let _mouse_capture = MouseCapture;
-    ratatui::run(|terminal| {
+    let mouse_capture = MouseCapture;
+    let terminal_result = ratatui::run(|terminal| {
         execute!(io::stdout(), EnableMouseCapture)?;
         let mut redraw = true;
         while !app.quit {
@@ -142,7 +142,10 @@ fn main() -> std::io::Result<()> {
             }
         }
         Ok(())
-    })
+    });
+    drop(mouse_capture);
+    let png_result = app.finish_png();
+    terminal_result.and(png_result)
 }
 
 #[cfg(test)]

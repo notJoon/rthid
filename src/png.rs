@@ -26,7 +26,7 @@ pub struct Worker {
     jobs: Option<Sender<(u64, Job)>>,
     results: Receiver<(u64, Option<io::Error>)>,
     latest: u64,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl Worker {
@@ -36,24 +36,29 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("preview-png".into())
             .spawn(move || {
+                let mut result = Ok(());
                 while let Ok(mut newest) = queued.recv() {
                     for job in queued.try_iter() {
                         newest = job;
                     }
                     let (id, job) = newest;
-                    let error = write_atomic(
+                    result = write_atomic(
                         &path,
                         &job.indices,
                         job.w,
                         job.h,
                         &job.palette,
                         preview_scale(job.w, job.h),
-                    )
-                    .err();
+                    );
+                    let error = result
+                        .as_ref()
+                        .err()
+                        .map(|error| io::Error::new(error.kind(), error.to_string()));
                     if finished.send((id, error)).is_err() {
                         break;
                     }
                 }
+                result
             })?;
         Ok(Self {
             jobs: Some(jobs),
@@ -79,6 +84,16 @@ impl Worker {
             .filter(|(id, _)| *id == self.latest)
             .last()
             .map(|(_, error)| error)
+    }
+
+    /// Waits for the final job and reports its result, even if it was already polled.
+    pub fn finish(mut self) -> io::Result<()> {
+        drop(self.jobs.take());
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| io::Error::other("PNG worker panicked"))?
     }
 }
 
@@ -177,7 +192,6 @@ mod tests {
 
     #[test]
     fn worker_eventually_writes_latest_job_and_reports_its_result() {
-        use std::time::{Duration, Instant};
         let dir = std::env::temp_dir().join(format!("rthid-worker-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("latest.png");
@@ -193,21 +207,88 @@ mod tests {
                 })
                 .unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(result) = worker.poll() {
-                assert!(result.is_none());
-                break;
-            }
-            assert!(Instant::now() < deadline, "latest PNG job timed out");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!(wait_for_result(&worker).is_none());
         let image = image::open(&path).unwrap().to_rgba8();
         assert_eq!(image.dimensions(), (12, 8));
         assert!(image.pixels().all(|p| p.0 == [255; 4]));
         drop(worker);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn wait_for_result(worker: &Worker) -> Option<io::Error> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(result) = worker.poll() {
+                return result;
+            }
+            assert!(std::time::Instant::now() < deadline, "PNG job timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn worker_finish_reports_unpolled_and_polled_write_failures() {
+        let dir = std::env::temp_dir().join(format!("rthid-finish-error-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        for polled in [false, true] {
+            let mut worker = Worker::new(dir.clone()).unwrap();
+            worker
+                .submit(Job {
+                    indices: vec![0],
+                    w: 1,
+                    h: 1,
+                    palette: make_palette(&["#000"]).unwrap(),
+                })
+                .unwrap();
+            if polled {
+                assert!(wait_for_result(&worker).is_some());
+            }
+            assert!(worker.finish().is_err());
+        }
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_finish_uses_latest_success_after_write_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("rthid-finish-recovery-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("preview.png");
+        let mut worker = Worker::new(path.clone()).unwrap();
+        for index in [1, 0] {
+            worker
+                .submit(Job {
+                    indices: vec![index],
+                    w: 1,
+                    h: 1,
+                    palette: make_palette(&["#000"]).unwrap(),
+                })
+                .unwrap();
+            if index == 1 {
+                assert!(wait_for_result(&worker).is_some());
+            }
+        }
+        worker.finish().unwrap();
+        assert!(image::open(path).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_finish_handles_no_jobs_and_panics() {
+        Worker::new(std::env::temp_dir().join("rthid-unused.png"))
+            .unwrap()
+            .finish()
+            .unwrap();
+        let (jobs, _) = mpsc::channel();
+        let (_, results) = mpsc::channel();
+        let worker = Worker {
+            jobs: Some(jobs),
+            results,
+            latest: 0,
+            thread: Some(thread::spawn(|| panic!("worker failed"))),
+        };
+        assert!(worker.finish().is_err());
     }
 
     #[test]
