@@ -23,20 +23,23 @@ impl Drop for MouseCapture {
     }
 }
 
-use crate::app::App;
+use crate::{app::App, view::Glyphs};
 
 // Sources are shrunk on load to bound dither work per keypress.
 // Keep the original around once export needs full resolution.
 const MAX_SOURCE_SIDE: u32 = 1024;
 
-fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<(PathBuf, Option<PathBuf>)> {
+fn parse_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> io::Result<(PathBuf, Option<PathBuf>, Option<Glyphs>)> {
     let mut args = args.into_iter();
     let mut source = None;
     let mut preview = None;
+    let mut glyphs = None;
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Usage: rthid [image] [--preview-png path]",
+            "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant]",
         )
     };
     while let Some(arg) = args.next() {
@@ -49,6 +52,17 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<(PathBuf, 
                 return Err(invalid());
             }
             preview = Some(PathBuf::from(value));
+        } else if arg == "--glyphs" {
+            if glyphs.is_some() {
+                return Err(invalid());
+            }
+            glyphs = Some(
+                match args.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("sextant") => Glyphs::Sextant,
+                    Some("quadrant") => Glyphs::Quadrant,
+                    _ => return Err(invalid()),
+                },
+            );
         } else if arg.as_encoded_bytes().starts_with(b"-") || source.is_some() {
             return Err(invalid());
         } else {
@@ -58,6 +72,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<(PathBuf, 
     Ok((
         source.unwrap_or_else(|| "tests/fixtures/hsl.jpg".into()),
         preview,
+        glyphs,
     ))
 }
 
@@ -81,7 +96,7 @@ fn needs_redraw(event: &Event) -> bool {
 }
 
 fn main() -> std::io::Result<()> {
-    let (path, preview_png) = parse_args(std::env::args_os().skip(1))?;
+    let (path, preview_png, glyphs) = parse_args(std::env::args_os().skip(1))?;
     check_not_source(&path, preview_png.as_deref())?;
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -106,6 +121,8 @@ fn main() -> std::io::Result<()> {
         }
     };
     let mut app = App::new(source, preview_png);
+    app.view.glyphs = glyphs
+        .unwrap_or_else(|| Glyphs::for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref()));
     let mouse_capture = MouseCapture;
     let terminal_result = ratatui::run(|terminal| {
         execute!(io::stdout(), EnableMouseCapture)?;
@@ -154,6 +171,39 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn cli_selects_glyphs_and_rejects_invalid_or_duplicate_values() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
+        assert_eq!(parse(&[]).unwrap().2, None);
+        for (value, expected) in [
+            ("sextant", view::Glyphs::Sextant),
+            ("quadrant", view::Glyphs::Quadrant),
+        ] {
+            for args in [
+                vec!["--glyphs", value],
+                vec!["photo.png", "--glyphs", value, "--preview-png", "dots.png"],
+                vec!["--preview-png", "dots.png", "--glyphs", value, "photo.png"],
+            ] {
+                assert_eq!(parse(&args).unwrap().2, Some(expected));
+            }
+        }
+        for args in [
+            vec!["--glyphs"],
+            vec!["--glyphs", ""],
+            vec!["--glyphs", "unknown"],
+            vec!["--glyphs", "Quadrant"],
+            vec!["--glyphs", "--preview-png"],
+            vec!["--glyphs", "quadrant", "--glyphs", "sextant"],
+            vec!["--glyphs", "sextant", "--glyphs", "sextant"],
+        ] {
+            assert_eq!(
+                parse(&args).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pointer_motion_alone_does_not_request_redraw() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
         let mouse = |kind| {
@@ -178,14 +228,17 @@ mod tests {
     #[test]
     fn cli_accepts_image_and_companion_and_rejects_invalid_arguments() {
         let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&[]).unwrap(), ("tests/fixtures/hsl.jpg".into(), None));
+        assert_eq!(
+            parse(&[]).unwrap(),
+            ("tests/fixtures/hsl.jpg".into(), None, None)
+        );
         assert_eq!(
             parse(&["photo.png", "--preview-png", "dots.png"]).unwrap(),
-            ("photo.png".into(), Some("dots.png".into()))
+            ("photo.png".into(), Some("dots.png".into()), None)
         );
         assert_eq!(
             parse(&["--preview-png", "dots.png", "photo.png"]).unwrap(),
-            ("photo.png".into(), Some("dots.png".into()))
+            ("photo.png".into(), Some("dots.png".into()), None)
         );
         for args in [
             vec!["--preview-png"],

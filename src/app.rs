@@ -583,6 +583,64 @@ mod tests {
     }
 
     #[test]
+    fn minimap_clicks_match_drawn_geometry_for_each_glyph_set() {
+        use crate::view::Glyphs;
+        use ratatui::buffer::Buffer;
+        for (glyphs, expected, center) in [
+            (Glyphs::Sextant, Rect::new(38, 4, 9, 4), (36, 27)),
+            (Glyphs::Quadrant, Rect::new(38, 4, 9, 4), (36, 27)),
+        ] {
+            let mut app = App::new(RgbaImage::new(120, 120), None);
+            app.preview_area = Rect::new(2, 3, 48, 18);
+            app.view.exact = true;
+            app.view.glyphs = glyphs;
+            let mut buffer = Buffer::empty(app.preview_area);
+            let (_, map, _) = app
+                .view
+                .render_minimap(
+                    &app.indices,
+                    120,
+                    120,
+                    &app.params.options.palette,
+                    app.preview_area,
+                    &mut buffer,
+                )
+                .unwrap();
+            assert_eq!(map, expected);
+            assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);
+            for (kind, column, row, expected) in [
+                (
+                    MouseEventKind::Down(MouseButton::Left),
+                    map.x + map.width / 2,
+                    map.y + 1,
+                    center,
+                ),
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    map.right() - 1,
+                    map.bottom() - 1,
+                    (72, 84),
+                ),
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    map.x,
+                    map.y,
+                    (0, 0),
+                ),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                });
+                assert_eq!((app.view.x, app.view.y), expected, "{glyphs:?}");
+                assert!(!app.dirty);
+            }
+        }
+    }
+
+    #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         app.preview_area = Rect::new(2, 3, 48, 18);

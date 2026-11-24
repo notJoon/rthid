@@ -3,11 +3,12 @@
 ## Synopsis
 
 ```text
-rthid [image] [--preview-png path]
+rthid [image] [--preview-png path] [--glyphs sextant|quadrant]
 ```
 
 `image` defaults to `tests/fixtures/hsl.jpg`. Use a terminal with Unicode
-sextant and half-block support.
+half-block support and support for the selected overview glyphs (sextants or
+quadrants).
 
 ## Display
 
@@ -52,6 +53,10 @@ In 1:1, mouse navigation works over the preview regardless of keyboard focus.
 
 ## Options
 
+`--glyphs sextant|quadrant`: select overview and minimap glyphs: sextants use
+2×3 sub-cells; quadrants use 2×2. Defaults to `quadrant` when `TERM_PROGRAM`
+is `Apple_Terminal`, otherwise `sextant`. An explicit value overrides the default.
+
 `--preview-png path`: save a PNG on startup and after each re-dither, replacing
 any existing file at `path`. The destination directory must exist; the path
 must differ from the source image. Each dot becomes a solid square at an
@@ -79,3 +84,19 @@ RTHID_DEBUG_LOG=/tmp/rthid-minimap.log rthid photo.png
 
 To report a rendering issue, reproduce it in 1:1, quit, and share the log with
 the pan direction and terminal size.
+
+## Troubleshooting
+
+**Overview or minimap shows `?` boxes.** The terminal's font has no sextant
+glyphs (U+1FB00–U+1FB3B), as in macOS Terminal.app. Use quadrants, which only
+need standard block elements:
+
+```sh
+rthid photo.png --glyphs quadrant
+```
+
+To check a terminal, run `printf '\U1FB00 \U1FB0F \U1FB3B'`: boxes mean sextants
+are unsupported. Quadrants are the default when `TERM_PROGRAM` is
+`Apple_Terminal`; other terminals cannot be detected, so pass `--glyphs`
+explicitly. Quadrants sample 2×2 dots per cell instead of 2×3, so the overview
+shows less detail; 1:1 is unaffected.

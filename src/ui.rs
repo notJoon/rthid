@@ -96,10 +96,12 @@ impl App {
                     self.view.y + h
                 )
             }
-        } else if approximate {
-            "Overview approximate".into()
         } else {
-            "Overview".into()
+            format!(
+                "Overview ({}){}",
+                self.view.glyphs.name(),
+                if approximate { " approximate" } else { "" },
+            )
         };
         frame.render_widget(
             Paragraph::new(self.png_error.clone().unwrap_or_else(|| {
@@ -275,7 +277,17 @@ mod tests {
                 .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
         }));
         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Overview"));
+        assert!(text.contains("Overview (sextant)"));
+        app.view.glyphs = view::Glyphs::Quadrant;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Overview (quadrant)"));
+        assert!(
+            !text
+                .chars()
+                .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
+        );
         app.view.exact = true;
         app.preview_focus = true;
         terminal.draw(|frame| app.draw(frame)).unwrap();
