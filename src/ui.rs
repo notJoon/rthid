@@ -56,7 +56,7 @@ impl App {
         )?;
         let geometry = view::geometry(&self.view, (w, h), layout.preview);
         let mut overview = ratatui::buffer::Buffer::empty(layout.preview);
-        let mut cache = std::mem::take(&mut self.rgb_overviews);
+        let mut cache = std::mem::take(&mut self.minimap);
         let pixels = self.displayed();
         if let Some(view::Minimap {
             frame: inset,
@@ -75,7 +75,7 @@ impl App {
                 )?;
             }
         }
-        self.rgb_overviews = cache;
+        self.minimap = cache;
         log.flush()
     }
 
@@ -147,8 +147,8 @@ impl App {
                     .unwrap_or_else(|| {
                         format!(
                             "{displayed} | {mode} | Source {}x{} | Grid {gw}x{gh} | Rotation {}°",
-                            self.source.width(),
-                            self.source.height(),
+                            self.pipeline.source.width(),
+                            self.pipeline.source.height(),
                             u16::from(self.params.rotation) * 90,
                         )
                     }),
@@ -162,7 +162,12 @@ impl App {
         let (gw, gh) = geometry.grid;
         let image_mode = self.show_original && !geometry.area.is_empty();
         let Some(graphics) = self.graphics.as_mut().filter(|_| image_mode) else {
-            let mut cache = std::mem::take(&mut self.rgb_overviews);
+            let cache = if self.view.exact {
+                &mut self.minimap
+            } else {
+                &mut self.overview
+            };
+            let mut cache = std::mem::take(cache);
             let approximate = view::render(
                 self.displayed(),
                 gw,
@@ -172,7 +177,11 @@ impl App {
                 frame.buffer_mut(),
                 &mut cache,
             );
-            self.rgb_overviews = cache;
+            if self.view.exact {
+                self.minimap = cache;
+            } else {
+                self.overview = cache;
+            }
             if let Some(graphics) = self.graphics.as_mut() {
                 graphics.hide(frame.buffer_mut());
             }
@@ -180,10 +189,11 @@ impl App {
         };
         graphics.draw_image(
             frame,
-            &self.original,
+            self.pipeline.grid.get().expect("processed grid"),
+            self.pipeline.grid.version(),
             &self.view,
             geometry,
-            &mut self.rgb_overviews,
+            &mut self.minimap,
         );
         false
     }
@@ -211,6 +221,30 @@ mod tests {
     fn terminal_layout(terminal: &Terminal<TestBackend>) -> Layout {
         let size = terminal.size().unwrap();
         layout(Rect::new(0, 0, size.width, size.height))
+    }
+
+    #[test]
+    fn rgb_overview_and_minimap_keep_separate_memos() {
+        let mut app = App::new(RgbaImage::new(120, 120), None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        for exact in [false, true, false, true] {
+            app.view.exact = exact;
+            terminal
+                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .unwrap();
+        }
+        assert_eq!(app.overview.version(), 1);
+        assert_eq!(app.minimap.version(), 1);
+        app.params.rotation = 2;
+        app.sync(&terminal_layout(&terminal));
+        for exact in [false, true] {
+            app.view.exact = exact;
+            terminal
+                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .unwrap();
+        }
+        assert_eq!(app.overview.version(), 2);
+        assert_eq!(app.minimap.version(), 2);
     }
 
     #[test]
@@ -458,8 +492,8 @@ mod tests {
     fn overview_and_exact_modes_draw_their_glyphs_and_status() {
         let mut app = App::new(RgbaImage::new(4, 6), None);
         app.show_original = false;
-        app.indices = vec![0; 24];
-        app.indices[0] = 1;
+        app.sync(&layout(Rect::new(0, 0, 100, 24)));
+        app.pipeline.dithered.get_mut().unwrap()[0] = 1;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, &layout(frame.area())))

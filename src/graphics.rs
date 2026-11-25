@@ -3,8 +3,12 @@ use std::{
     time::Duration,
 };
 
-use crate::view::{self, PreviewGeometry, RgbOverviewCache, View};
+use crate::{
+    memo::Memo,
+    view::{self, PreviewGeometry, View},
+};
 use image::RgbaImage;
+use ratatui::style::Color;
 use ratatui::{
     Frame,
     buffer::{Buffer, CellDiffOption},
@@ -46,12 +50,12 @@ impl Drop for KittyCleanup {
     }
 }
 
-type GraphicsCache = ((u32, u32, bool, Rect, bool), Rect, StatefulProtocol);
+type GraphicsCache = Memo<(u64, u32, u32, bool, Rect, bool), (Rect, StatefulProtocol)>;
 
 /// Terminal image protocol, cached image and placement state.
 pub struct Graphics {
     picker: Picker,
-    cache: Option<GraphicsCache>,
+    cache: GraphicsCache,
     error: Option<String>,
     placement: Option<(Rect, bool)>,
 }
@@ -91,15 +95,10 @@ impl Graphics {
     fn new(picker: Picker) -> Self {
         Self {
             picker,
-            cache: None,
+            cache: Memo::default(),
             error: None,
             placement: None,
         }
-    }
-
-    /// Invalidates the protocol image after the source grid changes.
-    pub fn clear(&mut self) {
-        self.cache = None;
     }
 
     /// Returns the protocol label used in the status line.
@@ -127,21 +126,24 @@ impl Graphics {
         &mut self,
         frame: &mut Frame,
         original: &RgbaImage,
+        grid_version: u64,
         view: &View,
         geometry: &PreviewGeometry,
-        rgb_overviews: &mut RgbOverviewCache,
+        rgb_overviews: &mut Memo<(u64, u16, u16), Vec<Color>>,
     ) -> Option<&str> {
         let (gw, gh) = geometry.grid;
+        // Overlay changes trigger image emission for iTerm2 and Sixel.
         let overlay = geometry.minimap.is_some();
         let key = (
-            geometry.origin.0,
-            geometry.origin.1,
+            grid_version,
+            if view.exact { geometry.origin.0 } else { 0 },
+            if view.exact { geometry.origin.1 } else { 0 },
             view.exact,
             geometry.area,
             overlay,
         );
-        if self.cache.as_ref().is_none_or(|(old, _, _)| *old != key) {
-            let picker = &self.picker;
+        let picker = &self.picker;
+        let rebuilt = self.cache.update(key, || {
             let font = picker.font_size();
             let (rect, image) =
                 view::original_image(original, view, geometry.area, (font.width, font.height));
@@ -162,13 +164,15 @@ impl Graphics {
             } else {
                 picker.new_resize_protocol(image.into())
             };
-            self.cache = Some((key, rect, protocol));
+            (rect, protocol)
+        });
+        if rebuilt {
             self.error = None;
         }
-        let rect = self.cache.as_ref().unwrap().1;
+        let rect = self.cache.get().unwrap().0;
         repaint_previous(self, Some((rect, overlay)), frame.buffer_mut());
         let picker = &self.picker;
-        let Some((_, rect, protocol)) = self.cache.as_mut() else {
+        let Some((rect, protocol)) = self.cache.get_mut() else {
             return self.error.as_deref();
         };
         frame.render_stateful_widget(
@@ -183,7 +187,7 @@ impl Graphics {
             return self.error.as_deref();
         }
         view::draw_minimap(
-            view::Pixels::Rgb(original),
+            view::Pixels::Rgb(original, grid_version),
             gw,
             gh,
             view,
@@ -225,38 +229,38 @@ mod tests {
     }
 
     #[test]
-    fn graphics_cache_tracks_grid() {
+    fn graphics_cache_tracks_grid_and_view() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let mut picker = ratatui_image::picker::Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Kitty);
         app.graphics = Some(Graphics::new(picker));
-        app.view.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, &layout(frame.area())))
-            .unwrap();
-
+        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            app.sync(&terminal_layout(terminal));
+            terminal
+                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .unwrap();
+            app.graphics.as_ref().unwrap().cache.version()
+        };
+        assert_eq!(draw(&mut app, &mut terminal), 1);
         app.params.options.strength = 0.5;
-        app.dirty = true;
-        app.sync(&terminal_layout(&terminal));
-        assert!(app.graphics.as_ref().unwrap().cache.is_some());
+        assert_eq!(draw(&mut app, &mut terminal), 1);
         app.view.x = 1;
-        terminal
-            .draw(|frame| app.draw(frame, &layout(frame.area())))
-            .unwrap();
-
+        app.view.y = 1;
+        assert_eq!(draw(&mut app, &mut terminal), 1);
+        app.view.exact = true;
+        assert_eq!(draw(&mut app, &mut terminal), 2);
+        app.view.x = 2;
+        assert_eq!(draw(&mut app, &mut terminal), 3);
+        app.view.hide_minimap = true;
+        assert_eq!(draw(&mut app, &mut terminal), 4);
         app.params.rotation = 2;
-        app.dirty = true;
-        app.sync(&terminal_layout(&terminal));
-        assert!(app.graphics.as_ref().unwrap().cache.is_none());
-        terminal
-            .draw(|frame| app.draw(frame, &layout(frame.area())))
-            .unwrap();
-
+        assert_eq!(draw(&mut app, &mut terminal), 5);
+        assert_eq!(draw(&mut app, &mut terminal), 5);
         app.params.scale = 50;
-        app.dirty = true;
-        app.sync(&terminal_layout(&terminal));
-        assert!(app.graphics.as_ref().unwrap().cache.is_none());
+        assert_eq!(draw(&mut app, &mut terminal), 6);
+        terminal.backend_mut().resize(90, 35);
+        assert_eq!(draw(&mut app, &mut terminal), 7);
     }
 
     #[test]

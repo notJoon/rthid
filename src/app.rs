@@ -1,7 +1,8 @@
 use crate::{
     graphics::Graphics,
+    memo::Memo,
     ui::Layout,
-    view::{Pixels, PreviewGeometry, RgbOverviewCache, View},
+    view::{Pixels, PreviewGeometry, View},
 };
 use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
@@ -14,12 +15,14 @@ use rthid::dither::{self, Mode, Options};
 use rthid::png::{Job, Worker};
 use std::path::PathBuf;
 
+/// Palette presets available in the parameter panel.
 pub const PALETTES: [(&str, &[&str]); 3] = [
     ("Black/white", &["#000", "#fff"]),
     ("4-gray", &["#000", "#555", "#aaa", "#fff"]),
     ("Warm inks", &["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"]),
 ];
 
+/// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Param {
     Scale,
@@ -31,7 +34,7 @@ pub enum Param {
     Contrast,
 }
 
-// Panel order.
+/// Parameter panel order.
 pub const PARAMS: [Param; 7] = [
     Param::Scale,
     Param::Mode,
@@ -42,12 +45,16 @@ pub const PARAMS: [Param; 7] = [
     Param::Contrast,
 ];
 
-// Everything the user edits; `Default` is what the reset keys restore.
+/// Editable values restored by the reset keys.
 #[derive(Clone, PartialEq)]
 pub struct Params {
+    /// Source size as a percentage.
     pub scale: i32,
+    /// Clockwise quarter turns.
     pub rotation: u8,
+    /// Selected palette preset.
     pub palette: usize,
+    /// Dither and tone settings.
     pub options: Options,
 }
 
@@ -71,29 +78,50 @@ impl Params {
     }
 }
 
+/// Source image and versioned image processing results.
+pub struct Pipeline {
+    /// Loaded image before scaling and rotation.
+    pub source: RgbaImage,
+    /// Scaled and rotated image keyed by size and rotation.
+    pub grid: Memo<(u32, u32, u8), RgbaImage>,
+    /// Palette indices keyed by grid version and dither options.
+    pub dithered: Memo<(u64, Options), Vec<u8>>,
+}
+
+/// Interactive parameters, preview state and image consumers.
 pub struct App {
     /// Terminal image rendering state when a graphics protocol is available.
     pub graphics: Option<Graphics>,
+    /// Optional companion PNG destination.
     pub preview_png: Option<PathBuf>,
+    /// Most recent PNG worker error.
     pub png_error: Option<String>,
     png_worker: Option<Worker>,
+    /// Preview position and display mode.
     pub view: View,
+    /// Whether keys control the preview.
     pub preview_focus: bool,
     last_drag: Option<(u16, u16)>,
-    pub source: RgbaImage,
+    /// Image processing caches.
+    pub pipeline: Pipeline,
+    /// Current image settings.
     pub params: Params,
+    /// Selected parameter and panel scroll position.
     pub parameter_list: ListState,
-    pub indices: Vec<u8>,
-    pub original: RgbaImage,
-    original_rotation: u8,
-    pub rgb_overviews: RgbOverviewCache,
-    dither_stale: bool,
+    /// Colors for the main RGB overview.
+    pub overview: Memo<(u64, u16, u16), Vec<ratatui::style::Color>>,
+    /// Colors for the RGB minimap.
+    pub minimap: Memo<(u64, u16, u16), Vec<ratatui::style::Color>>,
+    /// Whether the preview shows RGB pixels.
     pub show_original: bool,
+    /// Input change signal cleared by refresh, independent of memo validity.
     pub dirty: bool,
+    /// Whether the event loop should exit.
     pub quit: bool,
 }
 
 impl App {
+    /// Initializes image consumers and builds the initial preview grid.
     pub fn new(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
         let (png_worker, png_error) =
             match preview_png.as_ref().map(|path| Worker::new(path.clone())) {
@@ -109,14 +137,15 @@ impl App {
             view: View::default(),
             preview_focus: false,
             last_drag: None,
-            source,
+            pipeline: Pipeline {
+                source,
+                grid: Memo::default(),
+                dithered: Memo::default(),
+            },
             params: Params::default(),
             parameter_list: ListState::default().with_selected(Some(0)),
-            indices: Vec::new(),
-            original: RgbaImage::new(0, 0),
-            original_rotation: 0,
-            rgb_overviews: RgbOverviewCache::default(),
-            dither_stale: true,
+            overview: Memo::default(),
+            minimap: Memo::default(),
             show_original: true,
             dirty: true,
             quit: false,
@@ -133,9 +162,13 @@ impl App {
                 .round()
                 .max(1.0) as u32
         };
-        (scaled(self.source.width()), scaled(self.source.height()))
+        (
+            scaled(self.pipeline.source.width()),
+            scaled(self.pipeline.source.height()),
+        )
     }
 
+    /// Returns scaled dimensions after rotation.
     pub fn grid_size(&self) -> (u32, u32) {
         let (w, h) = self.scaled_size();
         if self.params.rotation.is_multiple_of(2) {
@@ -156,41 +189,40 @@ impl App {
     // Rebuilds the grid when needed and dithers only when a consumer needs it.
     fn refresh(&mut self) -> bool {
         let mut status_changed = self.poll_png();
-        if self.dirty {
-            self.dirty = false;
-            self.dither_stale = true;
-            if self.original.dimensions() != self.grid_size()
-                || self.original_rotation != self.params.rotation
-            {
-                let (w, h) = self.scaled_size();
-                let scaled = imageops::resize(&self.source, w, h, imageops::FilterType::Triangle);
-                self.original = match self.params.rotation {
-                    1 => imageops::rotate90(&scaled),
-                    2 => imageops::rotate180(&scaled),
-                    3 => imageops::rotate270(&scaled),
-                    _ => scaled,
-                };
-                self.original_rotation = self.params.rotation;
-                self.rgb_overviews.clear();
-                if let Some(graphics) = &mut self.graphics {
-                    graphics.clear();
-                }
+        self.dirty = false;
+        let (w, h) = self.scaled_size();
+        let pipeline = &mut self.pipeline;
+        pipeline.grid.update((w, h, self.params.rotation), || {
+            let scaled = imageops::resize(&pipeline.source, w, h, imageops::FilterType::Triangle);
+            match self.params.rotation {
+                1 => imageops::rotate90(&scaled),
+                2 => imageops::rotate180(&scaled),
+                3 => imageops::rotate270(&scaled),
+                _ => scaled,
             }
-        }
-        if !self.dither_stale || (self.show_original && self.png_worker.is_none()) {
+        });
+        if self.show_original && self.png_worker.is_none() {
             return status_changed;
         }
-        self.dither_stale = false;
-        let (gw, gh) = self.original.dimensions();
-        self.indices = dither::dither(
-            self.original.as_raw(),
-            gw as usize,
-            gh as usize,
-            &self.params.options,
+        let grid = pipeline.grid.get().expect("processed grid");
+        let (gw, gh) = grid.dimensions();
+        let rebuilt = pipeline.dithered.update(
+            (pipeline.grid.version(), self.params.options.clone()),
+            || {
+                dither::dither(
+                    grid.as_raw(),
+                    gw as usize,
+                    gh as usize,
+                    &self.params.options,
+                )
+            },
         );
+        if !rebuilt {
+            return status_changed;
+        }
         if let Some(worker) = &mut self.png_worker {
             let submitted = worker.submit(Job {
-                indices: self.indices.clone(),
+                indices: self.pipeline.dithered.get().expect("dithered grid").clone(),
                 w: gw,
                 h: gh,
                 palette: self.params.options.palette.clone(),
@@ -202,12 +234,16 @@ impl App {
         status_changed
     }
 
+    /// Returns the selected preview pixels after synchronization.
     pub fn displayed(&self) -> Pixels<'_> {
         if self.show_original {
-            Pixels::Rgb(&self.original)
+            Pixels::Rgb(
+                self.pipeline.grid.get().expect("processed grid"),
+                self.pipeline.grid.version(),
+            )
         } else {
             Pixels::Indexed {
-                indices: &self.indices,
+                indices: self.pipeline.dithered.get().expect("dithered grid"),
                 palette: &self.params.options.palette,
             }
         }
@@ -237,6 +273,7 @@ impl App {
         false
     }
 
+    /// Flushes pending image changes and waits for the PNG worker.
     pub fn finish_png(&mut self) -> std::io::Result<()> {
         // A change and quit can arrive in the same input batch.
         self.refresh();
@@ -294,7 +331,7 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            // Raw mode delivers Ctrl+C as a key; other Ctrl chords are not bound.
+            // Raw mode delivers Ctrl+C as a key. Other Ctrl chords are not bound.
             self.quit |= key.code == KeyCode::Char('c');
             return;
         }
@@ -306,7 +343,7 @@ impl App {
             self.show_original = !self.show_original;
             return;
         }
-        // Esc only leaves preview focus; quitting is q or Ctrl+C so a stray Esc never exits.
+        // Esc leaves preview focus. Only q or Ctrl+C exits.
         if key.code == KeyCode::Esc {
             self.preview_focus = false;
             return;
@@ -387,7 +424,7 @@ impl App {
     fn adjust(&mut self, direction: i32) {
         let p = &mut self.params;
         let o = &mut p.options;
-        // Steps a float and reports whether it moved, so clamped presses skip the re-dither.
+        // Clamped presses preserve the current preview selection.
         let step = |value: &mut f64, steps: f64, low: f64, high: f64| {
             let next = (((*value * steps).round() + f64::from(direction)) / steps).clamp(low, high);
             let changed = next != *value;
@@ -475,6 +512,35 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_keys_control_builds_without_dirty() {
+        let mut app = App::new(RgbaImage::new(20, 10), None);
+        assert_eq!(app.pipeline.grid.version(), 1);
+        assert_eq!(app.pipeline.dithered.version(), 0);
+        app.show_original = false;
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.dithered.version(), 1);
+        app.dirty = true;
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.grid.version(), 1);
+        assert_eq!(app.pipeline.dithered.version(), 1);
+        app.params.options.strength = 0.5;
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.grid.version(), 1);
+        assert_eq!(app.pipeline.dithered.version(), 2);
+        app.show_original = true;
+        app.params.rotation = 2;
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.grid.version(), 2);
+        assert_eq!(app.pipeline.dithered.version(), 2);
+        app.show_original = false;
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.dithered.version(), 3);
+        app.pipeline.dithered.clear();
+        app.sync(&test_layout());
+        assert_eq!(app.pipeline.dithered.version(), 4);
+    }
+
+    #[test]
     fn sync_clamps_after_layout_and_grid_changes() {
         let mut app = App::new(RgbaImage::new(120, 80), None);
         for (screen, scale, rotation, expected) in [
@@ -490,7 +556,10 @@ mod tests {
             app.view.y = 999;
             app.sync(&crate::ui::layout(screen));
             assert_eq!((app.view.x, app.view.y), expected);
-            assert_eq!(app.original.dimensions(), app.grid_size());
+            assert_eq!(
+                app.pipeline.grid.get().unwrap().dimensions(),
+                app.grid_size()
+            );
         }
     }
 
@@ -523,12 +592,12 @@ mod tests {
     #[test]
     fn original_defers_dithering_until_space_then_refresh() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
-        assert!(app.indices.is_empty());
+        assert!(app.pipeline.dithered.get().is_none());
         assert!(press(&mut app, KeyCode::Right));
-        assert_eq!(app.original.dimensions(), (22, 11));
+        assert_eq!(app.pipeline.grid.get().unwrap().dimensions(), (22, 11));
         assert!(app.show_original);
-        assert!(app.indices.is_empty());
-        assert!(app.dither_stale);
+        assert!(app.pipeline.dithered.get().is_none());
+        assert_eq!(app.pipeline.dithered.version(), 0);
         app.handle_key(
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             &preview_geometry(&app, test_layout().preview),
@@ -536,8 +605,8 @@ mod tests {
         assert!(!app.dirty);
         app.sync(&test_layout());
         let (w, h) = app.grid_size();
-        assert_eq!(app.indices.len(), (w * h) as usize);
-        assert!(!app.dither_stale);
+        assert_eq!(app.pipeline.dithered.get().unwrap().len(), (w * h) as usize);
+        assert_eq!(app.pipeline.dithered.version(), 1);
     }
 
     #[test]
@@ -549,14 +618,14 @@ mod tests {
         )
         .unwrap();
         let app = App::new(source, None);
-        let Pixels::Rgb(pixels) = app.displayed() else {
+        let Pixels::Rgb(pixels, _) = app.displayed() else {
             panic!("expected original RGB pixels");
         };
         assert_eq!(
             pixels.as_raw(),
             &[255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255]
         );
-        assert_eq!(&app.original, pixels);
+        assert_eq!(app.pipeline.grid.get().unwrap(), pixels);
     }
 
     #[test]
@@ -628,7 +697,7 @@ mod tests {
         let p = &app.params;
         assert_eq!((p.scale, p.rotation, p.palette), (100, 0, 0));
         assert_eq!(p.options.palette.len(), 2);
-        assert_eq!(app.indices.len(), 16);
+        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 16);
     }
 
     #[test]
@@ -691,7 +760,7 @@ mod tests {
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (128, 256));
-        assert_eq!(app.indices.len(), 128 * 256);
+        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 128 * 256);
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('R'));
@@ -706,7 +775,7 @@ mod tests {
             press(&mut app, KeyCode::Left);
         }
         assert_eq!(app.grid_size(), (2, 1));
-        assert_eq!(app.indices.len(), 2);
+        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 2);
     }
     #[test]
     fn tab_and_preview_keys_change_view_without_redithering() {
@@ -762,7 +831,7 @@ mod tests {
                 app.displayed(),
                 &geometry,
                 &mut buffer,
-                &mut RgbOverviewCache::default(),
+                &mut Memo::default(),
             );
             assert_eq!(map, expected);
             assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);
@@ -925,7 +994,7 @@ mod tests {
         );
         assert!(!app.sync(&test_layout()));
         std::fs::remove_dir(&path).unwrap();
-        app.dirty = true;
+        app.pipeline.dithered.clear();
         assert!(!app.sync(&test_layout()));
         wait_for_change(&mut app);
         assert!(app.png_error.is_none());
@@ -944,7 +1013,7 @@ mod tests {
         wait_for(&mut app, |app| app.png_error.is_some());
         std::fs::remove_dir(&path).unwrap();
         app.png_error = Some("previous write failed".into());
-        app.dirty = true;
+        app.pipeline.dithered.clear();
         app.sync(&test_layout());
         assert_eq!(app.png_error.as_deref(), Some("previous write failed"));
         drop(app);
@@ -968,13 +1037,13 @@ mod tests {
         app.sync(&test_layout());
         assert!(!path.exists());
         std::fs::create_dir(&path).unwrap();
-        app.dirty = true;
+        app.pipeline.dithered.clear();
         app.sync(&test_layout());
         wait_for(&mut app, |app| app.png_error.is_some());
         app.sync(&test_layout());
         assert!(app.png_error.is_some());
         std::fs::remove_dir(&path).unwrap();
-        app.dirty = true;
+        app.pipeline.dithered.clear();
         app.sync(&test_layout());
         wait_for(&mut app, |app| app.png_error.is_none());
         drop(app);

@@ -1,3 +1,4 @@
+use crate::memo::Memo;
 use image::{
     RgbaImage,
     imageops::{self, FilterType},
@@ -10,49 +11,30 @@ use ratatui::{
 };
 use rthid::dither::PaletteColor;
 
+/// Borrowed preview pixels for either display mode.
 #[derive(Clone, Copy)]
 pub enum Pixels<'a> {
+    /// Dithered palette indices and their colors.
     Indexed {
+        /// One palette index per grid pixel.
         indices: &'a [u8],
+        /// Colors referenced by the indices.
         palette: &'a [PaletteColor],
     },
-    Rgb(&'a RgbaImage),
+    /// Original grid and its build version.
+    Rgb(&'a RgbaImage, u64),
 }
 
 impl Pixels<'_> {
     fn rgb(self, i: usize) -> [u8; 3] {
         match self {
             Self::Indexed { indices, palette } => palette[usize::from(indices[i])].rgb,
-            Self::Rgb(pixels) => pixels.as_raw()[i * 4..i * 4 + 3].try_into().unwrap(),
+            Self::Rgb(pixels, _) => pixels.as_raw()[i * 4..i * 4 + 3].try_into().unwrap(),
         }
     }
 }
 
-#[derive(Default)]
-pub struct RgbOverviewCache {
-    entries: Vec<((u16, u16), Vec<Color>)>,
-}
-
-impl RgbOverviewCache {
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    fn colors(&mut self, pixels: &RgbaImage, cols: u16, rows: u16) -> &[Color] {
-        let key = (cols, rows);
-        let index = if let Some(index) = self.entries.iter().position(|(size, _)| *size == key) {
-            index
-        } else {
-            if self.entries.len() == 2 {
-                self.entries.remove(0);
-            }
-            self.entries.push((key, average_rgb(pixels, cols, rows)));
-            self.entries.len() - 1
-        };
-        &self.entries[index].1
-    }
-}
-
+/// Glyph set used to sample indexed overviews.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyphs {
     #[default]
@@ -61,6 +43,7 @@ pub enum Glyphs {
 }
 
 impl Glyphs {
+    /// Selects the glyph set supported by the terminal.
     pub fn for_terminal(program: Option<&str>) -> Self {
         if program == Some("Apple_Terminal") {
             Self::Quadrant
@@ -69,6 +52,7 @@ impl Glyphs {
         }
     }
 
+    /// Returns the glyph label used in status text.
     pub fn name(self) -> &'static str {
         match self {
             Self::Sextant => "sextant",
@@ -102,8 +86,7 @@ impl Glyphs {
     }
 }
 
-// Fits a grid into whole cells, keeping its aspect on cells about 2.25 times taller than wide.
-// The glyph set only changes how densely each cell is sampled, not the fitted shape.
+/// Fits the grid to cells about 2.25 times taller than wide, regardless of glyph set.
 pub fn fit(w: u32, h: u32, area: Rect) -> (u16, u16) {
     fit_aspect(w, h, area, 2.25)
 }
@@ -120,7 +103,7 @@ fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) {
     )
 }
 
-// Build an image that covers whole terminal cells without a second widget resize.
+/// Produces a grid image fitted to whole terminal cells.
 pub fn original_image(
     grid: &RgbaImage,
     view: &View,
@@ -176,12 +159,18 @@ pub fn original_image(
     (rect, image)
 }
 
+/// Preview mode and image origin.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct View {
+    /// Glyph set for indexed overviews.
     pub glyphs: Glyphs,
+    /// Whether one image pixel occupies one half cell.
     pub exact: bool,
+    /// Whether to suppress the exact mode inset.
     pub hide_minimap: bool,
+    /// Horizontal image origin.
     pub x: u32,
+    /// Vertical image origin.
     pub y: u32,
 }
 
@@ -236,8 +225,9 @@ pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
 }
 
 impl View {
+    /// Returns the border and map regions when the inset fits.
     pub fn minimap(&self, w: u32, h: u32, area: Rect) -> Option<(Rect, Rect)> {
-        // A bordered frame in the top-right corner; the overview fits inside the border.
+        // A bordered inset in the upper right corner contains the fitted overview.
         let fw = (area.width / 3).min(18);
         let frame = Rect::new(area.right() - fw, area.y, fw, (area.height / 3).min(10));
         let inner = Block::bordered().inner(frame);
@@ -251,6 +241,7 @@ impl View {
         ))
     }
 
+    /// Returns the image extent visible in exact mode.
     pub fn visible(&self, w: u32, h: u32, area: Rect) -> (u32, u32) {
         (
             w.min(u32::from(area.width)),
@@ -258,12 +249,14 @@ impl View {
         )
     }
 
+    /// Keeps the origin within the visible image bounds.
     pub fn clamp(&mut self, w: u32, h: u32, area: Rect) {
         let (vw, vh) = self.visible(w, h, area);
         self.x = self.x.min(w.saturating_sub(vw));
         self.y = self.y.min(h.saturating_sub(vh));
     }
 
+    /// Moves the origin within the visible image bounds.
     pub fn pan(&mut self, dx: i64, dy: i64, w: u32, h: u32, area: Rect) {
         self.x = i64::from(self.x)
             .saturating_add(dx)
@@ -280,7 +273,7 @@ impl View {
         pixels: Pixels<'_>,
         geometry: &PreviewGeometry,
         buffer: &mut Buffer,
-        cache: &mut RgbOverviewCache,
+        cache: &mut Memo<(u64, u16, u16), Vec<Color>>,
     ) {
         let Some(Minimap { frame, .. }) = geometry.minimap else {
             return;
@@ -298,6 +291,7 @@ impl View {
         );
     }
 
+    /// Centers the preview on the selected map cell.
     pub fn center_on_minimap(&mut self, point: (u16, u16), w: u32, h: u32, area: Rect, map: Rect) {
         let (vw, vh) = self.visible(w, h, area);
         let center = |cell: u16, cells: u16, dots: u32| {
@@ -312,6 +306,7 @@ impl View {
         );
     }
 
+    /// Projects the visible image region onto minimap cells.
     pub fn viewport_rect(&self, w: u32, h: u32, visible: (u32, u32), map: Rect) -> Rect {
         let project = |start: u32, length: u32, total: u32, cells: u16| {
             let first = (u64::from(start) * u64::from(cells) / u64::from(total)) as u16;
@@ -325,6 +320,7 @@ impl View {
     }
 }
 
+/// Paints the preview and reports whether indexed overview colors were approximated.
 pub fn render(
     pixels: Pixels<'_>,
     w: u32,
@@ -332,7 +328,7 @@ pub fn render(
     view: &View,
     area: Rect,
     buffer: &mut Buffer,
-    cache: &mut RgbOverviewCache,
+    cache: &mut Memo<(u64, u16, u16), Vec<Color>>,
 ) -> bool {
     if area.is_empty() {
         return false;
@@ -354,7 +350,7 @@ fn render_exact(
     view: &View,
     area: Rect,
     buffer: &mut Buffer,
-    cache: &mut RgbOverviewCache,
+    cache: &mut Memo<(u64, u16, u16), Vec<Color>>,
 ) {
     let color = |i| {
         let [r, g, b] = pixels.rgb(i);
@@ -386,7 +382,7 @@ pub fn draw_minimap(
     view: &View,
     area: Rect,
     buffer: &mut Buffer,
-    cache: &mut RgbOverviewCache,
+    cache: &mut Memo<(u64, u16, u16), Vec<Color>>,
 ) {
     let geometry = geometry(view, (w, h), area);
     if let Some(Minimap {
@@ -417,12 +413,13 @@ fn render_overview(
     glyphs: Glyphs,
     area: Rect,
     buffer: &mut Buffer,
-    cache: &mut RgbOverviewCache,
+    cache: &mut Memo<(u64, u16, u16), Vec<Color>>,
 ) -> bool {
     let (indices, palette) = match pixels {
-        Pixels::Rgb(pixels) => {
+        Pixels::Rgb(pixels, version) => {
             let (cols, rows) = fit(w, h, area);
-            let colors = cache.colors(pixels, cols, rows);
+            let colors =
+                cache.get_or_build((version, cols, rows), || average_rgb(pixels, cols, rows));
             let target = area.centered(Constraint::Length(cols), Constraint::Length(rows));
             render_overview_rgb(colors, target, buffer);
             return false;
@@ -760,7 +757,7 @@ mod tests {
             &view,
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default(),
+            &mut Memo::default(),
         );
         let is_block = |cell: &ratatui::buffer::Cell| {
             cell.symbol()
@@ -776,7 +773,7 @@ mod tests {
             indexed(&indices, &palette),
             &geometry,
             &mut buffer,
-            &mut RgbOverviewCache::default(),
+            &mut Memo::default(),
         );
         assert!(map.positions().all(|pos| is_block(&buffer[pos])));
         assert!(map.positions().any(|pos| buffer[pos].symbol() != " "));
@@ -806,7 +803,7 @@ mod tests {
             indexed(&indices, &palette),
             &geometry,
             &mut baseline,
-            &mut RgbOverviewCache::default(),
+            &mut Memo::default(),
         );
         Block::bordered()
             .border_style(Color::Gray)
@@ -823,7 +820,7 @@ mod tests {
                 &view,
                 area,
                 &mut current,
-                &mut RgbOverviewCache::default(),
+                &mut Memo::default(),
             );
             for pos in frame.positions() {
                 let original = &baseline[pos];
@@ -865,7 +862,7 @@ mod tests {
             indexed(&indices, &palette),
             &geometry,
             &mut baseline,
-            &mut RgbOverviewCache::default(),
+            &mut Memo::default(),
         );
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut previous: Option<(Buffer, Rect)> = None;
@@ -890,7 +887,7 @@ mod tests {
                         &view,
                         area,
                         f.buffer_mut(),
-                        &mut RgbOverviewCache::default(),
+                        &mut Memo::default(),
                     );
                 })
                 .unwrap();
@@ -904,7 +901,7 @@ mod tests {
                         &view,
                         area,
                         f.buffer_mut(),
-                        &mut RgbOverviewCache::default(),
+                        &mut Memo::default(),
                     );
                 })
                 .unwrap();
@@ -1016,7 +1013,7 @@ mod tests {
         let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
-        // Sample columns 1 and 3 of each row; column 0 must not participate.
+        // Sample columns 1 and 3 of each row. Column 0 must not participate.
         assert!(!render(
             indexed(&[2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1], &palette),
             4,
@@ -1024,7 +1021,7 @@ mod tests {
             &View::default(),
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▐");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
@@ -1036,7 +1033,7 @@ mod tests {
             &View::default(),
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▌");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
@@ -1059,7 +1056,7 @@ mod tests {
             &view,
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▐");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
@@ -1071,7 +1068,7 @@ mod tests {
             &view,
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▌");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
@@ -1079,20 +1076,48 @@ mod tests {
     }
 
     #[test]
-    fn rgb_overview_cache_reuses_two_sizes_and_clears() {
+    fn rgb_overview_memo_tracks_grid_and_size() {
         let pixels = rgb(1, 2, &[[25, 26, 128], [231, 47, 93]]);
-        let mut cache = RgbOverviewCache::default();
-        let first = cache.colors(&pixels, 1, 1).as_ptr();
-        cache.colors(&pixels, 2, 2);
-        assert_eq!(cache.colors(&pixels, 1, 1).as_ptr(), first);
-        assert_eq!(cache.entries.len(), 2);
-        cache.colors(&pixels, 3, 3);
-        assert_eq!(cache.entries.len(), 2);
-        assert_eq!(cache.entries[0].0, (2, 2));
-        cache.clear();
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut cache = Memo::default();
+        for (version, expected) in [(1, 1), (1, 1), (2, 2)] {
+            render(
+                Pixels::Rgb(&pixels, version),
+                1,
+                2,
+                &View::default(),
+                area,
+                &mut buffer,
+                &mut cache,
+            );
+            assert_eq!(cache.version(), expected);
+        }
+        let area = Rect::new(0, 0, 2, 2);
+        render(
+            Pixels::Rgb(&pixels, 2),
+            1,
+            2,
+            &View::default(),
+            area,
+            &mut Buffer::empty(area),
+            &mut cache,
+        );
+        assert_eq!(cache.version(), 3);
+        let area = Rect::new(0, 0, 1, 1);
         let updated = rgb(1, 2, &[[0; 3], [255; 3]]);
+        render(
+            Pixels::Rgb(&updated, 3),
+            1,
+            2,
+            &View::default(),
+            area,
+            &mut Buffer::empty(area),
+            &mut cache,
+        );
+        assert_eq!(cache.version(), 4);
         assert_eq!(
-            cache.colors(&updated, 1, 1),
+            cache.get().unwrap(),
             &[Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]
         );
     }
@@ -1103,7 +1128,7 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
         assert!(!render(
-            Pixels::Rgb(&pixels),
+            Pixels::Rgb(&pixels, 1),
             1,
             2,
             &View {
@@ -1112,7 +1137,7 @@ mod tests {
             },
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(25, 26, 128));
@@ -1129,7 +1154,7 @@ mod tests {
                 let area = Rect::new(2, 3, width, 3);
                 let mut buffer = Buffer::empty(area);
                 assert!(!render(
-                    Pixels::Rgb(&rgb(4, 4, &pixels)),
+                    Pixels::Rgb(&rgb(4, 4, &pixels), 1),
                     4,
                     4,
                     &View {
@@ -1138,7 +1163,7 @@ mod tests {
                     },
                     area,
                     &mut buffer,
-                    &mut RgbOverviewCache::default()
+                    &mut Memo::default()
                 ));
                 let (cw, ch) = fit(4, 4, area);
                 let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
@@ -1164,13 +1189,13 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
         assert!(!render(
-            Pixels::Rgb(&rgb(1, 4, &pixels)),
+            Pixels::Rgb(&rgb(1, 4, &pixels), 1),
             1,
             4,
             &View::default(),
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(50, 30, 150));
@@ -1183,13 +1208,13 @@ mod tests {
         let area = Rect::new(0, 0, 3, 3);
         let mut buffer = Buffer::empty(area);
         assert!(!render(
-            Pixels::Rgb(&rgb(1, 2, &pixels)),
+            Pixels::Rgb(&rgb(1, 2, &pixels), 1),
             1,
             2,
             &View::default(),
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         let (cw, ch) = fit(1, 2, area);
         let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
@@ -1220,7 +1245,7 @@ mod tests {
             },
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default()
+            &mut Memo::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
@@ -1244,9 +1269,9 @@ mod tests {
             &view,
             area,
             &mut buffer,
-            &mut RgbOverviewCache::default(),
+            &mut Memo::default(),
         );
-        // A 16x6 frame at x 32; the square grid fits 9x4 cells inside its 14x4 border.
+        // The square grid fits 9x4 cells inside the 14x4 border of a 16x6 frame at x 32.
         assert_eq!(buffer[(32, 0)].symbol(), "┌");
         assert_eq!(buffer[(47, 5)].symbol(), "┘");
         assert_eq!(buffer[(33, 2)].symbol(), " ");

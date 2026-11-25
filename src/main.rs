@@ -1,6 +1,8 @@
 mod app;
 /// Terminal graphics detection, rendering and cleanup.
 mod graphics;
+/// Single entry caches with build versions.
+mod memo;
 mod ui;
 mod view;
 
