@@ -12,12 +12,12 @@ mod ui;
 mod view;
 
 use std::{
-    ffi::OsString,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use clap::{Parser, ValueEnum};
 use image::imageops;
 use ratatui::crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
@@ -38,68 +38,33 @@ impl Drop for MouseCapture {
 // Keep the original around once export needs full resolution.
 const MAX_SOURCE_SIDE: u32 = 1024;
 
-fn parse_args(
-    args: impl IntoIterator<Item = OsString>,
-) -> io::Result<(PathBuf, Option<PathBuf>, Option<Glyphs>, Graphics)> {
-    let mut args = args.into_iter();
-    let mut source = None;
-    let mut preview = None;
-    let mut glyphs = None;
-    let mut graphics = None;
-    let invalid = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]",
-        )
-    };
-    fn choice<T: Copy>(
-        slot: &mut Option<T>,
-        next: Option<OsString>,
-        choices: &[(&str, T)],
-    ) -> Option<()> {
-        if slot.is_some() {
-            return None;
-        }
-        let next = next?;
-        *slot = Some(choices.iter().find(|(name, _)| next == *name)?.1);
-        Some(())
-    }
-    while let Some(arg) = args.next() {
-        if arg == "--preview-png" {
-            if preview.is_some() {
-                return Err(invalid());
-            }
-            let value = args.next().ok_or_else(invalid)?;
-            if value.is_empty() || value.as_encoded_bytes().starts_with(b"-") {
-                return Err(invalid());
-            }
-            preview = Some(PathBuf::from(value));
-        } else if arg == "--graphics" {
-            choice(
-                &mut graphics,
-                args.next(),
-                &[("auto", Graphics::Auto), ("off", Graphics::Off)],
-            )
-            .ok_or_else(invalid)?;
-        } else if arg == "--glyphs" {
-            choice(
-                &mut glyphs,
-                args.next(),
-                &[("sextant", Glyphs::Sextant), ("quadrant", Glyphs::Quadrant)],
-            )
-            .ok_or_else(invalid)?;
-        } else if arg.as_encoded_bytes().starts_with(b"-") || source.is_some() {
-            return Err(invalid());
-        } else {
-            source = Some(PathBuf::from(arg));
-        }
-    }
-    Ok((
-        source.unwrap_or_else(|| "tests/fixtures/hsl.jpg".into()),
-        preview,
-        glyphs,
-        graphics.unwrap_or_default(),
-    ))
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Source image to preview.
+    #[arg(default_value = "tests/fixtures/hsl.jpg")]
+    image: PathBuf,
+    /// Save the dithered preview to a PNG file.
+    #[arg(long, value_name = "PATH")]
+    preview_png: Option<PathBuf>,
+    /// Glyph set for the dithered overview and minimap.
+    #[arg(long, value_enum)]
+    glyphs: Option<CliGlyphs>,
+    /// Detect terminal graphics or use glyph rendering.
+    #[arg(long, value_enum, default_value = "auto")]
+    graphics: CliGraphics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliGlyphs {
+    Sextant,
+    Quadrant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliGraphics {
+    Auto,
+    Off,
 }
 
 // The companion PNG is replaced on every re-dither, so it must never be the source image.
@@ -122,7 +87,20 @@ fn needs_redraw(event: &Event) -> bool {
 }
 
 fn main() -> std::io::Result<()> {
-    let (path, preview_png, glyphs, graphics) = parse_args(std::env::args_os().skip(1))?;
+    let Args {
+        image: path,
+        preview_png,
+        glyphs,
+        graphics,
+    } = Args::parse();
+    let glyphs = glyphs.map(|glyphs| match glyphs {
+        CliGlyphs::Sextant => Glyphs::Sextant,
+        CliGlyphs::Quadrant => Glyphs::Quadrant,
+    });
+    let graphics = match graphics {
+        CliGraphics::Auto => Graphics::Auto,
+        CliGraphics::Off => Graphics::Off,
+    };
     check_not_source(&path, preview_png.as_deref())?;
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -204,48 +182,73 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use clap::CommandFactory;
 
     #[test]
-    fn cli_selects_graphics_and_rejects_invalid_or_duplicate_values() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&[]).unwrap().3, Graphics::Auto);
-        for (value, expected) in [("auto", Graphics::Auto), ("off", Graphics::Off)] {
-            assert_eq!(
-                parse(&["photo.png", "--graphics", value, "--glyphs", "quadrant"])
-                    .unwrap()
-                    .3,
-                expected
-            );
+    fn cli_defaults_and_definition() {
+        Args::command().debug_assert();
+        let args = Args::try_parse_from(["rthid"]).unwrap();
+        assert_eq!(args.image, PathBuf::from("tests/fixtures/hsl.jpg"));
+        assert_eq!(args.preview_png, None);
+        assert!(args.glyphs.is_none());
+        assert!(matches!(args.graphics, CliGraphics::Auto));
+    }
+
+    #[test]
+    fn cli_accepts_enum_values_and_paths() {
+        for (value, expected) in [("auto", CliGraphics::Auto), ("off", CliGraphics::Off)] {
+            let args = Args::try_parse_from(["rthid", "--graphics", value]).unwrap();
+            assert_eq!(args.graphics, expected);
         }
+        for (value, expected) in [
+            ("sextant", CliGlyphs::Sextant),
+            ("quadrant", CliGlyphs::Quadrant),
+        ] {
+            for args in [
+                vec!["rthid", "--glyphs", value],
+                vec![
+                    "rthid",
+                    "photo.png",
+                    "--glyphs",
+                    value,
+                    "--preview-png",
+                    "dots.png",
+                ],
+                vec![
+                    "rthid",
+                    "--preview-png",
+                    "dots.png",
+                    "--glyphs",
+                    value,
+                    "photo.png",
+                ],
+            ] {
+                let parsed = Args::try_parse_from(&args).unwrap();
+                assert_eq!(parsed.glyphs, Some(expected));
+                if args.len() > 3 {
+                    assert_eq!(parsed.image, PathBuf::from("photo.png"));
+                    assert_eq!(parsed.preview_png, Some(PathBuf::from("dots.png")));
+                }
+            }
+        }
+        let args = Args::try_parse_from(["rthid", "--glyphs=quadrant"]).unwrap();
+        assert!(matches!(args.glyphs, Some(CliGlyphs::Quadrant)));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_arguments() {
         for args in [
+            vec!["--preview-png"],
+            vec!["--preview-png", ""],
+            vec!["--preview-png="],
+            vec!["--preview-png", "-dots.png"],
+            vec!["--preview-png", "--wat"],
+            vec!["--preview-png", "a", "--preview-png", "b"],
             vec!["--graphics"],
             vec!["--graphics", ""],
             vec!["--graphics", "kitty"],
             vec!["--graphics", "Auto"],
             vec!["--graphics", "off", "--graphics", "auto"],
-        ] {
-            assert!(parse(&args).is_err(), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn cli_selects_glyphs_and_rejects_invalid_or_duplicate_values() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&[]).unwrap().2, None);
-        for (value, expected) in [
-            ("sextant", view::Glyphs::Sextant),
-            ("quadrant", view::Glyphs::Quadrant),
-        ] {
-            for args in [
-                vec!["--glyphs", value],
-                vec!["photo.png", "--glyphs", value, "--preview-png", "dots.png"],
-                vec!["--preview-png", "dots.png", "--glyphs", value, "photo.png"],
-            ] {
-                assert_eq!(parse(&args).unwrap().2, Some(expected));
-            }
-        }
-        for args in [
             vec!["--glyphs"],
             vec!["--glyphs", ""],
             vec!["--glyphs", "unknown"],
@@ -253,10 +256,11 @@ mod tests {
             vec!["--glyphs", "--preview-png"],
             vec!["--glyphs", "quadrant", "--glyphs", "sextant"],
             vec!["--glyphs", "sextant", "--glyphs", "sextant"],
+            vec!["--wat"],
+            vec!["a", "b"],
         ] {
-            assert_eq!(
-                parse(&args).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput,
+            assert!(
+                Args::try_parse_from(std::iter::once("rthid").chain(args.iter().copied())).is_err(),
                 "{args:?}"
             );
         }
@@ -281,42 +285,6 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         ] {
             assert!([&moved, &event, &moved].into_iter().any(needs_redraw));
-        }
-    }
-
-    #[test]
-    fn cli_accepts_image_and_companion_and_rejects_invalid_arguments() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(
-            parse(&[]).unwrap(),
-            ("tests/fixtures/hsl.jpg".into(), None, None, Graphics::Auto)
-        );
-        assert_eq!(
-            parse(&["photo.png", "--preview-png", "dots.png"]).unwrap(),
-            (
-                "photo.png".into(),
-                Some("dots.png".into()),
-                None,
-                Graphics::Auto
-            )
-        );
-        assert_eq!(
-            parse(&["--preview-png", "dots.png", "photo.png"]).unwrap(),
-            (
-                "photo.png".into(),
-                Some("dots.png".into()),
-                None,
-                Graphics::Auto
-            )
-        );
-        for args in [
-            vec!["--preview-png"],
-            vec!["--wat"],
-            vec!["a", "b"],
-            vec!["--preview-png", "a", "--preview-png", "b"],
-            vec!["--preview-png", "--wat"],
-        ] {
-            assert!(parse(&args).is_err(), "{args:?}");
         }
     }
 

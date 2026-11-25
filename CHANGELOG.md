@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- CLI help and version output via clap, with `--glyphs=quadrant` option syntax
+
 - Real-pixel Original preview via Kitty, iTerm2, or Sixel with automatic detection,
   cached encoding, half-block fallback, and `--graphics auto|off`
 
