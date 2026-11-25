@@ -1,4 +1,5 @@
 use crate::{
+    graphics::Graphics,
     ui::Layout,
     view::{Pixels, PreviewGeometry, RgbOverviewCache, View},
 };
@@ -6,6 +7,7 @@ use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+#[cfg(test)]
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use rthid::dither::{self, Mode, Options};
@@ -69,33 +71,8 @@ impl Params {
     }
 }
 
-type GraphicsCache = (
-    (u32, u32, bool, Rect, bool),
-    Rect,
-    ratatui_image::protocol::StatefulProtocol,
-);
-
-pub struct Graphics {
-    pub picker: ratatui_image::picker::Picker,
-    pub cache: Option<GraphicsCache>,
-    pub error: Option<String>,
-    pub placement: Option<(Rect, bool)>,
-}
-
-impl Graphics {
-    pub fn new(picker: ratatui_image::picker::Picker) -> Self {
-        Self {
-            picker,
-            cache: None,
-            error: None,
-            placement: None,
-        }
-    }
-}
-
-pub const KITTY_IMAGE_ID: u32 = 0x727468;
-
 pub struct App {
+    /// Terminal image rendering state when a graphics protocol is available.
     pub graphics: Option<Graphics>,
     pub preview_png: Option<PathBuf>,
     pub png_error: Option<String>,
@@ -196,7 +173,7 @@ impl App {
                 self.original_rotation = self.params.rotation;
                 self.rgb_overviews.clear();
                 if let Some(graphics) = &mut self.graphics {
-                    graphics.cache = None;
+                    graphics.clear();
                 }
             }
         }

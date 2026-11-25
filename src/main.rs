@@ -1,4 +1,6 @@
 mod app;
+/// Terminal graphics detection, rendering and cleanup.
+mod graphics;
 mod ui;
 mod view;
 
@@ -15,44 +17,14 @@ use ratatui::crossterm::{
     execute,
 };
 
+use crate::{app::App, graphics::Mode as Graphics, view::Glyphs};
+
 struct MouseCapture;
 
 impl Drop for MouseCapture {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), DisableMouseCapture);
     }
-}
-
-struct KittyCleanup {
-    tmux: bool,
-}
-
-impl Drop for KittyCleanup {
-    fn drop(&mut self) {
-        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
-        let mut stdout = io::stdout().lock();
-        let _ = write!(
-            stdout,
-            "{start}{escape}_Ga=d,d=I,i={KITTY_IMAGE_ID}{escape}\\{end}"
-        )
-        .and_then(|()| stdout.flush());
-    }
-}
-
-use crate::{
-    app::{App, KITTY_IMAGE_ID},
-    view::Glyphs,
-};
-use ratatui_image::picker::{
-    Picker, ProtocolType,
-    cap_parser::{Parser, QueryStdioOptions},
-};
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum Graphics {
-    #[default]
-    Auto,
-    Off,
 }
 
 // Sources are shrunk on load to bound dither work per keypress.
@@ -173,21 +145,9 @@ fn main() -> std::io::Result<()> {
     let mouse_capture = MouseCapture;
     let mut kitty_cleanup = None;
     let terminal_result = ratatui::run(|terminal| {
-        if graphics == Graphics::Auto && term_program.as_deref() != Some("Apple_Terminal") {
-            app.graphics = Picker::from_query_stdio_with_options(QueryStdioOptions {
-                timeout: Duration::from_millis(200),
-                ..QueryStdioOptions::default()
-            })
-            .ok()
-            .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
-            .map(|picker| {
-                if picker.protocol_type() == ProtocolType::Kitty {
-                    kitty_cleanup = Some(KittyCleanup {
-                        tmux: picker.tmux_detected(),
-                    });
-                }
-                app::Graphics::new(picker)
-            });
+        if let Some((graphics, cleanup)) = graphics::detect(graphics, term_program.as_deref()) {
+            app.graphics = Some(graphics);
+            kitty_cleanup = cleanup;
         }
         execute!(io::stdout(), EnableMouseCapture)?;
         let size = terminal.size()?;
