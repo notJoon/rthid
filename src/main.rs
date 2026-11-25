@@ -12,6 +12,7 @@ mod ui;
 mod view;
 
 use std::{
+    fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -19,12 +20,13 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use image::imageops;
+use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
     execute,
 };
 
-use crate::{app::App, graphics::Mode as Graphics, view::Glyphs};
+use crate::{app::App, graphics::Mode as Graphics, ui::Renderer, view::Glyphs};
 
 struct MouseCapture;
 
@@ -130,55 +132,63 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
-    // TODO: Extract an event_loop function that takes its dependencies explicitly.
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut layout = ui::layout(terminal.size()?);
-        let mut redraw = true;
-        while !app.quit {
-            if redraw {
-                app.poll_export();
-                app.sync(layout.preview);
-                let frame = terminal.draw(|frame| {
-                    ui::draw(frame, &app, &layout, &mut renderer);
-                })?;
-                if let Some(log) = &mut debug_log {
-                    ui::log_minimap(&app, log, &frame, &app.geometry(layout.preview))?;
-                }
-            }
-            redraw = false;
-            // With a companion PNG, wake periodically so background write results reach the status line.
-            if app.has_export() && !event::poll(Duration::from_millis(50))? {
-                redraw = app.poll_export();
-                continue;
-            }
-            // Drain queued input so held-down repeats cost one re-dither, not one each.
-            loop {
-                let event = event::read()?;
-                if let Some(log) = &mut debug_log {
-                    writeln!(log, "event {event:?}")?;
-                }
-                redraw |= needs_redraw(&event);
-                match event {
-                    Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
-                    Event::Resize(width, height) => {
-                        layout = ui::layout(ratatui::layout::Size::new(width, height));
-                        app.clamp_view(layout.preview);
-                    }
-                    _ => {}
-                }
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
-        Ok(())
+        event_loop(terminal, &mut app, &mut renderer, debug_log.as_mut())
     });
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    renderer: &mut Renderer,
+    mut debug_log: Option<&mut File>,
+) -> io::Result<()> {
+    let mut layout = ui::layout(terminal.size()?);
+    let mut redraw = true;
+    while !app.quit {
+        if redraw {
+            app.poll_export();
+            app.sync(layout.preview);
+            let frame = terminal.draw(|frame| {
+                ui::draw(frame, app, &layout, renderer);
+            })?;
+            if let Some(log) = &mut debug_log {
+                ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
+            }
+        }
+        redraw = false;
+        // With a companion PNG, wake periodically so background write results reach the status line.
+        if app.has_export() && !event::poll(Duration::from_millis(50))? {
+            redraw = app.poll_export();
+            continue;
+        }
+        // Drain queued input so held-down repeats cost one re-dither, not one each.
+        loop {
+            let event = event::read()?;
+            if let Some(log) = &mut debug_log {
+                writeln!(log, "event {event:?}")?;
+            }
+            redraw |= needs_redraw(&event);
+            match event {
+                Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
+                Event::Resize(width, height) => {
+                    layout = ui::layout(ratatui::layout::Size::new(width, height));
+                    app.clamp_view(layout.preview);
+                }
+                _ => {}
+            }
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
