@@ -22,8 +22,18 @@ jobs:
       # Installs the toolchain pinned in mise.toml and exposes its tasks.
       - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
-      - run: mise run lint
-      - run: mise run test
+      - run: mise run ci:rthid
+
+  widgets:
+    # Unit tests, doctests and rustdoc warnings for rthid-widgets, in parallel with check.
+    # The crate is platform independent, so one runner is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      # rust-cache keys entries by job, so this cache is separate from the check job's.
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci:widgets
 
   coverage:
     # Report only. Coverage does not depend on the OS, so one runner is enough.
