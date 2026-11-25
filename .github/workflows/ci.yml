@@ -36,19 +36,19 @@ jobs:
         id: filter
         with:
           # Manifests, the toolchain and this workflow can change either crate's build too.
+          # The shared list is declared once and reused through a YAML anchor.
           filters: |
+            shared: &shared
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'mise.toml'
+              - '.github/workflows/ci.yml'
             dither:
+              - *shared
               - 'crates/rthid-dither/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'mise.toml'
-              - '.github/workflows/ci.yml'
             widgets:
+              - *shared
               - 'crates/rthid-widgets/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'mise.toml'
-              - '.github/workflows/ci.yml'
 
   widgets:
     # Unit tests, doctests and rustdoc warnings for rthid-widgets, in parallel with check.

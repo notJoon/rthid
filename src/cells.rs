@@ -622,13 +622,12 @@ mod tests {
                 255,
             ),
         ] {
-            let viewport = Viewport::default();
             let mut buffer = Buffer::empty(area);
             assert_eq!(
                 render(
                     indexed(&indices, &palette),
                     glyphs,
-                    &geometry(&viewport, size, area),
+                    &geometry(&Viewport::default(), size, area),
                     &mut buffer,
                     &mut OverviewCaches::default(),
                 ),

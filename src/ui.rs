@@ -134,14 +134,10 @@ pub fn log_minimap(
     }) = geometry.minimap
     {
         let area = Block::bordered().inner(inset);
-        let fitted = viewport::Viewport {
-            zoom: viewport::Zoom::Fit,
-            ..app.viewport
-        };
         cells::render(
             pixels,
             app.glyphs,
-            &viewport::geometry(&fitted, geometry.grid, area),
+            &viewport::geometry(&viewport::Viewport::default(), geometry.grid, area),
             &mut overview,
             &mut cells::OverviewCaches::default(),
         );
