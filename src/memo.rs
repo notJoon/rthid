@@ -74,7 +74,8 @@ impl<K, V> Memo<K, V> {
         self.version
     }
 
-    fn clear(&mut self) {
+    /// Drops the cached entry while retaining its build count.
+    pub fn clear(&mut self) {
         self.entry = None;
     }
 }

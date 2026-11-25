@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ListPicker::select`, `index_at` and `handle_mouse` for selection, scroll aware
+  hit testing and clicking the selected item to submit
+
 - `Outcome` key handling result (`Ignored`, `Consumed`, `Submit`, `Cancel`), so a
   parent can fall back to its own bindings for keys a component does not use
 - `TextInput`: single line editing with a character limit, sideways scrolling and

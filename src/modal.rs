@@ -1,14 +1,31 @@
 //! Component based dialogs and palette drafts with cancel snapshots.
 
+use std::path::PathBuf;
+
 use crate::settings::{
     MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    text::Line,
+    widgets::Block,
+};
 use rthid_dither::dither::Mode;
-use rthid_widgets::{Confirm, ListPicker, Outcome, TextInput};
+use rthid_widgets::{Confirm, Dialog, ListPicker, Outcome, TextInput};
+
+const OPEN_HINTS: &[(&str, &str)] = &[
+    ("Up/Down", "select"),
+    ("click", "select"),
+    ("click again", "open"),
+    ("Enter", "open"),
+    ("Esc", "close"),
+];
 
 const PRESET_HINTS: &[(&str, &str)] = &[
     ("Up/Down j/k", "select"),
+    ("click", "select"),
+    ("click again", "apply"),
     ("Enter", "apply"),
     ("n", "new"),
     ("e", "edit"),
@@ -17,6 +34,8 @@ const PRESET_HINTS: &[(&str, &str)] = &[
 ];
 const TEMPLATE_HINTS: &[(&str, &str)] = &[
     ("Up/Down j/k", "select"),
+    ("click", "select"),
+    ("click again", "apply"),
     ("Enter", "apply"),
     ("n", "save current settings"),
     ("x", "delete"),
@@ -34,6 +53,8 @@ const INPUT_HINTS: &[(&str, &str)] = &[
 ];
 const EDITOR_HINTS: &[(&str, &str)] = &[
     ("Up/Down j/k", "row"),
+    ("click", "select"),
+    ("click again", "edit"),
     ("Enter/e", "edit"),
     ("Left/Right h/l", "mode"),
     ("a", "add"),
@@ -98,6 +119,10 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
+    /// Request a source image relative to the supplied folder without closing the dialog.
+    Open(PathBuf, PathBuf),
+    /// Request the entries of a directory.
+    ListDir(PathBuf),
     /// Report a validation error without leaving the dialog.
     Notice(String),
     /// Show settings in the dithered preview.
@@ -150,6 +175,8 @@ impl OnYes {
 
 /// Dialogs that capture all input except quitting with Ctrl+C.
 pub enum Modal {
+    /// Directory listing and editable image path.
+    OpenFile(Box<FilePicker>),
     /// Palette selection and optional removal confirmation.
     Presets {
         /// Selection and retained scroll position.
@@ -168,6 +195,83 @@ pub enum Modal {
     },
     /// Palette draft with an independent cancel snapshot.
     Editor(Box<Editor>),
+}
+
+/// Dialog regions shared by drawing and mouse input.
+pub struct ModalLayout {
+    /// Border and title rectangle.
+    pub dialog: Rect,
+    /// Active text field, when present.
+    pub field: Option<Rect>,
+    /// List content without a border, when present.
+    pub list: Option<Rect>,
+}
+
+/// Visible directory entry supplied by the event loop.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// File name relative to the listed directory.
+    pub name: String,
+    /// Whether selecting this entry lists a directory.
+    pub dir: bool,
+}
+
+/// Path field and directory selection for opening an image.
+pub struct FilePicker {
+    /// Editable path submitted after a text edit.
+    pub input: TextInput,
+    /// Selected entry and retained scroll position.
+    pub list: ListPicker,
+    /// Directory containing the listed entries.
+    pub dir: PathBuf,
+    /// Visible directories and supported image files.
+    pub entries: Vec<Entry>,
+    /// Whether Enter submits the field instead of the selected entry.
+    pub typed: bool,
+}
+
+impl FilePicker {
+    /// Replaces the directory and resets the field, selection and scroll.
+    pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        self.input = TextInput::new(dir.join("").to_string_lossy(), usize::MAX);
+        self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
+        self.dir = dir;
+        self.entries = entries;
+        self.typed = false;
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Step {
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.list.handle_key(key, self.entries.len());
+            self.typed = false;
+            return Step::stay();
+        }
+        match self.input.handle_key(key) {
+            Outcome::Consumed => self.typed = true,
+            Outcome::Cancel => return Step::close(),
+            Outcome::Submit(()) if self.typed => {
+                return Step::effect(
+                    Next::Stay,
+                    Effect::Open(PathBuf::from(self.input.text()), self.dir.clone()),
+                );
+            }
+            Outcome::Submit(()) => {
+                if let Some(entry) = self.entries.get(self.list.selected()) {
+                    let path = self.dir.join(&entry.name);
+                    return Step::effect(
+                        Next::Stay,
+                        if entry.dir {
+                            Effect::ListDir(path)
+                        } else {
+                            Effect::Open(PathBuf::from(&entry.name), self.dir.clone())
+                        },
+                    );
+                }
+            }
+            Outcome::Ignored => {}
+        }
+        Step::stay()
+    }
 }
 
 /// Editable palette and the settings it temporarily replaces.
@@ -314,7 +418,248 @@ impl Editor {
     }
 }
 
+/// Preset labels shared by dialog measurement and drawing.
+pub(crate) fn preset_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+    ctx.palettes
+        .iter()
+        .map(|preset| {
+            Line::raw(format!(
+                "{}{}{}",
+                if ctx.settings.uses(preset) {
+                    "* "
+                } else {
+                    "  "
+                },
+                preset.name,
+                if preset.builtin { " (built-in)" } else { "" }
+            ))
+        })
+        .collect()
+}
+
+/// Template labels or the empty hint shared by dialog measurement and drawing.
+pub(crate) fn template_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+    if ctx.templates.is_empty() {
+        vec![Line::raw("n: save current settings")]
+    } else {
+        ctx.templates
+            .iter()
+            .map(|template| {
+                Line::raw(format!(
+                    "{} | {} | {}",
+                    template.name,
+                    template.palette_name,
+                    crate::settings::mode_label(template.mode)
+                ))
+            })
+            .collect()
+    }
+}
+
 impl Modal {
+    /// Computes dialog and content rectangles without changing selection or scroll.
+    pub fn layout(&self, preview: Rect, screen: Rect, ctx: &Ctx<'_>) -> ModalLayout {
+        let (title, width, height) = match self {
+            Self::OpenFile(picker) => (
+                "Open image",
+                picker
+                    .entries
+                    .iter()
+                    .map(|entry| Line::raw(&entry.name).width() + usize::from(entry.dir))
+                    .chain([Line::raw(picker.input.text()).width()])
+                    .max()
+                    .unwrap_or(0),
+                picker.entries.len().saturating_add(1),
+            ),
+            Self::Presets { confirm, .. } => (
+                confirm
+                    .as_ref()
+                    .map_or("Presets", |(question, _)| question.message()),
+                preset_rows(ctx).iter().map(Line::width).max().unwrap_or(0),
+                ctx.palettes.len(),
+            ),
+            Self::Templates {
+                prompt, confirm, ..
+            } => (
+                confirm.as_ref().map_or(
+                    if prompt.is_some() {
+                        "Save template"
+                    } else {
+                        "Templates"
+                    },
+                    |(question, _)| question.message(),
+                ),
+                prompt.as_ref().map_or_else(
+                    || {
+                        template_rows(ctx)
+                            .iter()
+                            .map(Line::width)
+                            .max()
+                            .unwrap_or(0)
+                    },
+                    |input| Line::raw(format!("Name: {}", input.text())).width(),
+                ),
+                if prompt.is_some() {
+                    1
+                } else {
+                    ctx.templates.len().max(1)
+                },
+            ),
+            Self::Editor(editor) => {
+                let width = (0..=editor.draft.colors.len())
+                    .map(|row| {
+                        let prefix = if row == 0 {
+                            "Name: ".into()
+                        } else {
+                            format!("{row}: ")
+                        };
+                        let text = if let Some(input) = &editor.input
+                            && editor.rows.selected() == row
+                        {
+                            input.text()
+                        } else if row == 0 {
+                            &editor.draft.name
+                        } else {
+                            &editor.draft.colors[row - 1]
+                        };
+                        Line::raw(format!("{prefix}{text}")).width()
+                            + if editor.swatch_rgb(row).is_some() {
+                                4
+                            } else {
+                                0
+                            }
+                    })
+                    .chain([Line::raw(format!(
+                        "Mode: {}",
+                        editor
+                            .draft
+                            .mode
+                            .map_or("keep", crate::settings::mode_label)
+                    ))
+                    .width()])
+                    .max()
+                    .unwrap_or(0);
+                ("Preset editor", width, editor.draft.colors.len() + 2)
+            }
+        };
+        let dialog = Dialog {
+            title,
+            min_width: 28,
+        }
+        .area(
+            preview,
+            screen,
+            (
+                width.min(u16::MAX as usize) as u16,
+                height.min(u16::MAX as usize) as u16,
+            ),
+        );
+        let inner = Block::bordered().inner(dialog);
+        let (field, list) = match self {
+            Self::OpenFile(_) => {
+                let [field, list] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+                (Some(field), Some(list))
+            }
+            Self::Templates {
+                prompt: Some(_), ..
+            } => (
+                (inner.width > 2 && inner.height > 0)
+                    .then(|| Rect::new(inner.x + 2, inner.y, inner.width - 2, 1)),
+                None,
+            ),
+            Self::Editor(editor) => {
+                let field = editor.input.as_ref().and_then(|_| {
+                    let selected = editor.rows.selected().min(editor.draft.colors.len() + 1);
+                    let offset = editor.rows.offset().min(selected).max(
+                        selected
+                            .saturating_add(1)
+                            .saturating_sub(usize::from(inner.height)),
+                    );
+                    let row = selected.checked_sub(offset)?;
+                    (row < usize::from(inner.height) && inner.width > 2)
+                        .then(|| Rect::new(inner.x + 2, inner.y + row as u16, inner.width - 2, 1))
+                });
+                (field, Some(inner))
+            }
+            _ => (None, Some(inner)),
+        };
+        ModalLayout {
+            dialog,
+            field,
+            list,
+        }
+    }
+
+    /// Routes list mouse outcomes through the same actions as keyboard input.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &ModalLayout, ctx: Ctx<'_>) -> Step {
+        let Some(area) = layout.list else {
+            return Step::stay();
+        };
+        let outcome = match self {
+            Self::OpenFile(picker) => {
+                let outcome = picker.list.handle_mouse(mouse, area, picker.entries.len());
+                if matches!(outcome, Outcome::Consumed | Outcome::Submit(_)) {
+                    picker.typed = false;
+                }
+                outcome
+            }
+            Self::Presets {
+                list,
+                confirm: None,
+            } => list.handle_mouse(mouse, area, ctx.palettes.len()),
+            Self::Templates {
+                list,
+                prompt: None,
+                confirm: None,
+            } => list.handle_mouse(mouse, area, ctx.templates.len()),
+            Self::Editor(editor) if editor.input.is_none() => {
+                editor
+                    .rows
+                    .handle_mouse(mouse, area, editor.draft.colors.len() + 2)
+            }
+            _ => return Step::stay(),
+        };
+        match outcome {
+            Outcome::Submit(_) => {
+                self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), ctx)
+            }
+            Outcome::Consumed => {
+                if let Self::Editor(editor) = self {
+                    Step::effect(Next::Stay, Effect::Preview(editor.preview()))
+                } else {
+                    Step::stay()
+                }
+            }
+            _ => Step::stay(),
+        }
+    }
+
+    /// Opens a path field while the event loop loads the starting directory.
+    pub fn open_file(start: PathBuf) -> Self {
+        Self::OpenFile(Box::new(FilePicker {
+            input: TextInput::new(start.join("").to_string_lossy(), usize::MAX),
+            list: ListPicker::new(0),
+            dir: start,
+            entries: Vec::new(),
+            typed: false,
+        }))
+    }
+
+    /// Active text field, excluding prompts behind a confirmation.
+    pub fn text_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self {
+            Self::OpenFile(picker) => Some(&mut picker.input),
+            Self::Templates {
+                prompt,
+                confirm: None,
+                ..
+            } => prompt.as_mut(),
+            Self::Editor(editor) => editor.input.as_mut(),
+            _ => None,
+        }
+    }
+
     /// Opens on the current preset, or the first preset for detached colors.
     pub fn presets(settings: &Settings, palettes: &Palettes) -> Self {
         let list = ListPicker::new(palettes.find(&settings.palette_name).unwrap_or(0));
@@ -339,6 +684,7 @@ impl Modal {
     /// Key descriptions for the component currently receiving input.
     pub fn hints(&self) -> &'static [(&'static str, &'static str)] {
         match self {
+            Self::OpenFile(_) => OPEN_HINTS,
             Self::Presets {
                 confirm: Some((_, on_yes)),
                 ..
@@ -365,6 +711,7 @@ impl Modal {
             return Step::stay();
         }
         let confirm = match self {
+            Self::OpenFile(picker) => return picker.handle_key(key),
             Self::Presets { confirm, .. } | Self::Templates { confirm, .. } => confirm,
             Self::Editor(editor) => return editor.handle_key(key, &ctx),
         };
@@ -490,7 +837,7 @@ impl Modal {
                     }
                 }
             }
-            Self::Editor(_) => unreachable!(),
+            Self::Editor(_) | Self::OpenFile(_) => unreachable!(),
         }
         Step::stay()
     }
@@ -504,6 +851,207 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: ratatui::crossterm::event::MouseEventKind, area: Rect, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y + row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn open_mouse_selects_submits_and_scrolls() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let settings = Settings::default();
+        let context = || ctx(&palettes, &templates, &settings);
+        let mut modal = Modal::open_file("/images".into());
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(
+            "/images".into(),
+            vec![
+                Entry {
+                    name: "album".into(),
+                    dir: true,
+                },
+                Entry {
+                    name: "photo.png".into(),
+                    dir: false,
+                },
+            ],
+        );
+        picker.typed = true;
+        let layout = modal.layout(
+            Rect::new(0, 0, 80, 24),
+            Rect::new(0, 0, 100, 30),
+            &context(),
+        );
+        let area = layout.list.unwrap();
+        let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), area, row);
+        assert!(
+            modal
+                .handle_mouse(click(1), &layout, context())
+                .effect
+                .is_none()
+        );
+        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 1 && !p.typed));
+        let step = modal.handle_mouse(click(1), &layout, context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
+        );
+        modal.handle_mouse(mouse(MouseEventKind::ScrollUp, area, 0), &layout, context());
+        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 0));
+        assert!(
+            matches!(modal.handle_mouse(click(0), &layout, context()).effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
+        );
+        modal.handle_mouse(
+            mouse(MouseEventKind::ScrollDown, area, 0),
+            &layout,
+            context(),
+        );
+        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 1));
+        let outside = mouse(MouseEventKind::Down(MouseButton::Left), layout.dialog, 0);
+        assert!(
+            modal
+                .handle_mouse(outside, &layout, context())
+                .effect
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preset_mouse_click_again_applies_selection() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let settings = Settings::default();
+        let context = || ctx(&palettes, &templates, &settings);
+        let mut modal = Modal::presets(&settings, &palettes);
+        let layout = modal.layout(
+            Rect::new(0, 0, 80, 24),
+            Rect::new(0, 0, 100, 30),
+            &context(),
+        );
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.list.unwrap(),
+            1,
+        );
+        assert!(
+            modal
+                .handle_mouse(click, &layout, context())
+                .effect
+                .is_none()
+        );
+        let step = modal.handle_mouse(click, &layout, context());
+        assert!(matches!(step.next, Next::Close));
+        assert!(
+            matches!(step.effect, Some(Effect::Preview(s)) if s == settings.with_preset(palettes.get(1).unwrap()))
+        );
+        let Modal::Presets { confirm, .. } = &mut modal else {
+            unreachable!()
+        };
+        *confirm = Some((Confirm::new("Delete preset?"), OnYes::RemovePreset(1)));
+        let step = modal.handle_mouse(click, &layout, context());
+        assert!(step.effect.is_none());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(matches!(
+            modal,
+            Modal::Presets {
+                confirm: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn open_file_routes_selection_and_text() {
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let settings = Settings::default();
+        let mut modal = Modal::open_file(PathBuf::from("/images"));
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(
+            PathBuf::from("/images"),
+            vec![
+                Entry {
+                    name: "..".into(),
+                    dir: true,
+                },
+                Entry {
+                    name: "album".into(),
+                    dir: true,
+                },
+                Entry {
+                    name: "photo.png".into(),
+                    dir: false,
+                },
+            ],
+        );
+        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.input.text(), "/images/");
+        let context = || ctx(&palettes, &templates, &settings);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(
+            matches!(step.effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
+        );
+        modal.handle_key(key(KeyCode::Down), context());
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
+        );
+        modal.handle_key(key(KeyCode::Up), context());
+        modal.handle_key(key(KeyCode::Char('j')), context());
+        let Modal::OpenFile(picker) = &modal else {
+            unreachable!()
+        };
+        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.input.text(), "/images/j");
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.input = TextInput::new("~/raw path.png", usize::MAX);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("~/raw path.png") && dir == std::path::Path::new("/images"))
+        );
+        modal.handle_key(key(KeyCode::Down), context());
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
+        );
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(
+            PathBuf::from("/empty"),
+            vec![Entry {
+                name: "..".into(),
+                dir: true,
+            }],
+        );
+        assert_eq!(picker.list.selected(), 0);
+        picker.set_listing(PathBuf::from("/empty"), vec![]);
+        assert_eq!(picker.list.selected(), 0);
+        assert_eq!(picker.list.offset(), 0);
+        assert!(!picker.typed);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(step.effect.is_none());
+        assert!(matches!(
+            modal.handle_key(key(KeyCode::Esc), context()).next,
+            Next::Close
+        ));
     }
 
     fn ctx<'a>(

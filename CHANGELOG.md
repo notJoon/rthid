@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Optional image argument with an empty start screen and image drag and drop
+  through terminal bracketed paste
+- `o` to browse directories or type an image path, with home directory expansion
+  and errors that keep the dialog open
+
 - Palette preset manager (`P`) and settings template manager (`T`), saved to a
   configurable TOML file with overwrite and removal confirmation for templates
 - Unified preview zoom from Fit through 25%, 33%, 50%, 100%, 200%, 300%, and

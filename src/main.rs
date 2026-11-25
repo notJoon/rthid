@@ -34,6 +34,8 @@ mod grid;
 mod memo;
 /// Modal input and preset editing.
 mod modal;
+/// Paths carried by terminal paste events.
+mod paste;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -51,14 +53,23 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use image::imageops;
+use image::{RgbaImage, imageops};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, MouseEventKind,
+    },
     execute,
 };
 
-use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
+use crate::{
+    app::{App, Request},
+    cells::Glyphs,
+    graphics::Mode as Graphics,
+    modal::Entry,
+    ui::Renderer,
+};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -66,6 +77,15 @@ struct MouseCapture;
 impl Drop for MouseCapture {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
+
+/// Disables bracketed paste even when the terminal session fails.
+struct BracketedPaste;
+
+impl Drop for BracketedPaste {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
 
@@ -77,8 +97,7 @@ const MAX_SOURCE_SIDE: u32 = 1024;
 #[command(version, about)]
 struct Args {
     /// Source image to preview.
-    #[arg(default_value = "crates/rthid-dither/tests/fixtures/hsl.jpg")]
-    image: PathBuf,
+    image: Option<PathBuf>,
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
@@ -122,6 +141,114 @@ fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+// Shrinks sources on load to bound processing work.
+fn load_image(path: &Path) -> Result<RgbaImage, String> {
+    let source =
+        image::open(path).map_err(|error| format!("Could not load {}: {error}", path.display()))?;
+    Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
+        source.resize(
+            MAX_SOURCE_SIDE,
+            MAX_SOURCE_SIDE,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        source
+    }
+    .to_rgba8())
+}
+
+fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
+    let dir = dir.canonicalize()?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        if is_dir
+            || (metadata.is_file()
+                && image::ImageFormat::from_path(entry.path())
+                    .is_ok_and(|format| format.reading_enabled()))
+        {
+            entries.push(Entry { name, dir: is_dir });
+        }
+    }
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+    if dir.parent().is_some() {
+        entries.insert(
+            0,
+            Entry {
+                name: "..".into(),
+                dir: true,
+            },
+        );
+    }
+    Ok((dir, entries))
+}
+
+fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        if text == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = text.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
+
+fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
+    let request = match request {
+        Request::Open(path, dir) => {
+            let home_path = path == Path::new("~") || path.starts_with("~/");
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let path = path
+                .to_str()
+                .map(|text| expand_tilde(text, home.as_deref()))
+                .unwrap_or(path);
+            let path = if path.is_relative() && !home_path {
+                dir.map_or_else(|| path.clone(), |dir| dir.join(&path))
+            } else {
+                path
+            };
+            if path.is_dir() {
+                if !matches!(app.modal, Some(modal::Modal::OpenFile(_))) {
+                    app.modal = Some(modal::Modal::open_file(path.clone()));
+                }
+                Request::List(path)
+            } else {
+                Request::Open(path, None)
+            }
+        }
+        request => request,
+    };
+    match request {
+        Request::List(path) => match list_dir(&path) {
+            Ok((dir, entries)) => app.set_listing(dir, entries),
+            Err(error) => {
+                app.set_notice(format!("open: {}: {error}", path.display()));
+            }
+        },
+        Request::Open(path, _) => {
+            match check_not_source(&path, preview_png)
+                .map_err(|error| error.to_string())
+                .and_then(|()| load_image(&path))
+            {
+                Ok(image) => app.open_image(path, image),
+                Err(error) => {
+                    app.set_notice(format!("open: {error}"));
+                }
+            }
+        }
+    }
+}
+
 // Pointer motion alone changes nothing on screen.
 fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
@@ -143,7 +270,9 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Auto => Graphics::Auto,
         CliGraphics::Off => Graphics::Off,
     };
-    check_not_source(&path, preview_png.as_deref())?;
+    if let Some(path) = &path {
+        check_not_source(path, preview_png.as_deref())?;
+    }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
             std::fs::OpenOptions::new()
@@ -152,20 +281,13 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = image::open(&path).unwrap_or_else(|error| {
-        eprintln!("Could not load {}: {error}", path.display());
-        std::process::exit(1);
+    let source = path.map(|path| {
+        let image = load_image(&path).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        (path, image)
     });
-    let source = if source.width().max(source.height()) > MAX_SOURCE_SIDE {
-        source.resize(
-            MAX_SOURCE_SIDE,
-            MAX_SOURCE_SIDE,
-            imageops::FilterType::Triangle,
-        )
-    } else {
-        source
-    }
-    .to_rgba8();
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
     let mut messages = Vec::new();
@@ -184,7 +306,7 @@ fn main() -> std::io::Result<()> {
     let notice = (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")));
     let mut app = App::new(
         source,
-        preview_png,
+        preview_png.clone(),
         loaded.palettes,
         loaded.templates,
         notice,
@@ -193,17 +315,20 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
+    let bracketed_paste = BracketedPaste;
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
-        execute!(io::stdout(), EnableMouseCapture)?;
+        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         event_loop(
             terminal,
             &mut app,
             &mut renderer,
             debug_log.as_mut(),
             config_path.as_deref(),
+            preview_png.as_deref(),
         )
     });
+    drop(bracketed_paste);
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)
@@ -217,6 +342,7 @@ fn event_loop(
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
+    preview_png: Option<&Path>,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
@@ -230,6 +356,11 @@ fn event_loop(
             if let Some(log) = &mut debug_log {
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
+        }
+        if let Some(request) = app.take_request() {
+            handle_request(app, request, preview_png);
+            redraw = true;
+            continue;
         }
         redraw = false;
         // With a companion PNG, wake periodically so background write results reach the status line.
@@ -246,7 +377,10 @@ fn event_loop(
             redraw |= needs_redraw(&event);
             match event {
                 Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
-                Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+                }
+                Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(width, height) => {
                     layout = ui::layout(ratatui::layout::Size::new(width, height));
                     app.clamp_viewport(layout.preview);
@@ -273,13 +407,119 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn directory_listing_filters_and_sorts() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [".hidden.png", "z.png", "b.png", "notes.txt"] {
+            std::fs::write(temp.path().join(name), b"").unwrap();
+        }
+        for name in ["c", "a"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let (dir, entries) = list_dir(temp.path()).unwrap();
+        assert_eq!(dir, temp.path().canonicalize().unwrap());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.dir))
+                .collect::<Vec<_>>(),
+            [
+                ("..", true),
+                ("a", true),
+                ("c", true),
+                ("b.png", false),
+                ("z.png", false)
+            ]
+        );
+        assert!(list_dir(&temp.path().join("missing")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(temp.path().join("a"), temp.path().join("linked")).unwrap();
+            symlink(temp.path().join("b.png"), temp.path().join("linked.png")).unwrap();
+            symlink(temp.path().join("missing"), temp.path().join("broken.png")).unwrap();
+            let (_, entries) = list_dir(temp.path()).unwrap();
+            assert_eq!(entries.len(), 7);
+            assert!(entries.contains(&Entry {
+                name: "linked".into(),
+                dir: true
+            }));
+            assert!(entries.contains(&Entry {
+                name: "linked.png".into(),
+                dir: false
+            }));
+        }
+    }
+
+    #[test]
+    fn tilde_expansion_only_uses_a_home_prefix() {
+        for (text, home, expected) in [
+            ("~", Some(Path::new("/home/me")), "/home/me"),
+            (
+                "~/photo.png",
+                Some(Path::new("/home/me")),
+                "/home/me/photo.png",
+            ),
+            (
+                "~other/photo.png",
+                Some(Path::new("/home/me")),
+                "~other/photo.png",
+            ),
+            ("photo~.png", Some(Path::new("/home/me")), "photo~.png"),
+            ("~/photo.png", None, "~/photo.png"),
+            ("~", None, "~"),
+        ] {
+            assert_eq!(expand_tilde(text, home), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn open_requests_list_directories_and_keep_failures_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::empty();
+        app.handle_paste(&format!("'{}'", temp.path().display()));
+        assert!(app.modal.is_none());
+        assert!(app.notice().unwrap().starts_with("Loading "));
+        let request = app.take_request().unwrap();
+        handle_request(&mut app, request, None);
+        assert!(app.notice().is_none());
+        let Some(modal::Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert_eq!(picker.dir, temp.path().canonicalize().unwrap());
+        handle_request(
+            &mut app,
+            Request::Open(
+                PathBuf::from("missing.png"),
+                Some(temp.path().to_path_buf()),
+            ),
+            None,
+        );
+        assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
+        assert!(app.notice().unwrap().contains("Could not load"));
+        assert!(
+            app.notice()
+                .unwrap()
+                .contains(&temp.path().display().to_string())
+        );
+        let photo = temp.path().join("photo.png");
+        RgbaImage::new(2, 2).save(&photo).unwrap();
+        for path in [PathBuf::from("photo.png"), photo.clone()] {
+            handle_request(
+                &mut app,
+                Request::Open(path, Some(temp.path().to_path_buf())),
+                None,
+            );
+            assert_eq!(app.source_path(), Some(photo.as_path()));
+        }
+        assert!(app.modal.is_none());
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
     fn cli_defaults_and_definition() {
         Args::command().debug_assert();
         let args = Args::try_parse_from(["rthid"]).unwrap();
-        assert_eq!(
-            args.image,
-            PathBuf::from("crates/rthid-dither/tests/fixtures/hsl.jpg")
-        );
+        assert_eq!(args.image, None);
         assert_eq!(args.preview_png, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
@@ -312,7 +552,7 @@ mod tests {
             "presets.toml",
         ])
         .unwrap();
-        assert_eq!(args.image, PathBuf::from("photo.png"));
+        assert_eq!(args.image, Some(PathBuf::from("photo.png")));
         assert_eq!(args.config, Some(PathBuf::from("presets.toml")));
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);

@@ -8,7 +8,7 @@ rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|
 
 Use `rthid --help` for option details and `rthid --version` for the version.
 
-`image` defaults to `crates/rthid-dither/tests/fixtures/hsl.jpg`. Use a terminal
+Omit `image` to start with an empty preview. Use a terminal
 with Unicode half block support and support for the selected overview glyphs
 (sextants or quadrants).
 
@@ -47,6 +47,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 
 | Context | Key | Action |
 | --- | --- | --- |
+| Any, outside modals | `o` | Open an image |
 | Any, outside modals | `P` / `T` | Manage palette presets / settings templates |
 | Any | `Tab` | Switch focus between parameters and preview |
 | Any | `Space` | Toggle original / dithered; compute a pending result if needed |
@@ -66,6 +67,27 @@ Panning works whenever the image overflows, including reduced zoom levels, and
 stops at grid edges. Fit does not pan. Focus, panning, zoom, and minimap changes
 do not re-dither the image.
 
+## Opening images
+
+Start without an image to see an empty preview. Press `o` with or without an
+image loaded to open the file dialog. It starts in the current image's directory,
+or `.` before an image is loaded. Hidden entries are omitted. Directories appear
+first with a trailing `/`, followed by supported image files, sorted by name.
+
+Use `Up` / `Down` to select and `Enter` to open a directory or image. `..` goes
+to the parent directory. Type or paste a path into the field and press `Enter`
+to open it. `~` and `~/` expand to your home directory. Left and Right edit the
+field, and letters including `j` and `k` always enter text. After Up or Down,
+Enter opens the selected entry again. `Esc` closes the dialog. An open error
+appears in the status line and leaves the dialog open. Click an entry to select
+it and click it again to open it. The wheel moves the selection.
+
+You can also drag and drop an image outside a dialog when your terminal sends
+bracketed paste. Quoted paths, escaped spaces and local file URIs are accepted.
+Only the first path is opened. Pasting into a dialog inserts text in its active
+field. Opening an image keeps processing settings, resets rotation and navigation,
+and shows Original at Fit. A failed open keeps the current image.
+
 ## Presets and templates
 
 `P` opens presets: arrows or `j`/`k` select, `Enter` applies, `n` creates,
@@ -78,7 +100,10 @@ shows Dithered while keeping rotation, `n` saves current settings under a name
 of up to 32 characters, and `x` asks to delete. Names must be nonempty and
 cannot match a built-in preset. Reusing a template name asks to overwrite with
 `y`; any other key returns to the name prompt. `Esc` returns from naming to
-the list or closes the list. Modal keys appear in the help line.
+the list or closes the list. Click to select a preset, template, or editor row,
+then click again to apply or edit it. The wheel moves one row. Mouse input is
+ignored during confirmations and while editing a name or editor field. Modal
+keys appear in the help line.
 
 The config path lookup order is `--config path`, `RTHID_CONFIG`,
 `$XDG_CONFIG_HOME/rthid/config.toml` when `XDG_CONFIG_HOME` is absolute, then
