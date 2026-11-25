@@ -8,7 +8,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -23,7 +23,7 @@ pub enum Kind {
     Open,
     /// List a directory.
     List,
-    /// Write a PNG grid.
+    /// Write a PNG grid. Coalesces across paths because the companion path is fixed for a run.
     Export,
 }
 
@@ -268,10 +268,18 @@ impl Pending {
     }
 }
 
+/// Stable worker name used to isolate caught panics from terminal panic hooks.
+pub const WORKER_NAME: &str = "rthid-io";
+
+struct Queue {
+    slots: Mutex<[Option<(u64, Job)>; 3]>,
+    ready: Condvar,
+}
+
 /// One filesystem thread with an independent newest result for each work kind.
 #[allow(clippy::upper_case_acronyms)]
 pub struct IO {
-    jobs: Option<Sender<(u64, Job)>>,
+    jobs: Arc<Queue>,
     results: Receiver<Done>,
     local: VecDeque<Done>,
     pending: [Option<Pending>; 3],
@@ -285,15 +293,19 @@ const KINDS: [Kind; 3] = [Kind::Open, Kind::List, Kind::Export];
 impl IO {
     /// Starts the worker. `home` expands `~` in Open paths without reading the environment.
     pub fn new(home: Option<PathBuf>) -> io::Result<Self> {
-        let (jobs, queued) = mpsc::channel();
+        let jobs = Arc::new(Queue {
+            slots: Mutex::new([None, None, None]),
+            ready: Condvar::new(),
+        });
+        let queued = Arc::clone(&jobs);
         let (finished, results) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
         let thread = thread::Builder::new()
-            .name("rthid-io".into())
+            .name(WORKER_NAME.into())
             .spawn(move || run(queued, finished, home, stop))?;
         Ok(Self {
-            jobs: Some(jobs),
+            jobs,
             results,
             local: VecDeque::new(),
             pending: [None, None, None],
@@ -315,9 +327,12 @@ impl IO {
             path,
             submitted: Instant::now(),
         });
-        if self.jobs.as_ref().unwrap().send((id, job)).is_err() {
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
             self.local
                 .push_back(self.pending[kind as usize].as_ref().unwrap().stopped(kind));
+        } else {
+            self.jobs.slots.lock().unwrap()[kind as usize] = Some((id, job));
+            self.jobs.ready.notify_one();
         }
         id
     }
@@ -356,17 +371,35 @@ impl IO {
         self.pending.iter().any(Option::is_some)
     }
 
-    /// Skips queued reads, flushes the newest export, and returns unpolled newest results.
-    pub fn finish(mut self) -> Vec<Done> {
-        self.stop();
+    /// Skips queued reads and waits up to five seconds for the newest export.
+    /// Returns available results and detaches a worker still running at the deadline.
+    pub fn finish(self) -> Vec<Done> {
+        self.finish_timeout(Duration::from_secs(5))
+    }
+
+    fn finish_timeout(mut self, timeout: Duration) -> Vec<Done> {
+        self.stop_timeout(timeout);
         std::iter::from_fn(|| self.poll()).collect()
     }
 
     fn stop(&mut self) {
+        self.stop_timeout(Duration::from_secs(5));
+    }
+
+    fn stop_timeout(&mut self, timeout: Duration) {
         self.stopping.store(true, Ordering::SeqCst);
-        drop(self.jobs.take());
+        // Hold the mutex while notifying so an idle worker cannot miss shutdown.
+        let slots = self.jobs.slots.lock().unwrap();
+        self.jobs.ready.notify_one();
+        drop(slots);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let deadline = Instant::now() + timeout;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -390,27 +423,26 @@ fn failure(id: u64, kind: Kind, elapsed: Duration, op: Op, path: PathBuf, cause:
     }
 }
 
-fn run(
-    queued: Receiver<(u64, Job)>,
-    finished: Sender<Done>,
-    home: Option<PathBuf>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut waiting = VecDeque::new();
+fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: Arc<AtomicBool>) {
     loop {
-        if waiting.is_empty() {
-            match queued.recv() {
-                Ok(job) => waiting.push_back(job),
-                Err(_) => break,
+        let (id, job) = {
+            let mut slots = queued.slots.lock().unwrap();
+            loop {
+                if let Some(index) = slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, job)| job.as_ref().map(|(id, _)| (index, *id)))
+                    .min_by_key(|(_, id)| *id)
+                    .map(|(index, _)| index)
+                {
+                    break slots[index].take().unwrap();
+                }
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                slots = queued.ready.wait(slots).unwrap();
             }
-        }
-        waiting.extend(queued.try_iter());
-        let mut newest = [0; 3];
-        for (id, job) in &waiting {
-            newest[job.kind() as usize] = *id;
-        }
-        waiting.retain(|(id, job)| newest[job.kind() as usize] == *id);
-        let (id, job) = waiting.pop_front().unwrap();
+        };
         let kind = job.kind();
         let (mut op, mut path) = job.context();
         let started = Instant::now();
@@ -495,7 +527,7 @@ fn execute(
         #[cfg(test)]
         Job::Pause(entered, resume) => {
             entered.send(()).unwrap();
-            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            resume.recv().unwrap();
             listing(path).map(|listing| Outcome::Listed(Ok(listing)))
         }
     }
@@ -551,10 +583,14 @@ mod tests {
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
         let mut last = 0;
-        for n in 0..30 {
-            last = worker.submit(export(dir.path().join(format!("{n}.png")), n == 29));
+        for n in 0..100 {
+            last = worker.submit(export(dir.path().join(format!("{n}.png")), n == 99));
         }
         assert!(worker.busy());
+        assert_eq!(
+            worker.jobs.slots.lock().unwrap().iter().flatten().count(),
+            1
+        );
         resume.send(()).unwrap();
         let paused = wait(&mut worker);
         assert_eq!(paused.kind(), Kind::List);
@@ -693,9 +729,6 @@ mod tests {
         assert_eq!(wait(&mut worker).kind(), Kind::List);
         assert_eq!(wait(&mut worker).id, latest);
         worker.stop();
-        let (jobs, queued) = mpsc::channel();
-        drop(queued);
-        worker.jobs = Some(jobs);
         for _ in 0..2 {
             let id = worker.submit(open(dir.path().to_path_buf()));
             assert!(worker.busy());
@@ -716,14 +749,12 @@ mod tests {
     fn failed_join_returns_stopped_for_outstanding_ids() {
         let mut worker = IO::new(None).unwrap();
         worker.stop();
-        let (jobs, queued) = mpsc::channel();
         let (finished, results) = mpsc::channel();
         let (release, paused) = mpsc::channel();
-        worker.jobs = Some(jobs);
         worker.results = results;
         worker.thread = Some(thread::spawn(move || {
             paused.recv_timeout(Duration::from_secs(5)).unwrap();
-            drop((queued, finished));
+            drop(finished);
             panic!("worker failed outside a job");
         }));
         let id = worker.submit(Job::List("missing".into()));
@@ -738,6 +769,18 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn finish_detaches_a_blocked_worker_at_the_deadline() {
+        let mut worker = IO::new(None).unwrap();
+        let resume = pause(&mut worker);
+        worker.submit(export("unused.png".into(), false));
+        let started = Instant::now();
+        assert!(worker.finish_timeout(Duration::from_millis(50)).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Dropping the receiver makes the worker stop before the queued export.
+        resume.send(()).unwrap();
     }
 
     #[test]

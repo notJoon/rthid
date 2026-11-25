@@ -143,19 +143,19 @@ pub enum Effect {
         base: Settings,
     },
     /// Remove a user preset and request persistence.
-    RemovePreset(usize),
+    RemovePreset(String),
     /// Capture current settings under this name and request persistence.
     SaveTemplate(String),
     /// Remove a saved snapshot and request persistence.
-    RemoveTemplate(usize),
+    RemoveTemplate(String),
 }
 
 /// Action held while a confirmation captures keys.
 pub enum OnYes {
     /// Remove the selected user preset.
-    RemovePreset(usize),
+    RemovePreset(String),
     /// Remove the selected snapshot.
-    RemoveTemplate(usize),
+    RemoveTemplate(String),
     /// Save current settings under an existing name.
     OverwriteTemplate(String),
 }
@@ -767,7 +767,9 @@ impl Modal {
                         }
                         *confirm = Some((
                             Confirm::new("Delete preset?"),
-                            OnYes::RemovePreset(list.selected()),
+                            OnYes::RemovePreset(
+                                ctx.palettes.get(list.selected()).unwrap().name.clone(),
+                            ),
                         ));
                     }
                     _ => {}
@@ -820,7 +822,9 @@ impl Modal {
                             KeyCode::Char('x') if !ctx.templates.is_empty() => {
                                 *confirm = Some((
                                     Confirm::new("Delete template?"),
-                                    OnYes::RemoveTemplate(list.selected()),
+                                    OnYes::RemoveTemplate(
+                                        ctx.templates.get(list.selected()).unwrap().name.clone(),
+                                    ),
                                 ));
                             }
                             _ => {}
@@ -949,7 +953,10 @@ mod tests {
         let Modal::Presets { confirm, .. } = &mut modal else {
             unreachable!()
         };
-        *confirm = Some((Confirm::new("Delete preset?"), OnYes::RemovePreset(1)));
+        *confirm = Some((
+            Confirm::new("Delete preset?"),
+            OnYes::RemovePreset("Paper".into()),
+        ));
         let step = modal.handle_mouse(click, &layout, context());
         assert!(step.effect.is_none());
         assert!(matches!(step.next, Next::Stay));
@@ -1264,7 +1271,7 @@ mod tests {
             &settings,
         );
         assert!(
-            matches!(press(&mut modal, KeyCode::Char('y'), &palettes, &templates, &settings).effect, Some(Effect::RemovePreset(i)) if i == index)
+            matches!(press(&mut modal, KeyCode::Char('y'), &palettes, &templates, &settings).effect, Some(Effect::RemovePreset(name)) if name == "Paper")
         );
     }
 
@@ -1369,7 +1376,7 @@ mod tests {
                 &settings
             )
             .effect,
-            Some(Effect::RemoveTemplate(1))
+            Some(Effect::RemoveTemplate(name)) if name == "Zine"
         ));
     }
 }

@@ -618,14 +618,10 @@ impl App {
                 ))?;
                 self.pending.push(Change::UpsertPreset(preset));
             }
-            Effect::RemovePreset(index) => {
-                let name = self
-                    .palettes
-                    .get(index)
-                    .ok_or("preset does not exist")?
-                    .name
-                    .clone();
-                self.palettes.remove(index)?;
+            Effect::RemovePreset(name) => {
+                if let Some(index) = self.palettes.find(&name) {
+                    self.palettes.remove(index)?;
+                }
                 self.pending.push(Change::RemovePreset(name));
             }
             Effect::SaveTemplate(name) => {
@@ -633,12 +629,11 @@ impl App {
                 self.templates.upsert(template.clone())?;
                 self.pending.push(Change::UpsertTemplate(template));
             }
-            Effect::RemoveTemplate(index) => {
-                if let Some(template) = self.templates.get(index) {
-                    let name = template.name.clone();
+            Effect::RemoveTemplate(name) => {
+                if let Some(index) = self.templates.find(&name) {
                     self.templates.remove(index);
-                    self.pending.push(Change::RemoveTemplate(name));
                 }
+                self.pending.push(Change::RemoveTemplate(name));
             }
         }
         Ok(())
@@ -1033,7 +1028,7 @@ mod tests {
     fn failed_save_requeues_edits_before_newer_changes() {
         let mut app = App::empty();
         app.apply(Effect::SaveTemplate("First".into())).unwrap();
-        app.apply(Effect::RemoveTemplate(0)).unwrap();
+        app.apply(Effect::RemoveTemplate("First".into())).unwrap();
         let changes = app.take_changes();
         assert!(
             matches!(&changes[..], [Change::UpsertTemplate(t), Change::RemoveTemplate(name)]
@@ -1063,9 +1058,25 @@ mod tests {
         })
         .unwrap();
         let settings = app.settings.clone();
+        app.apply(Effect::SaveTemplate("Zine".into())).unwrap();
+        let mut preset_confirm = Modal::Presets {
+            list: rthid_widgets::ListPicker::new(0),
+            confirm: Some((
+                rthid_widgets::Confirm::new("Delete preset?"),
+                crate::modal::OnYes::RemovePreset("Selected".into()),
+            )),
+        };
+        let mut template_confirm = Modal::Templates {
+            list: rthid_widgets::ListPicker::new(0),
+            prompt: None,
+            confirm: Some((
+                rthid_widgets::Confirm::new("Delete template?"),
+                crate::modal::OnYes::RemoveTemplate("Zine".into()),
+            )),
+        };
         let index = app.palettes.find("Selected").unwrap();
         let loaded = crate::store::parse(
-            "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n",
+            "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n",
         );
         let notice = loaded.notice();
         app.saved(loaded);
@@ -1075,9 +1086,24 @@ mod tests {
         assert!(app.templates.find("Zine").is_some());
         assert_eq!(app.notice(), notice.as_deref());
         assert!(app.notice().unwrap().contains("1 entries skipped"));
-        app.apply(Effect::RemovePreset(index + 1)).unwrap();
+        let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let effect = preset_confirm
+            .handle_key(yes, app.modal_ctx())
+            .effect
+            .unwrap();
+        app.apply(effect).unwrap();
+        let effect = template_confirm
+            .handle_key(yes, app.modal_ctx())
+            .effect
+            .unwrap();
+        app.apply(effect).unwrap();
+        assert!(app.palettes.find("Other").is_some());
+        assert!(app.palettes.find("Selected").is_none());
+        assert!(app.templates.find("Other").is_some());
+        assert!(app.templates.find("Zine").is_none());
         assert!(
-            matches!(app.take_changes().last(), Some(Change::RemovePreset(name)) if name == "Selected")
+            app.take_changes()
+                .contains(&Change::RemovePreset("Selected".into()))
         );
         app.saved(Loaded::default());
         assert!(app.notice().is_none());

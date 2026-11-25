@@ -22,6 +22,18 @@ pub enum Change {
     RemoveTemplate(String),
 }
 
+impl Change {
+    /// Identifies the list and name replaced by this edit.
+    pub fn key(&self) -> (&str, &str) {
+        match self {
+            Self::UpsertPreset(preset) => ("palette", &preset.name),
+            Self::RemovePreset(name) => ("palette", name),
+            Self::UpsertTemplate(template) => ("template", &template.name),
+            Self::RemoveTemplate(name) => ("template", name),
+        }
+    }
+}
+
 /// Parsed entries and diagnostics that protect an unreadable file from replacement.
 pub struct Loaded {
     /// Built-ins followed by valid user presets.
@@ -96,13 +108,9 @@ impl From<FileMode> for Mode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct FileStore {
     version: u32,
-    #[serde(default)]
-    palette: Vec<FilePreset>,
-    #[serde(default)]
-    template: Vec<FileTemplate>,
 }
 #[derive(Serialize, Deserialize)]
 struct FilePreset {
@@ -213,7 +221,22 @@ pub fn load(path: &Path) -> Loaded {
 
 /// Parses valid entries and retains warnings and reasons to block saving.
 pub fn parse(text: &str) -> Loaded {
-    let file: FileStore = match toml::from_str(text) {
+    let mut table: toml::Table = match toml::from_str(text) {
+        Ok(table) => table,
+        Err(error) => {
+            return Loaded {
+                save_blocked: Some(error.to_string()),
+                ..Loaded::default()
+            };
+        }
+    };
+    let palettes = table
+        .remove("palette")
+        .unwrap_or(toml::Value::Array(Vec::new()));
+    let templates = table
+        .remove("template")
+        .unwrap_or(toml::Value::Array(Vec::new()));
+    let file: FileStore = match toml::Value::Table(table).try_into() {
         Ok(file) => file,
         Err(error) => {
             return Loaded {
@@ -222,11 +245,24 @@ pub fn parse(text: &str) -> Loaded {
             };
         }
     };
+    let (Some(palettes), Some(templates)) = (palettes.as_array(), templates.as_array()) else {
+        return Loaded {
+            save_blocked: Some("palette and template must be arrays".into()),
+            ..Loaded::default()
+        };
+    };
     let mut loaded = Loaded::default();
     if file.version > 1 {
         loaded.save_blocked = Some(format!("unsupported config version {}", file.version));
     }
-    for entry in file.palette {
+    for value in palettes {
+        let entry: FilePreset = match value.clone().try_into() {
+            Ok(entry) => entry,
+            Err(error) => {
+                loaded.warnings.push(format!("palette: {error}"));
+                continue;
+            }
+        };
         let preset = Preset {
             name: entry.name,
             colors: entry.colors,
@@ -243,7 +279,14 @@ pub fn parse(text: &str) -> Loaded {
             loaded.warnings.push(format!("palette {name:?}: {error}"));
         }
     }
-    for entry in file.template {
+    for value in templates {
+        let entry: FileTemplate = match value.clone().try_into() {
+            Ok(entry) => entry,
+            Err(error) => {
+                loaded.warnings.push(format!("template: {error}"));
+                continue;
+            }
+        };
         let template = Template::from(entry);
         let name = template.name.clone();
         let result = if loaded.templates.find(&name).is_some() {
@@ -259,12 +302,21 @@ pub fn parse(text: &str) -> Loaded {
 }
 
 /// Merges named edits into fresh text under the config lock and returns the saved entries.
+/// Untouched raw values retain their array order, including entries this version cannot parse.
+/// TOML comments and formatting are lost on save.
 pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
     atomic::update(path, |text| {
         let mut loaded = text.as_deref().map(parse).unwrap_or_default();
         if let Some(reason) = &loaded.save_blocked {
             return Err(io::Error::other(reason.clone()));
         }
+        let mut table: toml::Table = text
+            .as_deref()
+            .map(toml::from_str)
+            .transpose()
+            .map_err(io::Error::other)?
+            .unwrap_or_default();
+        table.entry("version").or_insert(toml::Value::Integer(1));
         for change in changes {
             match change {
                 Change::UpsertPreset(preset) => {
@@ -291,20 +343,46 @@ pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
                 }
             }
         }
-        let file = FileStore {
-            version: 1,
-            palette: loaded
-                .palettes
-                .user()
-                .map(|p| FilePreset {
-                    name: p.name.clone(),
-                    colors: p.colors.clone(),
-                    mode: p.mode.map(Into::into),
-                })
-                .collect(),
-            template: loaded.templates.iter().cloned().map(Into::into).collect(),
-        };
-        let text = toml::to_string_pretty(&file).map_err(io::Error::other)?;
+        for change in changes {
+            let (kind, name, replacement) = match change {
+                Change::UpsertPreset(preset) => (
+                    "palette",
+                    preset.name.as_str(),
+                    Some(
+                        toml::Value::try_from(FilePreset {
+                            name: preset.name.clone(),
+                            colors: preset.colors.clone(),
+                            mode: preset.mode.map(Into::into),
+                        })
+                        .map_err(io::Error::other)?,
+                    ),
+                ),
+                Change::RemovePreset(name) => ("palette", name.as_str(), None),
+                Change::UpsertTemplate(template) => (
+                    "template",
+                    template.name.as_str(),
+                    Some(
+                        toml::Value::try_from(FileTemplate::from(template.clone()))
+                            .map_err(io::Error::other)?,
+                    ),
+                ),
+                Change::RemoveTemplate(name) => ("template", name.as_str(), None),
+            };
+            let entries = table
+                .entry(kind)
+                .or_insert(toml::Value::Array(Vec::new()))
+                .as_array_mut()
+                .unwrap();
+            let position = entries
+                .iter()
+                .position(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name));
+            entries.retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some(name));
+            if let Some(value) = replacement {
+                entries.insert(position.unwrap_or(entries.len()).min(entries.len()), value);
+            }
+        }
+        let text = toml::to_string_pretty(&table).map_err(io::Error::other)?;
+        let loaded = parse(&text);
         Ok((text, loaded))
     })
 }
@@ -435,6 +513,37 @@ mod tests {
                 assert_eq!(merged.templates.get(0).unwrap().palette_hex, ["#123456"]);
             }
         }
+    }
+
+    #[test]
+    fn unrelated_saves_preserve_raw_entries_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "version = 1\nunknown = { enabled = true }\n[[palette]]\nname = 'Bad'\ncolors = 42\n[[palette]]\nname = 'Good'\ncolors = ['#fff']\n[[template]]\nname = 'Broken'\nmode = 'future'\n";
+        fs::write(&path, original).unwrap();
+        let before: toml::Table = toml::from_str(original).unwrap();
+        let loaded = save(
+            &path,
+            &[Change::UpsertTemplate(Template::capture(
+                "New".into(),
+                &Settings::default(),
+            ))],
+        )
+        .unwrap();
+        assert_eq!(loaded.warnings.len(), 2);
+        let after: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["unknown"], before["unknown"]);
+        assert_eq!(after["palette"], before["palette"]);
+        assert_eq!(after["template"][0], before["template"][0]);
+        save(
+            &path,
+            &[
+                Change::RemovePreset("Bad".into()),
+                Change::UpsertTemplate(Template::capture("Broken".into(), &Settings::default())),
+            ],
+        )
+        .unwrap();
+        assert!(load(&path).warnings.is_empty());
     }
 
     #[test]

@@ -23,6 +23,11 @@ pub fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()>
 
 /// Loads an image as RGBA and shrinks it to bound processing work.
 pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
+    if !path.metadata()?.is_file() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file").into(),
+        );
+    }
     let source = image::open(path)?;
     Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
         source.resize(
@@ -39,6 +44,20 @@ pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn decoding_rejects_non_regular_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("socket");
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        for path in [path.as_path(), dir.path()] {
+            let image::ImageError::IoError(error) = load_image(path).unwrap_err() else {
+                panic!("expected a file type error");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
 
     #[test]
     fn preview_png_may_not_overwrite_the_source() {

@@ -198,6 +198,17 @@ fn main() -> std::io::Result<()> {
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
     let mut terminal_result = ratatui::run(|terminal| {
+        let previous = std::panic::take_hook();
+        let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().name() == Some(rthid_io::io::WORKER_NAME) {
+                if let Some(mut log) = panic_log.as_ref() {
+                    let _ = writeln!(log, "IO worker panic: {info}");
+                }
+            } else {
+                previous(info);
+            }
+        }));
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         event_loop(
@@ -222,6 +233,14 @@ fn main() -> std::io::Result<()> {
     terminal_result.and(app.export_result())
 }
 
+// Keep only the last edit for each list and name while a save is pending.
+fn queue_changes(pending: &mut Vec<store::Change>, changes: Vec<store::Change>) {
+    for change in changes {
+        pending.retain(|older| older.key() != change.key());
+        pending.push(change);
+    }
+}
+
 // Syncs and draws when something changed, then waits for input and applies
 // every queued event before the next draw. Runs until the app requests quit.
 fn event_loop(
@@ -234,6 +253,8 @@ fn event_loop(
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
+    let mut pending = Vec::<store::Change>::new();
+    let mut retry_at: Option<Instant> = None;
     while !app.quit {
         while let Some(done) = io.poll() {
             log_done(&done, &mut debug_log)?;
@@ -256,44 +277,63 @@ fn event_loop(
             io.submit(job);
         }
         redraw = false;
-        if io.busy() && !event::poll(Duration::from_millis(30))? {
-            continue;
-        }
-        // Drain queued input so held-down repeats cost one re-dither, not one each.
-        loop {
-            let event = event::read()?;
-            if let Some(log) = &mut debug_log {
-                writeln!(log, "event {event:?}")?;
-            }
-            redraw |= needs_redraw(&event);
-            match event {
-                Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+        let timeout = retry_at.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let timeout = if io.busy() {
+            Some(
+                timeout
+                    .unwrap_or(Duration::from_millis(30))
+                    .min(Duration::from_millis(30)),
+            )
+        } else {
+            timeout
+        };
+        if timeout.is_none() || event::poll(timeout.unwrap())? {
+            // Drain queued input so held-down repeats cost one re-dither, not one each.
+            loop {
+                let event = event::read()?;
+                if let Some(log) = &mut debug_log {
+                    writeln!(log, "event {event:?}")?;
                 }
-                Event::Paste(text) => app.handle_paste(&text),
-                Event::Resize(width, height) => {
-                    layout = ui::layout(ratatui::layout::Size::new(width, height));
-                    app.clamp_viewport(layout.preview);
+                redraw |= needs_redraw(&event);
+                match event {
+                    Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+                    }
+                    Event::Paste(text) => app.handle_paste(&text),
+                    Event::Resize(width, height) => {
+                        layout = ui::layout(ratatui::layout::Size::new(width, height));
+                        app.clamp_viewport(layout.preview);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if !event::poll(Duration::ZERO)? {
-                break;
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
         let changes = app.take_changes();
-        if !changes.is_empty()
+        let new_changes = !changes.is_empty();
+        queue_changes(&mut pending, changes);
+        if !pending.is_empty()
+            && (new_changes || retry_at.is_some_and(|deadline| Instant::now() >= deadline))
             && let Some(path) = config_path
         {
             let started = Instant::now();
-            let result = store::save(path, &changes);
+            let result = store::save(path, &pending);
             if let Some(log) = &mut debug_log {
                 writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
             }
             match result {
-                Ok(loaded) => app.saved(loaded),
-                Err(error) => app.save_failed(changes, error.to_string()),
+                Ok(loaded) => {
+                    pending.clear();
+                    retry_at = None;
+                    app.saved(loaded);
+                }
+                Err(error) => {
+                    retry_at = Some(Instant::now() + Duration::from_secs(2));
+                    app.save_failed(Vec::new(), error.to_string());
+                }
             }
             redraw = true;
         }
@@ -305,6 +345,32 @@ fn event_loop(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn pending_saves_keep_the_last_change_per_list_and_name() {
+        use store::Change;
+        let mut pending = vec![
+            Change::RemovePreset("Shared".into()),
+            Change::RemoveTemplate("Shared".into()),
+        ];
+        let last = Change::UpsertTemplate(settings::Template::capture(
+            "Shared".into(),
+            &settings::Settings::default(),
+        ));
+        queue_changes(
+            &mut pending,
+            vec![last.clone(), Change::RemovePreset("Other".into())],
+        );
+        queue_changes(&mut pending, vec![Change::RemovePreset("Other".into())]);
+        assert_eq!(
+            pending,
+            vec![
+                Change::RemovePreset("Shared".into()),
+                last,
+                Change::RemovePreset("Other".into())
+            ]
+        );
+    }
 
     #[test]
     fn completion_timings_include_operation_duration_and_path() {

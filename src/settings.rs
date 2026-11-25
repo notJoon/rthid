@@ -148,6 +148,7 @@ impl Palettes {
     }
 
     /// User presets in their saved order.
+    #[cfg(test)]
     pub fn user(&self) -> impl Iterator<Item = &Preset> {
         self.iter().filter(|preset| !preset.builtin)
     }
