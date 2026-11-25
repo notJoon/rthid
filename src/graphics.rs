@@ -1,4 +1,4 @@
-//! Kitty, iTerm2 and Sixel output for the Original Overview.
+//! Kitty, iTerm2 and Sixel output for Original at Fit.
 //!
 //! This is the only path that draws real device pixels. Every other view is drawn
 //! with cell glyphs.
@@ -40,14 +40,14 @@ pub enum Mode {
     Off,
 }
 
-/// Grid version and available cells for the original overview.
+/// Grid version and available cells for Original at Fit.
 #[derive(PartialEq)]
 struct ImageKey {
     grid: u64,
     area: Rect,
 }
 
-/// Terminal image output for the Original Overview. Keeps one encoded image and
+/// Terminal image output for Original at Fit. Keeps one encoded image and
 /// the cell rectangle it last covered.
 pub struct Graphics {
     picker: Picker,
@@ -155,7 +155,7 @@ impl Graphics {
         self.placement = placement;
     }
 
-    /// Draws the Original Overview image centered in the preview area, or clears the
+    /// Draws Original centered at Fit, or clears the
     /// previous placement when `request` is None.
     ///
     /// Encodes again only when the grid version or preview area changes, and a rebuild
