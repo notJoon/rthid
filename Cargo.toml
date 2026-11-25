@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 image = "0.25.10"
 ratatui = "0.30.2"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 
 # Keep the dither loop responsive in dev builds
 [profile.dev]

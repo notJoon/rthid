@@ -1,4 +1,4 @@
-use crate::view::View;
+use crate::view::{Pixels, View};
 use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -66,7 +66,23 @@ impl Params {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct GraphicsKey {
+    pub generation: u64,
+    pub x: u32,
+    pub y: u32,
+    pub exact: bool,
+    pub area: Rect,
+    pub font: (u16, u16),
+}
+
+pub const KITTY_IMAGE_ID: u32 = 0x727468;
+
 pub struct App {
+    pub graphics: Option<ratatui_image::picker::Picker>,
+    pub graphics_cache: Option<(GraphicsKey, Rect, ratatui_image::protocol::StatefulProtocol)>,
+    pub graphics_error: Option<String>,
+    pub generation: u64,
     pub preview_png: Option<PathBuf>,
     pub png_error: Option<String>,
     png_worker: Option<Worker>,
@@ -78,6 +94,8 @@ pub struct App {
     pub params: Params,
     pub parameter_list: ListState,
     pub indices: Vec<u8>,
+    pub original: Vec<[u8; 3]>,
+    pub show_original: bool,
     pub dirty: bool,
     pub quit: bool,
 }
@@ -91,6 +109,10 @@ impl App {
                 None => (None, None),
             };
         let mut app = Self {
+            graphics: None,
+            graphics_cache: None,
+            graphics_error: None,
+            generation: 0,
             preview_png,
             png_error: None,
             png_worker,
@@ -102,6 +124,8 @@ impl App {
             params: Params::default(),
             parameter_list: ListState::default().with_selected(Some(0)),
             indices: Vec::new(),
+            original: Vec::new(),
+            show_original: true,
             dirty: true,
             quit: false,
         };
@@ -136,6 +160,7 @@ impl App {
             return status_changed;
         }
         self.dirty = false;
+        self.generation += 1;
         let (w, h) = self.scaled_size();
         let scaled = imageops::resize(&self.source, w, h, imageops::FilterType::Triangle);
         let grid = match self.params.rotation {
@@ -145,6 +170,10 @@ impl App {
             _ => scaled,
         };
         let (gw, gh) = grid.dimensions();
+        self.original = grid
+            .pixels()
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
         self.indices = dither::dither(
             grid.as_raw(),
             gw as usize,
@@ -163,6 +192,17 @@ impl App {
             }
         }
         status_changed
+    }
+
+    pub fn displayed(&self) -> Pixels<'_> {
+        if self.show_original {
+            Pixels::Rgb(&self.original)
+        } else {
+            Pixels::Indexed {
+                indices: &self.indices,
+                palette: &self.params.options.palette,
+            }
+        }
     }
 
     fn set_png_error(&mut self, error: Option<std::io::Error>) -> bool {
@@ -250,6 +290,10 @@ impl App {
         }
         if key.code == KeyCode::Tab {
             self.preview_focus = !self.preview_focus;
+            return;
+        }
+        if key.code == KeyCode::Char(' ') {
+            self.show_original = !self.show_original;
             return;
         }
         // Esc only leaves preview focus; quitting is q or Ctrl+C so a stray Esc never exits.
@@ -340,7 +384,8 @@ impl App {
             *value = next;
             changed
         };
-        let changed = match PARAMS[self.parameter_list.selected().unwrap_or(0)] {
+        let param = PARAMS[self.parameter_list.selected().unwrap_or(0)];
+        let changed = match param {
             Param::Scale => {
                 let next = (p.scale + direction * 10).clamp(10, 200);
                 let changed = next != p.scale;
@@ -368,6 +413,9 @@ impl App {
             Param::Contrast => step(&mut o.tone.contrast, 20.0, -0.5, 1.0),
         };
         self.dirty |= changed;
+        if changed && param != Param::Scale {
+            self.show_original = false;
+        }
     }
 }
 
@@ -403,6 +451,63 @@ mod tests {
         app.parameter_list
             .select(PARAMS.iter().position(|&p| p == param));
         app
+    }
+
+    #[test]
+    fn graphics_defaults_to_fallback_and_generation_changes_only_on_refresh() {
+        let mut app = App::new(RgbaImage::new(4, 4), None);
+        assert!(app.graphics.is_none());
+        assert!(app.graphics_cache.is_none());
+        let generation = app.generation;
+        app.refresh();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.refresh();
+        assert_eq!(app.generation, generation);
+        app.dirty = true;
+        app.refresh();
+        assert_eq!(app.generation, generation + 1);
+    }
+
+    #[test]
+    fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
+        let mut app = app_at(Param::Strength);
+        assert!(app.show_original);
+        for focus in [false, true] {
+            app.preview_focus = focus;
+            assert!(!press(&mut app, KeyCode::Char(' ')));
+            assert!(!app.show_original);
+            assert!(!press(&mut app, KeyCode::Char(' ')));
+            assert!(app.show_original);
+        }
+        app.preview_focus = false;
+        assert!(!press(&mut app, KeyCode::Right));
+        assert!(app.show_original);
+        assert!(press(&mut app, KeyCode::Left));
+        assert!(!app.show_original);
+        assert!(!press(&mut app, KeyCode::Char(' ')));
+        app.parameter_list.select(Some(0));
+        assert!(press(&mut app, KeyCode::Left));
+        assert!(app.show_original);
+        for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
+            assert!(press(&mut app, code));
+            assert!(app.show_original);
+        }
+    }
+
+    #[test]
+    fn original_preserves_rgb_and_ignores_alpha() {
+        let source = RgbaImage::from_raw(
+            3,
+            1,
+            vec![255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255],
+        )
+        .unwrap();
+        let app = App::new(source, None);
+        let Pixels::Rgb(pixels) = app.displayed() else {
+            panic!("expected original RGB pixels");
+        };
+        assert_eq!(pixels, [[255, 0, 0], [25, 26, 128], [255; 3]]);
+        assert_eq!(app.original, pixels);
     }
 
     #[test]
@@ -597,14 +702,7 @@ mod tests {
             let mut buffer = Buffer::empty(app.preview_area);
             let (_, map, _) = app
                 .view
-                .render_minimap(
-                    &app.indices,
-                    120,
-                    120,
-                    &app.params.options.palette,
-                    app.preview_area,
-                    &mut buffer,
-                )
+                .render_minimap(app.displayed(), 120, 120, app.preview_area, &mut buffer)
                 .unwrap();
             assert_eq!(map, expected);
             assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);

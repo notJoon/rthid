@@ -1,3 +1,7 @@
+use image::{
+    Rgba, RgbaImage,
+    imageops::{self, FilterType},
+};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Rect},
@@ -5,6 +9,24 @@ use ratatui::{
     widgets::{Block, Clear, Widget},
 };
 use rthid::dither::PaletteColor;
+
+#[derive(Clone, Copy)]
+pub enum Pixels<'a> {
+    Indexed {
+        indices: &'a [u8],
+        palette: &'a [PaletteColor],
+    },
+    Rgb(&'a [[u8; 3]]),
+}
+
+impl Pixels<'_> {
+    fn rgb(self, i: usize) -> [u8; 3] {
+        match self {
+            Self::Indexed { indices, palette } => palette[usize::from(indices[i])].rgb,
+            Self::Rgb(pixels) => pixels[i],
+        }
+    }
+}
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyphs {
@@ -70,6 +92,64 @@ pub fn fit(w: u32, h: u32, area: Rect) -> (u16, u16) {
     )
 }
 
+// Build an image that covers whole terminal cells without a second widget resize.
+pub fn original_image(
+    pixels: &[[u8; 3]],
+    w: u32,
+    h: u32,
+    view: &View,
+    area: Rect,
+    font: (u16, u16),
+) -> (Rect, RgbaImage) {
+    let (fw, fh) = (u32::from(font.0), u32::from(font.1));
+    if area.is_empty() || w == 0 || h == 0 || fw == 0 || fh == 0 {
+        return (Rect::new(area.x, area.y, 0, 0), RgbaImage::new(0, 0));
+    }
+    let grid = RgbaImage::from_fn(w, h, |x, y| {
+        let [r, g, b] = pixels[(y * w + x) as usize];
+        Rgba([r, g, b, 255])
+    });
+    if view.exact {
+        let mut view = *view;
+        view.clamp(w, h, area);
+        let (vw, vh) = view.visible(w, h, area);
+        let rect = Rect::new(area.x, area.y, vw as u16, vh.div_ceil(2) as u16);
+        let crop = imageops::crop_imm(&grid, view.x, view.y, vw, vh).to_image();
+        return (
+            rect,
+            imageops::resize(
+                &crop,
+                vw * fw,
+                u32::from(rect.height) * fh,
+                FilterType::Nearest,
+            ),
+        );
+    }
+    let aspect = f64::from(fh) / f64::from(fw);
+    let scale =
+        (f64::from(area.width) / f64::from(w)).min(f64::from(area.height) * aspect / f64::from(h));
+    let cw = (f64::from(w) * scale).floor().max(1.0) as u16;
+    let ch = (f64::from(h) * scale / aspect).floor().max(1.0) as u16;
+    let rect = area.centered(Constraint::Length(cw), Constraint::Length(ch));
+    let (pw, ph) = (u32::from(cw) * fw, u32::from(ch) * fh);
+    let filter = if pw < w || ph < h {
+        FilterType::Triangle
+    } else {
+        FilterType::Nearest
+    };
+    let resized = image::DynamicImage::ImageRgba8(grid)
+        .resize(pw, ph, filter)
+        .to_rgba8();
+    let mut image = RgbaImage::new(pw, ph);
+    imageops::overlay(
+        &mut image,
+        &resized,
+        i64::from((pw - resized.width()) / 2),
+        i64::from((ph - resized.height()) / 2),
+    );
+    (rect, image)
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub struct View {
     pub glyphs: Glyphs,
@@ -120,10 +200,9 @@ impl View {
 
     pub fn render_minimap(
         &self,
-        indices: &[u8],
+        pixels: Pixels<'_>,
         w: u32,
         h: u32,
-        palette: &[PaletteColor],
         area: Rect,
         buffer: &mut Buffer,
     ) -> Option<(Rect, Rect, Rect)> {
@@ -131,10 +210,9 @@ impl View {
         // Clear letterboxing so the 1:1 dots cannot show through the inset.
         Clear.render(frame, buffer);
         render_overview(
-            indices,
+            pixels,
             w,
             h,
-            palette,
             self.glyphs,
             Block::bordered().inner(frame),
             buffer,
@@ -174,10 +252,9 @@ impl View {
 }
 
 pub fn render(
-    indices: &[u8],
+    pixels: Pixels<'_>,
     w: u32,
     h: u32,
-    palette: &[PaletteColor],
     view: &View,
     area: Rect,
     buffer: &mut Buffer,
@@ -188,24 +265,16 @@ pub fn render(
     let mut view = *view;
     view.clamp(w, h, area);
     if view.exact {
-        render_exact(indices, w, h, palette, &view, area, buffer);
+        render_exact(pixels, w, h, &view, area, buffer);
         false
     } else {
-        render_overview(indices, w, h, palette, view.glyphs, area, buffer)
+        render_overview(pixels, w, h, view.glyphs, area, buffer)
     }
 }
 
-fn render_exact(
-    indices: &[u8],
-    w: u32,
-    h: u32,
-    palette: &[PaletteColor],
-    view: &View,
-    area: Rect,
-    buffer: &mut Buffer,
-) {
-    let color = |i: u8| {
-        let [r, g, b] = palette[usize::from(i)].rgb;
+fn render_exact(pixels: Pixels<'_>, w: u32, h: u32, view: &View, area: Rect, buffer: &mut Buffer) {
+    let color = |i| {
+        let [r, g, b] = pixels.rgb(i);
         Color::Rgb(r, g, b)
     };
     let (vw, vh) = view.visible(w, h, area);
@@ -213,18 +282,28 @@ fn render_exact(
         for x in 0..vw {
             let index = ((view.y + y) * w + view.x + x) as usize;
             let bg = if y + 1 < vh {
-                color(indices[index + w as usize])
+                color(index + w as usize)
             } else {
                 Color::Reset
             };
             buffer[(area.x + x as u16, area.y + (y / 2) as u16)]
                 .set_symbol("▀")
-                .set_fg(color(indices[index]))
+                .set_fg(color(index))
                 .set_bg(bg);
         }
     }
-    if let Some((frame, map, viewport)) = view.render_minimap(indices, w, h, palette, area, buffer)
-    {
+    render_minimap(pixels, w, h, view, area, buffer);
+}
+
+pub fn render_minimap(
+    pixels: Pixels<'_>,
+    w: u32,
+    h: u32,
+    view: &View,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
+    if let Some((frame, map, viewport)) = view.render_minimap(pixels, w, h, area, buffer) {
         Block::bordered()
             .border_style(Color::Gray)
             .render(frame, buffer);
@@ -240,20 +319,49 @@ fn render_exact(
 }
 
 fn render_overview(
-    indices: &[u8],
+    pixels: Pixels<'_>,
     w: u32,
     h: u32,
-    palette: &[PaletteColor],
     glyphs: Glyphs,
     area: Rect,
     buffer: &mut Buffer,
 ) -> bool {
+    let (cw, ch) = fit(w, h, area);
+    let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
+    let Pixels::Indexed { indices, palette } = pixels else {
+        let average = |cx: u16, half_row: u32| {
+            let x0 = u64::from(cx) * u64::from(w) / u64::from(cw);
+            let x1 = ((u64::from(cx) + 1) * u64::from(w) / u64::from(cw)).max(x0 + 1);
+            let y0 = u64::from(half_row) * u64::from(h) / (u64::from(ch) * 2);
+            let y1 = ((u64::from(half_row) + 1) * u64::from(h) / (u64::from(ch) * 2)).max(y0 + 1);
+            let mut sum = [0u64; 3];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    for (total, channel) in sum
+                        .iter_mut()
+                        .zip(pixels.rgb((y * u64::from(w) + x) as usize))
+                    {
+                        *total += u64::from(channel);
+                    }
+                }
+            }
+            let [r, g, b] = sum.map(|total| (total / ((x1 - x0) * (y1 - y0))) as u8);
+            Color::Rgb(r, g, b)
+        };
+        for cy in 0..ch {
+            for cx in 0..cw {
+                buffer[(target.x + cx, target.y + cy)]
+                    .set_symbol("▀")
+                    .set_fg(average(cx, u32::from(cy) * 2))
+                    .set_bg(average(cx, u32::from(cy) * 2 + 1));
+            }
+        }
+        return false;
+    };
     let color = |i: u8| {
         let [r, g, b] = palette[usize::from(i)].rgb;
         Color::Rgb(r, g, b)
     };
-    let (cw, ch) = fit(w, h, area);
-    let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
     let (cols, rows) = glyphs.subcells();
     let mut approximate = false;
     for cy in 0..ch {
@@ -315,6 +423,116 @@ mod tests {
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid::dither::make_palette;
 
+    fn checkerboard(w: u32, h: u32) -> Vec<[u8; 3]> {
+        (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    if (x + y) % 2 == 0 {
+                        [255, 0, 0]
+                    } else {
+                        [0, 0, 255]
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn graphics_exact_uses_visible_crop_and_nearest_pixels() {
+        let pixels = checkerboard(7, 9);
+        let view = View {
+            exact: true,
+            x: 2,
+            y: 3,
+            ..View::default()
+        };
+        let (rect, image) = original_image(&pixels, 7, 9, &view, Rect::new(4, 5, 3, 2), (6, 15));
+        assert_eq!(rect, Rect::new(4, 5, 3, 2));
+        assert_eq!(image.dimensions(), (18, 30));
+        for (x, y, pixel) in image.enumerate_pixels() {
+            let [r, g, b] = pixels[((view.y + (2 * y + 1) * 4 / 60) * 7 + view.x + x / 6) as usize];
+            assert_eq!(*pixel, Rgba([r, g, b, 255]));
+        }
+        let (rect, image) = original_image(
+            &pixels,
+            7,
+            9,
+            &View {
+                exact: true,
+                ..View::default()
+            },
+            Rect::new(1, 2, 20, 20),
+            (6, 15),
+        );
+        assert_eq!(rect, Rect::new(1, 2, 7, 5));
+        assert_eq!(image.dimensions(), (42, 75));
+        assert!(
+            image
+                .pixels()
+                .all(|p| p.0 == [255, 0, 0, 255] || p.0 == [0, 0, 255, 255])
+        );
+    }
+
+    #[test]
+    fn graphics_overview_uses_font_aspect_and_preserves_crisp_upscaling() {
+        let pixels = checkerboard(4, 4);
+        let (rect, image) = original_image(
+            &pixels,
+            4,
+            4,
+            &View::default(),
+            Rect::new(2, 3, 20, 10),
+            (8, 16),
+        );
+        assert_eq!(rect, Rect::new(2, 3, 20, 10));
+        assert_eq!(image.dimensions(), (160, 160));
+        assert!(
+            image
+                .pixels()
+                .all(|p| p.0 == [255, 0, 0, 255] || p.0 == [0, 0, 255, 255])
+        );
+        let (rect, image) = original_image(
+            &pixels,
+            4,
+            4,
+            &View::default(),
+            Rect::new(2, 3, 20, 10),
+            (8, 8),
+        );
+        assert_eq!(rect, Rect::new(7, 3, 10, 10));
+        assert_eq!(image.dimensions(), (80, 80));
+    }
+
+    #[test]
+    fn graphics_overview_pads_rounding_gaps_and_downscales() {
+        let pixels = vec![[10, 20, 30]; 300 * 100];
+        let (rect, image) = original_image(
+            &pixels,
+            300,
+            100,
+            &View::default(),
+            Rect::new(2, 3, 11, 10),
+            (7, 15),
+        );
+        assert_eq!(rect, Rect::new(2, 8, 11, 1));
+        assert_eq!(image.dimensions(), (77, 15));
+        let opaque: Vec<_> = image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] == 255)
+            .collect();
+        let width = opaque.iter().map(|(x, _, _)| x).max().unwrap()
+            - opaque.iter().map(|(x, _, _)| x).min().unwrap()
+            + 1;
+        assert_eq!(width, 45);
+        assert!(opaque.iter().all(|(_, _, p)| p.0 == [10, 20, 30, 255]));
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+        for area in [Rect::new(0, 0, 0, 3), Rect::new(0, 0, 3, 0)] {
+            let (rect, image) = original_image(&pixels, 300, 100, &View::default(), area, (7, 15));
+            assert!(rect.is_empty());
+            assert_eq!(image.dimensions(), (0, 0));
+        }
+    }
+
     #[test]
     fn quadrant_masks_use_row_major_bits() {
         let expected = [
@@ -345,7 +563,17 @@ mod tests {
         let area = Rect::new(2, 3, 60, 30);
         let mut buffer = Buffer::empty(area);
         view.exact = false;
-        render(&indices, w, h, &palette, &view, area, &mut buffer);
+        render(
+            Pixels::Indexed {
+                indices: &indices,
+                palette: &palette,
+            },
+            w,
+            h,
+            &view,
+            area,
+            &mut buffer,
+        );
         let is_block = |cell: &ratatui::buffer::Cell| {
             cell.symbol()
                 .chars()
@@ -355,7 +583,16 @@ mod tests {
         assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
         view.exact = true;
         let (_, map, _) = view
-            .render_minimap(&indices, w, h, &palette, area, &mut buffer)
+            .render_minimap(
+                Pixels::Indexed {
+                    indices: &indices,
+                    palette: &palette,
+                },
+                w,
+                h,
+                area,
+                &mut buffer,
+            )
             .unwrap();
         assert!(map.positions().all(|pos| is_block(&buffer[pos])));
         assert!(map.positions().any(|pos| buffer[pos].symbol() != " "));
@@ -380,7 +617,16 @@ mod tests {
         let (w, h, palette, indices, mut view) = minimap_fixture();
         let mut baseline = Buffer::empty(area);
         let (frame, map, _) = view
-            .render_minimap(&indices, w, h, &palette, area, &mut baseline)
+            .render_minimap(
+                Pixels::Indexed {
+                    indices: &indices,
+                    palette: &palette,
+                },
+                w,
+                h,
+                area,
+                &mut baseline,
+            )
             .unwrap();
         Block::bordered()
             .border_style(Color::Gray)
@@ -390,7 +636,17 @@ mod tests {
             view.x = x;
             view.y = y;
             let viewport = view.viewport_rect(w, h, view.visible(w, h, area), map);
-            render(&indices, w, h, &palette, &view, area, &mut current);
+            render(
+                Pixels::Indexed {
+                    indices: &indices,
+                    palette: &palette,
+                },
+                w,
+                h,
+                &view,
+                area,
+                &mut current,
+            );
             for pos in frame.positions() {
                 let original = &baseline[pos];
                 let cell = &current[pos];
@@ -426,7 +682,16 @@ mod tests {
         let (w, h, palette, indices, mut view) = minimap_fixture();
         let mut baseline = Buffer::empty(area);
         let (frame, map, _) = view
-            .render_minimap(&indices, w, h, &palette, area, &mut baseline)
+            .render_minimap(
+                Pixels::Indexed {
+                    indices: &indices,
+                    palette: &palette,
+                },
+                w,
+                h,
+                area,
+                &mut baseline,
+            )
             .unwrap();
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut previous: Option<(Buffer, Rect)> = None;
@@ -444,13 +709,33 @@ mod tests {
             let viewport = view.viewport_rect(w, h, view.visible(w, h, area), map);
             terminal
                 .draw(|f| {
-                    render(&indices, w, h, &palette, &view, area, f.buffer_mut());
+                    render(
+                        Pixels::Indexed {
+                            indices: &indices,
+                            palette: &palette,
+                        },
+                        w,
+                        h,
+                        &view,
+                        area,
+                        f.buffer_mut(),
+                    );
                 })
                 .unwrap();
             let current = terminal.backend().buffer().clone();
             let completed = ansi_terminal
                 .draw(|f| {
-                    render(&indices, w, h, &palette, &view, area, f.buffer_mut());
+                    render(
+                        Pixels::Indexed {
+                            indices: &indices,
+                            palette: &palette,
+                        },
+                        w,
+                        h,
+                        &view,
+                        area,
+                        f.buffer_mut(),
+                    );
                 })
                 .unwrap();
             assert_eq!(completed.buffer, &current);
@@ -563,10 +848,12 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         // Sample columns 1 and 3 of each row; column 0 must not participate.
         assert!(!render(
-            &[2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1],
+            Pixels::Indexed {
+                indices: &[2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1],
+                palette: &palette
+            },
             4,
             3,
-            &palette,
             &View::default(),
             area,
             &mut buffer
@@ -575,10 +862,12 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
         assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 0));
         assert!(render(
-            &[0, 2, 0, 2, 1, 2],
+            Pixels::Indexed {
+                indices: &[0, 2, 0, 2, 1, 2],
+                palette: &palette
+            },
             2,
             3,
-            &palette,
             &View::default(),
             area,
             &mut buffer
@@ -598,10 +887,12 @@ mod tests {
             ..View::default()
         };
         assert!(!render(
-            &[2, 2, 2, 2, 2, 0, 2, 1, 2, 2, 2, 2, 2, 0, 2, 1],
+            Pixels::Indexed {
+                indices: &[2, 2, 2, 2, 2, 0, 2, 1, 2, 2, 2, 2, 2, 0, 2, 1],
+                palette: &palette
+            },
             4,
             4,
-            &palette,
             &view,
             area,
             &mut buffer,
@@ -610,10 +901,12 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
         assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 0));
         assert!(render(
-            &[0, 2, 1, 2],
+            Pixels::Indexed {
+                indices: &[0, 2, 1, 2],
+                palette: &palette
+            },
             2,
             2,
-            &palette,
             &view,
             area,
             &mut buffer
@@ -624,15 +917,121 @@ mod tests {
     }
 
     #[test]
+    fn rgb_exact_preserves_each_pixel() {
+        let pixels = [[25, 26, 128], [231, 47, 93]];
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        assert!(!render(
+            Pixels::Rgb(&pixels),
+            1,
+            2,
+            &View {
+                exact: true,
+                ..View::default()
+            },
+            area,
+            &mut buffer,
+        ));
+        assert_eq!(buffer[(0, 0)].symbol(), "▀");
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(25, 26, 128));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(231, 47, 93));
+    }
+
+    #[test]
+    fn rgb_overview_averages_half_cells_in_the_fitted_rectangle() {
+        let pixels: Vec<_> = (0..16)
+            .map(|i| if i % 4 < 2 { [0; 3] } else { [255; 3] })
+            .collect();
+        for glyphs in [Glyphs::Sextant, Glyphs::Quadrant] {
+            for (width, expected) in [(2, vec![0, 255]), (1, vec![127])] {
+                let area = Rect::new(2, 3, width, 3);
+                let mut buffer = Buffer::empty(area);
+                assert!(!render(
+                    Pixels::Rgb(&pixels),
+                    4,
+                    4,
+                    &View {
+                        glyphs,
+                        ..View::default()
+                    },
+                    area,
+                    &mut buffer
+                ));
+                let (cw, ch) = fit(4, 4, area);
+                let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
+                assert_eq!((cw, ch), (width, 1));
+                for (x, value) in expected.into_iter().enumerate() {
+                    let cell = &buffer[(target.x + x as u16, target.y)];
+                    assert_eq!(cell.symbol(), "▀");
+                    assert_eq!(cell.fg, Color::Rgb(value, value, value));
+                    assert_eq!(cell.bg, Color::Rgb(value, value, value));
+                }
+                assert!(
+                    area.positions()
+                        .filter(|&pos| !target.contains(pos))
+                        .all(|pos| buffer[pos].symbol() == " ")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_overview_averages_source_rows_into_distinct_halves() {
+        let pixels = [[0, 20, 100], [100, 40, 200], [200, 60, 0], [254, 80, 100]];
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        assert!(!render(
+            Pixels::Rgb(&pixels),
+            1,
+            4,
+            &View::default(),
+            area,
+            &mut buffer
+        ));
+        assert_eq!(buffer[(0, 0)].symbol(), "▀");
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(50, 30, 150));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(227, 70, 50));
+    }
+
+    #[test]
+    fn rgb_overview_samples_at_least_one_pixel_when_enlarged() {
+        let pixels = [[25, 26, 128], [231, 47, 93]];
+        let area = Rect::new(0, 0, 3, 3);
+        let mut buffer = Buffer::empty(area);
+        assert!(!render(
+            Pixels::Rgb(&pixels),
+            1,
+            2,
+            &View::default(),
+            area,
+            &mut buffer
+        ));
+        let (cw, ch) = fit(1, 2, area);
+        let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
+        assert_eq!((cw, ch), (3, 2));
+        for y in 0..ch {
+            for x in 0..cw {
+                let cell = &buffer[(target.x + x, target.y + y)];
+                let [r, g, b] = pixels[y as usize];
+                assert_eq!(cell.symbol(), "▀");
+                assert_eq!(cell.fg, Color::Rgb(r, g, b));
+                assert_eq!(cell.bg, Color::Rgb(r, g, b));
+            }
+        }
+    }
+
+    #[test]
     fn exact_view_keeps_each_dot_and_odd_bottom_row() {
         let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
         let area = Rect::new(0, 0, 1, 2);
         let mut buffer = Buffer::empty(area);
         assert!(!render(
-            &[0, 1, 2],
+            Pixels::Indexed {
+                indices: &[0, 1, 2],
+                palette: &palette
+            },
             1,
             3,
-            &palette,
             &View {
                 exact: true,
                 ..View::default()
@@ -656,10 +1055,12 @@ mod tests {
             ..View::default()
         };
         render(
-            &vec![0; 120 * 120],
+            Pixels::Indexed {
+                indices: &vec![0; 120 * 120],
+                palette: &palette,
+            },
             120,
             120,
-            &palette,
             &view,
             area,
             &mut buffer,

@@ -23,7 +23,18 @@ impl Drop for MouseCapture {
     }
 }
 
-use crate::{app::App, view::Glyphs};
+use crate::{
+    app::{App, KITTY_IMAGE_ID},
+    view::Glyphs,
+};
+use ratatui_image::picker::{Picker, ProtocolType, cap_parser::Parser};
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum Graphics {
+    #[default]
+    Auto,
+    Off,
+}
 
 // Sources are shrunk on load to bound dither work per keypress.
 // Keep the original around once export needs full resolution.
@@ -31,15 +42,16 @@ const MAX_SOURCE_SIDE: u32 = 1024;
 
 fn parse_args(
     args: impl IntoIterator<Item = OsString>,
-) -> io::Result<(PathBuf, Option<PathBuf>, Option<Glyphs>)> {
+) -> io::Result<(PathBuf, Option<PathBuf>, Option<Glyphs>, Graphics)> {
     let mut args = args.into_iter();
     let mut source = None;
     let mut preview = None;
     let mut glyphs = None;
+    let mut graphics = None;
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant]",
+            "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]",
         )
     };
     while let Some(arg) = args.next() {
@@ -52,6 +64,17 @@ fn parse_args(
                 return Err(invalid());
             }
             preview = Some(PathBuf::from(value));
+        } else if arg == "--graphics" {
+            if graphics.is_some() {
+                return Err(invalid());
+            }
+            graphics = Some(
+                match args.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("auto") => Graphics::Auto,
+                    Some("off") => Graphics::Off,
+                    _ => return Err(invalid()),
+                },
+            );
         } else if arg == "--glyphs" {
             if glyphs.is_some() {
                 return Err(invalid());
@@ -73,6 +96,7 @@ fn parse_args(
         source.unwrap_or_else(|| "tests/fixtures/hsl.jpg".into()),
         preview,
         glyphs,
+        graphics.unwrap_or_default(),
     ))
 }
 
@@ -96,7 +120,7 @@ fn needs_redraw(event: &Event) -> bool {
 }
 
 fn main() -> std::io::Result<()> {
-    let (path, preview_png, glyphs) = parse_args(std::env::args_os().skip(1))?;
+    let (path, preview_png, glyphs, graphics) = parse_args(std::env::args_os().skip(1))?;
     check_not_source(&path, preview_png.as_deref())?;
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -125,12 +149,35 @@ fn main() -> std::io::Result<()> {
         .unwrap_or_else(|| Glyphs::for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref()));
     let mouse_capture = MouseCapture;
     let terminal_result = ratatui::run(|terminal| {
+        if graphics == Graphics::Auto {
+            app.graphics = Picker::from_query_stdio()
+                .ok()
+                .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+        }
         execute!(io::stdout(), EnableMouseCapture)?;
         let mut redraw = true;
+        let mut image_drawn = false;
+        let mut exact = app.view.exact;
+        let mut hide_minimap = app.view.hide_minimap;
+        let mut needs_clear = false;
         while !app.quit {
             if redraw {
+                let image_mode = app.show_original && app.graphics.is_some();
+                if image_drawn
+                    && (needs_clear
+                        || !image_mode
+                        || app.dirty
+                        || exact != app.view.exact
+                        || hide_minimap != app.view.hide_minimap)
+                {
+                    terminal.clear()?;
+                }
+                needs_clear = false;
                 app.refresh();
                 let frame = terminal.draw(|frame| app.draw(frame))?;
+                image_drawn = image_mode && !app.preview_area.is_empty();
+                exact = app.view.exact;
+                hide_minimap = app.view.hide_minimap;
                 if let Some(log) = &mut debug_log {
                     app.log_minimap(log, &frame)?;
                 }
@@ -151,6 +198,7 @@ fn main() -> std::io::Result<()> {
                 match event {
                     Event::Key(key) => app.handle_key(key),
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Resize(_, _) => needs_clear |= image_drawn,
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -160,15 +208,51 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     });
+    let cleanup_result = if let Some(picker) = app.graphics.as_ref()
+        && picker.protocol_type() == ProtocolType::Kitty
+    {
+        let (start, escape, end) = Parser::tmux_start_escape_end(picker.tmux_detected());
+        let mut stdout = io::stdout().lock();
+        write!(
+            stdout,
+            "{start}{escape}_Ga=d,d=I,i={KITTY_IMAGE_ID}{escape}\\{end}"
+        )
+        .and_then(|()| stdout.flush())
+    } else {
+        Ok(())
+    };
     drop(mouse_capture);
     let png_result = app.finish_png();
-    terminal_result.and(png_result)
+    terminal_result.and(cleanup_result).and(png_result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn cli_selects_graphics_and_rejects_invalid_or_duplicate_values() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
+        assert_eq!(parse(&[]).unwrap().3, Graphics::Auto);
+        for (value, expected) in [("auto", Graphics::Auto), ("off", Graphics::Off)] {
+            assert_eq!(
+                parse(&["photo.png", "--graphics", value, "--glyphs", "quadrant"])
+                    .unwrap()
+                    .3,
+                expected
+            );
+        }
+        for args in [
+            vec!["--graphics"],
+            vec!["--graphics", ""],
+            vec!["--graphics", "kitty"],
+            vec!["--graphics", "Auto"],
+            vec!["--graphics", "off", "--graphics", "auto"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
 
     #[test]
     fn cli_selects_glyphs_and_rejects_invalid_or_duplicate_values() {
@@ -230,15 +314,25 @@ mod tests {
         let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
         assert_eq!(
             parse(&[]).unwrap(),
-            ("tests/fixtures/hsl.jpg".into(), None, None)
+            ("tests/fixtures/hsl.jpg".into(), None, None, Graphics::Auto)
         );
         assert_eq!(
             parse(&["photo.png", "--preview-png", "dots.png"]).unwrap(),
-            ("photo.png".into(), Some("dots.png".into()), None)
+            (
+                "photo.png".into(),
+                Some("dots.png".into()),
+                None,
+                Graphics::Auto
+            )
         );
         assert_eq!(
             parse(&["--preview-png", "dots.png", "photo.png"]).unwrap(),
-            ("photo.png".into(), Some("dots.png".into()), None)
+            (
+                "photo.png".into(),
+                Some("dots.png".into()),
+                None,
+                Graphics::Auto
+            )
         );
         for args in [
             vec!["--preview-png"],
