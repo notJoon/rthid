@@ -4,8 +4,8 @@ use std::cell::Cell;
 
 use ratatui::{
     buffer::Buffer,
-    crossterm::event::{KeyCode, KeyEvent},
-    layout::Rect,
+    crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
+    layout::{Position, Rect},
     style::Style,
     text::Line,
     widgets::{Block, List, ListState, StatefulWidget},
@@ -61,8 +61,8 @@ impl ListPicker {
 
     /// Returns the selected index as stored.
     ///
-    /// Only [`ListPicker::handle_key`] clamps the stored index. Drawing clamps
-    /// a copy, so this may exceed the item count until the next key.
+    /// Keys and handled mouse events clamp the stored index. Drawing clamps
+    /// a copy, so this may exceed the item count until the next input.
     ///
     /// # Examples
     ///
@@ -77,6 +77,88 @@ impl ListPicker {
     /// ```
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// Sets the index, clamped on the next key or draw as with [`Self::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rthid_widgets::ListPicker;
+    /// let mut picker = ListPicker::new(0);
+    /// picker.select(3);
+    /// assert_eq!(picker.selected(), 3);
+    /// ```
+    pub fn select(&mut self, index: usize) {
+        self.selected = index;
+    }
+
+    /// Returns the item at a position using the last draw's scroll offset.
+    ///
+    /// `area` must be the list content rectangle without a block.
+    /// Positions outside the area or beyond `len` return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::layout::{Position, Rect};
+    /// use rthid_widgets::ListPicker;
+    /// let picker = ListPicker::new(0);
+    /// assert_eq!(picker.index_at(Rect::new(2, 3, 10, 4), Position::new(2, 4), 3), Some(1));
+    /// ```
+    pub fn index_at(&self, area: Rect, position: Position, len: usize) -> Option<usize> {
+        if !area.contains(position) {
+            return None;
+        }
+        let index = self
+            .offset
+            .get()
+            .saturating_add(usize::from(position.y - area.y));
+        (index < len).then_some(index)
+    }
+
+    /// Selects a clicked item or submits it when already selected.
+    ///
+    /// Wheel events inside `area` move one item. Other events are ignored.
+    /// Clicking the selected item stands in for a double click in terminals.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{layout::Rect, crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind}};
+    /// use rthid_widgets::{ListPicker, Outcome};
+    /// let mut picker = ListPicker::new(0);
+    /// let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 1, modifiers: KeyModifiers::NONE };
+    /// assert_eq!(picker.handle_mouse(click, Rect::new(0, 0, 10, 3), 3), Outcome::Consumed);
+    /// assert_eq!(picker.handle_mouse(click, Rect::new(0, 0, 10, 3), 3), Outcome::Submit(1));
+    /// ```
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect, len: usize) -> Outcome<usize> {
+        let position = Position::new(mouse.column, mouse.row);
+        if !area.contains(position) {
+            return Outcome::Ignored;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = self.index_at(area, position, len) else {
+                    return Outcome::Ignored;
+                };
+                if index == self.selected.min(len.saturating_sub(1)) {
+                    self.select(index);
+                    return Outcome::Submit(index);
+                }
+                self.select(index);
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.selected = self.selected.min(len.saturating_sub(1));
+                self.selected = if mouse.kind == MouseEventKind::ScrollUp {
+                    self.selected.saturating_sub(1)
+                } else {
+                    self.selected.saturating_add(1).min(len.saturating_sub(1))
+                };
+            }
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Consumed
     }
 
     /// Handles a key for a list of `len` items.
@@ -228,6 +310,42 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn mouse_uses_scrolled_rows_and_ignores_empty_space() {
+        let area = Rect::new(2, 3, 10, 3);
+        let mut picker = ListPicker::new(4);
+        picker.render(
+            ["a", "b", "c", "d", "e"].map(Line::raw),
+            None,
+            Style::default(),
+            area,
+            &mut Buffer::empty(area),
+        );
+        assert_eq!(picker.offset(), 2);
+        let mut mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
+        assert_eq!(picker.selected(), 2);
+        assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Submit(2));
+        mouse.kind = MouseEventKind::ScrollDown;
+        assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
+        assert_eq!(picker.selected(), 3);
+        mouse.kind = MouseEventKind::ScrollUp;
+        assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
+        assert_eq!(picker.selected(), 2);
+        mouse.column = 1;
+        assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Ignored);
+        mouse.column = 2;
+        mouse.row = 5;
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(picker.handle_mouse(mouse, area, 3), Outcome::Ignored);
+        assert_eq!(picker.handle_mouse(mouse, area, 0), Outcome::Ignored);
     }
 
     #[test]

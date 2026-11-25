@@ -79,7 +79,8 @@ to the parent directory. Type or paste a path into the field and press `Enter`
 to open it. `~` and `~/` expand to your home directory. Left and Right edit the
 field, and letters including `j` and `k` always enter text. After Up or Down,
 Enter opens the selected entry again. `Esc` closes the dialog. An open error
-appears in the status line and leaves the dialog open.
+appears in the status line and leaves the dialog open. Click an entry to select
+it and click it again to open it. The wheel moves the selection.
 
 You can also drag and drop an image outside a dialog when your terminal sends
 bracketed paste. Quoted paths, escaped spaces and local file URIs are accepted.
@@ -99,7 +100,10 @@ shows Dithered while keeping rotation, `n` saves current settings under a name
 of up to 32 characters, and `x` asks to delete. Names must be nonempty and
 cannot match a built-in preset. Reusing a template name asks to overwrite with
 `y`; any other key returns to the name prompt. `Esc` returns from naming to
-the list or closes the list. Modal keys appear in the help line.
+the list or closes the list. Click to select a preset, template, or editor row,
+then click again to apply or edit it. The wheel moves one row. Mouse input is
+ignored during confirmations and while editing a name or editor field. Modal
+keys appear in the help line.
 
 The config path lookup order is `--config path`, `RTHID_CONFIG`,
 `$XDG_CONFIG_HOME/rthid/config.toml` when `XDG_CONFIG_HOME` is absolute, then

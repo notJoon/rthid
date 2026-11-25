@@ -5,7 +5,7 @@ use crate::{
     export::Export,
     grid::GridCache,
     memo::Memo,
-    modal::{Ctx, Effect, Entry, Modal, Next},
+    modal::{Ctx, Effect, Entry, Modal, Next, Step},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
@@ -311,9 +311,22 @@ impl App {
         self.export.as_mut().map_or(Ok(()), Export::finish)
     }
 
-    /// Pans overflowing previews at any focus and recenters through the minimap.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
-        if self.source_path().is_none() || self.modal.is_some() {
+    /// Routes modal mouse input or pans and recenters the preview.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry, screen: Rect) {
+        if let Some(modal) = &mut self.modal {
+            self.last_drag = None;
+            let ctx = Ctx {
+                palettes: &self.palettes,
+                templates: &self.templates,
+                settings: &self.settings,
+                show_original: self.show_original,
+            };
+            let layout = modal.layout(geometry.area, screen, &ctx);
+            let step = modal.handle_mouse(mouse, &layout, ctx);
+            self.apply_step(step);
+            return;
+        }
+        if self.source_path().is_none() {
             self.last_drag = None;
             return;
         }
@@ -356,14 +369,30 @@ impl App {
         }
     }
 
-    /// Borrows the preview and saved entries needed by dialogs, for tests that build a modal directly.
-    #[cfg(test)]
+    /// Borrows the preview and saved entries needed by dialogs.
     pub fn modal_ctx(&self) -> Ctx<'_> {
         Ctx {
             palettes: &self.palettes,
             templates: &self.templates,
             settings: &self.settings,
             show_original: self.show_original,
+        }
+    }
+
+    fn apply_step(&mut self, step: Step) {
+        if step.effect.is_some() {
+            self.notice = None;
+        }
+        if let Some(effect) = step.effect
+            && let Err(error) = self.apply(effect)
+        {
+            self.set_notice(error);
+            return;
+        }
+        match step.next {
+            Next::Stay => {}
+            Next::Close => self.modal = None,
+            Next::Replace(modal) => self.modal = Some(modal),
         }
     }
 
@@ -394,17 +423,7 @@ impl App {
                     show_original: self.show_original,
                 },
             );
-            if let Some(effect) = step.effect
-                && let Err(error) = self.apply(effect)
-            {
-                self.set_notice(error);
-                return;
-            }
-            match step.next {
-                Next::Stay => {}
-                Next::Close => self.modal = None,
-                Next::Replace(modal) => self.modal = Some(modal),
-            }
+            self.apply_step(step);
             return;
         }
         if key.code == KeyCode::Char('o') {
@@ -702,6 +721,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 &app.geometry(test_layout().preview),
+                test_layout().screen,
             );
             assert_eq!(app.viewport.zoom, Zoom::Fit);
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
@@ -1288,6 +1308,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 &app.geometry(area),
+                test_layout().screen,
             );
             app.refresh();
             assert_eq!(versions(app), version);
@@ -1393,6 +1414,7 @@ mod tests {
                         modifiers: KeyModifiers::NONE,
                     },
                     &app.geometry(area),
+                    test_layout().screen,
                 );
             }
             assert_eq!((app.viewport.x, app.viewport.y), dragged, "{zoom:?}");
@@ -1405,6 +1427,7 @@ mod tests {
                         modifiers: KeyModifiers::NONE,
                     },
                     &app.geometry(area),
+                    test_layout().screen,
                 );
             }
             assert_eq!((app.viewport.x, app.viewport.y), scrolled, "{zoom:?}");

@@ -8,7 +8,8 @@ cargo run -- [image]
 
 Omit the image path to start with an empty preview. Press `o` to browse directories
 or type an image path, including `~/` paths. Use `Up` / `Down` to select,
-`Enter` to open, and `Esc` to close. You can also drop an image into a terminal
+`Enter` to open, and `Esc` to close. In dialog lists, click to select and click
+again to open, apply, or edit. The wheel moves the selection. You can also drop an image into a terminal
 that supports bracketed paste. Open errors appear in the status line and keep
 the current image and dialog available.
 

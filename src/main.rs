@@ -377,7 +377,9 @@ fn event_loop(
             redraw |= needs_redraw(&event);
             match event {
                 Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
-                Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+                }
                 Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(width, height) => {
                     layout = ui::layout(ratatui::layout::Size::new(width, height));

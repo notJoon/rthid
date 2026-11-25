@@ -4,7 +4,11 @@
 //! Drawing borrows App immutably. Renderer retains preview caches and terminal
 //! graphics while the panel retains its own scroll offset.
 
-use crate::{cells, graphics, modal::Modal, viewport};
+use crate::{
+    cells, graphics,
+    modal::{Modal, preset_rows, template_rows},
+    viewport,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
@@ -49,6 +53,8 @@ const PANEL_HINTS: &[(&str, &str)] = &[
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
+    /// Full terminal rectangle for modal placement.
+    pub screen: Rect,
     /// Preview border and title.
     pub preview_block: Rect,
     /// Preview content inside the border, the area passed to App::sync and
@@ -65,15 +71,17 @@ pub struct Layout {
 /// Splits the screen into the preview and a fixed width parameter panel above
 /// one help row and one status row.
 pub fn layout(screen: impl Into<Rect>) -> Layout {
+    let screen = screen.into();
     let [body, help, status] = Split::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(screen.into());
+    .areas(screen);
     let [preview_block, panel] =
         Split::horizontal([Constraint::Min(0), Constraint::Length(29)]).areas(body);
     Layout {
+        screen,
         preview_block,
         preview: Block::bordered().inner(preview_block),
         panel,
@@ -198,11 +206,9 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         layout.status,
     );
     if app.modal.is_some() {
-        draw_modal(frame, app, layout.preview);
+        draw_modal(frame, app, layout);
     }
 }
-
-const DIALOG_MIN_WIDTH: u16 = 28;
 
 struct ModalContent<'a> {
     title: &'a str,
@@ -213,7 +219,6 @@ struct ModalContent<'a> {
 struct Editing<'a> {
     input: &'a TextInput,
     prefix: String,
-    selected: usize,
     invalid: bool,
     swatch: Option<[u8; 3]>,
 }
@@ -222,8 +227,13 @@ fn swatch_span([r, g, b]: [u8; 3], style: Style) -> Span<'static> {
     Span::styled("  ██", style.fg(Color::Rgb(r, g, b)))
 }
 
-fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
+fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
     let modal = app.modal.as_ref().unwrap();
+    let layout = modal.layout(
+        screen_layout.preview,
+        screen_layout.screen,
+        &app.modal_ctx(),
+    );
     let mut editing = None;
     let ModalContent {
         title,
@@ -242,22 +252,13 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
                     ))
                 })
                 .collect();
-            let dialog = Dialog {
+            Dialog {
                 title: "Open image",
-                min_width: DIALOG_MIN_WIDTH,
-            };
-            let width = rows
-                .iter()
-                .map(Line::width)
-                .chain([Line::raw(picker.input.text()).width()])
-                .max()
-                .unwrap_or(0)
-                .min(u16::MAX as usize) as u16;
-            let height = rows.len().saturating_add(1).min(u16::MAX as usize) as u16;
-            let area = dialog.area(preview, frame.area(), (width, height));
-            let inner = dialog.render(area, frame.buffer_mut());
-            let [field, entries] =
-                Split::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+                min_width: 28,
+            }
+            .render(layout.dialog, frame.buffer_mut());
+            let field = layout.field.unwrap();
+            let entries = layout.list.unwrap();
             if let Some(cursor) =
                 picker
                     .input
@@ -291,7 +292,6 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
                 editing = Some(Editing {
                     input,
                     prefix: "Name: ".to_owned(),
-                    selected: 0,
                     invalid: false,
                     swatch: None,
                 });
@@ -301,21 +301,7 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
                     picker: None,
                 }
             } else {
-                let rows = if app.templates.is_empty() {
-                    vec![Line::raw("n: save current settings")]
-                } else {
-                    app.templates
-                        .iter()
-                        .map(|template| {
-                            Line::raw(format!(
-                                "{} | {} | {}",
-                                template.name,
-                                template.palette_name,
-                                crate::settings::mode_label(template.mode)
-                            ))
-                        })
-                        .collect()
-                };
+                let rows = template_rows(&app.modal_ctx());
                 ModalContent {
                     title,
                     rows,
@@ -324,22 +310,7 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
             }
         }
         Modal::Presets { list, confirm } => {
-            let rows = app
-                .palettes
-                .iter()
-                .map(|preset| {
-                    Line::raw(format!(
-                        "{}{}{}",
-                        if app.settings.uses(preset) {
-                            "* "
-                        } else {
-                            "  "
-                        },
-                        preset.name,
-                        if preset.builtin { " (built-in)" } else { "" }
-                    ))
-                })
-                .collect();
+            let rows = preset_rows(&app.modal_ctx());
             ModalContent {
                 title: confirm
                     .as_ref()
@@ -362,7 +333,6 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
                     editing = Some(Editing {
                         input,
                         prefix: prefix.clone(),
-                        selected: row,
                         invalid: editor.invalid_hex(),
                         swatch: editor.swatch_rgb(row),
                     });
@@ -394,34 +364,27 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
     };
     let dialog = Dialog {
         title,
-        min_width: DIALOG_MIN_WIDTH,
+        min_width: 28,
     };
-    let content = (
-        rows.iter()
-            .map(Line::width)
-            .max()
-            .unwrap_or(0)
-            .min(u16::MAX as usize) as u16,
-        rows.len().min(u16::MAX as usize) as u16,
-    );
-    let area = dialog.area(preview, frame.area(), content);
-    let inner = dialog.render(area, frame.buffer_mut());
+    dialog.render(layout.dialog, frame.buffer_mut());
     let highlight = Style::default().bg(Color::DarkGray);
     if let Some(picker) = picker {
-        picker.render(rows, None, highlight, inner, frame.buffer_mut());
+        picker.render(
+            rows,
+            None,
+            highlight,
+            layout.list.unwrap(),
+            frame.buffer_mut(),
+        );
     }
     if let Some(Editing {
         input,
         prefix,
-        selected,
         invalid,
         swatch,
     }) = editing
-        && let Some(row) = selected.checked_sub(picker.map_or(0, |list| list.offset()))
-        && row < usize::from(inner.height)
-        && inner.width > 2
+        && let Some(text_area) = layout.field
     {
-        let text_area = Rect::new(inner.x + 2, inner.y + row as u16, inner.width - 2, 1);
         frame.render_widget(Paragraph::new("").style(highlight), text_area);
         let style = highlight.fg(if invalid { Color::Red } else { Color::Reset });
         if let Some(cursor) = input.render(&prefix, style, text_area, frame.buffer_mut()) {
@@ -657,15 +620,14 @@ mod tests {
                     .iter()
                     .any(|cell| cell.symbol() == "o" && cell.fg == Color::Red)
             );
-            let dialog = Dialog {
-                title: "Preset editor",
-                min_width: DIALOG_MIN_WIDTH,
-            };
-            let inner = Block::bordered().inner(dialog.area(
-                layout(terminal.size().unwrap()).preview,
-                terminal.backend().buffer().area,
-                (13, 4),
-            ));
+            let layout = layout(terminal.size().unwrap());
+            let inner = app
+                .modal
+                .as_ref()
+                .unwrap()
+                .layout(layout.preview, layout.screen, &app.modal_ctx())
+                .list
+                .unwrap();
             assert_eq!(
                 terminal.get_cursor_position().unwrap(),
                 (inner.x + 2 + 3 + 4, inner.y + 1).into()
@@ -696,6 +658,24 @@ mod tests {
                 .unwrap();
             assert!(
                 draw_text(&mut terminal, &app, &mut renderer).contains("Z | Black/white | tone")
+            );
+            let mut template = crate::settings::Template::capture(
+                "A template with a long name".into(),
+                &Settings::default(),
+            );
+            template.palette_name = "A palette with a long name".into();
+            app.templates.upsert(template).unwrap();
+            assert!(
+                usize::from(
+                    app.modal
+                        .as_ref()
+                        .unwrap()
+                        .layout(layout.preview, layout.screen, &app.modal_ctx())
+                        .list
+                        .unwrap()
+                        .width
+                ) >= Line::raw("A template with a long name | A palette with a long name | tone")
+                    .width()
             );
         }
     }
@@ -784,6 +764,7 @@ mod tests {
             (
                 Rect::new(0, 0, 100, 40),
                 Layout {
+                    screen: Rect::new(0, 0, 100, 40),
                     preview_block: Rect::new(0, 0, 71, 38),
                     preview: Rect::new(1, 1, 69, 36),
                     panel: Rect::new(71, 0, 29, 38),
@@ -794,6 +775,7 @@ mod tests {
             (
                 Rect::new(2, 3, 41, 9),
                 Layout {
+                    screen: Rect::new(2, 3, 41, 9),
                     preview_block: Rect::new(2, 3, 12, 7),
                     preview: Rect::new(3, 4, 10, 5),
                     panel: Rect::new(14, 3, 29, 7),
@@ -804,6 +786,7 @@ mod tests {
             (
                 Rect::new(0, 0, 20, 5),
                 Layout {
+                    screen: Rect::new(0, 0, 20, 5),
                     preview_block: Rect::new(0, 0, 0, 3),
                     preview: Rect::new(0, 1, 0, 1),
                     panel: Rect::new(0, 0, 20, 3),
@@ -814,6 +797,7 @@ mod tests {
             (
                 Rect::default(),
                 Layout {
+                    screen: Rect::default(),
                     preview_block: Rect::default(),
                     preview: Rect::default(),
                     panel: Rect::default(),
