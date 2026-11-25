@@ -2075,7 +2075,15 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "rthid-widgets",
  "tempfile",
+]
+
+[[package]]
+name = "rthid-widgets"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]

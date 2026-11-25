@@ -1,16 +1,47 @@
 //! Screen layout and per frame drawing of the preview, parameter panel, help line
 //! and status line.
 //!
-//! Drawing never mutates App. State that must change while drawing, such as caches
-//! and scroll offsets, lives in Renderer.
+//! Drawing borrows App immutably. Renderer retains preview caches and terminal
+//! graphics while the panel retains its own scroll offset.
 
 use crate::{cells, graphics, viewport};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Paragraph};
+use rthid_widgets::key_hints;
 
 use crate::{app::App, settings::Setting};
+
+const PREVIEW_HINTS: &[(&str, &str)] = &[
+    ("Tab", "focus"),
+    ("Space", "original/dithered"),
+    ("+/-", "zoom"),
+    ("0", "fit"),
+    ("hjkl/arrows", "pan"),
+    ("HJKL", "page"),
+    ("m", "map"),
+    ("mouse", "drag/wheel/map"),
+    ("r/R", "rotate"),
+    ("d/D", "reset"),
+    ("Esc", "back"),
+    ("q", "quit"),
+];
+
+const PANEL_HINTS: &[(&str, &str)] = &[
+    ("Tab", "focus"),
+    ("Space", "original/dithered"),
+    ("+/-", "zoom"),
+    ("0", "fit"),
+    ("m", "map"),
+    ("mouse", "drag/wheel/map"),
+    ("Up/Down k/j", "select"),
+    ("Left/Right h/l", "change"),
+    ("r/R", "rotate"),
+    ("d/D", "reset"),
+    ("q", "quit"),
+];
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,13 +80,11 @@ pub fn layout(screen: impl Into<Rect>) -> Layout {
 }
 
 /// Drawing state that lives across frames, so draw can update caches while App
-/// stays borrowed immutably. Holds terminal graphics, RGB overview caches and the
-/// parameter panel scroll state.
+/// stays borrowed immutably. Holds terminal graphics and RGB overview caches.
 #[derive(Default)]
 pub struct Renderer {
     graphics: Option<graphics::Graphics>,
     overviews: cells::OverviewCaches,
-    setting_list: ListState,
 }
 
 impl Renderer {
@@ -125,8 +154,8 @@ pub fn log_minimap(
     log.flush()
 }
 
-/// Draws the preview, parameter panel, help line and status line without changing
-/// App. Expects App::sync to have run for this layout.
+/// Draws using a shared App borrow and retains the panel scroll offset.
+/// Expects App::sync to have run for this layout.
 pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
@@ -136,24 +165,26 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let list = List::new(Setting::ALL.map(|setting| setting.label(&app.settings)))
-        .block(
-            Block::bordered()
-                .title("Parameters")
-                .border_style(focus_style(!app.preview_focus)),
-        )
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-    renderer.setting_list.select(Some(app.selected));
-    frame.render_stateful_widget(list, layout.panel, &mut renderer.setting_list);
+    let labels = Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings)));
+    let block = Block::bordered()
+        .title("Parameters")
+        .border_style(focus_style(!app.preview_focus));
+    let highlight = Style::default().fg(Color::Black).bg(Color::Cyan);
+    app.panel.render(
+        labels,
+        Some(block),
+        highlight,
+        layout.panel,
+        frame.buffer_mut(),
+    );
     frame.render_widget(
-            Paragraph::new(if app.preview_focus {
-                "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
-            } else {
-                "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
-            }),
-            layout.help,
-        );
+        Paragraph::new(key_hints(&[if app.preview_focus {
+            PREVIEW_HINTS
+        } else {
+            PANEL_HINTS
+        }])),
+        layout.help,
+    );
     frame.render_widget(
         Paragraph::new(status(app, &geometry, report)),
         layout.status,
@@ -494,6 +525,18 @@ mod tests {
         }
     }
     #[test]
+    fn help_hints_preserve_exact_text() {
+        assert_eq!(
+            key_hints(&[PREVIEW_HINTS]),
+            "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+        );
+        assert_eq!(
+            key_hints(&[PANEL_HINTS]),
+            "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+        );
+    }
+
+    #[test]
     fn setting_list_keeps_scroll_offset_when_moving_within_visible_rows() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -511,15 +554,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(renderer.setting_list.selected(), Some(6));
-        assert_eq!(renderer.setting_list.offset(), 4);
+        assert_eq!(app.panel.selected(), 6);
+        assert_eq!(app.panel.offset(), 4);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(renderer.setting_list.selected(), Some(5));
-        assert_eq!(renderer.setting_list.offset(), 4);
+        assert_eq!(app.panel.selected(), 5);
+        assert_eq!(app.panel.offset(), 4);
         for label in ["Serpentine", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
