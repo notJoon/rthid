@@ -741,7 +741,16 @@ mod tests {
             if with_export {
                 app = App::builtin(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
-                assert!(app.finish_png().is_err());
+                app.complete(rthid_io::io::Done {
+                    id: 1,
+                    elapsed: std::time::Duration::ZERO,
+                    outcome: rthid_io::io::Outcome::Exported(Err(rthid_io::io::IoError {
+                        op: rthid_io::io::Op::Encode,
+                        path: dir.path().to_path_buf(),
+                        cause: rthid_io::io::Cause::Io(std::io::Error::other("denied")),
+                    })),
+                });
+                assert!(app.export_result().is_err());
             }
             app.set_notice("Config notice".into());
             assert_eq!(

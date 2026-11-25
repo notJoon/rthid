@@ -51,8 +51,6 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-#[cfg(test)]
-use image::RgbaImage;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{
@@ -62,17 +60,11 @@ use ratatui::crossterm::{
     execute,
 };
 use rthid_io::{
-    dir::list_dir,
     image::{check_not_source, load_image},
-    path::expand_tilde,
+    io::{Done, IO},
 };
 
-use crate::{
-    app::{App, Request},
-    cells::Glyphs,
-    graphics::Mode as Graphics,
-    ui::Renderer,
-};
+use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -125,78 +117,15 @@ enum CliGraphics {
     Off,
 }
 
-fn handle_request(
-    app: &mut App,
-    request: Request,
-    preview_png: Option<&Path>,
-    mut debug_log: Option<&mut File>,
-) -> io::Result<()> {
-    let request = match request {
-        Request::Open(path, dir) => {
-            let home_path = path == Path::new("~") || path.starts_with("~/");
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let path = path
-                .to_str()
-                .map(|text| expand_tilde(text, home.as_deref()))
-                .unwrap_or(path);
-            let path = if path.is_relative() && !home_path {
-                dir.map_or_else(|| path.clone(), |dir| dir.join(&path))
-            } else {
-                path
-            };
-            if path.is_dir() {
-                if !matches!(app.modal, Some(modal::Modal::OpenFile(_))) {
-                    app.modal = Some(modal::Modal::open_file(path.clone()));
-                }
-                Request::List(path)
-            } else {
-                Request::Open(path, None)
-            }
-        }
-        request => request,
-    };
-    match request {
-        Request::List(path) => {
-            let started = Instant::now();
-            let result = list_dir(&path);
-            if let Some(log) = &mut debug_log {
-                writeln!(
-                    log,
-                    "[timing] list {} {}",
-                    started.elapsed().as_millis(),
-                    path.display()
-                )?;
-            }
-            match result {
-                Ok((dir, entries)) => app.set_listing(dir, entries),
-                Err(error) => {
-                    app.set_notice(format!("open: {}: {error}", path.display()));
-                }
-            }
-        }
-        Request::Open(path, _) => {
-            let started = Instant::now();
-            let result = check_not_source(&path, preview_png)
-                .map_err(|error| error.to_string())
-                .and_then(|()| {
-                    load_image(&path)
-                        .map_err(|error| format!("Could not load {}: {error}", path.display()))
-                });
-            if let Some(log) = &mut debug_log {
-                writeln!(
-                    log,
-                    "[timing] decode {} {}",
-                    started.elapsed().as_millis(),
-                    path.display()
-                )?;
-            }
-            match result {
-                Ok(image) => app.open_image(path, image),
-                Err(error) => {
-                    app.set_notice(format!("open: {error}"));
-                }
-            }
-        }
+fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
+    if let Some(log) = debug_log {
+        writeln!(
+            log,
+            "[timing] {} {} {}",
+            done.op(),
+            done.elapsed.as_millis(),
+            done.path().display()
+        )?;
     }
     Ok(())
 }
@@ -278,9 +207,10 @@ fn main() -> std::io::Result<()> {
     );
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
-    let terminal_result = ratatui::run(|terminal| {
+    let mut terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         event_loop(
@@ -289,13 +219,20 @@ fn main() -> std::io::Result<()> {
             &mut renderer,
             debug_log.as_mut(),
             config_path.as_deref(),
-            preview_png.as_deref(),
+            &mut io,
         )
     });
     drop(bracketed_paste);
     drop(mouse_capture);
-    let png_result = app.finish_png();
-    terminal_result.and(png_result)
+    app.finish();
+    for job in app.take_jobs() {
+        io.submit(job);
+    }
+    for done in io.finish() {
+        terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
+        app.complete(done);
+    }
+    terminal_result.and(app.export_result())
 }
 
 // Syncs and draws when something changed, then waits for input and applies
@@ -306,13 +243,16 @@ fn event_loop(
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
-    preview_png: Option<&Path>,
+    io: &mut IO,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
     while !app.quit {
+        while let Some(done) = io.poll() {
+            log_done(&done, &mut debug_log)?;
+            redraw |= app.complete(done);
+        }
         if redraw {
-            poll_export(app, &mut debug_log)?;
             let started = Instant::now();
             let rebuilt = app.sync(layout.preview);
             if rebuilt && let Some(log) = &mut debug_log {
@@ -325,15 +265,11 @@ fn event_loop(
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
         }
-        if let Some(request) = app.take_request() {
-            handle_request(app, request, preview_png, debug_log.as_deref_mut())?;
-            redraw = true;
-            continue;
+        for job in app.take_jobs() {
+            io.submit(job);
         }
         redraw = false;
-        // With a companion PNG, wake periodically so background write results reach the status line.
-        if app.has_export() && !event::poll(Duration::from_millis(50))? {
-            redraw = poll_export(app, &mut debug_log)?;
+        if io.busy() && !event::poll(Duration::from_millis(30))? {
             continue;
         }
         // Drain queued input so held-down repeats cost one re-dither, not one each.
@@ -375,96 +311,43 @@ fn event_loop(
     Ok(())
 }
 
-fn poll_export(app: &mut App, debug_log: &mut Option<&mut File>) -> io::Result<bool> {
-    let changed = app.poll_export();
-    if let Some(elapsed) = app.take_encode_elapsed()
-        && let Some(log) = debug_log
-    {
-        writeln!(log, "[timing] encode {}", elapsed.as_millis())?;
-    }
-    Ok(changed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
 
     #[test]
-    fn request_timings_include_operation_and_path() {
+    fn completion_timings_include_operation_duration_and_path() {
+        use rthid_io::io::{Listing, Opened, Outcome};
         let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("photo.png");
-        RgbaImage::new(2, 2).save(&image).unwrap();
         let log_path = dir.path().join("debug.log");
         let mut log = File::create(&log_path).unwrap();
-        let mut app = App::empty();
-        for request in [
-            Request::List(dir.path().into()),
-            Request::Open(image.clone(), None),
+        let path = PathBuf::from("photo.png");
+        for outcome in [
+            Outcome::Listed(Ok(Listing {
+                dir: path.clone(),
+                entries: vec![],
+            })),
+            Outcome::Opened(Ok(Opened::Image {
+                path: path.clone(),
+                image: image::RgbaImage::new(1, 1),
+            })),
+            Outcome::Exported(Ok(path)),
         ] {
-            handle_request(&mut app, request, None, Some(&mut log)).unwrap();
-        }
-        let text = std::fs::read_to_string(log_path).unwrap();
-        let lines: Vec<_> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        for (line, operation, path) in [
-            (lines[0], "list", dir.path()),
-            (lines[1], "decode", image.as_path()),
-        ] {
-            let rest = line
-                .strip_prefix(&format!("[timing] {operation} "))
-                .unwrap();
-            let (milliseconds, logged_path) = rest.split_once(' ').unwrap();
-            milliseconds.parse::<u128>().unwrap();
-            assert_eq!(logged_path, path.display().to_string());
-        }
-    }
-
-    #[test]
-    fn open_requests_list_directories_and_keep_failures_open() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = App::empty();
-        app.handle_paste(&format!("'{}'", temp.path().display()));
-        assert!(app.modal.is_none());
-        assert!(app.notice().unwrap().starts_with("Loading "));
-        let request = app.take_request().unwrap();
-        handle_request(&mut app, request, None, None).unwrap();
-        assert!(app.notice().is_none());
-        let Some(modal::Modal::OpenFile(picker)) = &app.modal else {
-            panic!("open dialog expected")
-        };
-        assert_eq!(picker.dir, temp.path().canonicalize().unwrap());
-        handle_request(
-            &mut app,
-            Request::Open(
-                PathBuf::from("missing.png"),
-                Some(temp.path().to_path_buf()),
-            ),
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
-        assert!(app.notice().unwrap().contains("Could not load"));
-        assert!(
-            app.notice()
-                .unwrap()
-                .contains(&temp.path().display().to_string())
-        );
-        let photo = temp.path().join("photo.png");
-        RgbaImage::new(2, 2).save(&photo).unwrap();
-        for path in [PathBuf::from("photo.png"), photo.clone()] {
-            handle_request(
-                &mut app,
-                Request::Open(path, Some(temp.path().to_path_buf())),
-                None,
-                None,
+            log_done(
+                &Done {
+                    id: 1,
+                    elapsed: Duration::from_millis(7),
+                    outcome,
+                },
+                &mut Some(&mut log),
             )
             .unwrap();
-            assert_eq!(app.source_path(), Some(photo.as_path()));
         }
-        assert!(app.modal.is_none());
-        assert!(app.notice().is_none());
+        assert_eq!(
+            std::fs::read_to_string(log_path).unwrap(),
+            "[timing] list 7 photo.png\n[timing] decode 7 photo.png\n[timing] encode 7 photo.png\n"
+        );
     }
 
     #[test]

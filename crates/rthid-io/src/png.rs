@@ -1,15 +1,9 @@
-//! Background PNG writer for the dithered grid. Each dot becomes a solid square
+//! PNG encoding for the dithered grid. Each dot becomes a solid square
 //! and the file is replaced only after a complete encode.
 
 use image::ImageEncoder;
 use rthid_dither::dither::{self, PaletteColor};
-use std::{
-    io,
-    path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
+use std::{io, path::Path};
 
 /// Integer dot size from 1 to 4 that keeps the long side within 2048 px,
 /// unless the grid is already larger.
@@ -27,109 +21,6 @@ pub struct Grid {
     pub h: u32,
     /// Colors referenced by the indices.
     pub palette: Vec<PaletteColor>,
-}
-
-/// Result and duration of a completed PNG write. Callers decide whether to log the time.
-pub struct Completion {
-    /// Whether the file was written successfully.
-    pub result: io::Result<()>,
-    /// Time spent encoding and writing.
-    pub elapsed: Duration,
-}
-
-/// Background PNG writer. When several grids are queued only the newest is written.
-pub struct Worker {
-    jobs: Option<Sender<(u64, Grid)>>,
-    results: Receiver<(u64, Completion)>,
-    latest: u64,
-    thread: Option<JoinHandle<io::Result<()>>>,
-}
-
-impl Worker {
-    /// Spawns the writer thread for the destination path.
-    pub fn new(path: PathBuf) -> io::Result<Self> {
-        let (jobs, queued) = mpsc::channel::<(u64, Grid)>();
-        let (finished, results) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("preview-png".into())
-            .spawn(move || {
-                let mut result = Ok(());
-                while let Ok(first) = queued.recv() {
-                    let (id, job) = queued.try_iter().last().unwrap_or(first);
-                    let started = Instant::now();
-                    result = write_atomic(
-                        &path,
-                        &job.indices,
-                        job.w,
-                        job.h,
-                        &job.palette,
-                        preview_scale(job.w, job.h),
-                    );
-                    let elapsed = started.elapsed();
-                    let error = result
-                        .as_ref()
-                        .err()
-                        .map(|error| io::Error::new(error.kind(), error.to_string()));
-                    if finished
-                        .send((
-                            id,
-                            Completion {
-                                result: error.map_or(Ok(()), Err),
-                                elapsed,
-                            },
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                result
-            })?;
-        Ok(Self {
-            jobs: Some(jobs),
-            results,
-            latest: 0,
-            thread: Some(thread),
-        })
-    }
-
-    /// Queues a grid without blocking and makes it the latest requested result.
-    pub fn submit(&mut self, job: Grid) -> io::Result<()> {
-        self.latest += 1;
-        self.jobs
-            .as_ref()
-            .unwrap()
-            .send((self.latest, job))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PNG worker stopped"))
-    }
-
-    /// Returns the result for the latest submitted grid once written, ignoring replaced grids.
-    pub fn poll(&self) -> Option<Completion> {
-        self.results
-            .try_iter()
-            .filter(|(id, _)| *id == self.latest)
-            .last()
-            .map(|(_, completion)| completion)
-    }
-
-    /// Waits for the final job and reports its result, even if it was already polled.
-    pub fn finish(mut self) -> io::Result<()> {
-        drop(self.jobs.take());
-        self.thread
-            .take()
-            .unwrap()
-            .join()
-            .map_err(|_| io::Error::other("PNG worker panicked"))?
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        drop(self.jobs.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 /// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
@@ -175,34 +66,6 @@ pub fn write_atomic(
 mod tests {
     use super::*;
     use rthid_dither::dither::make_palette;
-    use std::fs;
-
-    #[test]
-    fn poll_carries_latest_write_duration_once() {
-        let (jobs, _) = mpsc::channel();
-        let (finished, results) = mpsc::channel();
-        let worker = Worker {
-            jobs: Some(jobs),
-            results,
-            latest: 2,
-            thread: None,
-        };
-        for id in [1, 2] {
-            finished
-                .send((
-                    id,
-                    Completion {
-                        result: Ok(()),
-                        elapsed: Duration::from_millis(id),
-                    },
-                ))
-                .unwrap();
-        }
-        let completion = worker.poll().unwrap();
-        assert!(completion.result.is_ok());
-        assert_eq!(completion.elapsed, Duration::from_millis(2));
-        assert!(worker.poll().is_none());
-    }
 
     #[test]
     fn preview_scale_bounds_the_long_side_with_exact_integer_dots() {
@@ -217,104 +80,6 @@ mod tests {
         ] {
             assert_eq!(preview_scale(w, h), expected, "{w}x{h}");
         }
-    }
-
-    #[test]
-    fn worker_eventually_writes_latest_job_and_reports_its_result() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        let path = dir.join("latest.png");
-        let mut worker = Worker::new(path.clone()).unwrap();
-        let palette = make_palette(&["#000", "#fff"]).unwrap();
-        for n in 0..30 {
-            worker
-                .submit(Grid {
-                    indices: vec![if n == 0 { 2 } else { u8::from(n == 29) }; 6],
-                    w: 3,
-                    h: 2,
-                    palette: palette.clone(),
-                })
-                .unwrap();
-        }
-        assert!(wait_for_result(&worker).is_ok());
-        let image = image::open(&path).unwrap().to_rgba8();
-        assert_eq!(image.dimensions(), (12, 8));
-        assert!(image.pixels().all(|p| p.0 == [255; 4]));
-        drop(worker);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-    }
-
-    fn wait_for_result(worker: &Worker) -> io::Result<()> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Some(result) = worker.poll() {
-                return result.result;
-            }
-            assert!(std::time::Instant::now() < deadline, "PNG job timed out");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn worker_finish_reports_unpolled_and_polled_write_failures() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        for polled in [false, true] {
-            let mut worker = Worker::new(dir.clone()).unwrap();
-            worker
-                .submit(Grid {
-                    indices: vec![0],
-                    w: 1,
-                    h: 1,
-                    palette: make_palette(&["#000"]).unwrap(),
-                })
-                .unwrap();
-            if polled {
-                assert!(wait_for_result(&worker).is_err());
-            }
-            assert!(worker.finish().is_err());
-        }
-    }
-
-    #[test]
-    fn worker_finish_uses_latest_success_after_write_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        let path = dir.join("preview.png");
-        let mut worker = Worker::new(path.clone()).unwrap();
-        for index in [1, 0] {
-            worker
-                .submit(Grid {
-                    indices: vec![index],
-                    w: 1,
-                    h: 1,
-                    palette: make_palette(&["#000"]).unwrap(),
-                })
-                .unwrap();
-            if index == 1 {
-                assert!(wait_for_result(&worker).is_err());
-            }
-        }
-        worker.finish().unwrap();
-        assert!(image::open(path).is_ok());
-    }
-
-    #[test]
-    fn worker_finish_handles_no_jobs_and_panics() {
-        let dir = tempfile::tempdir().unwrap();
-        Worker::new(dir.path().join("rthid-unused.png"))
-            .unwrap()
-            .finish()
-            .unwrap();
-        let (jobs, _) = mpsc::channel();
-        let (_, results) = mpsc::channel();
-        let worker = Worker {
-            jobs: Some(jobs),
-            results,
-            latest: 0,
-            thread: Some(thread::spawn(|| panic!("worker failed"))),
-        };
-        assert!(worker.finish().is_err());
     }
 
     #[test]
