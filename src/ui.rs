@@ -68,8 +68,7 @@ impl Renderer {
     }
 }
 
-// TODO: Use Glyphs { approximate } and Image { protocol, error } variants alongside
-// the PreviewGeometry enum when the slider lands.
+// TODO: Use Glyphs { approximate } and Image { protocol, error } variants when the slider lands.
 /// What the preview draw learned for the status line.
 #[derive(Default)]
 struct PreviewReport {
@@ -81,8 +80,7 @@ struct PreviewReport {
 /// Writes a minimap record for RTHID_DEBUG_LOG. After a header line, each minimap
 /// cell is logged as drawn next to the same cell of an undimmed overview.
 ///
-/// Only the header is written when no minimap is shown, which includes every
-/// frame outside 1:1.
+/// Only the header is written when no minimap is shown.
 pub fn log_minimap(
     app: &App,
     log: &mut impl std::io::Write,
@@ -104,13 +102,14 @@ pub fn log_minimap(
     }) = geometry.minimap
     {
         let area = Block::bordered().inner(inset);
+        let fitted = viewport::Viewport {
+            zoom: viewport::Zoom::Fit,
+            ..app.viewport
+        };
         cells::render(
             pixels,
-            &viewport::Viewport {
-                exact: false,
-                ..app.viewport
-            },
-            &viewport::PreviewGeometry { area, ..*geometry },
+            &fitted,
+            &viewport::geometry(&fitted, geometry.grid, area),
             &mut overview,
             &mut cells::OverviewCaches::default(),
         );
@@ -149,9 +148,9 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     frame.render_stateful_widget(list, layout.panel, &mut renderer.setting_list);
     frame.render_widget(
             Paragraph::new(if app.preview_focus {
-                "Tab: focus | Space: original/dithered | z: overview/1:1 | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+                "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
             } else {
-                "Tab: focus | Space: original/dithered | mouse: drag/wheel/map (1:1) | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+                "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
             }),
             layout.help,
         );
@@ -161,7 +160,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     );
 }
 
-// Uses terminal graphics only for Original in Overview and cell glyphs otherwise.
+// Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
 // Calls present every frame so a hidden image is cleared.
 fn draw_preview(
     frame: &mut Frame,
@@ -171,7 +170,7 @@ fn draw_preview(
 ) -> PreviewReport {
     let image_mode = renderer.graphics.is_some()
         && app.show_original
-        && !app.viewport.exact
+        && geometry.zoom == viewport::Zoom::Fit
         && !geometry.area.is_empty();
     let approximate = if image_mode {
         false
@@ -211,29 +210,30 @@ fn draw_preview(
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
     let (gw, gh) = geometry.grid;
     let (sw, sh) = app.grid_cache.source_size();
-    let mode = if app.viewport.exact {
+    let mode = if geometry.zoom == viewport::Zoom::Fit {
+        format!(
+            "Fit ({}){}",
+            app.viewport.glyphs.name(),
+            if report.approximate {
+                " approximate"
+            } else {
+                ""
+            }
+        )
+    } else {
+        let percent = (geometry.zoom.scale(geometry.grid, geometry.area) * 100.0).round() as u32;
         let (w, h) = geometry.visible;
         if w == 0 || h == 0 {
-            "1:1 empty".into()
+            format!("{percent}% empty")
         } else {
             format!(
-                "1:1 x {}-{} y {}-{}",
+                "{percent}% x {}-{} y {}-{}",
                 geometry.origin.0 + 1,
                 geometry.origin.0 + w,
                 geometry.origin.1 + 1,
                 geometry.origin.1 + h
             )
         }
-    } else {
-        format!(
-            "Overview ({}){}",
-            app.viewport.glyphs.name(),
-            if report.approximate {
-                " approximate"
-            } else {
-                ""
-            },
-        )
     };
     let displayed = if let Some(name) = report.graphics_name {
         format!("Original ({name})")
@@ -289,7 +289,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original | Overview (sextant) approximate |")
+            .starts_with("Original | Fit (sextant) approximate |")
         );
         assert!(
             status(
@@ -300,7 +300,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original (kitty) | Overview (sextant) |")
+            .starts_with("Original (kitty) | Fit (sextant) |")
         );
         let dir = tempfile::tempdir().unwrap();
         for with_export in [false, true] {
@@ -375,7 +375,7 @@ mod tests {
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
-        app.viewport.exact = true;
+        app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
         let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
@@ -427,7 +427,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
-        app.viewport.exact = true;
+        app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
@@ -439,7 +439,7 @@ mod tests {
             "Serpentine",
             "Brightness",
             "Contrast",
-            "Original | 1:1",
+            "Original | 100%",
             "Source 3x3",
             "Grid 3x3",
             "Rotation 0",
@@ -503,15 +503,15 @@ mod tests {
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert!(text.contains("Dithered | Overview (sextant)"));
+        assert!(text.contains("Dithered | Fit (sextant)"));
         app.viewport.glyphs = cells::Glyphs::Quadrant;
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert!(text.contains("Overview (quadrant)"));
-        app.viewport.exact = true;
+        assert!(text.contains("Fit (quadrant)"));
+        app.viewport.zoom = viewport::Zoom::In(1);
         app.preview_focus = true;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        assert!(text.contains("1:1 x 1-4 y 1-6"));
+        assert!(text.contains("100% x 1-4 y 1-6"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
     }
     #[test]
@@ -546,7 +546,11 @@ mod tests {
                     })
                     .unwrap();
                 app.show_original = exact;
-                app.viewport.exact = exact;
+                app.viewport.zoom = if exact {
+                    viewport::Zoom::In(1)
+                } else {
+                    viewport::Zoom::Fit
+                };
                 app.sync(layout(terminal.size().unwrap()).preview);
                 let completed = terminal
                     .draw(|frame| {
@@ -582,6 +586,50 @@ mod tests {
                     "Original ({})",
                     renderer.graphics.as_ref().unwrap().name()
                 )));
+            }
+        }
+    }
+    #[test]
+    fn graphics_are_only_drawn_for_original_at_fit() {
+        use ratatui_image::picker::ProtocolType;
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            let mut picker = ratatui_image::picker::Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            let mut app = App::new(RgbaImage::new(400, 400), None);
+            for original in [true, false] {
+                app.show_original = original;
+                app.sync(layout(terminal.size().unwrap()).preview);
+                for zoom in [
+                    viewport::Zoom::Fit,
+                    viewport::Zoom::Out(4),
+                    viewport::Zoom::Out(3),
+                    viewport::Zoom::Out(2),
+                    viewport::Zoom::In(1),
+                    viewport::Zoom::In(2),
+                    viewport::Zoom::In(3),
+                    viewport::Zoom::In(4),
+                ] {
+                    app.viewport.zoom = zoom;
+                    terminal
+                        .draw(|frame| {
+                            let g = app.geometry(layout(frame.area()).preview);
+                            let report = draw_preview(frame, &app, &g, &mut renderer);
+                            assert_eq!(
+                                report.graphics_name.is_some(),
+                                original && zoom == viewport::Zoom::Fit
+                            );
+                            if !original {
+                                assert!(report.graphics_name.is_none());
+                            }
+                        })
+                        .unwrap();
+                }
             }
         }
     }

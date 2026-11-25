@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Unified preview zoom from Fit through 25%, 33%, 50%, 100%, 200%, 300%, and
+  400%, with global `+` / `=` / `-`, `0` for Fit, and center preservation
+- Panning and a dimmed minimap whenever the zoomed image overflows the preview
+
 - CLI help and version output via clap, with `--glyphs=quadrant` option syntax
 
 - Real-pixel Original preview via Kitty, iTerm2, or Sixel with automatic detection,
@@ -36,6 +40,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   default in macOS Terminal.app ([#13])
 - `RTHID_DEBUG_LOG` for terminal rendering diagnostics ([#13])
 - CI on macOS arm64 ([#13])
+
+### Changed
+
+- Replaced the Overview / 1:1 toggle and `z` with zoom levels that skip scales no
+  larger than Fit, with crisp enlarged dots and aspect corrected reduced scales
+- Minimap toggle `m` now works in either focus. Mouse and keyboard navigation
+  follow the current zoom, and terminal images are used only for Original at Fit
+- Preview status and help show zoom controls and inclusive dot ranges
 
 ### Fixed
 

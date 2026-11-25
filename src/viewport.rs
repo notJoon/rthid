@@ -1,7 +1,7 @@
-//! Preview coordinates for the Overview, 1:1 view and minimap.
+//! Pure preview geometry shared by input and rendering.
 //!
-//! A dot is one grid pixel. The 1:1 view (`exact` in code) shows two dots per cell,
-//! one above the other.
+//! Dots are grid pixels. Fit and Out preserve the terminal cell aspect.
+//! In uses crisp half blocks, so dots look 12.5 percent taller.
 
 use crate::cells::Glyphs;
 use ratatui::{
@@ -26,59 +26,164 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
     )
 }
 
-/// User controlled preview state: glyph set, Overview or 1:1, minimap, and 1:1 origin.
+/// Preview scale, ordered from the fitted image to enlarged dots.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zoom {
+    /// The whole grid fitted to the preview.
+    #[default]
+    Fit,
+    /// Dots per cell column, from two through four.
+    Out(u8),
+    /// Cells wide and half cells tall per dot, from one through four.
+    In(u8),
+}
+
+impl Zoom {
+    /// Cell columns per dot, with Fit determined by the available area.
+    pub fn scale(self, grid: (u32, u32), area: Rect) -> f64 {
+        match self {
+            Self::Fit => {
+                if grid.0 == 0 || grid.1 == 0 || area.is_empty() {
+                    return 0.0;
+                }
+                (f64::from(area.width) / f64::from(grid.0))
+                    .min(f64::from(area.height) * CELL_ASPECT / f64::from(grid.1))
+            }
+            Self::Out(n) => 1.0 / f64::from(n),
+            Self::In(k) => f64::from(k),
+        }
+    }
+
+    /// Next scale in the chosen direction, skipping scales no larger than Fit.
+    pub fn step(self, inward: bool, grid: (u32, u32), area: Rect) -> Self {
+        let steps = [
+            Self::Out(4),
+            Self::Out(3),
+            Self::Out(2),
+            Self::In(1),
+            Self::In(2),
+            Self::In(3),
+            Self::In(4),
+        ];
+        let fit = Self::Fit.scale(grid, area);
+        let current = self.scale(grid, area);
+        if inward {
+            steps
+                .into_iter()
+                .find(|s| s.scale(grid, area) > current.max(fit))
+                .unwrap_or(self)
+        } else {
+            steps
+                .into_iter()
+                .rev()
+                .find(|s| {
+                    let scale = s.scale(grid, area);
+                    scale < current && scale > fit
+                })
+                .unwrap_or(Self::Fit)
+        }
+    }
+
+    /// Dots covered by one cell on each axis.
+    pub fn dots_per_cell(self, grid: (u32, u32), area: Rect) -> (f64, f64) {
+        match self {
+            Self::In(k) => (1.0 / f64::from(k), 2.0 / f64::from(k)),
+            _ => {
+                let dots = 1.0 / self.scale(grid, area);
+                (dots, dots * CELL_ASPECT)
+            }
+        }
+    }
+}
+
+/// User controlled glyphs, zoom, minimap visibility and dot origin.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Viewport {
-    /// Glyph set for the Dithered Overview and minimap.
+    /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
-    /// 1:1 view, one dot per half cell, instead of the Overview.
-    pub exact: bool,
-    /// Hides the minimap in the 1:1 view.
+    /// Current preview scale.
+    pub zoom: Zoom,
+    /// Whether the user has hidden the minimap.
     pub hide_minimap: bool,
-    /// Grid column at the left edge in 1:1. May exceed the grid until the next clamp.
+    /// Leftmost grid column before clamping.
     pub x: u32,
-    /// Grid row at the top edge in 1:1. May exceed the grid until the next clamp.
+    /// Topmost grid row before clamping.
     pub y: u32,
 }
 
-// TODO: Use Overview { target }, Exact { visible, origin, minimap } and Empty variants
-// with the PreviewReport enum when the slider lands.
-/// Preview coordinates shared by input handling and rendering.
-///
-/// Rebuilt from the Viewport for each frame and input event. The origin is clamped here
-/// without changing the Viewport.
+/// Preview coordinates shared by input and rendering without mutating the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreviewGeometry {
-    /// Grid size in dots, after scaling and rotation.
+    /// Grid dimensions in dots after scaling and rotation.
     pub grid: (u32, u32),
     /// Terminal cells available for the preview.
     pub area: Rect,
-    /// Dots that fit in the preview at 1:1, two per cell row, capped by the grid size.
-    /// Computed in every mode but only used by the 1:1 view.
+    /// Current preview scale.
+    pub zoom: Zoom,
+    /// Visible dot dimensions, including partially visible dots at enlarged scales.
     pub visible: (u32, u32),
-    /// Clamped Viewport origin, the grid dot at the top left of the 1:1 view.
+    /// Clamped dot origin of the visible region.
     pub origin: (u32, u32),
-    /// Present only in 1:1 when the minimap is shown and fits.
+    /// Cells occupied by the visible region.
+    pub target: Rect,
+    /// Optional minimap when the image overflows the preview.
     pub minimap: Option<Minimap>,
 }
 
-/// Minimap placement in the upper right corner of the 1:1 view.
+impl PreviewGeometry {
+    /// Whether any image dots lie outside the visible region.
+    pub fn overflows(&self) -> bool {
+        if self.zoom == Zoom::Fit {
+            return false;
+        }
+        let (dx, dy) = self.zoom.dots_per_cell(self.grid, self.area);
+        f64::from(self.grid.0) > f64::from(self.area.width) * dx
+            || f64::from(self.grid.1) > f64::from(self.area.height) * dy
+    }
+
+    /// Whole dot distance for a keyboard cell step on each axis.
+    pub fn pan_step(&self) -> (u32, u32) {
+        if self.zoom == Zoom::Fit || self.target.is_empty() {
+            return (1, 1);
+        }
+        let (x, y) = self.zoom.dots_per_cell(self.grid, self.area);
+        (x.round().max(1.0) as u32, y.round().max(1.0) as u32)
+    }
+}
+
+/// Minimap placement in the upper right of the preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Minimap {
-    /// Bordered inset, including the border.
+    /// Inset including its border.
     pub frame: Rect,
-    /// Cells of the fitted overview, centered inside the border.
+    /// Cells of the fitted image inside the border.
     pub map: Rect,
-    /// Map cells covering the region visible at 1:1. They stay undimmed.
+    /// Map cells covering the visible dots, which stay undimmed.
     pub viewport: Rect,
 }
 
-/// Builds the PreviewGeometry for `viewport` over a grid of `grid` dots in `area`.
+/// Clamped visible region, target cells and optional minimap for this preview.
 pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeometry {
     let (w, h) = grid;
     let mut viewport = *viewport;
     viewport.clamp(w, h, area);
     let visible = viewport.visible(w, h, area);
+    let (cw, ch) = if area.is_empty() || w == 0 || h == 0 {
+        (0, 0)
+    } else if viewport.zoom == Zoom::Fit {
+        fit_aspect(w, h, area, CELL_ASPECT)
+    } else {
+        let (dx, dy) = viewport.zoom.dots_per_cell(grid, area);
+        (
+            ((f64::from(visible.0) / dx).ceil() as u16).min(area.width),
+            ((f64::from(visible.1) / dy).ceil() as u16).min(area.height),
+        )
+    };
+    let target = if viewport.zoom == Zoom::Fit {
+        area.centered(Constraint::Length(cw), Constraint::Length(ch))
+    } else {
+        Rect::new(area.x, area.y, cw, ch)
+    };
     let minimap = viewport.minimap(w, h, area).map(|(frame, map)| Minimap {
         frame,
         map,
@@ -87,25 +192,26 @@ pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeo
     PreviewGeometry {
         grid,
         area,
+        zoom: viewport.zoom,
         visible,
         origin: (viewport.x, viewport.y),
+        target,
         minimap,
     }
 }
 
 impl Viewport {
-    /// Minimap frame and map cells, in that order.
-    ///
-    /// None in the Overview, when the minimap is hidden, when the grid is empty, or
-    /// when the area inside the border is smaller than 3x3 cells.
+    /// Minimap border and fitted map, absent when hidden, unnecessary or too small.
     pub fn minimap(&self, w: u32, h: u32, area: Rect) -> Option<(Rect, Rect)> {
-        // A bordered inset in the upper right corner contains the fitted overview.
         let fw = (area.width / 3).min(18);
         let frame = Rect::new(area.right() - fw, area.y, fw, (area.height / 3).min(10));
         let inner = Block::bordered().inner(frame);
+        let (dx, dy) = self.zoom.dots_per_cell((w, h), area);
         if w == 0
             || h == 0
-            || !self.exact
+            || self.zoom == Zoom::Fit
+            || (f64::from(w) <= f64::from(area.width) * dx
+                && f64::from(h) <= f64::from(area.height) * dy)
             || self.hide_minimap
             || inner.width < 3
             || inner.height < 3
@@ -119,33 +225,55 @@ impl Viewport {
         ))
     }
 
-    /// Dots visible at 1:1 within the preview area.
+    /// Dot dimensions covered by the available cells at this zoom.
     pub(crate) fn visible(&self, w: u32, h: u32, area: Rect) -> (u32, u32) {
-        (
-            w.min(u32::from(area.width)),
-            h.min(u32::from(area.height) * 2),
-        )
+        if self.zoom == Zoom::Fit {
+            return (w, h);
+        }
+        if area.is_empty() {
+            return (0, 0);
+        }
+        let (dx, dy) = self.zoom.dots_per_cell((w, h), area);
+        let count = |cells: u16, dots: f64| {
+            let size = f64::from(cells) * dots;
+            if matches!(self.zoom, Zoom::In(_)) {
+                size.ceil() as u32
+            } else {
+                size.floor() as u32
+            }
+        };
+        (w.min(count(area.width, dx)), h.min(count(area.height, dy)))
     }
 
-    /// Moves the origin so the 1:1 window stays inside the grid.
+    /// Keeps the visible region inside the grid.
     pub fn clamp(&mut self, w: u32, h: u32, area: Rect) {
         let (vw, vh) = self.visible(w, h, area);
         self.x = self.x.min(w.saturating_sub(vw));
         self.y = self.y.min(h.saturating_sub(vh));
     }
 
-    /// Shifts the origin by whole dots and keeps the 1:1 window inside the grid.
+    /// Changes scale around the visible center, then clamps to the grid.
+    pub fn set_zoom(&mut self, zoom: Zoom, geometry: &PreviewGeometry) {
+        self.zoom = zoom;
+        let (w, h) = geometry.grid;
+        let next = self.visible(w, h, geometry.area);
+        self.x = (geometry.origin.0 + geometry.visible.0 / 2).saturating_sub(next.0 / 2);
+        self.y = (geometry.origin.1 + geometry.visible.1 / 2).saturating_sub(next.1 / 2);
+        self.clamp(w, h, geometry.area);
+    }
+
+    /// Shifts the visible region by dots and clamps to the grid.
     pub fn pan(&mut self, dx: i64, dy: i64, geometry: &PreviewGeometry) {
-        self.x = i64::from(self.x)
+        self.x = i64::from(geometry.origin.0)
             .saturating_add(dx)
             .clamp(0, i64::from(u32::MAX)) as u32;
-        self.y = i64::from(self.y)
+        self.y = i64::from(geometry.origin.1)
             .saturating_add(dy)
             .clamp(0, i64::from(u32::MAX)) as u32;
         self.clamp(geometry.grid.0, geometry.grid.1, geometry.area);
     }
 
-    /// Centers the 1:1 window on the dots under a terminal cell inside the map.
+    /// Centers the visible region on the dots under a terminal cell inside the map.
     /// Does nothing without a minimap.
     pub fn center_on_minimap(&mut self, point: (u16, u16), geometry: &PreviewGeometry) {
         let Some(Minimap { map, .. }) = geometry.minimap else {
@@ -157,8 +285,12 @@ impl Viewport {
             ((u64::from(cell) * 2 + 1) * u64::from(dots) / (u64::from(cells) * 2)) as i64
         };
         self.pan(
-            center(point.0 - map.x, map.width, w) - i64::from(vw / 2) - i64::from(self.x),
-            center(point.1 - map.y, map.height, h) - i64::from(vh / 2) - i64::from(self.y),
+            center(point.0 - map.x, map.width, w)
+                - i64::from(vw / 2)
+                - i64::from(geometry.origin.0),
+            center(point.1 - map.y, map.height, h)
+                - i64::from(vh / 2)
+                - i64::from(geometry.origin.1),
             geometry,
         );
     }
@@ -181,105 +313,179 @@ impl Viewport {
 mod tests {
     use super::*;
 
+    const STEPS: [Zoom; 8] = [
+        Zoom::Fit,
+        Zoom::Out(4),
+        Zoom::Out(3),
+        Zoom::Out(2),
+        Zoom::In(1),
+        Zoom::In(2),
+        Zoom::In(3),
+        Zoom::In(4),
+    ];
+
     #[test]
-    fn geometry_preserves_visible_size_and_minimap_coordinates() {
+    fn zoom_step_table_and_limits() {
+        let grid = (1000, 1000);
         let area = Rect::new(2, 3, 48, 18);
-        for (exact, hidden, grid, area, origin, visible, expected_minimap) in [
-            (false, false, (120, 120), area, (72, 84), (48, 36), None),
-            (true, true, (120, 120), area, (72, 84), (48, 36), None),
-            (
-                true,
-                false,
-                (120, 120),
-                area,
-                (72, 84),
-                (48, 36),
-                Some(Minimap {
-                    frame: Rect::new(34, 3, 16, 6),
-                    map: Rect::new(38, 4, 9, 4),
-                    viewport: Rect::new(43, 6, 4, 2),
-                }),
-            ),
-            (
-                true,
-                false,
-                (120, 120),
-                Rect::new(2, 3, 10, 5),
-                (110, 110),
-                (10, 10),
-                None,
-            ),
-            (
-                true,
-                false,
-                (120, 120),
-                Rect::default(),
-                (120, 120),
-                (0, 0),
-                None,
-            ),
-            (true, false, (0, 0), area, (0, 0), (0, 0), None),
-            (
-                true,
-                false,
-                (2, 3),
-                area,
-                (0, 0),
-                (2, 3),
-                Some(Minimap {
-                    frame: Rect::new(34, 3, 16, 6),
-                    map: Rect::new(39, 4, 6, 4),
-                    viewport: Rect::new(39, 4, 6, 4),
-                }),
-            ),
+        for (i, zoom) in STEPS.into_iter().enumerate() {
+            assert_eq!(zoom.step(true, grid, area), STEPS[(i + 1).min(7)]);
+            assert_eq!(zoom.step(false, grid, area), STEPS[i.saturating_sub(1)]);
+        }
+        assert_eq!(Zoom::default(), Zoom::Fit);
+    }
+
+    #[test]
+    fn steps_no_larger_than_fit_are_skipped_in_both_directions() {
+        let grid = (120, 1);
+        for (width, first) in [
+            (20, Zoom::Out(4)),
+            (30, Zoom::Out(3)),
+            (40, Zoom::Out(2)),
+            (60, Zoom::In(1)),
+            (120, Zoom::In(2)),
+            (240, Zoom::In(3)),
+            (360, Zoom::In(4)),
+            (480, Zoom::Fit),
+            (600, Zoom::Fit),
         ] {
-            let viewport = Viewport {
-                exact,
-                hide_minimap: hidden,
-                x: 999,
-                y: 999,
-                ..Viewport::default()
-            };
-            assert_eq!(
-                geometry(&viewport, grid, area),
-                PreviewGeometry {
-                    grid,
-                    area,
-                    visible,
-                    origin,
-                    minimap: expected_minimap,
-                },
-            );
-            assert_eq!((viewport.x, viewport.y), (999, 999));
+            let area = Rect::new(0, 0, width, 100);
+            assert_eq!(Zoom::Fit.step(true, grid, area), first, "width {width}");
+            assert_eq!(first.step(false, grid, area), Zoom::Fit, "width {width}");
         }
     }
 
     #[test]
-    fn glyph_set_does_not_change_fitted_shape() {
-        let map = |glyphs| {
-            let viewport = Viewport {
-                glyphs,
-                exact: true,
+    fn visible_regions_targets_and_clamps_at_every_zoom() {
+        let area = Rect::new(2, 3, 48, 18);
+        let grid = (1000, 1000);
+        for (zoom, visible) in [
+            (Zoom::Fit, grid),
+            (Zoom::Out(4), (192, 162)),
+            (Zoom::Out(3), (144, 121)),
+            (Zoom::Out(2), (96, 81)),
+            (Zoom::In(1), (48, 36)),
+            (Zoom::In(2), (24, 18)),
+            (Zoom::In(3), (16, 12)),
+            (Zoom::In(4), (12, 9)),
+        ] {
+            let mut viewport = Viewport {
+                zoom,
+                x: 9999,
+                y: 9999,
                 ..Viewport::default()
             };
-            viewport
-                .minimap(120, 120, Rect::new(0, 0, 48, 18))
-                .unwrap()
-                .1
+            let g = geometry(&viewport, grid, area);
+            assert_eq!(g.zoom, zoom);
+            assert_eq!(g.visible, visible);
+            assert_eq!(g.origin, (1000 - visible.0, 1000 - visible.1));
+            assert_eq!((viewport.x, viewport.y), (9999, 9999));
+            assert_eq!(
+                g.target,
+                if zoom == Zoom::Fit {
+                    Rect::new(6, 3, 40, 18)
+                } else {
+                    area
+                }
+            );
+            viewport.pan(i64::MAX, i64::MAX, &g);
+            assert_eq!((viewport.x, viewport.y), g.origin);
+            viewport.pan(i64::MIN, i64::MIN, &geometry(&viewport, grid, area));
+            assert_eq!((viewport.x, viewport.y), (0, 0));
+            viewport.pan(1, 1, &geometry(&viewport, grid, area));
+            assert_eq!(
+                (viewport.x, viewport.y),
+                if zoom == Zoom::Fit { (0, 0) } else { (1, 1) }
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_preserves_the_center_dot_and_clamps_at_edges() {
+        let area = Rect::new(0, 0, 48, 18);
+        let grid = (1000, 1000);
+        let mut viewport = Viewport::default();
+        for zoom in STEPS.into_iter().chain(STEPS.into_iter().rev()) {
+            let before = geometry(&viewport, grid, area);
+            let center = (
+                before.origin.0 + before.visible.0 / 2,
+                before.origin.1 + before.visible.1 / 2,
+            );
+            viewport.set_zoom(zoom, &before);
+            let after = geometry(&viewport, grid, area);
+            assert_eq!(
+                (
+                    after.origin.0 + after.visible.0 / 2,
+                    after.origin.1 + after.visible.1 / 2
+                ),
+                center
+            );
+        }
+        viewport.zoom = Zoom::In(4);
+        viewport.set_zoom(Zoom::Out(4), &geometry(&viewport, grid, area));
+        assert_eq!((viewport.x, viewport.y), (0, 0));
+    }
+
+    #[test]
+    fn minimap_requires_overflow_space_and_user_visibility() {
+        let area = Rect::new(2, 3, 48, 18);
+        for zoom in STEPS {
+            for hidden in [false, true] {
+                for grid in [(120, 120), (1, 1), (0, 0)] {
+                    let viewport = Viewport {
+                        zoom,
+                        hide_minimap: hidden,
+                        ..Viewport::default()
+                    };
+                    let g = geometry(&viewport, grid, area);
+                    assert_eq!(g.minimap.is_some(), !hidden && g.overflows());
+                    assert!(
+                        geometry(&viewport, grid, Rect::new(0, 0, 10, 5))
+                            .minimap
+                            .is_none()
+                    );
+                }
+            }
+        }
+        let viewport = Viewport {
+            zoom: Zoom::In(1),
+            x: 72,
+            y: 84,
+            ..Viewport::default()
         };
-        assert_eq!(map(Glyphs::Quadrant), map(Glyphs::Sextant));
         assert_eq!(
-            fit_aspect(120, 120, Rect::new(0, 0, 0, 5), CELL_ASPECT),
-            (0, 0)
+            geometry(&viewport, (120, 120), area).minimap,
+            Some(Minimap {
+                frame: Rect::new(34, 3, 16, 6),
+                map: Rect::new(38, 4, 9, 4),
+                viewport: Rect::new(43, 6, 4, 2),
+            })
         );
+        let mut quadrant = viewport;
+        quadrant.glyphs = Glyphs::Quadrant;
         assert_eq!(
-            fit_aspect(120, 120, Rect::new(0, 0, 5, 0), CELL_ASPECT),
-            (0, 0)
+            geometry(&viewport, (120, 120), area),
+            geometry(&quadrant, (120, 120), area)
         );
     }
 
     #[test]
-    fn overview_fit_corrects_cell_aspect() {
+    fn empty_previews_and_aspect_fit() {
+        for zoom in STEPS {
+            let viewport = Viewport {
+                zoom,
+                ..Viewport::default()
+            };
+            for area in [
+                Rect::default(),
+                Rect::new(2, 3, 0, 5),
+                Rect::new(2, 3, 5, 0),
+            ] {
+                let g = geometry(&viewport, (100, 100), area);
+                assert!(g.target.is_empty());
+                assert!(g.minimap.is_none());
+            }
+        }
         assert_eq!(
             fit_aspect(120, 120, Rect::new(0, 0, 60, 40), CELL_ASPECT),
             (60, 26)
@@ -292,28 +498,5 @@ mod tests {
             fit_aspect(1, 1000, Rect::new(0, 0, 1, 1), CELL_ASPECT),
             (1, 1)
         );
-    }
-    #[test]
-    fn clamps_pan_and_projects_minimap_viewport() {
-        let mut viewport = Viewport {
-            exact: true,
-            hide_minimap: false,
-            x: 99,
-            y: 99,
-            ..Viewport::default()
-        };
-        viewport.clamp(100, 80, Rect::new(0, 0, 20, 10));
-        assert_eq!((viewport.x, viewport.y), (80, 60));
-        assert_eq!(viewport.visible(100, 80, Rect::new(0, 0, 20, 10)), (20, 20));
-        assert_eq!(
-            viewport.viewport_rect(100, 80, (20, 20), Rect::new(3, 4, 10, 8)),
-            Rect::new(11, 10, 2, 2)
-        );
-        assert_eq!(
-            viewport.viewport_rect(10_000, 10_000, (1, 1), Rect::new(3, 4, 10, 8)),
-            Rect::new(3, 4, 1, 1)
-        );
-        viewport.clamp(2, 3, Rect::new(0, 0, 20, 10));
-        assert_eq!((viewport.x, viewport.y), (0, 0));
     }
 }

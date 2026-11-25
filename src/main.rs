@@ -10,22 +10,23 @@
 //! - Grid: the scaled and rotated image. Its pixels are also called dots.
 //! - Cell: one terminal character position.
 //! - Half block: the `▀` glyph whose fg and bg colors show two stacked dots in one cell.
-//! - Sextant and Quadrant: glyph sets for the dithered Overview and minimap that split a
+//! - Sextant and Quadrant: glyph sets for the sampled Dithered preview and minimap that split a
 //!   cell into 2x3 or 2x2 subcells painted in the cell fg or bg color.
-//! - Overview: the whole grid fitted to the preview.
-//! - 1:1 (`exact` in code): one dot per half cell, panned from the viewport origin.
-//! - Minimap: an Overview inset shown in 1:1, dimmed outside the visible region.
-//! - Approximate: some Overview cell sampled more than two palette colors, so
+//! - Fit: the whole grid fitted to the preview.
+//! - Zoom levels: Fit, 25%, 33%, 50%, 100%, 200%, 300% and 400%.
+//! - 1:1: 100 percent, one dot per half cell.
+//! - Minimap: a fitted inset when the image overflows, dimmed outside the visible region.
+//! - Approximate: some sampled cell used more than two palette colors, so
 //!   the extra samples took the nearer kept color.
 //! - Companion PNG: the optional `--preview-png` file, rewritten after each new dither.
 
 /// Interactive state and input handling.
 mod app;
-/// Cell rendering for Overview, 1:1 and the minimap.
+/// Cell rendering for Fit, zoom levels and the minimap.
 mod cells;
 /// Companion PNG writer and its status.
 mod export;
-/// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for the Original Overview.
+/// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for Original at Fit.
 mod graphics;
 /// Source image, scaled grid and dithered indices caches.
 mod grid;
@@ -35,7 +36,7 @@ mod memo;
 mod settings;
 /// Screen layout, panels and status line.
 mod ui;
-/// Preview coordinates for Overview, 1:1 and the minimap.
+/// Preview coordinates for Fit, zoom levels and the minimap.
 mod viewport;
 
 use std::{
@@ -77,7 +78,7 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
-    /// Glyph set for the dithered overview and minimap.
+    /// Glyph set for the sampled Dithered preview and minimap.
     #[arg(long, value_enum)]
     glyphs: Option<CliGlyphs>,
     /// Detect terminal graphics or use glyph rendering.

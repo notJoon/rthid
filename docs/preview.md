@@ -14,26 +14,32 @@ quadrants).
 
 ## Display
 
-Original / Dithered selects the image layer; Overview / 1:1 selects how it is
-shown. The preview starts with Original in Overview.
+Original / Dithered selects the image layer. Zoom selects its display scale.
+The preview starts with Original at Fit.
 
 - **Original / Dithered**: Original shows the scaled, rotated source as real pixels
-  via Kitty, iTerm2, or Sixel in Overview when supported. Otherwise, including
-  in 1:1, it uses truecolor half blocks. The status line names the graphics protocol
-  only while drawing an image. Graphics overview preserves aspect using the terminal's cell pixel size.
-  Half block overview averages pixels per half cell. Press `Space` to toggle
-  between original and dithered. Dithering is deferred while Original is shown
-  unless a companion PNG is enabled.
-  Changing a dither parameter reveals the dithered result; scale, rotation,
-  and resets keep the current view. PNG exports always use the dithered result.
-- **Overview**: fits the whole grid into the preview. For Dithered,
-  `approximate` means colors were reduced for terminal display; sampling may
-  omit detail even without this label.
-- **1:1**: shows each grid pixel as half a cell without resampling or color reduction.
-  The status line shows inclusive, one-based x/y dot ranges.
-- **Minimap**: appears in the top-right corner in 1:1. The visible region keeps
-  its colors; the rest is dimmed. Hidden when the terminal is too small.
-  Press `m` with preview focus to hide or show it.
+  via Kitty, iTerm2, or Sixel at Fit when supported. The status line names the
+  protocol only while drawing an image. Graphics preserve aspect using the
+  terminal's cell pixel size. Otherwise Original uses truecolor half blocks,
+  averaged at Fit and reduced zoom levels. Press `Space` to toggle the layer.
+  Dithering is deferred while Original is shown unless a companion PNG is enabled.
+  Changing a dither parameter reveals Dithered. Scale, rotation, and resets keep
+  the selected layer. PNG exports always use the dithered result.
+- **Fit**: shows the whole grid with terminal cell aspect correction. For Dithered,
+  `Fit (sextant)` or `Fit (quadrant)` names the sampling glyphs. `approximate`
+  means samples needed color reduction. Sampling may omit detail without this label.
+- **Zoom levels**: Fit, 25%, 33%, 50%, 100%, 200%, 300%, and 400%.
+  `+` or `=` zooms in, `-` zooms out, and `0` returns to Fit. Steps no larger
+  than Fit are skipped. Zoom keeps the center dot fixed, then clamps at edges.
+  At 25%, 33%, and 50%, each cell column covers four, three, or two dots.
+  These levels preserve the true aspect and use the same sampling as Fit.
+  At 100% (1:1), each dot occupies one cell column and one half cell in height.
+  At 200%, 300%, and 400%, dots occupy two, three, or four columns and half cells.
+  These crisp half blocks make dots look 12.5 percent taller.
+  The status line shows inclusive, one based x/y dot ranges at every level except Fit.
+- **Minimap**: appears in the upper right whenever the image overflows the preview.
+  The visible region keeps its colors and the rest is dimmed. It is hidden when
+  the terminal is too small. Press `m` in either focus to hide or show it.
 
 ## Keys
 
@@ -49,22 +55,26 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
 | Parameters | `←` / `→`, `h` / `l` | Change value |
-| Preview | `z` | Toggle Overview / 1:1 |
-| Preview | `m` | Toggle minimap |
-| Preview, 1:1 | Arrows or `h` / `j` / `k` / `l` | Pan one dot left / down / up / right |
-| Preview, 1:1 | `H` / `J` / `K` / `L` | Pan one page left / down / up / right, with two dots of overlap |
+| Any | `+` / `=` / `-` | Zoom in / in / out |
+| Any | `0` | Return to Fit |
+| Any | `m` | Toggle minimap |
+| Preview | Arrows or `h` / `j` / `k` / `l` | Pan one cell worth of dots, at least one dot |
+| Preview | `H` / `J` / `K` / `L` | Pan one visible page with two cells of overlap, at least one step |
 
-Panning stops at grid edges. Focus, panning, and Overview / 1:1 changes do not re-dither the image.
+Panning works whenever the image overflows, including reduced zoom levels, and
+stops at grid edges. Fit does not pan. Focus, panning, zoom, and minimap changes
+do not re-dither the image.
 
 ## Mouse
 
-In 1:1, mouse navigation works over the preview regardless of keyboard focus.
+When the image overflows the preview, mouse navigation works over it at any
+zoom regardless of keyboard focus.
 
 | Input | Action |
 | --- | --- |
 | Left click or drag on the minimap image | Center the viewport there |
 | Left drag on the main preview | Move the image with the pointer |
-| Wheel or horizontal trackpad scroll | Pan six dots per step in the scroll direction |
+| Wheel or horizontal trackpad scroll | Pan six cells worth of dots per step in the scroll direction |
 
 ## Options
 
@@ -73,7 +83,7 @@ Detection waits about 200 ms and is skipped on Apple Terminal.
 If detection fails or no graphics protocol is available, Original uses half blocks.
 `off` skips the terminal query and always uses half blocks. Dithered stays cell-rendered.
 
-`--glyphs sextant|quadrant`: select Dithered overview and minimap glyphs:
+`--glyphs sextant|quadrant`: select Dithered sampling and minimap glyphs:
 sextants use 2×3 sub-cells; quadrants use 2×2. Defaults to `quadrant` when `TERM_PROGRAM`
 is `Apple_Terminal`, otherwise `sextant`. An explicit value overrides the default.
 
@@ -107,7 +117,7 @@ the pan direction and terminal size.
 
 ## Troubleshooting
 
-**Overview or minimap shows `?` boxes.** The terminal's font has no sextant
+**Fit, reduced zoom, or minimap shows `?` boxes.** The terminal's font has no sextant
 glyphs (U+1FB00–U+1FB3B), as in macOS Terminal.app. Use quadrants, which only
 need standard block elements:
 
@@ -119,4 +129,4 @@ To check a terminal, run `printf '\U1FB00 \U1FB0F \U1FB3B'`: boxes mean sextants
 are unsupported. Quadrants are the default when `TERM_PROGRAM` is
 `Apple_Terminal`; other terminals cannot be detected, so pass `--glyphs`
 explicitly. Quadrants sample 2×2 dots per cell instead of 2×3, so the overview
-shows less detail; 1:1 is unaffected.
+shows less detail. Zoom levels from 100% upward are unaffected.

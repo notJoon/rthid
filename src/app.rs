@@ -6,7 +6,7 @@ use crate::{
     grid::GridCache,
     memo::Memo,
     settings::{Setting, Settings},
-    viewport::{PreviewGeometry, Viewport},
+    viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
 use ratatui::crossterm::event::{
@@ -19,11 +19,11 @@ use std::path::PathBuf;
 /// the optional companion PNG.
 pub struct App {
     export: Option<Export>,
-    /// Preview mode (Overview or 1:1), glyphs, minimap and image origin.
+    /// Preview zoom, glyphs, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
-    last_drag: Option<(u16, u16)>,
+    last_drag: Option<((u16, u16), (u32, u32))>,
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Current image settings.
@@ -142,15 +142,15 @@ impl App {
         self.export.as_mut().map_or(Ok(()), Export::finish)
     }
 
-    /// Handles the mouse only in 1:1 over the preview, regardless of focus. A left
-    /// click or drag on the minimap recenters there, a drag elsewhere moves the
-    /// image with the pointer, and the wheel pans six dots (grid pixels).
+    /// Pans overflowing previews at any focus and recenters through the minimap.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
-        if !self.viewport.exact || !geometry.area.contains(point.into()) {
+        if !geometry.overflows() || !geometry.area.contains(point.into()) {
             return;
         }
+        let (dx, dy) = geometry.zoom.dots_per_cell(geometry.grid, geometry.area);
+        let (sx, sy) = ((dx * 6.0).round() as i64, (dy * 6.0).round() as i64);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(minimap) = geometry.minimap
@@ -159,30 +159,31 @@ impl App {
                     self.viewport.center_on_minimap(point, geometry);
                 } else {
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
-                        && let Some((x, y)) = prev
+                        && let Some(((x, y), origin)) = prev
                     {
+                        let anchored = PreviewGeometry {
+                            origin,
+                            ..*geometry
+                        };
                         self.viewport.pan(
-                            i64::from(x) - i64::from(mouse.column),
-                            (i64::from(y) - i64::from(mouse.row)) * 2,
-                            geometry,
+                            (f64::from(i32::from(x) - i32::from(mouse.column)) * dx).round() as i64,
+                            (f64::from(i32::from(y) - i32::from(mouse.row)) * dy).round() as i64,
+                            &anchored,
                         );
                     }
-                    self.last_drag = Some(point);
+                    self.last_drag = Some(prev.unwrap_or((point, geometry.origin)));
                 }
             }
-            MouseEventKind::ScrollUp => self.viewport.pan(0, -6, geometry),
-            MouseEventKind::ScrollDown => self.viewport.pan(0, 6, geometry),
+            MouseEventKind::ScrollUp => self.viewport.pan(0, -sy, geometry),
+            MouseEventKind::ScrollDown => self.viewport.pan(0, sy, geometry),
             // Trackpads send horizontal swipes as sideways scrolls.
-            MouseEventKind::ScrollLeft => self.viewport.pan(-6, 0, geometry),
-            MouseEventKind::ScrollRight => self.viewport.pan(6, 0, geometry),
+            MouseEventKind::ScrollLeft => self.viewport.pan(-sx, 0, geometry),
+            MouseEventKind::ScrollRight => self.viewport.pan(sx, 0, geometry),
             _ => {}
         }
     }
 
-    // TODO: Introduce an Action enum with a pure key mapping once more bindings arrive.
-    /// Global keys come first (Ctrl+C, Tab, Space, Esc). With preview focus, m, z
-    /// and the pan keys act on the viewport, and pans do nothing in Overview. All other
-    /// keys fall through to the quit, row, rotation, reset and adjust keys.
+    /// Handles global zoom and focus keys, then preview panning or parameter edits.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
             return;
@@ -205,26 +206,32 @@ impl App {
             self.preview_focus = false;
             return;
         }
-        if self.preview_focus {
-            match key.code {
-                KeyCode::Char('m') => {
-                    self.viewport.hide_minimap = !self.viewport.hide_minimap;
-                    return;
-                }
-                KeyCode::Char('z') => {
-                    self.viewport.exact = !self.viewport.exact;
-                    self.last_drag = None;
-                    return;
-                }
-                _ => {}
-            }
-            let pan = pan_delta(key.code, geometry.visible);
-            if let Some((dx, dy)) = pan {
-                if self.viewport.exact {
-                    self.viewport.pan(dx, dy, geometry);
-                }
+        match key.code {
+            KeyCode::Char('m') => {
+                self.viewport.hide_minimap = !self.viewport.hide_minimap;
                 return;
             }
+            KeyCode::Char('+' | '=' | '-' | '0') => {
+                let zoom = if key.code == KeyCode::Char('0') {
+                    Zoom::Fit
+                } else {
+                    self.viewport.zoom.step(
+                        key.code != KeyCode::Char('-'),
+                        geometry.grid,
+                        geometry.area,
+                    )
+                };
+                self.viewport.set_zoom(zoom, geometry);
+                self.last_drag = None;
+                return;
+            }
+            _ => {}
+        }
+        if self.preview_focus
+            && let Some((dx, dy)) = pan_delta(key.code, geometry.visible, geometry.pan_step())
+        {
+            self.viewport.pan(dx, dy, geometry);
+            return;
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -255,18 +262,19 @@ impl App {
     }
 }
 
-fn pan_delta(code: KeyCode, visible: (u32, u32)) -> Option<(i64, i64)> {
-    let page_x = i64::from(visible.0.saturating_sub(2).max(1));
-    let page_y = i64::from(visible.1.saturating_sub(2).max(1));
+fn pan_delta(code: KeyCode, visible: (u32, u32), step: (u32, u32)) -> Option<(i64, i64)> {
+    let page_x = i64::from(visible.0.saturating_sub(step.0 * 2).max(step.0));
+    let page_y = i64::from(visible.1.saturating_sub(step.1 * 2).max(step.1));
+    let (sx, sy) = (i64::from(step.0), i64::from(step.1));
     match code {
         KeyCode::Char('H') => Some((-page_x, 0)),
         KeyCode::Char('L') => Some((page_x, 0)),
         KeyCode::Char('K') => Some((0, -page_y)),
         KeyCode::Char('J') => Some((0, page_y)),
-        KeyCode::Left | KeyCode::Char('h') => Some((-1, 0)),
-        KeyCode::Right | KeyCode::Char('l') => Some((1, 0)),
-        KeyCode::Up | KeyCode::Char('k') => Some((0, -1)),
-        KeyCode::Down | KeyCode::Char('j') => Some((0, 1)),
+        KeyCode::Left | KeyCode::Char('h') => Some((-sx, 0)),
+        KeyCode::Right | KeyCode::Char('l') => Some((sx, 0)),
+        KeyCode::Up | KeyCode::Char('k') => Some((0, -sy)),
+        KeyCode::Down | KeyCode::Char('j') => Some((0, sy)),
         _ => None,
     }
 }
@@ -287,7 +295,7 @@ mod tests {
             ([KeyCode::Down, KeyCode::Char('j')], (0, 1)),
         ] {
             for code in codes {
-                assert_eq!(pan_delta(code, (20, 12)), Some(expected));
+                assert_eq!(pan_delta(code, (20, 12), (1, 1)), Some(expected));
             }
         }
         for (code, expected) in [
@@ -296,14 +304,20 @@ mod tests {
             ('K', (0, -10)),
             ('J', (0, 10)),
         ] {
-            assert_eq!(pan_delta(KeyCode::Char(code), (20, 12)), Some(expected));
+            assert_eq!(
+                pan_delta(KeyCode::Char(code), (20, 12), (1, 1)),
+                Some(expected)
+            );
         }
         for visible in [(0, 0), (1, 1), (2, 2)] {
-            assert_eq!(pan_delta(KeyCode::Char('H'), visible), Some((-1, 0)));
-            assert_eq!(pan_delta(KeyCode::Char('J'), visible), Some((0, 1)));
+            assert_eq!(
+                pan_delta(KeyCode::Char('H'), visible, (1, 1)),
+                Some((-1, 0))
+            );
+            assert_eq!(pan_delta(KeyCode::Char('J'), visible, (1, 1)), Some((0, 1)));
         }
         for code in ['m', 'z', 'q'] {
-            assert_eq!(pan_delta(KeyCode::Char(code), (20, 12)), None);
+            assert_eq!(pan_delta(KeyCode::Char(code), (20, 12), (1, 1)), None);
         }
     }
 
@@ -333,6 +347,32 @@ mod tests {
         let mut app = App::new(RgbaImage::new(4, 4), None);
         app.selected = Setting::ALL.iter().position(|&p| p == setting).unwrap();
         app
+    }
+
+    #[test]
+    fn empty_preview_navigation_and_scaled_pages() {
+        let mut app = App::new(RgbaImage::new(4, 4), None);
+        app.preview_focus = true;
+        for zoom in [Zoom::Fit, Zoom::Out(2), Zoom::In(4)] {
+            app.viewport.zoom = zoom;
+            for code in [
+                KeyCode::Left,
+                KeyCode::Char('J'),
+                KeyCode::Char('+'),
+                KeyCode::Char('-'),
+            ] {
+                app.handle_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    &app.geometry(Rect::default()),
+                );
+            }
+        }
+        for (code, expected) in [('h', (-2, 0)), ('j', (0, 5)), ('L', (16, 0)), ('J', (0, 5))] {
+            assert_eq!(
+                pan_delta(KeyCode::Char(code), (20, 12), (2, 5)),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -370,6 +410,7 @@ mod tests {
     #[test]
     fn sync_clamps_after_layout_and_grid_changes() {
         let mut app = App::new(RgbaImage::new(120, 80), None);
+        app.viewport.zoom = Zoom::In(1);
         for (screen, scale, rotation, expected) in [
             (Rect::new(0, 0, 41, 9), 100, Rotation::R0, (110, 70)),
             (Rect::new(0, 0, 100, 40), 100, Rotation::R0, (51, 8)),
@@ -599,30 +640,39 @@ mod tests {
         assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 2);
     }
     #[test]
-    fn tab_and_preview_keys_change_viewport_without_redithering() {
-        let mut app = App::new(RgbaImage::new(40, 40), None);
-        assert!(!press(&mut app, KeyCode::Char('z')));
-        assert!(!app.viewport.exact);
-        assert!(!press(&mut app, KeyCode::Tab));
-        assert!(app.preview_focus);
-        assert!(!press(&mut app, KeyCode::Char('z')));
-        assert!(app.viewport.exact);
-        assert!(!press(&mut app, KeyCode::Char('L')));
-        assert_eq!(app.viewport.x, 8);
-        assert!(!press(&mut app, KeyCode::Right));
-        assert_eq!((app.viewport.x, app.viewport.y), (9, 0));
-        assert_eq!(app.selected, 0);
-        for _ in 0..100 {
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Down);
+    fn global_zoom_and_preview_pans_skip_redithering() {
+        let mut app = App::new(RgbaImage::new(400, 400), None);
+        for focus in [false, true] {
+            app.preview_focus = focus;
+            assert!(!press(&mut app, KeyCode::Char('0')));
+            assert_eq!(app.viewport.zoom, Zoom::Fit);
+            assert!(!press(&mut app, KeyCode::Char('+')));
+            assert_eq!(app.viewport.zoom, Zoom::Out(4));
+            assert!(!press(&mut app, KeyCode::Char('=')));
+            assert_eq!(app.viewport.zoom, Zoom::Out(3));
+            assert!(!press(&mut app, KeyCode::Char('-')));
+            assert_eq!(app.viewport.zoom, Zoom::Out(4));
+            assert!(!press(&mut app, KeyCode::Char('m')));
         }
-        assert_eq!((app.viewport.x, app.viewport.y), (30, 30));
-        press(&mut app, KeyCode::Left);
-        press(&mut app, KeyCode::Up);
-        assert_eq!((app.viewport.x, app.viewport.y), (29, 29));
-        press(&mut app, KeyCode::Char('z'));
+        app.viewport.zoom = Zoom::Out(2);
+        app.viewport.x = 0;
+        app.viewport.y = 0;
+        assert!(!press(&mut app, KeyCode::Right));
+        assert_eq!(app.viewport.x, 2);
+        assert!(!press(&mut app, KeyCode::Char('L')));
+        assert_eq!(app.viewport.x, 18);
+        assert!(!press(&mut app, KeyCode::Down));
+        assert_eq!(app.viewport.y, 5);
+        for _ in 0..100 {
+            press(&mut app, KeyCode::Char('J'));
+        }
+        assert_eq!(app.viewport.y, 378);
+        press(&mut app, KeyCode::Char('0'));
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.viewport.x, 29);
+        assert_eq!(app.viewport.x, 0);
+        assert_eq!(app.viewport.zoom, Zoom::Fit);
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.viewport.zoom, Zoom::Fit);
         press(&mut app, KeyCode::Tab);
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!(app.settings.scale, 110);
@@ -632,7 +682,7 @@ mod tests {
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
-        app.viewport.exact = true;
+        app.viewport.zoom = Zoom::In(1);
         let map = app.geometry(area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
             let version = versions(app);
@@ -668,7 +718,7 @@ mod tests {
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 13, 12);
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
         mouse(&mut app, MouseEventKind::ScrollUp, 13, 12);
-        assert_eq!(app.viewport.y, 74);
+        assert_eq!(app.viewport.y, 68);
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
         assert_eq!(app.viewport.y, 80);
         mouse(&mut app, MouseEventKind::ScrollLeft, 13, 12);
@@ -684,7 +734,7 @@ mod tests {
         mouse(&mut app, MouseEventKind::ScrollDown, 0, 0);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 14, 13);
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
-        app.viewport.exact = false;
+        app.viewport.zoom = Zoom::Fit;
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -693,7 +743,7 @@ mod tests {
         );
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
-        app.viewport.exact = true;
+        app.viewport.zoom = Zoom::In(1);
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -713,11 +763,59 @@ mod tests {
     fn minimap_toggle_changes_visibility_without_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         app.preview_focus = true;
-        app.viewport.exact = true;
+        app.viewport.zoom = Zoom::In(1);
         assert!(press(&mut app, KeyCode::Char(' ')));
         for hidden in [true, false] {
             assert!(!press(&mut app, KeyCode::Char('m')));
             assert_eq!(app.viewport.hide_minimap, hidden);
+        }
+    }
+
+    #[test]
+    fn mouse_drag_and_scroll_follow_zoom_without_focus() {
+        let area = Rect::new(0, 0, 48, 18);
+        for (zoom, dragged, scrolled) in [
+            (Zoom::Out(2), (106, 109), (118, 136)),
+            (Zoom::In(2), (102, 102), (105, 108)),
+            (Zoom::In(4), (101, 101), (103, 104)),
+        ] {
+            let mut app = App::new(RgbaImage::new(1000, 1000), None);
+            app.viewport = Viewport {
+                zoom,
+                x: 100,
+                y: 100,
+                hide_minimap: true,
+                ..Viewport::default()
+            };
+            for (kind, column, row) in [
+                (MouseEventKind::Down(MouseButton::Left), 10, 10),
+                (MouseEventKind::Drag(MouseButton::Left), 9, 9),
+                (MouseEventKind::Drag(MouseButton::Left), 7, 8),
+            ] {
+                app.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &app.geometry(area),
+                );
+            }
+            assert_eq!((app.viewport.x, app.viewport.y), dragged, "{zoom:?}");
+            for kind in [MouseEventKind::ScrollRight, MouseEventKind::ScrollDown] {
+                app.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: 7,
+                        row: 8,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &app.geometry(area),
+                );
+            }
+            assert_eq!((app.viewport.x, app.viewport.y), scrolled, "{zoom:?}");
+            assert!(!app.preview_focus);
         }
     }
 
