@@ -18,6 +18,8 @@ image = "0.25.10"
 ratatui.workspace = true
 rthid-widgets = { path = "crates/rthid-widgets" }
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.3"
 
 # Keep the dither loop responsive in dev builds
 [profile.dev]

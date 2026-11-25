@@ -4,13 +4,9 @@
 use crate::dither::{self, PaletteColor};
 use image::ImageEncoder;
 use std::{
-    fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
 };
 
@@ -148,38 +144,18 @@ pub fn write_atomic(
         oh as usize,
         |i| palette[usize::from(i)].rgb,
     );
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let (temp, mut file) = loop {
-        let temp = parent.join(format!(
-            ".rthid-preview-{}-{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(file) => break (temp, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let encoded = image::codecs::png::PngEncoder::new(&mut file)
-        .write_image(&pixels, ow, oh, image::ExtendedColorType::Rgba8)
-        .map_err(io::Error::other);
-    drop(file);
-    let result = encoded.and_then(|()| fs::rename(&temp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    crate::atomic::replace(path, |file| {
+        image::codecs::png::PngEncoder::new(file)
+            .write_image(&pixels, ow, oh, image::ExtendedColorType::Rgba8)
+            .map_err(io::Error::other)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dither::make_palette;
+    use std::fs;
 
     #[test]
     fn preview_scale_bounds_the_long_side_with_exact_integer_dots() {

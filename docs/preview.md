@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```text
-rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]
+rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off] [--config path]
 ```
 
 Use `rthid --help` for option details and `rthid --version` for the version.
@@ -47,6 +47,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 
 | Context | Key | Action |
 | --- | --- | --- |
+| Any, outside modals | `P` / `T` | Manage palette presets / settings templates |
 | Any | `Tab` | Switch focus between parameters and preview |
 | Any | `Space` | Toggle original / dithered; compute a pending result if needed |
 | Any | `Esc` | Return focus to parameters |
@@ -64,6 +65,45 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 Panning works whenever the image overflows, including reduced zoom levels, and
 stops at grid edges. Fit does not pan. Focus, panning, zoom, and minimap changes
 do not re-dither the image.
+
+## Presets and templates
+
+`P` opens presets: arrows or `j`/`k` select, `Enter` applies, `n` creates,
+`e` edits a copy, and `x` deletes a user preset after confirmation. In the
+editor, `Enter` edits a field, `a` adds a color, `x` removes a color, and `s` saves.
+`Esc` cancels an edit or closes the dialog.
+
+`T` opens templates: arrows or `j`/`k` select, `Enter` restores settings and
+shows Dithered while keeping rotation, `n` saves current settings under a name
+of up to 32 characters, and `x` asks to delete. Names must be nonempty and
+cannot match a built-in preset. Reusing a template name asks to overwrite with
+`y`; any other key returns to the name prompt. `Esc` returns from naming to
+the list or closes the list. Modal keys appear in the help line.
+
+The config path lookup order is `--config path`, `RTHID_CONFIG`,
+`$XDG_CONFIG_HOME/rthid/config.toml` when `XDG_CONFIG_HOME` is absolute, then
+`$HOME/.config/rthid/config.toml`. Changes save automatically with atomic
+replacement. Load and save errors appear in the status line.
+
+Example `config.toml` (omitted template settings use defaults):
+
+```toml
+version = 1
+
+[[palette]]
+name = "Paper"
+colors = ["#123456", "#fff"]
+mode = "color"
+
+[[template]]
+name = "Zine"
+palette = "Paper"
+colors = ["#123456", "#fff"]
+mode = "color"
+strength = 0.8
+```
+
+Templates keep their own colors, so later preset edits or removal do not alter them.
 
 ## Mouse
 
