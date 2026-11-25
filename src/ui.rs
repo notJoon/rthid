@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, List, Paragraph};
 
-use crate::app::{App, GraphicsKey, KITTY_IMAGE_ID, PALETTES, PARAMS, Param};
+use crate::app::{App, KITTY_IMAGE_ID, PALETTES, PARAMS, Param};
 use ratatui::buffer::CellDiffOption;
 use ratatui_image::{
     Resize, StatefulImage,
@@ -12,9 +12,25 @@ use ratatui_image::{
     protocol::{StatefulProtocol, StatefulProtocolType, kitty::StatefulKitty},
 };
 
+fn repaint_previous(
+    graphics: &mut crate::app::Graphics,
+    placement: Option<(ratatui::layout::Rect, bool)>,
+    buffer: &mut ratatui::buffer::Buffer,
+) {
+    if graphics.picker.protocol_type() != ProtocolType::Kitty
+        && graphics.placement != placement
+        && let Some((rect, _)) = graphics.placement
+    {
+        for pos in rect.intersection(buffer.area).positions() {
+            buffer[pos].set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+    graphics.placement = placement;
+}
+
 impl App {
     pub fn log_minimap(
-        &self,
+        &mut self,
         log: &mut impl std::io::Write,
         frame: &ratatui::CompletedFrame<'_>,
     ) -> std::io::Result<()> {
@@ -25,10 +41,11 @@ impl App {
             frame.count, self.view, self.preview_area
         )?;
         let mut overview = ratatui::buffer::Buffer::empty(self.preview_area);
+        let mut cache = std::mem::take(&mut self.rgb_overviews);
         let pixels = self.displayed();
         if let Some((inset, map, viewport)) =
             self.view
-                .render_minimap(pixels, w, h, self.preview_area, &mut overview)
+                .render_minimap(pixels, w, h, self.preview_area, &mut overview, &mut cache)
         {
             writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
             for pos in inset.positions() {
@@ -39,6 +56,7 @@ impl App {
                 )?;
             }
         }
+        self.rgb_overviews = cache;
         log.flush()
     }
 
@@ -59,90 +77,12 @@ impl App {
         self.preview_area = block.inner(preview);
         let (gw, gh) = self.grid_size();
         self.view.clamp(gw, gh, self.preview_area);
-        let graphics =
-            self.show_original && self.graphics.is_some() && !self.preview_area.is_empty();
-        let approximate = if graphics {
-            let picker = self.graphics.as_ref().unwrap();
-            let font = picker.font_size();
-            let key = GraphicsKey {
-                generation: self.generation,
-                x: self.view.x,
-                y: self.view.y,
-                exact: self.view.exact,
-                area: self.preview_area,
-                font: (font.width, font.height),
-            };
-            if self
-                .graphics_cache
-                .as_ref()
-                .is_none_or(|(old, _, _)| *old != key)
-            {
-                let (rect, image) = view::original_image(
-                    &self.original,
-                    gw,
-                    gh,
-                    &self.view,
-                    self.preview_area,
-                    key.font,
-                );
-                let protocol = if picker.protocol_type() == ProtocolType::Kitty {
-                    StatefulProtocol::new(
-                        image.into(),
-                        font,
-                        None,
-                        StatefulProtocolType::Kitty(StatefulKitty::new(
-                            KITTY_IMAGE_ID,
-                            picker.tmux_detected(),
-                            picker
-                                .capabilities()
-                                .contains(&Capability::KittyCompression),
-                        )),
-                    )
-                } else {
-                    picker.new_resize_protocol(image.into())
-                };
-                self.graphics_cache = Some((key, rect, protocol));
-                self.graphics_error = None;
-            }
-            let (_, rect, protocol) = self.graphics_cache.as_mut().unwrap();
-            frame.render_stateful_widget(
-                StatefulImage::new().resize(Resize::Fit(None)),
-                *rect,
-                protocol,
-            );
-            if let Some(result) = protocol.last_encoding_result() {
-                self.graphics_error = result.err().map(|error| format!("Graphics: {error}"));
-            }
-            if self.view.exact {
-                view::render_minimap(
-                    self.displayed(),
-                    gw,
-                    gh,
-                    &self.view,
-                    self.preview_area,
-                    frame.buffer_mut(),
-                );
-                if matches!(
-                    picker.protocol_type(),
-                    ProtocolType::Iterm2 | ProtocolType::Sixel
-                ) && let Some((inset, _)) = self.view.minimap(gw, gh, self.preview_area)
-                {
-                    for pos in inset.positions() {
-                        frame.buffer_mut()[pos].set_diff_option(CellDiffOption::AlwaysUpdate);
-                    }
-                }
-            }
-            false
-        } else {
-            view::render(
-                self.displayed(),
-                gw,
-                gh,
-                &self.view,
-                self.preview_area,
-                frame.buffer_mut(),
-            )
-        };
+        let approximate = self.draw_preview(frame);
+        let picker = self
+            .graphics
+            .as_ref()
+            .map(|graphics| &graphics.picker)
+            .filter(|_| self.show_original && !self.preview_area.is_empty());
         frame.render_widget(block, preview);
         let list = List::new(PARAMS.map(|param| self.label(param)))
             .block(
@@ -181,8 +121,8 @@ impl App {
                 if approximate { " approximate" } else { "" },
             )
         };
-        let displayed = if graphics {
-            let name = match self.graphics.as_ref().unwrap().protocol_type() {
+        let displayed = if let Some(picker) = picker {
+            let name = match picker.protocol_type() {
                 ProtocolType::Kitty => "kitty",
                 ProtocolType::Iterm2 => "iTerm2",
                 ProtocolType::Sixel => "sixel",
@@ -198,7 +138,7 @@ impl App {
             Paragraph::new(
                 self.png_error
                     .clone()
-                    .or_else(|| graphics.then(|| self.graphics_error.clone()).flatten())
+                    .or_else(|| picker.and_then(|_| self.graphics.as_ref()?.error.clone()))
                     .unwrap_or_else(|| {
                         format!(
                             "{displayed} | {mode} | Source {}x{} | Grid {gw}x{gh} | Rotation {}°",
@@ -210,6 +150,106 @@ impl App {
             ),
             status,
         );
+    }
+
+    // Draws the preview, as a protocol image when Original is shown on a graphics terminal.
+    fn draw_preview(&mut self, frame: &mut Frame) -> bool {
+        let (gw, gh) = self.grid_size();
+        let image_mode = self.show_original && !self.preview_area.is_empty();
+        let Some(graphics) = self.graphics.as_mut().filter(|_| image_mode) else {
+            let mut cache = std::mem::take(&mut self.rgb_overviews);
+            let approximate = view::render(
+                self.displayed(),
+                gw,
+                gh,
+                &self.view,
+                self.preview_area,
+                frame.buffer_mut(),
+                &mut cache,
+            );
+            self.rgb_overviews = cache;
+            if let Some(graphics) = self.graphics.as_mut() {
+                repaint_previous(graphics, None, frame.buffer_mut());
+            }
+            return approximate;
+        };
+        let overlay = self.view.exact && self.view.minimap(gw, gh, self.preview_area).is_some();
+        let key = (
+            self.view.x,
+            self.view.y,
+            self.view.exact,
+            self.preview_area,
+            overlay,
+        );
+        if graphics
+            .cache
+            .as_ref()
+            .is_none_or(|(old, _, _)| *old != key)
+        {
+            let picker = &graphics.picker;
+            let font = picker.font_size();
+            let (rect, image) = view::original_image(
+                &self.original,
+                &self.view,
+                self.preview_area,
+                (font.width, font.height),
+            );
+            let protocol = if picker.protocol_type() == ProtocolType::Kitty {
+                // Pin the image id so exit cleanup can delete it.
+                StatefulProtocol::new(
+                    image.into(),
+                    font,
+                    None,
+                    StatefulProtocolType::Kitty(StatefulKitty::new(
+                        KITTY_IMAGE_ID,
+                        picker.tmux_detected(),
+                        picker
+                            .capabilities()
+                            .contains(&Capability::KittyCompression),
+                    )),
+                )
+            } else {
+                picker.new_resize_protocol(image.into())
+            };
+            graphics.cache = Some((key, rect, protocol));
+            graphics.error = None;
+        }
+        let rect = graphics.cache.as_ref().unwrap().1;
+        repaint_previous(graphics, Some((rect, overlay)), frame.buffer_mut());
+        let picker = &graphics.picker;
+        let Some((_, rect, protocol)) = graphics.cache.as_mut() else {
+            return false;
+        };
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Fit(None)),
+            *rect,
+            protocol,
+        );
+        if let Some(result) = protocol.last_encoding_result() {
+            graphics.error = result.err().map(|error| format!("Graphics: {error}"));
+        }
+        if !overlay {
+            return false;
+        }
+        view::draw_minimap(
+            view::Pixels::Rgb(&self.original),
+            gw,
+            gh,
+            &self.view,
+            self.preview_area,
+            frame.buffer_mut(),
+            &mut self.rgb_overviews,
+        );
+        if matches!(
+            picker.protocol_type(),
+            ProtocolType::Iterm2 | ProtocolType::Sixel
+        ) && let Some((inset, _)) = self.view.minimap(gw, gh, self.preview_area)
+        {
+            for pos in inset.positions() {
+                frame.buffer_mut()[pos].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+        false
     }
 
     fn label(&self, param: Param) -> String {
@@ -231,6 +271,105 @@ mod tests {
     use super::*;
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn graphics_cache_tracks_grid() {
+        let mut app = App::new(RgbaImage::new(120, 120), None);
+        let mut picker = ratatui_image::picker::Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        app.graphics = Some(crate::app::Graphics::new(picker));
+        app.view.exact = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        app.params.options.strength = 0.5;
+        app.dirty = true;
+        app.refresh();
+        assert!(app.graphics.as_ref().unwrap().cache.is_some());
+        app.view.x = 1;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        app.params.rotation = 2;
+        app.dirty = true;
+        app.refresh();
+        assert!(app.graphics.as_ref().unwrap().cache.is_none());
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        app.params.scale = 50;
+        app.dirty = true;
+        app.refresh();
+        assert!(app.graphics.as_ref().unwrap().cache.is_none());
+    }
+
+    #[test]
+    fn image_placement_repaints_only_previous_rect_for_iterm2_and_sixel() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let area = Rect::new(0, 0, 10, 8);
+        let old = Rect::new(2, 1, 6, 5);
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            let mut picker = ratatui_image::picker::Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            let mut graphics = crate::app::Graphics::new(picker);
+            for placement in [
+                Some((Rect::new(3, 2, 2, 2), false)),
+                Some((old, true)),
+                None,
+            ] {
+                graphics.placement = Some((old, false));
+                let mut buffer = Buffer::empty(area);
+                let baseline = buffer.clone();
+                repaint_previous(&mut graphics, placement, &mut buffer);
+                let emitted = baseline.diff(&buffer);
+                let expected = if protocol == ProtocolType::Kitty {
+                    0
+                } else {
+                    old.area()
+                };
+                assert_eq!(emitted.len(), expected as usize);
+                assert!(
+                    emitted
+                        .iter()
+                        .all(|(x, y, _)| old.contains((*x, *y).into()))
+                );
+                let baseline = Buffer::empty(area);
+                let mut unchanged = baseline.clone();
+                repaint_previous(&mut graphics, placement, &mut unchanged);
+                assert!(baseline.diff(&unchanged).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            let mut app = App::new(RgbaImage::new(12, 12), None);
+            let mut picker = ratatui_image::picker::Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            app.graphics = Some(crate::app::Graphics::new(picker));
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let (old, _) = app.graphics.as_ref().unwrap().placement.unwrap();
+            app.show_original = false;
+            app.refresh();
+            let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
+            for pos in completed.buffer.area.positions() {
+                assert_eq!(
+                    completed.buffer[pos].diff_option == CellDiffOption::AlwaysUpdate,
+                    protocol != ProtocolType::Kitty && old.contains(pos),
+                    "{protocol:?} at {pos:?}",
+                );
+            }
+            assert!(app.graphics.as_ref().unwrap().placement.is_none());
+        }
+    }
 
     #[test]
     fn minimap_log_records_completed_cells_and_uncovered_reference() {

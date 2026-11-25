@@ -20,7 +20,8 @@ shown. The preview starts with Original in Overview.
   The status line names the graphics protocol when active. 1:1 uses nearest-neighbor
   scaling; graphics overview preserves aspect using the terminal's cell pixel size.
   Half-block overview averages pixels per half cell. Press `Space` to toggle
-  between original and dithered.
+  between original and dithered. Dithering is deferred while Original is shown
+  unless a companion PNG is enabled.
   Changing a dither parameter reveals the dithered result; scale, rotation,
   and resets keep the current view. PNG exports always use the dithered result.
 - **Overview**: fits the whole grid into the preview. For Dithered,
@@ -39,7 +40,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Context | Key | Action |
 | --- | --- | --- |
 | Any | `Tab` | Switch focus between parameters and preview |
-| Any | `Space` | Toggle original / dithered without re-dithering |
+| Any | `Space` | Toggle original / dithered; compute a pending result if needed |
 | Any | `Esc` | Return focus to parameters |
 | Any | `r` / `R` | Rotate 90° clockwise / counterclockwise |
 | Any | `d` / `D` | Reset selected parameter / all parameters and rotation |
@@ -51,7 +52,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Preview, 1:1 | Arrows or `h` / `j` / `k` / `l` | Pan one dot left / down / up / right |
 | Preview, 1:1 | `H` / `J` / `K` / `L` | Pan one page left / down / up / right, with two dots of overlap |
 
-Panning stops at grid edges. Focus and view changes do not re-dither the image.
+Panning stops at grid edges. Focus, panning, and Overview / 1:1 changes do not re-dither the image.
 
 ## Mouse
 
@@ -66,6 +67,7 @@ In 1:1, mouse navigation works over the preview regardless of keyboard focus.
 ## Options
 
 `--graphics auto|off`: detect Kitty, iTerm2, or Sixel on startup (`auto`, the default).
+Detection waits about 200 ms and is skipped on Apple Terminal.
 If detection fails or no graphics protocol is available, Original uses half blocks.
 `off` skips the terminal query and always uses half blocks. Dithered stays cell-rendered.
 

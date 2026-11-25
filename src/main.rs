@@ -23,11 +23,30 @@ impl Drop for MouseCapture {
     }
 }
 
+struct KittyCleanup {
+    tmux: bool,
+}
+
+impl Drop for KittyCleanup {
+    fn drop(&mut self) {
+        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
+        let mut stdout = io::stdout().lock();
+        let _ = write!(
+            stdout,
+            "{start}{escape}_Ga=d,d=I,i={KITTY_IMAGE_ID}{escape}\\{end}"
+        )
+        .and_then(|()| stdout.flush());
+    }
+}
+
 use crate::{
     app::{App, KITTY_IMAGE_ID},
     view::Glyphs,
 };
-use ratatui_image::picker::{Picker, ProtocolType, cap_parser::Parser};
+use ratatui_image::picker::{
+    Picker, ProtocolType,
+    cap_parser::{Parser, QueryStdioOptions},
+};
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum Graphics {
@@ -54,6 +73,18 @@ fn parse_args(
             "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]",
         )
     };
+    fn choice<T: Copy>(
+        slot: &mut Option<T>,
+        next: Option<OsString>,
+        choices: &[(&str, T)],
+    ) -> Option<()> {
+        if slot.is_some() {
+            return None;
+        }
+        let next = next?;
+        *slot = Some(choices.iter().find(|(name, _)| next == *name)?.1);
+        Some(())
+    }
     while let Some(arg) = args.next() {
         if arg == "--preview-png" {
             if preview.is_some() {
@@ -65,27 +96,19 @@ fn parse_args(
             }
             preview = Some(PathBuf::from(value));
         } else if arg == "--graphics" {
-            if graphics.is_some() {
-                return Err(invalid());
-            }
-            graphics = Some(
-                match args.next().as_deref().and_then(|value| value.to_str()) {
-                    Some("auto") => Graphics::Auto,
-                    Some("off") => Graphics::Off,
-                    _ => return Err(invalid()),
-                },
-            );
+            choice(
+                &mut graphics,
+                args.next(),
+                &[("auto", Graphics::Auto), ("off", Graphics::Off)],
+            )
+            .ok_or_else(invalid)?;
         } else if arg == "--glyphs" {
-            if glyphs.is_some() {
-                return Err(invalid());
-            }
-            glyphs = Some(
-                match args.next().as_deref().and_then(|value| value.to_str()) {
-                    Some("sextant") => Glyphs::Sextant,
-                    Some("quadrant") => Glyphs::Quadrant,
-                    _ => return Err(invalid()),
-                },
-            );
+            choice(
+                &mut glyphs,
+                args.next(),
+                &[("sextant", Glyphs::Sextant), ("quadrant", Glyphs::Quadrant)],
+            )
+            .ok_or_else(invalid)?;
         } else if arg.as_encoded_bytes().starts_with(b"-") || source.is_some() {
             return Err(invalid());
         } else {
@@ -145,39 +168,33 @@ fn main() -> std::io::Result<()> {
         }
     };
     let mut app = App::new(source, preview_png);
-    app.view.glyphs = glyphs
-        .unwrap_or_else(|| Glyphs::for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref()));
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
+    let mut kitty_cleanup = None;
     let terminal_result = ratatui::run(|terminal| {
-        if graphics == Graphics::Auto {
-            app.graphics = Picker::from_query_stdio()
-                .ok()
-                .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+        if graphics == Graphics::Auto && term_program.as_deref() != Some("Apple_Terminal") {
+            app.graphics = Picker::from_query_stdio_with_options(QueryStdioOptions {
+                timeout: Duration::from_millis(200),
+                ..QueryStdioOptions::default()
+            })
+            .ok()
+            .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
+            .map(|picker| {
+                if picker.protocol_type() == ProtocolType::Kitty {
+                    kitty_cleanup = Some(KittyCleanup {
+                        tmux: picker.tmux_detected(),
+                    });
+                }
+                app::Graphics::new(picker)
+            });
         }
         execute!(io::stdout(), EnableMouseCapture)?;
         let mut redraw = true;
-        let mut image_drawn = false;
-        let mut exact = app.view.exact;
-        let mut hide_minimap = app.view.hide_minimap;
-        let mut needs_clear = false;
         while !app.quit {
             if redraw {
-                let image_mode = app.show_original && app.graphics.is_some();
-                if image_drawn
-                    && (needs_clear
-                        || !image_mode
-                        || app.dirty
-                        || exact != app.view.exact
-                        || hide_minimap != app.view.hide_minimap)
-                {
-                    terminal.clear()?;
-                }
-                needs_clear = false;
                 app.refresh();
                 let frame = terminal.draw(|frame| app.draw(frame))?;
-                image_drawn = image_mode && !app.preview_area.is_empty();
-                exact = app.view.exact;
-                hide_minimap = app.view.hide_minimap;
                 if let Some(log) = &mut debug_log {
                     app.log_minimap(log, &frame)?;
                 }
@@ -198,7 +215,6 @@ fn main() -> std::io::Result<()> {
                 match event {
                     Event::Key(key) => app.handle_key(key),
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    Event::Resize(_, _) => needs_clear |= image_drawn,
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -208,22 +224,10 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     });
-    let cleanup_result = if let Some(picker) = app.graphics.as_ref()
-        && picker.protocol_type() == ProtocolType::Kitty
-    {
-        let (start, escape, end) = Parser::tmux_start_escape_end(picker.tmux_detected());
-        let mut stdout = io::stdout().lock();
-        write!(
-            stdout,
-            "{start}{escape}_Ga=d,d=I,i={KITTY_IMAGE_ID}{escape}\\{end}"
-        )
-        .and_then(|()| stdout.flush())
-    } else {
-        Ok(())
-    };
+    drop(kitty_cleanup);
     drop(mouse_capture);
     let png_result = app.finish_png();
-    terminal_result.and(cleanup_result).and(png_result)
+    terminal_result.and(png_result)
 }
 
 #[cfg(test)]
