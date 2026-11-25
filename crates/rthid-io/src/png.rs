@@ -18,7 +18,7 @@ pub fn preview_scale(w: u32, h: u32) -> u32 {
 }
 
 /// Owned grid submitted for background PNG encoding.
-pub struct Job {
+pub struct Grid {
     /// One palette index per dot, row major.
     pub indices: Vec<u8>,
     /// Grid width in pixels.
@@ -39,7 +39,7 @@ pub struct Completion {
 
 /// Background PNG writer. When several grids are queued only the newest is written.
 pub struct Worker {
-    jobs: Option<Sender<(u64, Job)>>,
+    jobs: Option<Sender<(u64, Grid)>>,
     results: Receiver<(u64, Completion)>,
     latest: u64,
     thread: Option<JoinHandle<io::Result<()>>>,
@@ -48,7 +48,7 @@ pub struct Worker {
 impl Worker {
     /// Spawns the writer thread for the destination path.
     pub fn new(path: PathBuf) -> io::Result<Self> {
-        let (jobs, queued) = mpsc::channel::<(u64, Job)>();
+        let (jobs, queued) = mpsc::channel::<(u64, Grid)>();
         let (finished, results) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("preview-png".into())
@@ -94,7 +94,7 @@ impl Worker {
     }
 
     /// Queues a grid without blocking and makes it the latest requested result.
-    pub fn submit(&mut self, job: Job) -> io::Result<()> {
+    pub fn submit(&mut self, job: Grid) -> io::Result<()> {
         self.latest += 1;
         self.jobs
             .as_ref()
@@ -228,7 +228,7 @@ mod tests {
         let palette = make_palette(&["#000", "#fff"]).unwrap();
         for n in 0..30 {
             worker
-                .submit(Job {
+                .submit(Grid {
                     indices: vec![if n == 0 { 2 } else { u8::from(n == 29) }; 6],
                     w: 3,
                     h: 2,
@@ -262,7 +262,7 @@ mod tests {
         for polled in [false, true] {
             let mut worker = Worker::new(dir.clone()).unwrap();
             worker
-                .submit(Job {
+                .submit(Grid {
                     indices: vec![0],
                     w: 1,
                     h: 1,
@@ -284,7 +284,7 @@ mod tests {
         let mut worker = Worker::new(path.clone()).unwrap();
         for index in [1, 0] {
             worker
-                .submit(Job {
+                .submit(Grid {
                     indices: vec![index],
                     w: 1,
                     h: 1,

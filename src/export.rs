@@ -2,7 +2,7 @@
 //! writer and keeps the latest error for the status line.
 
 use rthid_dither::dither::PaletteColor;
-use rthid_io::png::{Job, Worker};
+use rthid_io::png::{Grid, Worker};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -41,7 +41,7 @@ impl Export {
     /// Records an error if the writer has stopped.
     pub fn sync(&mut self, indices: &[u8], w: u32, h: u32, palette: &[PaletteColor]) {
         if let Some(worker) = &mut self.worker
-            && let Err(error) = worker.submit(Job {
+            && let Err(error) = worker.submit(Grid {
                 indices: indices.to_vec(),
                 w,
                 h,

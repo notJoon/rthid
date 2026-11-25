@@ -178,7 +178,10 @@ fn handle_request(
             let started = Instant::now();
             let result = check_not_source(&path, preview_png)
                 .map_err(|error| error.to_string())
-                .and_then(|()| load_image(&path));
+                .and_then(|()| {
+                    load_image(&path)
+                        .map_err(|error| format!("Could not load {}: {error}", path.display()))
+                });
             if let Some(log) = &mut debug_log {
                 writeln!(
                     log,
@@ -242,7 +245,7 @@ fn main() -> std::io::Result<()> {
             )?;
         }
         let image = image.unwrap_or_else(|error| {
-            eprintln!("{error}");
+            eprintln!("Could not load {}: {error}", path.display());
             std::process::exit(1);
         });
         Some((path, image))

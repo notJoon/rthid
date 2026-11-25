@@ -22,9 +22,8 @@ pub fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()>
 }
 
 /// Loads an image as RGBA and shrinks it to bound processing work.
-pub fn load_image(path: &Path) -> Result<RgbaImage, String> {
-    let source =
-        image::open(path).map_err(|error| format!("Could not load {}: {error}", path.display()))?;
+pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
+    let source = image::open(path)?;
     Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
         source.resize(
             MAX_SOURCE_SIDE,
