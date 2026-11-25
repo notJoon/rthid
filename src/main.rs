@@ -153,7 +153,8 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Off => Graphics::Off,
     };
     if let Some(path) = &path {
-        check_not_source(path, preview_png.as_deref())?;
+        check_not_source(path, preview_png.as_deref())
+            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause.to_string()))?;
     }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -266,7 +267,7 @@ fn save_on_quit(
         && let Some(path) = path
     {
         let started = Instant::now();
-        let result = store::save(path, pending);
+        let result = store::save(path, Duration::from_secs(1), pending);
         if let Some(log) = debug_log {
             writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
         }
@@ -366,7 +367,7 @@ fn event_loop(
             && let Some(path) = config_path
         {
             let started = Instant::now();
-            let result = store::save(path, pending);
+            let result = store::save(path, Duration::from_millis(50), pending);
             if let Some(log) = &mut debug_log {
                 writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
             }
@@ -401,7 +402,7 @@ mod tests {
             &settings::Settings::default(),
         ))];
         std::fs::write(&path, "version = [").unwrap();
-        assert!(store::save(&path, &changes).is_err());
+        assert!(store::save(&path, Duration::from_millis(50), &changes).is_err());
         assert!(save_on_quit(Some(&path), &changes, &mut None).is_err());
         std::fs::write(&path, "version = 1").unwrap();
         save_on_quit(Some(&path), &changes, &mut None).unwrap();

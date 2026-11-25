@@ -111,8 +111,10 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let error =
-            crate::atomic::update::<()>(&fifo, |_| panic!("must not read a FIFO")).unwrap_err();
+        let error = crate::atomic::update::<()>(&fifo, std::time::Duration::from_secs(1), |_| {
+            panic!("must not read a FIFO")
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("not a regular file"));
 
         // APFS refuses invalid UTF-8 file names.

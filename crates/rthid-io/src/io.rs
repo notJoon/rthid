@@ -129,7 +129,7 @@ pub struct Done {
 
 impl Done {
     /// Returns the kind carried by the outcome.
-    pub fn kind(&self) -> Kind {
+    pub(crate) fn kind(&self) -> Kind {
         match self.outcome {
             Outcome::Opened(_) => Kind::Open,
             Outcome::Listed(_) => Kind::List,
@@ -517,8 +517,7 @@ fn execute(
                 *op = Op::List;
                 return listing(path).map(|listing| Outcome::Opened(Ok(Opened::Dir(listing))));
             }
-            crate::image::check_not_source(path, protect.as_deref())
-                .map_err(|_| Cause::IsSource)?;
+            crate::image::check_not_source(path, protect.as_deref())?;
             let image = crate::image::load_image(path).map_err(Cause::Decode)?;
             Ok(Outcome::Opened(Ok(Opened::Image {
                 path: path.clone(),

@@ -12,21 +12,19 @@ const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const MAX_DECODE_SIDE: u32 = 16384;
 
 /// Rejects a companion PNG destination that resolves to the source image.
-pub fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
+pub fn check_not_source(source: &Path, preview: Option<&Path>) -> Result<(), crate::io::Cause> {
     if let Some(preview) = preview
         && let (Ok(a), Ok(b)) = (source.canonicalize(), preview.canonicalize())
         && a == b
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--preview-png must not point at the source image",
-        ));
+        return Err(crate::io::Cause::IsSource);
     }
     Ok(())
 }
 
 /// Loads an image as RGBA and shrinks it to bound processing work.
 pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
+    // TODO: Open without blocking and check handle metadata to prevent a FIFO swap from blocking the IO thread.
     if !path.metadata()?.is_file() {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file").into(),
@@ -75,7 +73,10 @@ mod tests {
         let source = dir.path().join("photo.png");
         std::fs::write(&source, b"image").unwrap();
         let aliased = dir.path().join(".").join("photo.png");
-        assert!(check_not_source(&source, Some(&aliased)).is_err());
+        assert!(matches!(
+            check_not_source(&source, Some(&aliased)),
+            Err(crate::io::Cause::IsSource)
+        ));
         assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
         assert!(check_not_source(&source, None).is_ok());
     }

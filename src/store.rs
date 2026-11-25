@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 /// A named edit applied to the latest configuration when saving.
@@ -316,9 +317,9 @@ pub fn parse(text: &str) -> Loaded {
 
 /// Merges named edits into fresh text under the config lock and returns the saved entries.
 /// Untouched raw values retain their array order, including entries this version cannot parse.
-/// TOML comments and formatting are lost on save.
-pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
-    atomic::update(path, |text| {
+/// Waits up to `wait` for the config lock. TOML comments and formatting are lost on save.
+pub fn save(path: &Path, wait: Duration, changes: &[Change]) -> io::Result<Loaded> {
+    atomic::update(path, wait, |text| {
         let text = text.filter(|text| !text.trim().is_empty());
         let mut loaded = text.as_deref().map(parse).unwrap_or_default();
         if let Some(reason) = &loaded.save_blocked {
@@ -461,7 +462,7 @@ mod tests {
             .map(Change::UpsertPreset)
             .chain(templates.iter().cloned().map(Change::UpsertTemplate))
             .collect();
-        save(&path, &changes).unwrap();
+        save(&path, Duration::from_secs(1), &changes).unwrap();
         let loaded = load(&path);
         assert_eq!(loaded.palettes, palettes);
         assert_eq!(loaded.templates, templates);
@@ -487,7 +488,8 @@ mod tests {
         for text in ["", " \n\t", "[[template]]\nname = 'Existing'\n"] {
             fs::write(&path, text).unwrap();
             assert!(load(&path).save_blocked.is_none());
-            let loaded = save(&path, std::slice::from_ref(&change)).unwrap();
+            let loaded =
+                save(&path, Duration::from_secs(1), std::slice::from_ref(&change)).unwrap();
             assert!(loaded.templates.find("Saved").is_some());
             assert!(loaded.save_blocked.is_none());
             if !text.trim().is_empty() {
@@ -526,8 +528,8 @@ mod tests {
             let mut second = load(&path);
             assert!(first.palettes.find("First").is_none());
             assert!(second.templates.find("Second").is_none());
-            first = save(&path, &[upsert("First", "#000")]).unwrap();
-            second = save(&path, &[upsert("Second", "#fff")]).unwrap();
+            first = save(&path, Duration::from_secs(1), &[upsert("First", "#000")]).unwrap();
+            second = save(&path, Duration::from_secs(1), &[upsert("Second", "#fff")]).unwrap();
             let names = |loaded: &Loaded| -> Vec<String> {
                 if presets {
                     loaded.palettes.user().map(|p| p.name.clone()).collect()
@@ -537,8 +539,18 @@ mod tests {
             };
             assert_eq!(names(&first), ["First"]);
             assert_eq!(names(&second), ["First", "Second"]);
-            save(&path, &[remove("First"), remove("Missing")]).unwrap();
-            let merged = save(&path, &[upsert("Second", "#123456")]).unwrap();
+            save(
+                &path,
+                Duration::from_secs(1),
+                &[remove("First"), remove("Missing")],
+            )
+            .unwrap();
+            let merged = save(
+                &path,
+                Duration::from_secs(1),
+                &[upsert("Second", "#123456")],
+            )
+            .unwrap();
             assert_eq!(names(&merged), ["Second"]);
             if presets {
                 assert_eq!(merged.palettes.user().next().unwrap().colors, ["#123456"]);
@@ -557,6 +569,7 @@ mod tests {
         let before: toml::Table = toml::from_str(original).unwrap();
         let loaded = save(
             &path,
+            Duration::from_secs(1),
             &[Change::UpsertTemplate(Template::capture(
                 "New".into(),
                 &Settings::default(),
@@ -570,6 +583,7 @@ mod tests {
         assert_eq!(after["template"][0], before["template"][0]);
         save(
             &path,
+            Duration::from_secs(1),
             &[
                 Change::RemovePreset("Bad".into()),
                 Change::UpsertTemplate(Template::capture("Broken".into(), &Settings::default())),
@@ -584,13 +598,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let change = Change::UpsertTemplate(Template::capture("Zine".into(), &Settings::default()));
-        save(&path, &[]).unwrap();
+        save(&path, Duration::from_secs(1), &[]).unwrap();
         for text in ["version = [", "version = 2\n"] {
             fs::write(&path, text).unwrap();
-            assert!(save(&path, std::slice::from_ref(&change)).is_err());
+            assert!(save(&path, Duration::from_secs(1), std::slice::from_ref(&change)).is_err());
             assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
             fs::write(&path, "version = 1\n").unwrap();
-            let loaded = save(&path, std::slice::from_ref(&change)).unwrap();
+            let loaded =
+                save(&path, Duration::from_secs(1), std::slice::from_ref(&change)).unwrap();
             assert!(loaded.templates.find("Zine").is_some());
             assert!(loaded.save_blocked.is_none());
         }

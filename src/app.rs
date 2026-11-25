@@ -33,6 +33,7 @@ pub struct App {
     export: Option<Export>,
     source_path: Option<PathBuf>,
     notice: Option<String>,
+    deferred_notice: Option<String>,
     save_blocked: Option<String>,
     outbox: Vec<Job>,
     pending: Vec<Change>,
@@ -89,6 +90,7 @@ impl App {
             palettes,
             templates,
             notice: None,
+            deferred_notice: None,
             save_blocked,
             outbox: Vec::new(),
             pending: Vec::new(),
@@ -164,9 +166,10 @@ impl App {
         self.notice.as_deref()
     }
 
-    /// Reports an error unless an Open is loading, returning whether the status changed.
+    /// Reports a notice or defers it during loading, returning whether the display changed.
     pub fn set_notice(&mut self, notice: String) -> bool {
         if self.loading() {
+            self.deferred_notice = Some(notice);
             return false;
         }
         let changed = self.notice.as_ref() != Some(&notice);
@@ -186,14 +189,17 @@ impl App {
     /// Replaces saved lists while retaining the current palette selection by name.
     pub fn saved(&mut self, loaded: Loaded) {
         let notice = loaded.notice();
-        if !self.loading()
-            && (notice.is_some()
-                || self
-                    .notice
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with("config:")))
-        {
-            self.notice = notice;
+        if let Some(notice) = notice {
+            self.set_notice(notice);
+        } else {
+            let notice = if self.loading() {
+                &mut self.deferred_notice
+            } else {
+                &mut self.notice
+            };
+            if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
+                *notice = None;
+            }
         }
         self.save_error = None;
         self.palettes = loaded.palettes;
@@ -220,7 +226,8 @@ impl App {
     pub fn complete(&mut self, done: Done) -> bool {
         let mut changed = false;
         let mut from_dialog = false;
-        if matches!(done.outcome, IoOutcome::Opened(_)) {
+        let opened = matches!(done.outcome, IoOutcome::Opened(_));
+        if opened {
             let Some(OpenRequest::Submitted {
                 id,
                 from_dialog: origin,
@@ -233,14 +240,13 @@ impl App {
             }
             from_dialog = origin;
             self.open_request = None;
-            if self.loading() {
-                self.notice = None;
-                changed = true;
-            }
+            self.notice = None;
+            changed = true;
         }
-        match done.outcome {
+        let changed = match done.outcome {
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
                 if from_dialog && matches!(self.modal, Some(Modal::OpenFile(_))) {
+                    // TODO: A dialog generation counter would keep an earlier load from closing a reopened dialog.
                     self.modal = None;
                 }
                 self.open_image(path, image);
@@ -284,13 +290,18 @@ impl App {
             IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
                 self.set_notice(error.to_string()) | changed
             }
+        };
+        if opened {
+            let deferred = self.deferred_notice.take();
+            if self.notice.is_none() {
+                self.notice = deferred;
+            }
         }
+        changed
     }
 
     fn loading(&self) -> bool {
-        self.notice
-            .as_deref()
-            .is_some_and(|n| n.starts_with("Loading "))
+        self.open_request.is_some()
     }
 
     /// Associates the worker id with the origin captured when Open was requested.
@@ -1205,6 +1216,63 @@ mod tests {
         assert_eq!(app.notice(), Some("config: denied"));
         app.saved(Loaded::default());
         assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn loading_defers_notices_until_open_finishes() {
+        use rthid_io::io::{Listing, Op};
+        for notice_kind in 0..3 {
+            for result_kind in 0..3 {
+                let mut app = App::empty();
+                app.set_notice("Loading is only text".into());
+                assert!(!app.loading());
+                app.request_open("photo.png".into(), None);
+                app.open_submitted(1);
+                assert!(app.loading());
+                app.set_notice("earlier notice".into());
+                let expected = match notice_kind {
+                    0 => {
+                        app.save_failed(vec![], "config is busy".into());
+                        app.save_failed(vec![], "config is busy".into());
+                        assert_eq!(app.save_error.as_deref(), Some("config is busy"));
+                        "config: config is busy".to_string()
+                    }
+                    1 => {
+                        let error = failure(Op::List);
+                        let expected = error.to_string();
+                        app.complete(done(IoOutcome::Listed(Err(error))));
+                        expected
+                    }
+                    _ => {
+                        let loaded = crate::store::parse("version = 99");
+                        let expected = loaded.notice().unwrap();
+                        app.saved(loaded);
+                        expected
+                    }
+                };
+                assert_eq!(app.notice(), Some("Loading photo.png"));
+                let outcome = match result_kind {
+                    0 => IoOutcome::Opened(Ok(Opened::Image {
+                        path: "photo.png".into(),
+                        image: RgbaImage::new(2, 3),
+                    })),
+                    1 => IoOutcome::Opened(Ok(Opened::Dir(Listing {
+                        dir: "/images".into(),
+                        entries: vec![],
+                    }))),
+                    _ => IoOutcome::Opened(Err(failure(Op::Decode))),
+                };
+                let expected = if result_kind == 2 {
+                    failure(Op::Decode).to_string()
+                } else {
+                    expected
+                };
+                assert!(app.complete(done(outcome)));
+                assert!(!app.loading());
+                assert_eq!(app.notice(), Some(expected.as_str()));
+                assert!(app.deferred_notice.is_none());
+            }
+        }
     }
 
     #[test]

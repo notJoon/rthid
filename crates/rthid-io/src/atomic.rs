@@ -4,10 +4,14 @@
 //! A config bind mounted as a single file cannot be replaced and fails to save.
 
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -31,7 +35,9 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    if let Ok(entries) = fs::read_dir(parent) {
+    static SWEPT: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+    let first = SWEPT.lock().unwrap().insert(parent.to_path_buf());
+    if first && let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -105,12 +111,13 @@ fn resolve(path: &Path, create_parent: bool) -> io::Result<PathBuf> {
 }
 
 /// Creates missing parents and updates fresh text under an advisory sibling lock.
-/// Syncs the replacement file before returning.
+/// Waits up to `wait` for the lock and syncs the replacement file before returning.
 /// Resolves the destination once so symlink aliases share the lock and keep the symlink.
 /// Lock errors, including unsupported filesystem locking, never permit unlocked writes.
 /// The persistent lock file survives config replacement.
 pub fn update<T>(
     path: &Path,
+    wait: Duration,
     transform: impl FnOnce(Option<String>) -> io::Result<(String, T)>,
 ) -> io::Result<T> {
     let path = resolve(path, true)?;
@@ -122,7 +129,7 @@ pub fn update<T>(
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + wait;
     let mut delay = Duration::from_millis(5);
     loop {
         match lock.try_lock() {
@@ -175,7 +182,7 @@ mod tests {
                 let path = &path;
                 scope.spawn(move || {
                     for line in 0..50 {
-                        update(path, |text| {
+                        update(path, Duration::from_secs(1), |text| {
                             let mut text = text.unwrap_or_default();
                             text.push_str(&format!("{writer}:{line}\n"));
                             Ok((text, ()))
@@ -207,7 +214,10 @@ mod tests {
         fs::write(&path, "original").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         symlink(&path, &alias).unwrap();
-        update(&alias, |_| Ok(("updated".into(), ()))).unwrap();
+        update(&alias, Duration::from_secs(1), |_| {
+            Ok(("updated".into(), ()))
+        })
+        .unwrap();
         assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&path).unwrap(), "updated");
         assert_eq!(
@@ -226,7 +236,10 @@ mod tests {
         let path = dir.path().join("nested/config");
         let alias = dir.path().join("alias");
         symlink("nested/config", &alias).unwrap();
-        update(&alias, |_| Ok(("created".into(), ()))).unwrap();
+        update(&alias, Duration::from_secs(1), |_| {
+            Ok(("created".into(), ()))
+        })
+        .unwrap();
         assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&path).unwrap(), "created");
         assert!(path.with_extension("lock").exists());
@@ -239,11 +252,20 @@ mod tests {
             };
             symlink(target, dir.path().join(format!("link{hop}"))).unwrap();
         }
-        update(&dir.path().join("link1"), |text| Ok((text.unwrap(), ()))).unwrap();
-        assert!(update(&dir.path().join("link0"), |_| Ok((String::new(), ()))).is_err());
+        update(&dir.path().join("link1"), Duration::from_secs(1), |text| {
+            Ok((text.unwrap(), ()))
+        })
+        .unwrap();
+        assert!(
+            update(&dir.path().join("link0"), Duration::from_secs(1), |_| Ok((
+                String::new(),
+                ()
+            )))
+            .is_err()
+        );
         let cycle = dir.path().join("cycle");
         symlink("cycle", &cycle).unwrap();
-        assert!(update(&cycle, |_| Ok((String::new(), ()))).is_err());
+        assert!(update(&cycle, Duration::from_secs(1), |_| Ok((String::new(), ()))).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "created");
     }
 
@@ -264,6 +286,32 @@ mod tests {
         assert!(!old.exists());
         assert!(recent.exists());
         assert!(unrelated.exists());
+        File::create(&old).unwrap().set_modified(earlier).unwrap();
+        replace(&dir.path().join("export.png"), |file| {
+            file.write_all(b"export")
+        })
+        .unwrap();
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn update_respects_the_lock_wait_and_leaves_the_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        fs::write(&path, "original").unwrap();
+        let lock = File::create(path.with_extension("lock")).unwrap();
+        lock.lock().unwrap();
+        let started = Instant::now();
+        let wait = Duration::from_millis(50);
+        let error =
+            update::<()>(&path, wait, |_| panic!("must not update while locked")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "config is busy");
+        assert!(started.elapsed() >= wait);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        drop(lock);
+        update(&path, Duration::ZERO, |text| Ok((text.unwrap(), ()))).unwrap();
     }
 
     #[test]
@@ -271,11 +319,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config");
         fs::write(&path, "original").unwrap();
-        let result: io::Result<()> = update(&path, |_| Err(io::Error::other("failed")));
+        let result: io::Result<()> = update(&path, Duration::from_secs(1), |_| {
+            Err(io::Error::other("failed"))
+        });
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-        update(&path, |text| Ok((text.unwrap(), ()))).unwrap();
+        update(&path, Duration::from_secs(1), |text| {
+            Ok((text.unwrap(), ()))
+        })
+        .unwrap();
     }
 
     #[test]
