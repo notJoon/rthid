@@ -4,13 +4,13 @@
 //! Drawing never mutates App. State that must change while drawing, such as caches
 //! and scroll offsets, lives in Renderer.
 
-use crate::{graphics, view};
+use crate::{graphics, render, view};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::app::{App, Param};
+use crate::{app::App, params::Param};
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +54,7 @@ pub fn layout(screen: impl Into<Rect>) -> Layout {
 #[derive(Default)]
 pub struct Renderer {
     graphics: Option<graphics::Graphics>,
-    overviews: view::OverviewCaches,
+    overviews: render::OverviewCaches,
     parameter_list: ListState,
 }
 
@@ -104,7 +104,7 @@ pub fn log_minimap(
     }) = geometry.minimap
     {
         let area = Block::bordered().inner(inset);
-        view::render(
+        render::render(
             pixels,
             &view::View {
                 exact: false,
@@ -112,7 +112,7 @@ pub fn log_minimap(
             },
             &view::PreviewGeometry { area, ..*geometry },
             &mut overview,
-            &mut view::OverviewCaches::default(),
+            &mut render::OverviewCaches::default(),
         );
         writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
         for pos in inset.positions() {
@@ -176,7 +176,7 @@ fn draw_preview(
     let approximate = if image_mode {
         false
     } else {
-        view::render(
+        render::render(
             app.displayed(),
             &app.view,
             geometry,
@@ -498,7 +498,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Overview (sextant)"));
-        app.view.glyphs = view::Glyphs::Quadrant;
+        app.view.glyphs = render::Glyphs::Quadrant;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Overview (quadrant)"));
         app.view.exact = true;

@@ -1,9 +1,9 @@
 //! rthid previews dithering of an image in the terminal.
 //!
-//! The source is loaded and shrunk once. `Pipeline` scales and rotates it into
+//! The source is loaded and shrunk once. `pipeline::Pipeline` scales and rotates it into
 //! the grid and, when Dithered or a companion PNG needs it, dithers the grid
-//! into palette indices. `App` holds the settings and the `View`. `ui::draw`
-//! turns them into a frame through `view` (cell glyphs) or `graphics`
+//! into palette indices. `app::App` holds `params::Params` and the `view::View`. `ui::draw`
+//! turns them into a frame through `render` (cell glyphs) or `graphics`
 //! (terminal images), and `Export` writes the dithered grid to the companion PNG.
 //!
 //! Glossary:
@@ -19,7 +19,7 @@
 //!   the extra samples took the nearer kept color.
 //! - Companion PNG: the optional `--preview-png` file, rewritten after each new dither.
 
-/// Settings, image pipeline and input handling.
+/// Interactive state and input handling.
 mod app;
 /// Companion PNG writer and its status.
 mod export;
@@ -27,11 +27,18 @@ mod export;
 mod graphics;
 /// Single entry caches with build versions.
 mod memo;
+/// Editable settings and palette presets.
+mod params;
+/// Image pipeline from source to grid to dithered indices.
+mod pipeline;
+/// Cell rendering for Overview, 1:1 and the minimap.
+mod render;
+/// Shared test fixtures.
 #[cfg(test)]
 mod test_support;
 /// Screen layout, panels and status line.
 mod ui;
-/// Preview geometry and cell rendering for Overview, 1:1 and the minimap.
+/// Preview coordinates for Overview, 1:1 and the minimap.
 mod view;
 
 use std::{
@@ -49,7 +56,7 @@ use ratatui::crossterm::{
     execute,
 };
 
-use crate::{app::App, graphics::Mode as Graphics, ui::Renderer, view::Glyphs};
+use crate::{app::App, graphics::Mode as Graphics, render::Glyphs, ui::Renderer};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -81,7 +88,7 @@ struct Args {
     graphics: CliGraphics,
 }
 
-// TODO: These enums mirror view::Glyphs and graphics::Mode to keep clap out of lower modules.
+// TODO: These enums mirror render::Glyphs and graphics::Mode to keep clap out of lower modules.
 // Revisit deriving ValueEnum on domain enums if that separation stops mattering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CliGlyphs {
