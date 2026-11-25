@@ -161,12 +161,14 @@ fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
     let dir = dir.canonicalize()?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+        let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
         let is_dir = metadata.is_dir();
         if is_dir
             || (metadata.is_file()
@@ -203,16 +205,25 @@ fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
 
 fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
     let request = match request {
-        Request::Open(path) => {
+        Request::Open(path, dir) => {
+            let home_path = path == Path::new("~") || path.starts_with("~/");
             let home = std::env::var_os("HOME").map(PathBuf::from);
             let path = path
                 .to_str()
                 .map(|text| expand_tilde(text, home.as_deref()))
                 .unwrap_or(path);
+            let path = if path.is_relative() && !home_path {
+                dir.map_or_else(|| path.clone(), |dir| dir.join(&path))
+            } else {
+                path
+            };
             if path.is_dir() {
+                if !matches!(app.modal, Some(modal::Modal::OpenFile(_))) {
+                    app.modal = Some(modal::Modal::open_file(path.clone()));
+                }
                 Request::List(path)
             } else {
-                Request::Open(path)
+                Request::Open(path, None)
             }
         }
         request => request,
@@ -224,7 +235,7 @@ fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
                 app.set_notice(format!("open: {}: {error}", path.display()));
             }
         },
-        Request::Open(path) => {
+        Request::Open(path, _) => {
             match check_not_source(&path, preview_png)
                 .map_err(|error| error.to_string())
                 .and_then(|()| load_image(&path))
@@ -418,6 +429,23 @@ mod tests {
             ]
         );
         assert!(list_dir(&temp.path().join("missing")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(temp.path().join("a"), temp.path().join("linked")).unwrap();
+            symlink(temp.path().join("b.png"), temp.path().join("linked.png")).unwrap();
+            symlink(temp.path().join("missing"), temp.path().join("broken.png")).unwrap();
+            let (_, entries) = list_dir(temp.path()).unwrap();
+            assert_eq!(entries.len(), 7);
+            assert!(entries.contains(&Entry {
+                name: "linked".into(),
+                dir: true
+            }));
+            assert!(entries.contains(&Entry {
+                name: "linked.png".into(),
+                dir: false
+            }));
+        }
     }
 
     #[test]
@@ -446,8 +474,9 @@ mod tests {
     fn open_requests_list_directories_and_keep_failures_open() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = App::empty();
-        app.modal = Some(modal::Modal::open_file(temp.path().to_path_buf()));
-        app.request_open(temp.path().to_path_buf());
+        app.handle_paste(&format!("'{}'", temp.path().display()));
+        assert!(app.modal.is_none());
+        assert!(app.notice().unwrap().starts_with("Loading "));
         let request = app.take_request().unwrap();
         handle_request(&mut app, request, None);
         assert!(app.notice().is_none());
@@ -457,12 +486,29 @@ mod tests {
         assert_eq!(picker.dir, temp.path().canonicalize().unwrap());
         handle_request(
             &mut app,
-            Request::Open(temp.path().join("missing.png")),
+            Request::Open(
+                PathBuf::from("missing.png"),
+                Some(temp.path().to_path_buf()),
+            ),
             None,
         );
         assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
         assert!(app.notice().unwrap().contains("Could not load"));
-        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 2));
+        assert!(
+            app.notice()
+                .unwrap()
+                .contains(&temp.path().display().to_string())
+        );
+        let photo = temp.path().join("photo.png");
+        RgbaImage::new(2, 2).save(&photo).unwrap();
+        for path in [PathBuf::from("photo.png"), photo.clone()] {
+            handle_request(
+                &mut app,
+                Request::Open(path, Some(temp.path().to_path_buf())),
+                None,
+            );
+            assert_eq!(app.source_path(), Some(photo.as_path()));
+        }
         assert!(app.modal.is_none());
         assert!(app.notice().is_none());
     }

@@ -20,8 +20,8 @@ use std::path::PathBuf;
 /// File operations performed by the event loop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
-    /// Load a replacement source image.
-    Open(PathBuf),
+    /// Load a replacement source image with an optional folder for relative paths.
+    Open(PathBuf, Option<PathBuf>),
     /// Read a directory for the open dialog.
     List(PathBuf),
 }
@@ -154,8 +154,8 @@ impl App {
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
         if let Some(Modal::OpenFile(picker)) = &mut self.modal {
             picker.set_listing(dir, entries);
-            self.notice = None;
         }
+        self.notice = None;
     }
 
     /// Current configuration diagnostic for the status line.
@@ -181,19 +181,32 @@ impl App {
     }
 
     /// Queues an image load and shows its file name while loading.
-    pub fn request_open(&mut self, path: PathBuf) {
+    pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         self.set_notice(format!(
             "Loading {}",
             path.file_name()
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy()
         ));
-        self.request = Some(Request::Open(path));
+        self.request = Some(Request::Open(path, dir));
+    }
+
+    fn request_list(&mut self, path: PathBuf) {
+        if !matches!(self.request, Some(Request::Open(..))) {
+            self.request = Some(Request::List(path));
+        }
     }
 
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(modal) = &mut self.modal {
+            if let Modal::OpenFile(picker) = modal
+                && let Some(path) = crate::paste::dropped_path(text)
+            {
+                picker.input = rthid_widgets::TextInput::new(path.to_string_lossy(), usize::MAX);
+                picker.typed = true;
+                return;
+            }
             if modal.text_input_mut().is_some() {
                 for c in text.chars().filter(|c| !c.is_control()) {
                     modal.handle_key(
@@ -208,7 +221,7 @@ impl App {
                 }
             }
         } else if let Some(path) = crate::paste::dropped_path(text) {
-            self.request_open(path);
+            self.request_open(path, None);
         }
     }
 
@@ -403,7 +416,7 @@ impl App {
                 .to_path_buf();
             self.last_drag = None;
             self.modal = Some(Modal::open_file(start.clone()));
-            self.request = Some(Request::List(start));
+            self.request_list(start);
             return;
         }
         if key.code == KeyCode::Char('P') {
@@ -485,8 +498,8 @@ impl App {
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
-            Effect::Open(path) => self.request_open(path),
-            Effect::ListDir(path) => self.request = Some(Request::List(path)),
+            Effect::Open(path, dir) => self.request_open(path, Some(dir)),
+            Effect::ListDir(path) => self.request_list(path),
             Effect::Notice(message) => {
                 self.set_notice(message);
             }
@@ -582,17 +595,34 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             assert_eq!(
                 app.take_request(),
-                Some(Request::Open(PathBuf::from(dir).join("bad.png")))
+                Some(Request::Open(
+                    PathBuf::from("bad.png"),
+                    Some(PathBuf::from(dir))
+                ))
             );
             app.set_notice("open: invalid image".into());
             assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
             assert_eq!(app.notice(), Some("open: invalid image"));
-            app.handle_paste("/typed.png");
-            press(&mut app, KeyCode::Enter);
+            app.handle_paste("'file:///tmp/My%20Photo.png'");
+            assert!(app.take_request().is_none());
+            let Some(Modal::OpenFile(picker)) = &app.modal else {
+                panic!("open dialog expected")
+            };
+            assert_eq!(picker.input.text(), "/tmp/My Photo.png");
+            assert!(picker.typed);
+            app.handle_paste(" suffix");
             assert_eq!(
-                app.take_request(),
-                Some(Request::Open(PathBuf::from(format!("{dir}/typed.png"))))
+                app.modal.as_mut().unwrap().text_input_mut().unwrap().text(),
+                "/tmp/My Photo.png suffix"
             );
+            for path in ["/typed.png", "relative.png"] {
+                app.handle_paste(path);
+                press(&mut app, KeyCode::Enter);
+                assert_eq!(
+                    app.take_request(),
+                    Some(Request::Open(PathBuf::from(path), Some(PathBuf::from(dir))))
+                );
+            }
         }
     }
 
@@ -621,12 +651,15 @@ mod tests {
         );
         app.modal = None;
         app.handle_paste("ordinary text");
+        app.handle_paste("notes.txt");
         assert!(app.take_request().is_none());
         app.handle_paste("'/tmp/My Photo.jpg'");
         assert_eq!(app.notice(), Some("Loading My Photo.jpg"));
+        press(&mut app, KeyCode::Char('o'));
+        app.apply(Effect::ListDir(PathBuf::from("/other"))).unwrap();
         assert_eq!(
             app.take_request(),
-            Some(Request::Open(PathBuf::from("/tmp/My Photo.jpg")))
+            Some(Request::Open(PathBuf::from("/tmp/My Photo.jpg"), None))
         );
         assert!(app.take_request().is_none());
     }

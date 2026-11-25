@@ -102,8 +102,8 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
-    /// Request a source image without closing the dialog.
-    Open(PathBuf),
+    /// Request a source image relative to the supplied folder without closing the dialog.
+    Open(PathBuf, PathBuf),
     /// Request the entries of a directory.
     ListDir(PathBuf),
     /// Report a validation error without leaving the dialog.
@@ -206,8 +206,8 @@ pub struct FilePicker {
 impl FilePicker {
     /// Replaces the directory and resets the field, selection and scroll.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
-        self.input = TextInput::new(dir.to_string_lossy(), usize::MAX);
-        self.list = ListPicker::new(0);
+        self.input = TextInput::new(dir.join("").to_string_lossy(), usize::MAX);
+        self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
         self.dir = dir;
         self.entries = entries;
         self.typed = false;
@@ -223,7 +223,10 @@ impl FilePicker {
             Outcome::Consumed => self.typed = true,
             Outcome::Cancel => return Step::close(),
             Outcome::Submit(()) if self.typed => {
-                return Step::effect(Next::Stay, Effect::Open(PathBuf::from(self.input.text())));
+                return Step::effect(
+                    Next::Stay,
+                    Effect::Open(PathBuf::from(self.input.text()), self.dir.clone()),
+                );
             }
             Outcome::Submit(()) => {
                 if let Some(entry) = self.entries.get(self.list.selected()) {
@@ -233,7 +236,7 @@ impl FilePicker {
                         if entry.dir {
                             Effect::ListDir(path)
                         } else {
-                            Effect::Open(path)
+                            Effect::Open(PathBuf::from(&entry.name), self.dir.clone())
                         },
                     );
                 }
@@ -392,7 +395,7 @@ impl Modal {
     /// Opens a path field while the event loop loads the starting directory.
     pub fn open_file(start: PathBuf) -> Self {
         Self::OpenFile(Box::new(FilePicker {
-            input: TextInput::new(start.to_string_lossy(), usize::MAX),
+            input: TextInput::new(start.join("").to_string_lossy(), usize::MAX),
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
@@ -620,6 +623,10 @@ mod tests {
             PathBuf::from("/images"),
             vec![
                 Entry {
+                    name: "..".into(),
+                    dir: true,
+                },
+                Entry {
                     name: "album".into(),
                     dir: true,
                 },
@@ -629,6 +636,8 @@ mod tests {
                 },
             ],
         );
+        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.input.text(), "/images/");
         let context = || ctx(&palettes, &templates, &settings);
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
@@ -638,15 +647,15 @@ mod tests {
         modal.handle_key(key(KeyCode::Down), context());
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(
-            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("/images/photo.png"))
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
         );
         modal.handle_key(key(KeyCode::Up), context());
         modal.handle_key(key(KeyCode::Char('j')), context());
         let Modal::OpenFile(picker) = &modal else {
             unreachable!()
         };
-        assert_eq!(picker.list.selected(), 0);
-        assert_eq!(picker.input.text(), "/imagesj");
+        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.input.text(), "/images/j");
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
@@ -654,16 +663,24 @@ mod tests {
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(
-            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("~/raw path.png"))
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("~/raw path.png") && dir == std::path::Path::new("/images"))
         );
         modal.handle_key(key(KeyCode::Down), context());
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(
-            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("/images/photo.png"))
+            matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
         );
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
+        picker.set_listing(
+            PathBuf::from("/empty"),
+            vec![Entry {
+                name: "..".into(),
+                dir: true,
+            }],
+        );
+        assert_eq!(picker.list.selected(), 0);
         picker.set_listing(PathBuf::from("/empty"), vec![]);
         assert_eq!(picker.list.selected(), 0);
         assert_eq!(picker.list.offset(), 0);

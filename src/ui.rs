@@ -962,7 +962,7 @@ mod tests {
                 assert!(text.contains("/images"));
                 assert!(text.contains("folder20/"));
                 assert!(cursor.y < buffer.area.height);
-                assert_eq!(buffer[(cursor.x - 1, cursor.y)].symbol(), "s");
+                assert_eq!(buffer[(cursor.x - 1, cursor.y)].symbol(), "/");
             }
         }
     }

@@ -3,14 +3,24 @@
 use std::path::PathBuf;
 
 /// Reads the first quoted or escaped path, including local file URIs.
-/// Plain words without a directory or extension are ignored.
+/// Text without a directory must have a readable image extension.
 pub fn dropped_path(text: &str) -> Option<PathBuf> {
     let mut token = String::new();
     let mut quote = None;
-    let mut chars = text.trim().chars();
+    let mut chars = text.trim().chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' if quote != Some('\'') => token.push(chars.next()?),
+            '\\' if quote == Some('"') => {
+                if chars
+                    .peek()
+                    .is_some_and(|c| matches!(c, '"' | '\\' | '$' | '`'))
+                {
+                    token.push(chars.next()?);
+                } else {
+                    token.push(c);
+                }
+            }
+            '\\' if quote.is_none() => token.push(chars.next()?),
             '\'' | '"' if quote == Some(c) => quote = None,
             '\'' | '"' if quote.is_none() => quote = Some(c),
             c if c.is_whitespace() && quote.is_none() => break,
@@ -44,7 +54,9 @@ pub fn dropped_path(text: &str) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(&token);
-    (token.contains('/') || path.extension().is_some()).then_some(path)
+    (token.contains(std::path::is_separator)
+        || image::ImageFormat::from_path(&path).is_ok_and(|format| format.reading_enabled()))
+    .then_some(path)
 }
 
 #[cfg(test)]
@@ -57,6 +69,11 @@ mod tests {
             ("", None),
             (" \r\n\t ", None),
             ("hello world", None),
+            ("notes.txt", None),
+            ("photo.unknown", None),
+            ("/tmp/notes.txt", Some("/tmp/notes.txt")),
+            (r#""/tmp/a\q.jpg""#, Some(r"/tmp/a\q.jpg")),
+            (r#""/tmp/a\\b\$c\`d.jpg""#, Some(r"/tmp/a\b$c`d.jpg")),
             (" \t/tmp/photo.jpg\r\n", Some("/tmp/photo.jpg")),
             ("photo.jpg", Some("photo.jpg")),
             ("'My Photo.jpg'", Some("My Photo.jpg")),
