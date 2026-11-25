@@ -24,3 +24,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mise run lint
       - run: mise run test
+
+  coverage:
+    # Report only. Coverage does not depend on the OS, so one runner is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Coverage summary
+        # Explicit bash enables pipefail, so a failing coverage run is not masked by tee.
+        shell: bash
+        run: |
+          mise run coverage | tee coverage.txt
+          { echo '```text'; grep -E '^(Filename|TOTAL|\S+\.rs )' coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
