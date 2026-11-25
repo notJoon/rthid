@@ -7,6 +7,7 @@ use crate::{
     memo::Memo,
     modal::{Ctx, Effect, Modal, Next, Step},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
+    store::{Change, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -29,8 +30,7 @@ pub struct App {
     notice: Option<String>,
     save_blocked: Option<String>,
     outbox: Vec<Job>,
-    /// Whether palette or template changes need persistence.
-    pub(crate) save_requested: bool,
+    pending: Vec<Change>,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
     /// Saved settings with independent palette colors.
@@ -84,7 +84,7 @@ impl App {
             notice: None,
             save_blocked,
             outbox: Vec::new(),
-            save_requested: false,
+            pending: Vec::new(),
             modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
@@ -164,9 +164,28 @@ impl App {
         changed
     }
 
-    /// Consumes a pending save unless configuration loading blocked writes.
-    pub fn take_save(&mut self) -> bool {
-        std::mem::take(&mut self.save_requested) && self.save_blocked.is_none()
+    /// Drains pending edits unless configuration loading blocked writes.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        if self.save_blocked.is_some() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    /// Replaces saved lists while retaining the current palette selection by name.
+    pub fn saved(&mut self, loaded: Loaded) {
+        self.notice = loaded.notice();
+        self.palettes = loaded.palettes;
+        self.templates = loaded.templates;
+        self.save_blocked = loaded.save_blocked;
+    }
+
+    /// Restores failed edits before newer ones and reports the save error.
+    pub fn save_failed(&mut self, mut changes: Vec<Change>, error: String) {
+        changes.append(&mut self.pending);
+        self.pending = changes;
+        self.notice = Some(format!("config: {error}"));
     }
 
     /// Drains filesystem jobs for submission after sync.
@@ -593,24 +612,33 @@ impl App {
                 self.show_original = show_original;
             }
             Effect::SavePreset { preset, base } => {
-                let index = self.palettes.upsert(preset)?;
+                let index = self.palettes.upsert(preset.clone())?;
                 self.apply(Effect::Preview(
                     base.with_preset(self.palettes.get(index).unwrap()),
                 ))?;
-                self.save_requested = true;
+                self.pending.push(Change::UpsertPreset(preset));
             }
             Effect::RemovePreset(index) => {
+                let name = self
+                    .palettes
+                    .get(index)
+                    .ok_or("preset does not exist")?
+                    .name
+                    .clone();
                 self.palettes.remove(index)?;
-                self.save_requested = true;
+                self.pending.push(Change::RemovePreset(name));
             }
             Effect::SaveTemplate(name) => {
-                self.templates
-                    .upsert(Template::capture(name, &self.settings))?;
-                self.save_requested = true;
+                let template = Template::capture(name, &self.settings);
+                self.templates.upsert(template.clone())?;
+                self.pending.push(Change::UpsertTemplate(template));
             }
             Effect::RemoveTemplate(index) => {
-                self.templates.remove(index);
-                self.save_requested = true;
+                if let Some(template) = self.templates.get(index) {
+                    let name = template.name.clone();
+                    self.templates.remove(index);
+                    self.pending.push(Change::RemoveTemplate(name));
+                }
             }
         }
         Ok(())
@@ -956,7 +984,7 @@ mod tests {
         ] {
             press(&mut app, code);
         }
-        assert!(app.modal.is_none() && app.take_save());
+        assert!(app.modal.is_none() && !app.take_changes().is_empty());
         assert_eq!(
             app.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
@@ -968,7 +996,7 @@ mod tests {
         }
         assert_eq!(app.settings.options.strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
-        assert!(!app.show_original && app.modal.is_none() && !app.take_save());
+        assert!(!app.show_original && app.modal.is_none() && app.take_changes().is_empty());
     }
 
     #[test]
@@ -978,7 +1006,7 @@ mod tests {
             press(&mut app, code);
         }
         assert!(app.notice().unwrap().contains("must not be empty"));
-        assert!(app.modal.is_some() && !app.take_save());
+        assert!(app.modal.is_some() && app.take_changes().is_empty());
         press(&mut app, KeyCode::Down);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -998,7 +1026,61 @@ mod tests {
         }
         assert_eq!(app.settings.palette_name, "Z");
         assert!(app.palettes.find("Z").is_some());
-        assert!(app.modal.is_none() && app.take_save() && !app.show_original);
+        assert!(app.modal.is_none() && !app.take_changes().is_empty() && !app.show_original);
+    }
+
+    #[test]
+    fn failed_save_requeues_edits_before_newer_changes() {
+        let mut app = App::empty();
+        app.apply(Effect::SaveTemplate("First".into())).unwrap();
+        app.apply(Effect::RemoveTemplate(0)).unwrap();
+        let changes = app.take_changes();
+        assert!(
+            matches!(&changes[..], [Change::UpsertTemplate(t), Change::RemoveTemplate(name)]
+            if t.name == "First" && name == "First")
+        );
+        app.apply(Effect::SaveTemplate("Later".into())).unwrap();
+        let mut expected = changes.clone();
+        expected.extend(app.pending.clone());
+        app.save_failed(changes, "busy".into());
+        assert_eq!(app.notice(), Some("config: busy"));
+        assert_eq!(app.take_changes(), expected);
+        assert!(app.take_changes().is_empty());
+    }
+
+    #[test]
+    fn saved_keeps_palette_selection_by_name_and_reports_warnings() {
+        let mut app = App::empty();
+        let preset = crate::settings::Preset {
+            name: "Selected".into(),
+            colors: vec!["#123456".into()],
+            mode: None,
+            builtin: false,
+        };
+        app.apply(Effect::SavePreset {
+            preset,
+            base: app.settings.clone(),
+        })
+        .unwrap();
+        let settings = app.settings.clone();
+        let index = app.palettes.find("Selected").unwrap();
+        let loaded = crate::store::parse(
+            "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n",
+        );
+        let notice = loaded.notice();
+        app.saved(loaded);
+        assert_eq!(app.settings.palette_name, "Selected");
+        assert!(app.settings == settings);
+        assert_eq!(app.palettes.find("Selected"), Some(index + 1));
+        assert!(app.templates.find("Zine").is_some());
+        assert_eq!(app.notice(), notice.as_deref());
+        assert!(app.notice().unwrap().contains("1 entries skipped"));
+        app.apply(Effect::RemovePreset(index + 1)).unwrap();
+        assert!(
+            matches!(app.take_changes().last(), Some(Change::RemovePreset(name)) if name == "Selected")
+        );
+        app.saved(Loaded::default());
+        assert!(app.notice().is_none());
     }
 
     #[test]
@@ -1018,15 +1100,15 @@ mod tests {
             );
             assert_eq!(app.templates, templates);
             assert_eq!(app.notice(), Some("config warning"));
-            assert!(!app.take_save());
+            assert!(app.take_changes().is_empty());
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &app.geometry(Rect::new(0, 0, 20, 10)),
             );
             assert!(app.notice().is_none());
             app.apply(Effect::SaveTemplate("Another".into())).unwrap();
-            assert_eq!(app.take_save(), !blocked);
-            assert!(!app.take_save());
+            assert_eq!(app.take_changes().is_empty(), blocked);
+            assert!(app.take_changes().is_empty());
         }
     }
 

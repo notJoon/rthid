@@ -5,10 +5,22 @@ use rthid_dither::dither::{Mode, Tone};
 use rthid_io::atomic;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
+
+/// A named edit applied to the latest configuration when saving.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    /// Replaces a user preset by name or appends it.
+    UpsertPreset(Preset),
+    /// Removes a user preset by name if present.
+    RemovePreset(String),
+    /// Replaces a template by name or appends it.
+    UpsertTemplate(Template),
+    /// Removes a template by name if present.
+    RemoveTemplate(String),
+}
 
 /// Parsed entries and diagnostics that protect an unreadable file from replacement.
 pub struct Loaded {
@@ -20,6 +32,23 @@ pub struct Loaded {
     pub warnings: Vec<String>,
     /// Reason saving must remain disabled for this session.
     pub save_blocked: Option<String>,
+}
+
+impl Loaded {
+    /// Summarizes skipped entries and blocked saving for the status line.
+    pub fn notice(&self) -> Option<String> {
+        let mut messages = Vec::new();
+        if let Some(first) = self.warnings.first() {
+            messages.push(format!("{} entries skipped: {first}", self.warnings.len()));
+        }
+        if let Some(reason) = &self.save_blocked {
+            messages.push(format!(
+                "saving disabled: {}",
+                reason.lines().next().unwrap_or(reason)
+            ));
+        }
+        (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")))
+    }
 }
 
 impl Default for Loaded {
@@ -179,7 +208,12 @@ pub fn load(path: &Path) -> Loaded {
             };
         }
     };
-    let file: FileStore = match toml::from_str(&text) {
+    parse(&text)
+}
+
+/// Parses valid entries and retains warnings and reasons to block saving.
+pub fn parse(text: &str) -> Loaded {
+    let file: FileStore = match toml::from_str(text) {
         Ok(file) => file,
         Err(error) => {
             return Loaded {
@@ -224,25 +258,54 @@ pub fn load(path: &Path) -> Loaded {
     loaded
 }
 
-/// Serializes version 1 and atomically replaces the destination.
-pub fn save(path: &Path, palettes: &Palettes, templates: &Templates) -> io::Result<()> {
-    // TODO: Saving overwrites edits from other instances and drops comments, merge and preserve them.
-    let file = FileStore {
-        version: 1,
-        palette: palettes
-            .user()
-            .map(|p| FilePreset {
-                name: p.name.clone(),
-                colors: p.colors.clone(),
-                mode: p.mode.map(Into::into),
-            })
-            .collect(),
-        template: templates.iter().cloned().map(Into::into).collect(),
-    };
-    let text = toml::to_string_pretty(&file).map_err(io::Error::other)?;
-    atomic::replace(path, |file| {
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
+/// Merges named edits into fresh text under the config lock and returns the saved entries.
+pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
+    atomic::update(path, |text| {
+        let mut loaded = text.as_deref().map(parse).unwrap_or_default();
+        if let Some(reason) = &loaded.save_blocked {
+            return Err(io::Error::other(reason.clone()));
+        }
+        for change in changes {
+            match change {
+                Change::UpsertPreset(preset) => {
+                    loaded
+                        .palettes
+                        .upsert(preset.clone())
+                        .map_err(io::Error::other)?;
+                }
+                Change::RemovePreset(name) => {
+                    if let Some(index) = loaded.palettes.find(name) {
+                        loaded.palettes.remove(index).map_err(io::Error::other)?;
+                    }
+                }
+                Change::UpsertTemplate(template) => {
+                    loaded
+                        .templates
+                        .upsert(template.clone())
+                        .map_err(io::Error::other)?;
+                }
+                Change::RemoveTemplate(name) => {
+                    if let Some(index) = loaded.templates.find(name) {
+                        loaded.templates.remove(index);
+                    }
+                }
+            }
+        }
+        let file = FileStore {
+            version: 1,
+            palette: loaded
+                .palettes
+                .user()
+                .map(|p| FilePreset {
+                    name: p.name.clone(),
+                    colors: p.colors.clone(),
+                    mode: p.mode.map(Into::into),
+                })
+                .collect(),
+            template: loaded.templates.iter().cloned().map(Into::into).collect(),
+        };
+        let text = toml::to_string_pretty(&file).map_err(io::Error::other)?;
+        Ok((text, loaded))
     })
 }
 
@@ -299,7 +362,13 @@ mod tests {
         templates
             .upsert(Template::capture("Zine".into(), &settings))
             .unwrap();
-        save(&path, &palettes, &templates).unwrap();
+        let changes: Vec<_> = palettes
+            .user()
+            .cloned()
+            .map(Change::UpsertPreset)
+            .chain(templates.iter().cloned().map(Change::UpsertTemplate))
+            .collect();
+        save(&path, &changes).unwrap();
         let loaded = load(&path);
         assert_eq!(loaded.palettes, palettes);
         assert_eq!(loaded.templates, templates);
@@ -314,6 +383,75 @@ mod tests {
             vec![expected]
         );
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn stale_instances_merge_named_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for presets in [true, false] {
+            let upsert = |name: &str, color: &str| {
+                if presets {
+                    Change::UpsertPreset(Preset {
+                        name: name.into(),
+                        colors: vec![color.into()],
+                        mode: None,
+                        builtin: false,
+                    })
+                } else {
+                    let mut template = Template::capture(name.into(), &Settings::default());
+                    template.palette_hex = vec![color.into()];
+                    Change::UpsertTemplate(template)
+                }
+            };
+            let remove = |name: &str| {
+                if presets {
+                    Change::RemovePreset(name.into())
+                } else {
+                    Change::RemoveTemplate(name.into())
+                }
+            };
+            let mut first = load(&path);
+            let mut second = load(&path);
+            assert!(first.palettes.find("First").is_none());
+            assert!(second.templates.find("Second").is_none());
+            first = save(&path, &[upsert("First", "#000")]).unwrap();
+            second = save(&path, &[upsert("Second", "#fff")]).unwrap();
+            let names = |loaded: &Loaded| -> Vec<String> {
+                if presets {
+                    loaded.palettes.user().map(|p| p.name.clone()).collect()
+                } else {
+                    loaded.templates.iter().map(|t| t.name.clone()).collect()
+                }
+            };
+            assert_eq!(names(&first), ["First"]);
+            assert_eq!(names(&second), ["First", "Second"]);
+            save(&path, &[remove("First"), remove("Missing")]).unwrap();
+            let merged = save(&path, &[upsert("Second", "#123456")]).unwrap();
+            assert_eq!(names(&merged), ["Second"]);
+            if presets {
+                assert_eq!(merged.palettes.user().next().unwrap().colors, ["#123456"]);
+            } else {
+                assert_eq!(merged.templates.get(0).unwrap().palette_hex, ["#123456"]);
+            }
+        }
+    }
+
+    #[test]
+    fn save_rechecks_current_file_and_recovers_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let change = Change::UpsertTemplate(Template::capture("Zine".into(), &Settings::default()));
+        save(&path, &[]).unwrap();
+        for text in ["version = [", "version = 2\n"] {
+            fs::write(&path, text).unwrap();
+            assert!(save(&path, std::slice::from_ref(&change)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+            fs::write(&path, "version = 1\n").unwrap();
+            let loaded = save(&path, std::slice::from_ref(&change)).unwrap();
+            assert!(loaded.templates.find("Zine").is_some());
+            assert!(loaded.save_blocked.is_none());
+        }
     }
 
     #[test]

@@ -183,20 +183,7 @@ fn main() -> std::io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut messages = Vec::new();
-    if let Some(first) = loaded.warnings.first() {
-        messages.push(format!(
-            "{} entries skipped: {first}",
-            loaded.warnings.len()
-        ));
-    }
-    if let Some(reason) = &loaded.save_blocked {
-        messages.push(format!(
-            "saving disabled: {}",
-            reason.lines().next().unwrap_or(reason)
-        ));
-    }
-    let notice = (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")));
+    let notice = loaded.notice();
     let mut app = App::new(
         source,
         preview_png.clone(),
@@ -295,17 +282,20 @@ fn event_loop(
                 break;
             }
         }
-        if app.take_save()
+        let changes = app.take_changes();
+        if !changes.is_empty()
             && let Some(path) = config_path
         {
             let started = Instant::now();
-            let result = store::save(path, &app.palettes, &app.templates);
+            let result = store::save(path, &changes);
             if let Some(log) = &mut debug_log {
                 writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
             }
-            if let Err(error) = result {
-                redraw |= app.set_notice(format!("config: {error}"));
+            match result {
+                Ok(loaded) => app.saved(loaded),
+                Err(error) => app.save_failed(changes, error.to_string()),
             }
+            redraw = true;
         }
     }
     Ok(())
