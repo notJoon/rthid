@@ -4,15 +4,18 @@
 //! Drawing borrows App immutably. Renderer retains preview caches and terminal
 //! graphics while the panel retains its own scroll offset.
 
-use crate::{cells, graphics, viewport};
+use crate::{cells, graphics, modal::Modal, viewport};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use rthid_widgets::key_hints;
+use rthid_widgets::{Dialog, ListPicker, TextInput, key_hints};
 
 use crate::{app::App, settings::Setting};
+
+// Keys that open a modal, shown first on the main screen.
+const MODAL_HINTS: &[(&str, &str)] = &[("P", "presets"), ("T", "templates")];
 
 const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("Tab", "focus"),
@@ -165,7 +168,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let labels = Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings)));
+    let labels = Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.palettes)));
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
@@ -178,17 +181,220 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         frame.buffer_mut(),
     );
     frame.render_widget(
-        Paragraph::new(key_hints(&[if app.preview_focus {
-            PREVIEW_HINTS
+        Paragraph::new(if let Some(modal) = &app.modal {
+            key_hints(&[modal.hints()])
         } else {
-            PANEL_HINTS
-        }])),
+            key_hints(&[
+                MODAL_HINTS,
+                if app.preview_focus {
+                    PREVIEW_HINTS
+                } else {
+                    PANEL_HINTS
+                },
+            ])
+        }),
         layout.help,
     );
     frame.render_widget(
         Paragraph::new(status(app, &geometry, report)),
         layout.status,
     );
+    if app.modal.is_some() {
+        draw_modal(frame, app, layout.preview);
+    }
+}
+
+const DIALOG_MIN_WIDTH: u16 = 28;
+
+struct ModalContent<'a> {
+    title: &'a str,
+    rows: Vec<Line<'static>>,
+    picker: Option<&'a ListPicker>,
+}
+
+struct Editing<'a> {
+    input: &'a TextInput,
+    prefix: String,
+    selected: usize,
+    invalid: bool,
+    swatch: Option<[u8; 3]>,
+}
+
+fn swatch_span([r, g, b]: [u8; 3], style: Style) -> Span<'static> {
+    Span::styled("  ██", style.fg(Color::Rgb(r, g, b)))
+}
+
+fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
+    let modal = app.modal.as_ref().unwrap();
+    let mut editing = None;
+    let ModalContent {
+        title,
+        rows,
+        picker,
+    } = match modal {
+        Modal::Templates {
+            list,
+            prompt,
+            confirm,
+        } => {
+            let title = confirm
+                .as_ref()
+                .map(|(question, _)| question.message())
+                .unwrap_or(if prompt.is_some() {
+                    "Save template"
+                } else {
+                    "Templates"
+                });
+            if let Some(input) = prompt {
+                editing = Some(Editing {
+                    input,
+                    prefix: "Name: ".to_owned(),
+                    selected: 0,
+                    invalid: false,
+                    swatch: None,
+                });
+                ModalContent {
+                    title,
+                    rows: vec![Line::raw(format!("Name: {}", input.text()))],
+                    picker: None,
+                }
+            } else {
+                let rows = if app.templates.is_empty() {
+                    vec![Line::raw("n: save current settings")]
+                } else {
+                    app.templates
+                        .iter()
+                        .map(|template| {
+                            Line::raw(format!(
+                                "{} | {} | {}",
+                                template.name,
+                                template.palette_name,
+                                crate::settings::mode_label(template.mode)
+                            ))
+                        })
+                        .collect()
+                };
+                ModalContent {
+                    title,
+                    rows,
+                    picker: Some(list),
+                }
+            }
+        }
+        Modal::Presets { list, confirm } => {
+            let rows = app
+                .palettes
+                .iter()
+                .map(|preset| {
+                    Line::raw(format!(
+                        "{}{}{}",
+                        if app.settings.uses(preset) {
+                            "* "
+                        } else {
+                            "  "
+                        },
+                        preset.name,
+                        if preset.builtin { " (built-in)" } else { "" }
+                    ))
+                })
+                .collect();
+            ModalContent {
+                title: confirm
+                    .as_ref()
+                    .map_or("Presets", |(question, _)| question.message()),
+                rows,
+                picker: Some(list),
+            }
+        }
+        Modal::Editor(editor) => {
+            let mut rows = Vec::new();
+            for row in 0..=editor.draft.colors.len() {
+                let prefix = if row == 0 {
+                    "Name: ".into()
+                } else {
+                    format!("{row}: ")
+                };
+                let text = if let Some(input) = &editor.input
+                    && editor.rows.selected() == row
+                {
+                    editing = Some(Editing {
+                        input,
+                        prefix: prefix.clone(),
+                        selected: row,
+                        invalid: editor.invalid_hex(),
+                        swatch: editor.swatch_rgb(row),
+                    });
+                    input.text()
+                } else if row == 0 {
+                    &editor.draft.name
+                } else {
+                    &editor.draft.colors[row - 1]
+                };
+                let mut spans = vec![Span::raw(prefix), Span::raw(text.to_owned())];
+                if let Some(rgb) = editor.swatch_rgb(row) {
+                    spans.push(swatch_span(rgb, Style::default()));
+                }
+                rows.push(Line::from(spans));
+            }
+            rows.push(Line::raw(format!(
+                "Mode: {}",
+                editor
+                    .draft
+                    .mode
+                    .map_or("keep", crate::settings::mode_label)
+            )));
+            ModalContent {
+                title: "Preset editor",
+                rows,
+                picker: Some(&editor.rows),
+            }
+        }
+    };
+    let dialog = Dialog {
+        title,
+        min_width: DIALOG_MIN_WIDTH,
+    };
+    let content = (
+        rows.iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16,
+        rows.len().min(u16::MAX as usize) as u16,
+    );
+    let area = dialog.area(preview, frame.area(), content);
+    let inner = dialog.render(area, frame.buffer_mut());
+    let highlight = Style::default().bg(Color::DarkGray);
+    if let Some(picker) = picker {
+        picker.render(rows, None, highlight, inner, frame.buffer_mut());
+    }
+    if let Some(Editing {
+        input,
+        prefix,
+        selected,
+        invalid,
+        swatch,
+    }) = editing
+        && let Some(row) = selected.checked_sub(picker.map_or(0, |list| list.offset()))
+        && row < usize::from(inner.height)
+        && inner.width > 2
+    {
+        let text_area = Rect::new(inner.x + 2, inner.y + row as u16, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new("").style(highlight), text_area);
+        let style = highlight.fg(if invalid { Color::Red } else { Color::Reset });
+        if let Some(cursor) = input.render(&prefix, style, text_area, frame.buffer_mut()) {
+            frame.set_cursor_position(cursor);
+        }
+        let width = Line::raw(format!("{prefix}{}", input.text())).width();
+        if let Some(rgb) = swatch
+            && width + 4 <= usize::from(text_area.width)
+        {
+            frame.render_widget(
+                Paragraph::new(swatch_span(rgb, highlight)),
+                Rect::new(text_area.x + width as u16, text_area.y, 4, 1),
+            );
+        }
+    }
 }
 
 // Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
@@ -199,7 +405,8 @@ fn draw_preview(
     geometry: &viewport::PreviewGeometry,
     renderer: &mut Renderer,
 ) -> PreviewReport {
-    let image_mode = renderer.graphics.is_some()
+    let image_mode = app.modal.is_none()
+        && renderer.graphics.is_some()
         && app.show_original
         && geometry.zoom == viewport::Zoom::Fit
         && !geometry.area.is_empty();
@@ -237,7 +444,7 @@ fn draw_preview(
     report
 }
 
-// A companion PNG error, then a graphics error, replaces the normal status line.
+// PNG errors, config notices and graphics errors replace the normal status line.
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
     let (gw, gh) = geometry.grid;
     let (sw, sh) = app.grid_cache.source_size();
@@ -275,6 +482,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     app.export_status()
         .map(str::to_owned)
+        .or_else(|| app.notice().map(str::to_owned))
         .or(report.graphics_error)
         .unwrap_or_else(|| {
             format!(
@@ -308,8 +516,109 @@ mod tests {
     }
 
     #[test]
+    fn modals_draw_text_swatches_and_cursor_without_terminal_images() {
+        use crate::{
+            modal::Editor,
+            settings::{MAX_NAME_CHARS, Preset, Settings},
+        };
+        use ratatui_image::picker::ProtocolType;
+        use rthid_widgets::{ListPicker, TextInput};
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            let mut picker = ratatui_image::picker::Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
+            let mut app = App::builtin(RgbaImage::new(12, 12), None);
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            draw_text(&mut terminal, &app, &mut renderer);
+            app.modal = Some(Modal::presets(&app.settings, &app.palettes));
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            assert!(text.contains("(built-in)") && text.contains("Presets"));
+            assert!(!text.contains(&format!(
+                "Original ({})",
+                renderer.graphics.as_ref().unwrap().name()
+            )));
+            app.modal = Some(Modal::Editor(Box::new(Editor::new(
+                &app.modal_ctx(),
+                Preset {
+                    name: "Paper".into(),
+                    colors: vec!["#000".into(), "#fff".into()],
+                    mode: None,
+                    builtin: false,
+                },
+            ))));
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            assert!(text.contains("Preset editor") && text.contains("Mode: keep"));
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "█" && cell.fg == Color::Rgb(0, 0, 0))
+            );
+            if let Some(Modal::Editor(editor)) = &mut app.modal {
+                editor.rows = ListPicker::new(1);
+                editor.input = Some(TextInput::new("oops", 7));
+            }
+            draw_text(&mut terminal, &app, &mut renderer);
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "o" && cell.fg == Color::Red)
+            );
+            let dialog = Dialog {
+                title: "Preset editor",
+                min_width: DIALOG_MIN_WIDTH,
+            };
+            let inner = Block::bordered().inner(dialog.area(
+                layout(terminal.size().unwrap()).preview,
+                terminal.backend().buffer().area,
+                (13, 4),
+            ));
+            assert_eq!(
+                terminal.get_cursor_position().unwrap(),
+                (inner.x + 2 + 3 + 4, inner.y + 1).into()
+            );
+            for (width, height) in [(0, 0), (1, 1), (20, 5), (60, 12)] {
+                let mut tiny = Terminal::new(TestBackend::new(width, height)).unwrap();
+                draw_text(&mut tiny, &app, &mut renderer);
+            }
+            app.modal = Some(Modal::Templates {
+                list: ListPicker::new(0),
+                prompt: Some(TextInput::new("Z", MAX_NAME_CHARS)),
+                confirm: None,
+            });
+            assert!(draw_text(&mut terminal, &app, &mut renderer).contains("Name: Z"));
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .area
+                    .contains(terminal.get_cursor_position().unwrap())
+            );
+            app.modal = Some(Modal::templates());
+            app.templates
+                .upsert(crate::settings::Template::capture(
+                    "Z".into(),
+                    &Settings::default(),
+                ))
+                .unwrap();
+            assert!(
+                draw_text(&mut terminal, &app, &mut renderer).contains("Z | Black/white | tone")
+            );
+        }
+    }
+
+    #[test]
     fn status_excludes_partial_edge_dots_until_panned() {
-        let mut app = App::new(RgbaImage::new(16, 16), None);
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
         for (zoom, area, initial, panned) in [
             // 47 columns at 3x clip the sixteenth column and 31 rows at 4x clip the sixteenth row.
             (
@@ -339,7 +648,7 @@ mod tests {
 
     #[test]
     fn status_uses_preview_report_and_prioritizes_export_errors() {
-        let mut app = App::new(RgbaImage::new(4, 6), None);
+        let mut app = App::builtin(RgbaImage::new(4, 6), None);
         let geometry = app.geometry(Rect::new(1, 1, 20, 10));
         assert!(
             status(
@@ -366,10 +675,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for with_export in [false, true] {
             if with_export {
-                app = App::new(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
+                app = App::builtin(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
                 assert!(app.finish_png().is_err());
             }
+            app.set_notice("Config notice".into());
             assert_eq!(
                 status(
                     &app,
@@ -379,7 +689,7 @@ mod tests {
                         ..PreviewReport::default()
                     },
                 ),
-                app.export_status().unwrap_or("Graphics failed"),
+                app.export_status().unwrap_or("Config notice"),
             );
         }
     }
@@ -435,7 +745,7 @@ mod tests {
     #[test]
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
         let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
+        let mut app = App::builtin(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
@@ -486,7 +796,7 @@ mod tests {
     #[test]
     fn draws_settings_and_truecolor_half_blocks() {
         let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
+        let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -500,6 +810,10 @@ mod tests {
             "Serpentine",
             "Brightness",
             "Contrast",
+            "Gamma: 1.00",
+            "Black: 0.00",
+            "White: 1.00",
+            "Sharpen: 0.00",
             "Original | 100%",
             "Source 3x3",
             "Grid 3x3",
@@ -527,12 +841,12 @@ mod tests {
     #[test]
     fn help_hints_preserve_exact_text() {
         assert_eq!(
-            key_hints(&[PREVIEW_HINTS]),
-            "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+            key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
+            "P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
-            key_hints(&[PANEL_HINTS]),
-            "Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+            key_hints(&[MODAL_HINTS, PANEL_HINTS]),
+            "P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
         );
     }
 
@@ -541,7 +855,7 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::new(4, 4), None);
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
         let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
         for _ in 0..6 {
             app.handle_key(
@@ -571,7 +885,7 @@ mod tests {
     #[test]
     fn overview_and_exact_modes_show_their_status() {
         let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::new(4, 6), None);
+        let mut app = App::builtin(RgbaImage::new(4, 6), None);
         app.show_original = false;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -597,7 +911,7 @@ mod tests {
                 ProtocolType::Iterm2,
                 ProtocolType::Sixel,
             ] {
-                let mut app = App::new(RgbaImage::new(12, 12), None);
+                let mut app = App::builtin(RgbaImage::new(12, 12), None);
                 let mut picker = ratatui_image::picker::Picker::halfblocks();
                 picker.set_protocol_type(protocol);
                 let font = picker.font_size();
@@ -674,7 +988,7 @@ mod tests {
             picker.set_protocol_type(protocol);
             let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
             let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-            let mut app = App::new(RgbaImage::new(400, 400), None);
+            let mut app = App::builtin(RgbaImage::new(400, 400), None);
             for original in [true, false] {
                 app.show_original = original;
                 app.sync(layout(terminal.size().unwrap()).preview);

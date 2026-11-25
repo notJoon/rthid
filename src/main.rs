@@ -32,8 +32,12 @@ mod graphics;
 mod grid;
 /// Single entry caches with build versions.
 mod memo;
+/// Modal input and preset editing.
+mod modal;
 /// Editable settings and palette presets.
 mod settings;
+/// Configuration storage and independent settings templates.
+mod store;
 /// Screen layout, panels and status line.
 mod ui;
 /// Preview coordinates for Fit, zoom levels and the minimap.
@@ -78,6 +82,9 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
+    /// Load user presets and templates from this TOML file.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
     /// Glyph set for the sampled Dithered preview and minimap.
     #[arg(long, value_enum)]
     glyphs: Option<CliGlyphs>,
@@ -124,6 +131,7 @@ fn main() -> std::io::Result<()> {
     let Args {
         image: path,
         preview_png,
+        config,
         glyphs,
         graphics,
     } = Args::parse();
@@ -158,14 +166,43 @@ fn main() -> std::io::Result<()> {
         source
     }
     .to_rgba8();
-    let mut app = App::new(source, preview_png);
+    let config_path = store::config_path(config);
+    let loaded = store::load_or_builtin(config_path.as_deref());
+    let mut messages = Vec::new();
+    if let Some(first) = loaded.warnings.first() {
+        messages.push(format!(
+            "{} entries skipped: {first}",
+            loaded.warnings.len()
+        ));
+    }
+    if let Some(reason) = &loaded.save_blocked {
+        messages.push(format!(
+            "saving disabled: {}",
+            reason.lines().next().unwrap_or(reason)
+        ));
+    }
+    let notice = (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")));
+    let mut app = App::new(
+        source,
+        preview_png,
+        loaded.palettes,
+        loaded.templates,
+        notice,
+        loaded.save_blocked,
+    );
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.viewport.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
-        event_loop(terminal, &mut app, &mut renderer, debug_log.as_mut())
+        event_loop(
+            terminal,
+            &mut app,
+            &mut renderer,
+            debug_log.as_mut(),
+            config_path.as_deref(),
+        )
     });
     drop(mouse_capture);
     let png_result = app.finish_png();
@@ -179,6 +216,7 @@ fn event_loop(
     app: &mut App,
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
+    config_path: Option<&Path>,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
@@ -219,6 +257,12 @@ fn event_loop(
                 break;
             }
         }
+        if app.take_save()
+            && let Some(path) = config_path
+            && let Err(error) = store::save(path, &app.palettes, &app.templates)
+        {
+            redraw |= app.set_notice(format!("config: {error}"));
+        }
     }
     Ok(())
 }
@@ -234,6 +278,7 @@ mod tests {
         let args = Args::try_parse_from(["rthid"]).unwrap();
         assert_eq!(args.image, PathBuf::from("tests/fixtures/hsl.jpg"));
         assert_eq!(args.preview_png, None);
+        assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
         assert!(matches!(args.graphics, CliGraphics::Auto));
     }
@@ -260,9 +305,12 @@ mod tests {
             "quadrant",
             "--preview-png",
             "dots.png",
+            "--config",
+            "presets.toml",
         ])
         .unwrap();
         assert_eq!(args.image, PathBuf::from("photo.png"));
+        assert_eq!(args.config, Some(PathBuf::from("presets.toml")));
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
@@ -274,6 +322,7 @@ mod tests {
             vec!["--graphics", "kitty"],
             vec!["--glyphs", "unknown"],
             vec!["--preview-png", ""],
+            vec!["--config", ""],
             vec!["a", "b"],
         ] {
             assert!(

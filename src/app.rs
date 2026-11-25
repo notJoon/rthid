@@ -5,7 +5,8 @@ use crate::{
     export::Export,
     grid::GridCache,
     memo::Memo,
-    settings::{Setting, Settings},
+    modal::{Ctx, Effect, Modal, Next},
+    settings::{Palettes, Setting, Settings, Template, Templates},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -20,6 +21,14 @@ use std::path::PathBuf;
 /// the optional companion PNG.
 pub struct App {
     export: Option<Export>,
+    notice: Option<String>,
+    save_blocked: Option<String>,
+    /// Whether palette or template changes need persistence.
+    pub(crate) save_requested: bool,
+    /// Active dialog, which receives input before global bindings.
+    pub modal: Option<Modal>,
+    /// Saved settings with independent palette colors.
+    pub templates: Templates,
     /// Preview zoom, glyphs, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
@@ -27,6 +36,8 @@ pub struct App {
     last_drag: Option<((u16, u16), (u32, u32))>,
     /// Image processing caches.
     pub grid_cache: GridCache,
+    /// Built-in and user palette presets in selection order.
+    pub palettes: Palettes,
     /// Current image settings.
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
@@ -41,7 +52,14 @@ pub struct App {
 impl App {
     /// Starts the companion PNG writer when a path is given and builds the
     /// first grid. With a running writer it also dithers at once.
-    pub fn new(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
+    pub fn new(
+        source: RgbaImage,
+        preview_png: Option<PathBuf>,
+        palettes: Palettes,
+        templates: Templates,
+        notice: Option<String>,
+        save_blocked: Option<String>,
+    ) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
             viewport: Viewport::default(),
@@ -52,6 +70,12 @@ impl App {
                 grid: Memo::default(),
                 dithered: Memo::default(),
             },
+            palettes,
+            templates,
+            notice,
+            save_blocked,
+            save_requested: false,
+            modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
             show_original: true,
@@ -59,6 +83,36 @@ impl App {
         };
         app.refresh();
         app
+    }
+
+    /// Builds an app with built-ins and no configuration diagnostics for tests.
+    #[cfg(test)]
+    pub fn builtin(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
+        Self::new(
+            source,
+            preview_png,
+            Palettes::builtin(),
+            Templates::default(),
+            None,
+            None,
+        )
+    }
+
+    /// Current configuration diagnostic for the status line.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Reports a validation or configuration error and whether the status changed.
+    pub fn set_notice(&mut self, notice: String) -> bool {
+        let changed = self.notice.as_ref() != Some(&notice);
+        self.notice = Some(notice);
+        changed
+    }
+
+    /// Consumes a pending save unless configuration loading blocked writes.
+    pub fn take_save(&mut self) -> bool {
+        std::mem::take(&mut self.save_requested) && self.save_blocked.is_none()
     }
 
     /// Grid size for the current settings after rotation, known before `sync`
@@ -145,6 +199,10 @@ impl App {
 
     /// Pans overflowing previews at any focus and recenters through the minimap.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
+        if self.modal.is_some() {
+            self.last_drag = None;
+            return;
+        }
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
         if !geometry.overflows() || !geometry.area.contains(point.into()) {
@@ -184,14 +242,65 @@ impl App {
         }
     }
 
+    /// Borrows the preview and saved entries needed by dialogs, for tests that build a modal directly.
+    #[cfg(test)]
+    pub fn modal_ctx(&self) -> Ctx<'_> {
+        Ctx {
+            palettes: &self.palettes,
+            templates: &self.templates,
+            settings: &self.settings,
+            show_original: self.show_original,
+        }
+    }
+
     /// Handles global zoom and focus keys, then preview panning or parameter edits.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            // Raw mode delivers Ctrl+C as a key. Other Ctrl chords are not bound.
-            self.quit |= key.code == KeyCode::Char('c');
+        self.notice = None;
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        // Borrowing fields one by one lets the modal stay in place while it reads the rest of App.
+        if let Some(modal) = &mut self.modal {
+            let step = modal.handle_key(
+                key,
+                Ctx {
+                    palettes: &self.palettes,
+                    templates: &self.templates,
+                    settings: &self.settings,
+                    show_original: self.show_original,
+                },
+            );
+            if let Some(effect) = step.effect
+                && let Err(error) = self.apply(effect)
+            {
+                self.set_notice(error);
+                return;
+            }
+            match step.next {
+                Next::Stay => {}
+                Next::Close => self.modal = None,
+                Next::Replace(modal) => self.modal = Some(modal),
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('P') {
+            self.last_drag = None;
+            self.modal = Some(Modal::presets(&self.settings, &self.palettes));
+            return;
+        }
+        if key.code == KeyCode::Char('T') {
+            self.last_drag = None;
+            self.modal = Some(Modal::templates());
             return;
         }
         if key.code == KeyCode::Tab {
@@ -245,7 +354,7 @@ impl App {
             KeyCode::Char('d') => {
                 self.settings = self
                     .settings
-                    .with_default(Setting::ALL[self.panel.selected()])
+                    .with_default(Setting::ALL[self.panel.selected()], &self.palettes)
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -254,14 +363,55 @@ impl App {
         }
     }
 
+    fn apply(&mut self, effect: Effect) -> Result<(), String> {
+        match effect {
+            Effect::Notice(message) => {
+                self.set_notice(message);
+            }
+            Effect::Preview(settings) => {
+                self.settings = settings;
+                self.show_original = false;
+            }
+            Effect::Restore {
+                settings,
+                show_original,
+            } => {
+                self.settings = settings;
+                self.show_original = show_original;
+            }
+            Effect::SavePreset { preset, base } => {
+                let index = self.palettes.upsert(preset)?;
+                self.apply(Effect::Preview(
+                    base.with_preset(self.palettes.get(index).unwrap()),
+                ))?;
+                self.save_requested = true;
+            }
+            Effect::RemovePreset(index) => {
+                self.palettes.remove(index)?;
+                self.save_requested = true;
+            }
+            Effect::SaveTemplate(name) => {
+                self.templates
+                    .upsert(Template::capture(name, &self.settings))?;
+                self.save_requested = true;
+            }
+            Effect::RemoveTemplate(index) => {
+                self.templates.remove(index);
+                self.save_requested = true;
+            }
+        }
+        Ok(())
+    }
+
     fn adjust(&mut self, direction: i32) {
         let setting = Setting::ALL[self.panel.selected()];
-        let next = self.settings.adjusted(setting, direction);
+        let next = self.settings.adjusted(setting, direction, &self.palettes);
         // Clamped presses preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
-            self.show_original = false;
+            self.apply(Effect::Preview(next)).expect("preview is valid");
+        } else {
+            self.settings = next;
         }
-        self.settings = next;
     }
 }
 
@@ -285,9 +435,99 @@ fn pan_delta(code: KeyCode, visible: (u32, u32), step: (u32, u32)) -> Option<(i6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{settings::Rotation, ui::Layout};
+    use crate::{
+        settings::{Palettes, Rotation},
+        ui::Layout,
+    };
     use ratatui::layout::Rect;
     use rthid::dither::Mode;
+
+    #[test]
+    fn template_manager_saves_and_applies_settings() {
+        let mut app = app_at(Setting::Strength);
+        app.settings.options.strength = 0.5;
+        let saved = app.settings.clone();
+        for code in [
+            KeyCode::Char('T'),
+            KeyCode::Char('n'),
+            KeyCode::Char('Z'),
+            KeyCode::Enter,
+        ] {
+            press(&mut app, code);
+        }
+        assert!(app.modal.is_none() && app.take_save());
+        assert_eq!(
+            app.templates.get(0),
+            Some(&Template::capture("Z".into(), &saved))
+        );
+        app.settings.options.strength = 0.9;
+        app.settings.rotation = Rotation::R90;
+        for code in [KeyCode::Char('T'), KeyCode::Enter] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.settings.options.strength, 0.5);
+        assert_eq!(app.settings.rotation, Rotation::R90);
+        assert!(!app.show_original && app.modal.is_none() && !app.take_save());
+    }
+
+    #[test]
+    fn preset_editor_saves_and_keeps_failed_save_open() {
+        let mut app = app_at(Setting::Palette);
+        for code in [KeyCode::Char('P'), KeyCode::Char('n'), KeyCode::Char('s')] {
+            press(&mut app, code);
+        }
+        assert!(app.notice().unwrap().contains("must not be empty"));
+        assert!(app.modal.is_some() && !app.take_save());
+        press(&mut app, KeyCode::Down);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &app.geometry(test_layout().preview),
+        );
+        assert!(
+            matches!(&app.modal, Some(Modal::Editor(editor)) if editor.draft.colors == app.settings.palette_hex && editor.rows.selected() == 1 && editor.input.is_none())
+        );
+        press(&mut app, KeyCode::Up);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('Z'),
+            KeyCode::Enter,
+            KeyCode::Char('s'),
+        ] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.settings.palette_name, "Z");
+        assert!(app.palettes.find("Z").is_some());
+        assert!(app.modal.is_none() && app.take_save() && !app.show_original);
+    }
+
+    #[test]
+    fn notices_and_save_blocking_survive_input() {
+        for blocked in [false, true] {
+            let mut templates = Templates::default();
+            templates
+                .upsert(Template::capture("Zine".into(), &Settings::default()))
+                .unwrap();
+            let mut app = App::new(
+                RgbaImage::new(4, 4),
+                None,
+                Palettes::builtin(),
+                templates.clone(),
+                Some("config warning".into()),
+                blocked.then(|| "broken file".into()),
+            );
+            assert_eq!(app.templates, templates);
+            assert_eq!(app.notice(), Some("config warning"));
+            assert!(!app.take_save());
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &app.geometry(Rect::new(0, 0, 20, 10)),
+            );
+            assert!(app.notice().is_none());
+            app.apply(Effect::SaveTemplate("Another".into())).unwrap();
+            assert_eq!(app.take_save(), !blocked);
+            assert!(!app.take_save());
+        }
+    }
 
     #[test]
     fn pan_keys_use_pixels_and_visible_pages() {
@@ -347,14 +587,14 @@ mod tests {
     }
 
     fn app_at(setting: Setting) -> App {
-        let mut app = App::new(RgbaImage::new(4, 4), None);
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
         app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
         app
     }
 
     #[test]
     fn empty_preview_navigation_and_scaled_pages() {
-        let mut app = App::new(RgbaImage::new(4, 4), None);
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
         app.preview_focus = true;
         for zoom in [Zoom::Fit, Zoom::Out(2), Zoom::In(4)] {
             app.viewport.zoom = zoom;
@@ -380,7 +620,7 @@ mod tests {
 
     #[test]
     fn grid_cache_rebuilds_only_stale_stages() {
-        let mut app = App::new(RgbaImage::new(20, 10), None);
+        let mut app = App::builtin(RgbaImage::new(20, 10), None);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 0);
         app.show_original = false;
@@ -412,7 +652,7 @@ mod tests {
 
     #[test]
     fn sync_clamps_after_layout_and_grid_changes() {
-        let mut app = App::new(RgbaImage::new(120, 80), None);
+        let mut app = App::builtin(RgbaImage::new(120, 80), None);
         app.viewport.zoom = Zoom::In(1);
         for (screen, scale, rotation, expected) in [
             (Rect::new(0, 0, 41, 9), 100, Rotation::R0, (110, 70)),
@@ -435,7 +675,7 @@ mod tests {
 
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
-        let mut app = App::new(RgbaImage::new(20, 10), None);
+        let mut app = App::builtin(RgbaImage::new(20, 10), None);
         app.panel = ListPicker::new(
             Setting::ALL
                 .iter()
@@ -473,7 +713,7 @@ mod tests {
             vec![255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255],
         )
         .unwrap();
-        let app = App::new(source, None);
+        let app = App::builtin(source, None);
         let Pixels::Rgb(pixels, _) = app.displayed() else {
             panic!("expected original RGB pixels");
         };
@@ -489,10 +729,10 @@ mod tests {
         let mut app = app_at(Setting::Scale);
         assert!(!press(&mut app, KeyCode::Up));
         assert_eq!(app.panel.selected(), 0);
-        for _ in 0..10 {
+        for _ in 0..Setting::ALL.len() + 2 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(Setting::ALL[app.panel.selected()], Setting::Contrast);
+        assert_eq!(Setting::ALL[app.panel.selected()], Setting::Sharpen);
         for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
             assert!(!press(&mut app, code));
             assert_eq!(app.panel.selected(), Setting::ALL.len() - 1);
@@ -503,17 +743,21 @@ mod tests {
     #[test]
     fn numeric_settings_clamp_without_redither() {
         type Getter = fn(&Settings) -> f64;
-        let cases: [(Setting, Getter); 4] = [
+        let cases: [(Setting, Getter); 8] = [
             (Setting::Scale, |p| f64::from(p.scale)),
             (Setting::Strength, |p| p.options.strength),
             (Setting::Brightness, |p| p.options.tone.brightness),
             (Setting::Contrast, |p| p.options.tone.contrast),
+            (Setting::Gamma, |p| p.options.tone.gamma),
+            (Setting::Black, |p| p.options.tone.black),
+            (Setting::White, |p| p.options.tone.white),
+            (Setting::Sharpen, |p| p.options.tone.sharpen),
         ];
         for (setting, get) in cases {
             let (_, low, high) = setting.range().unwrap();
             let mut app = app_at(setting);
             for (key, limit) in [(KeyCode::Left, low), (KeyCode::Right, high)] {
-                for _ in 0..50 {
+                for _ in 0..100 {
                     press(&mut app, key);
                 }
                 assert_eq!(get(&app.settings), limit, "{setting:?}");
@@ -534,11 +778,13 @@ mod tests {
         press(&mut app, KeyCode::Right);
         assert!(!app.settings.options.serpentine);
         let mut app = app_at(Setting::Palette);
+        // Wrapping back lands on the last built-in, which also switches to its Color mode.
         press(&mut app, KeyCode::Left);
-        assert_eq!(app.settings.palette, 2);
-        assert_eq!(app.settings.options.palette.len(), 4);
+        assert_eq!(app.settings.palette_name, "Pratt");
+        assert_eq!(app.settings.options.palette.len(), 5);
+        assert_eq!(app.settings.options.mode, Mode::Color);
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.settings.palette, 0);
+        assert_eq!(app.settings.palette_name, "Black/white");
         assert_eq!(app.settings.options.palette.len(), 2);
     }
 
@@ -559,7 +805,8 @@ mod tests {
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.settings;
-        assert_eq!((p.scale, p.rotation, p.palette), (100, Rotation::R0, 0));
+        assert_eq!((p.scale, p.rotation), (100, Rotation::R0));
+        assert_eq!(p.palette_name, "Black/white");
         assert_eq!(p.options.palette.len(), 2);
         assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 16);
     }
@@ -567,14 +814,19 @@ mod tests {
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
         for setting in Setting::ALL {
-            let mut app = App::new(RgbaImage::new(20, 10), None);
+            let mut app = App::builtin(RgbaImage::new(20, 10), None);
             app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
-            assert!(press(&mut app, KeyCode::Left));
+            let change = if matches!(setting, Setting::Black | Setting::Sharpen) {
+                KeyCode::Right
+            } else {
+                KeyCode::Left
+            };
+            assert!(press(&mut app, change));
             assert!(press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
-            assert!(press(&mut app, KeyCode::Left));
+            assert!(press(&mut app, change));
             assert!(press(&mut app, KeyCode::Char('D')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
         }
@@ -626,7 +878,7 @@ mod tests {
 
     #[test]
     fn rotation_and_scale_set_the_actual_dither_grid() {
-        let mut app = App::new(RgbaImage::new(256, 128), None);
+        let mut app = App::builtin(RgbaImage::new(256, 128), None);
         app.show_original = false;
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('r'));
@@ -640,7 +892,7 @@ mod tests {
         press(&mut app, KeyCode::Char('R'));
         assert_eq!(app.settings.rotation, Rotation::R270);
         assert_eq!(app.grid_size(), (128, 256));
-        let mut app = App::new(RgbaImage::new(15, 1), None);
+        let mut app = App::builtin(RgbaImage::new(15, 1), None);
         app.show_original = false;
         for _ in 0..9 {
             press(&mut app, KeyCode::Left);
@@ -650,7 +902,7 @@ mod tests {
     }
     #[test]
     fn global_zoom_and_preview_pans_skip_redithering() {
-        let mut app = App::new(RgbaImage::new(400, 400), None);
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
         for focus in [false, true] {
             app.preview_focus = focus;
             assert!(!press(&mut app, KeyCode::Char('0')));
@@ -689,7 +941,7 @@ mod tests {
 
     #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
-        let mut app = App::new(RgbaImage::new(120, 120), None);
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
         app.viewport.zoom = Zoom::In(1);
         let map = app.geometry(area).minimap.unwrap().map;
@@ -770,7 +1022,7 @@ mod tests {
 
     #[test]
     fn minimap_toggle_changes_visibility_without_redithering() {
-        let mut app = App::new(RgbaImage::new(120, 120), None);
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
         app.preview_focus = true;
         app.viewport.zoom = Zoom::In(1);
         assert!(press(&mut app, KeyCode::Char(' ')));
@@ -788,7 +1040,7 @@ mod tests {
             (Zoom::In(2), (102, 102), (105, 108)),
             (Zoom::In(4), (101, 101), (103, 104)),
         ] {
-            let mut app = App::new(RgbaImage::new(1000, 1000), None);
+            let mut app = App::builtin(RgbaImage::new(1000, 1000), None);
             app.viewport = Viewport {
                 zoom,
                 x: 100,
@@ -832,7 +1084,7 @@ mod tests {
     fn finish_png_exports_changes_queued_with_quit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preview.png");
-        let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
+        let mut app = App::builtin(RgbaImage::new(4, 2), Some(path.clone()));
         for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
             app.handle_key(
                 KeyEvent::new(code, KeyModifiers::NONE),

@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Palette preset manager (`P`) and settings template manager (`T`), saved to a
+  configurable TOML file with overwrite and removal confirmation for templates
 - Unified preview zoom from Fit through 25%, 33%, 50%, 100%, 200%, 300%, and
   400%, with global `+` / `=` / `-`, `0` for Fit, and center preservation
 - Panning and a dimmed minimap whenever the zoomed image overflows the preview

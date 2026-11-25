@@ -5,3 +5,6 @@
 pub mod dither;
 /// Atomic PNG export and background writing.
 pub mod png;
+
+/// Complete file replacement through a temporary file beside the destination.
+pub mod atomic;
