@@ -134,7 +134,7 @@ fn to_channels(rgba: &[u8], w: usize, h: usize, tone: &Tone) -> [Vec<f32>; 3] {
     let span = (tone.white - tone.black).max(0.02);
     let g = 1.0 / tone.gamma;
     for (c, channel) in channels.iter_mut().enumerate() {
-        for (value, pixel) in channel.iter_mut().zip(rgba.chunks_exact(4)) {
+        for (value, pixel) in channel.iter_mut().zip(rgba.as_chunks::<4>().0) {
             *value = (f64::from(pixel[c]) / 255.0) as f32;
         }
         if tone.sharpen > 0.0 {
