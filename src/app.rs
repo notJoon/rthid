@@ -1,4 +1,4 @@
-use crate::view::View;
+use crate::view::{Pixels, RgbOverviewCache, View};
 use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -66,7 +66,34 @@ impl Params {
     }
 }
 
+type GraphicsCache = (
+    (u32, u32, bool, Rect, bool),
+    Rect,
+    ratatui_image::protocol::StatefulProtocol,
+);
+
+pub struct Graphics {
+    pub picker: ratatui_image::picker::Picker,
+    pub cache: Option<GraphicsCache>,
+    pub error: Option<String>,
+    pub placement: Option<(Rect, bool)>,
+}
+
+impl Graphics {
+    pub fn new(picker: ratatui_image::picker::Picker) -> Self {
+        Self {
+            picker,
+            cache: None,
+            error: None,
+            placement: None,
+        }
+    }
+}
+
+pub const KITTY_IMAGE_ID: u32 = 0x727468;
+
 pub struct App {
+    pub graphics: Option<Graphics>,
     pub preview_png: Option<PathBuf>,
     pub png_error: Option<String>,
     png_worker: Option<Worker>,
@@ -78,6 +105,11 @@ pub struct App {
     pub params: Params,
     pub parameter_list: ListState,
     pub indices: Vec<u8>,
+    pub original: RgbaImage,
+    original_rotation: u8,
+    pub rgb_overviews: RgbOverviewCache,
+    dither_stale: bool,
+    pub show_original: bool,
     pub dirty: bool,
     pub quit: bool,
 }
@@ -91,6 +123,7 @@ impl App {
                 None => (None, None),
             };
         let mut app = Self {
+            graphics: None,
             preview_png,
             png_error: None,
             png_worker,
@@ -102,6 +135,11 @@ impl App {
             params: Params::default(),
             parameter_list: ListState::default().with_selected(Some(0)),
             indices: Vec::new(),
+            original: RgbaImage::new(0, 0),
+            original_rotation: 0,
+            rgb_overviews: RgbOverviewCache::default(),
+            dither_stale: true,
+            show_original: true,
             dirty: true,
             quit: false,
         };
@@ -129,24 +167,37 @@ impl App {
         }
     }
 
-    // Re-dithers once after any number of parameter changes.
+    // Rebuilds the grid when needed and dithers only when a consumer needs it.
     pub fn refresh(&mut self) -> bool {
         let mut status_changed = self.poll_png();
-        if !self.dirty {
+        if self.dirty {
+            self.dirty = false;
+            self.dither_stale = true;
+            if self.original.dimensions() != self.grid_size()
+                || self.original_rotation != self.params.rotation
+            {
+                let (w, h) = self.scaled_size();
+                let scaled = imageops::resize(&self.source, w, h, imageops::FilterType::Triangle);
+                self.original = match self.params.rotation {
+                    1 => imageops::rotate90(&scaled),
+                    2 => imageops::rotate180(&scaled),
+                    3 => imageops::rotate270(&scaled),
+                    _ => scaled,
+                };
+                self.original_rotation = self.params.rotation;
+                self.rgb_overviews.clear();
+                if let Some(graphics) = &mut self.graphics {
+                    graphics.cache = None;
+                }
+            }
+        }
+        if !self.dither_stale || (self.show_original && self.png_worker.is_none()) {
             return status_changed;
         }
-        self.dirty = false;
-        let (w, h) = self.scaled_size();
-        let scaled = imageops::resize(&self.source, w, h, imageops::FilterType::Triangle);
-        let grid = match self.params.rotation {
-            1 => imageops::rotate90(&scaled),
-            2 => imageops::rotate180(&scaled),
-            3 => imageops::rotate270(&scaled),
-            _ => scaled,
-        };
-        let (gw, gh) = grid.dimensions();
+        self.dither_stale = false;
+        let (gw, gh) = self.original.dimensions();
         self.indices = dither::dither(
-            grid.as_raw(),
+            self.original.as_raw(),
             gw as usize,
             gh as usize,
             &self.params.options,
@@ -163,6 +214,17 @@ impl App {
             }
         }
         status_changed
+    }
+
+    pub fn displayed(&self) -> Pixels<'_> {
+        if self.show_original {
+            Pixels::Rgb(&self.original)
+        } else {
+            Pixels::Indexed {
+                indices: &self.indices,
+                palette: &self.params.options.palette,
+            }
+        }
     }
 
     fn set_png_error(&mut self, error: Option<std::io::Error>) -> bool {
@@ -250,6 +312,10 @@ impl App {
         }
         if key.code == KeyCode::Tab {
             self.preview_focus = !self.preview_focus;
+            return;
+        }
+        if key.code == KeyCode::Char(' ') {
+            self.show_original = !self.show_original;
             return;
         }
         // Esc only leaves preview focus; quitting is q or Ctrl+C so a stray Esc never exits.
@@ -340,7 +406,8 @@ impl App {
             *value = next;
             changed
         };
-        let changed = match PARAMS[self.parameter_list.selected().unwrap_or(0)] {
+        let param = PARAMS[self.parameter_list.selected().unwrap_or(0)];
+        let changed = match param {
             Param::Scale => {
                 let next = (p.scale + direction * 10).clamp(10, 200);
                 let changed = next != p.scale;
@@ -368,6 +435,9 @@ impl App {
             Param::Contrast => step(&mut o.tone.contrast, 20.0, -0.5, 1.0),
         };
         self.dirty |= changed;
+        if changed && param != Param::Scale {
+            self.show_original = false;
+        }
     }
 }
 
@@ -403,6 +473,68 @@ mod tests {
         app.parameter_list
             .select(PARAMS.iter().position(|&p| p == param));
         app
+    }
+
+    #[test]
+    fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
+        let mut app = app_at(Param::Strength);
+        assert!(app.show_original);
+        for focus in [false, true] {
+            app.preview_focus = focus;
+            assert!(!press(&mut app, KeyCode::Char(' ')));
+            assert!(!app.show_original);
+            assert!(!press(&mut app, KeyCode::Char(' ')));
+            assert!(app.show_original);
+        }
+        app.preview_focus = false;
+        assert!(!press(&mut app, KeyCode::Right));
+        assert!(app.show_original);
+        assert!(press(&mut app, KeyCode::Left));
+        assert!(!app.show_original);
+        assert!(!press(&mut app, KeyCode::Char(' ')));
+        app.parameter_list.select(Some(0));
+        assert!(press(&mut app, KeyCode::Left));
+        assert!(app.show_original);
+        for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
+            assert!(press(&mut app, code));
+            assert!(app.show_original);
+        }
+    }
+
+    #[test]
+    fn original_defers_dithering_until_space_then_refresh() {
+        let mut app = App::new(RgbaImage::new(20, 10), None);
+        assert!(app.indices.is_empty());
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(app.original.dimensions(), (22, 11));
+        assert!(app.show_original);
+        assert!(app.indices.is_empty());
+        assert!(app.dither_stale);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.dirty);
+        app.refresh();
+        let (w, h) = app.grid_size();
+        assert_eq!(app.indices.len(), (w * h) as usize);
+        assert!(!app.dither_stale);
+    }
+
+    #[test]
+    fn original_preserves_rgb_and_ignores_alpha() {
+        let source = RgbaImage::from_raw(
+            3,
+            1,
+            vec![255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255],
+        )
+        .unwrap();
+        let app = App::new(source, None);
+        let Pixels::Rgb(pixels) = app.displayed() else {
+            panic!("expected original RGB pixels");
+        };
+        assert_eq!(
+            pixels.as_raw(),
+            &[255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255]
+        );
+        assert_eq!(&app.original, pixels);
     }
 
     #[test]
@@ -527,6 +659,7 @@ mod tests {
     #[test]
     fn rotation_and_scale_set_the_actual_dither_grid() {
         let mut app = App::new(RgbaImage::new(256, 128), None);
+        app.show_original = false;
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (128, 256));
@@ -540,6 +673,7 @@ mod tests {
         assert_eq!(app.params.rotation, 3);
         assert_eq!(app.grid_size(), (128, 256));
         let mut app = App::new(RgbaImage::new(15, 1), None);
+        app.show_original = false;
         for _ in 0..9 {
             press(&mut app, KeyCode::Left);
         }
@@ -598,12 +732,12 @@ mod tests {
             let (_, map, _) = app
                 .view
                 .render_minimap(
-                    &app.indices,
+                    app.displayed(),
                     120,
                     120,
-                    &app.params.options.palette,
                     app.preview_area,
                     &mut buffer,
+                    &mut RgbOverviewCache::default(),
                 )
                 .unwrap();
             assert_eq!(map, expected);

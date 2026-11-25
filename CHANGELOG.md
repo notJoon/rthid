@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Real-pixel Original preview via Kitty, iTerm2, or Sixel with automatic detection,
+  cached encoding, half-block fallback, and `--graphics auto|off`
+
+- Truecolor Original preview on startup (lossless at 1:1, box-averaged in
+  overview) with `Space` to toggle original / dithered;
+  changing dither parameters reveals the dithered result
 - Atkinson error diffusion engine with tone (luminance levels) and color
   (nearest palette color) modes, serpentine scanning, and diffusion strength
 - Engine tone adjustments: brightness, contrast, gamma, black and white points,
