@@ -32,3 +32,12 @@ run = [
   "cargo test -p rthid-widgets --doc",
   "cargo doc -p rthid-widgets --no-deps",
 ]
+
+[tasks."ci:dither"]
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = [
+  "cargo fmt -p rthid-dither --check",
+  "cargo clippy -p rthid-dither --all-targets -- -D warnings",
+  "cargo test -p rthid-dither",
+  "cargo doc -p rthid-dither --no-deps",
+]

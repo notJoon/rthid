@@ -3,7 +3,6 @@
 //! Dots are grid pixels. Fit and Out preserve the terminal cell aspect.
 //! In uses crisp half blocks, so dots look 12.5 percent taller.
 
-use crate::cells::Glyphs;
 use ratatui::{
     layout::{Constraint, Rect},
     widgets::Block,
@@ -96,11 +95,9 @@ impl Zoom {
     }
 }
 
-/// User controlled glyphs, zoom, minimap visibility and dot origin.
+/// User controlled zoom, minimap visibility and dot origin.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Viewport {
-    /// Glyph set for sampled Dithered cells and the minimap.
-    pub glyphs: Glyphs,
     /// Current preview scale.
     pub zoom: Zoom,
     /// Whether the user has hidden the minimap.
@@ -495,12 +492,6 @@ mod tests {
                 map: Rect::new(38, 4, 9, 4),
                 viewport: Rect::new(43, 6, 4, 2),
             })
-        );
-        let mut quadrant = viewport;
-        quadrant.glyphs = Glyphs::Quadrant;
-        assert_eq!(
-            geometry(&viewport, (120, 120), area),
-            geometry(&quadrant, (120, 120), area)
         );
     }
 

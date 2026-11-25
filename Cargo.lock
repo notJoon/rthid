@@ -2085,10 +2085,19 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "rthid-dither",
  "rthid-widgets",
  "serde",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "rthid-dither"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "tempfile",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use crate::{
     settings::{Rotation, Settings},
 };
 use image::{RgbaImage, imageops};
-use rthid::dither::{self, Options};
+use rthid_dither::dither::{self, Options};
 
 /// Scaled size before rotation, plus the rotation applied after scaling.
 #[derive(PartialEq)]

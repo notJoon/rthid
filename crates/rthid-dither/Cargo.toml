@@ -1,0 +1,14 @@
+[package]
+name = "rthid-dither"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+image.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

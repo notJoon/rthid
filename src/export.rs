@@ -1,7 +1,7 @@
 //! Companion PNG wrapper. Submits each new dithered grid to the background
 //! writer and keeps the latest error for the status line.
 
-use rthid::{
+use rthid_dither::{
     dither::PaletteColor,
     png::{Job, Worker},
 };
@@ -93,7 +93,7 @@ fn message(path: &Path, error: Option<io::Error>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rthid::dither::make_palette;
+    use rthid_dither::dither::make_palette;
 
     fn sync(export: &mut Export, w: u32, h: u32) {
         export.sync(
