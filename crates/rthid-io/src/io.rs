@@ -519,15 +519,8 @@ fn execute(
         }
         Job::List(_) => listing(path).map(|listing| Outcome::Listed(Ok(listing))),
         Job::Export { grid, .. } => {
-            png::write_atomic(
-                path,
-                &grid.indices,
-                grid.w,
-                grid.h,
-                &grid.palette,
-                png::preview_scale(grid.w, grid.h),
-            )
-            .map_err(Cause::Io)?;
+            png::write_atomic(path, &grid, png::preview_scale(grid.w, grid.h))
+                .map_err(Cause::Io)?;
             Ok(Outcome::Exported(Ok(path.clone())))
         }
         #[cfg(test)]

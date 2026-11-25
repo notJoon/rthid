@@ -23,17 +23,15 @@ pub struct Grid {
     pub palette: Vec<PaletteColor>,
 }
 
-// TODO: Take `&Grid` instead of its fields, since the only caller destructures a Grid.
 /// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
 /// file beside `path` and renames it over the destination only after encoding succeeds.
-pub fn write_atomic(
-    path: &Path,
-    indices: &[u8],
-    w: u32,
-    h: u32,
-    palette: &[PaletteColor],
-    scale: u32,
-) -> io::Result<()> {
+pub fn write_atomic(path: &Path, grid: &Grid, scale: u32) -> io::Result<()> {
+    let &Grid {
+        ref indices,
+        w,
+        h,
+        ref palette,
+    } = grid;
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid PNG grid or scale");
     let scaled = |n: u32| n.checked_mul(scale).filter(|&v| v > 0).ok_or_else(invalid);
     let ow = scaled(w)?;
@@ -68,6 +66,15 @@ mod tests {
     use super::*;
     use rthid_dither::dither::make_palette;
 
+    fn grid(indices: &[u8], w: u32, h: u32, colors: &[&str]) -> Grid {
+        Grid {
+            indices: indices.to_vec(),
+            w,
+            h,
+            palette: make_palette(colors).unwrap(),
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn filesystem_boundaries_preserve_links_and_refuse_unsafe_inputs() {
@@ -76,16 +83,14 @@ mod tests {
         let target = dir.path().join("actual.jpg");
         let alias = dir.path().join("link.png");
         symlink("actual.jpg", &alias).unwrap();
-        let palette = make_palette(&["#000"]).unwrap();
-        write_atomic(&alias, &[0], 1, 1, &palette, 1).unwrap();
+        let black = grid(&[0], 1, 1, &["#000"]);
+        write_atomic(&alias, &black, 1).unwrap();
         assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
         assert_eq!(
             crate::image::load_image(&target).unwrap().dimensions(),
             (1, 1)
         );
-        assert!(
-            write_atomic(&dir.path().join("missing/out.png"), &[0], 1, 1, &palette, 1).is_err()
-        );
+        assert!(write_atomic(&dir.path().join("missing/out.png"), &black, 1).is_err());
         assert!(!dir.path().join("missing").exists());
 
         let huge = dir.path().join("huge.bmp");
@@ -157,9 +162,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
         let path = dir.join("preview.png");
-        let palette = make_palette(&["#000", "#fff"]).unwrap();
+        let colors = ["#000", "#fff"];
         std::fs::write(&path, b"old").unwrap();
-        write_atomic(&path, &[0, 1], 2, 1, &palette, 4).unwrap();
+        write_atomic(&path, &grid(&[0, 1], 2, 1, &colors), 4).unwrap();
         let image = image::open(&path).unwrap().to_rgba8();
         assert_eq!(image.dimensions(), (8, 4));
         assert_eq!(image.get_pixel(3, 3).0, [0, 0, 0, 255]);
@@ -171,12 +176,12 @@ mod tests {
             (&[0][..], 1, 1, 0),
             (&[0][..], 1, 1, u32::MAX),
         ] {
-            assert!(write_atomic(&path, indices, w, h, &palette, scale).is_err());
+            assert!(write_atomic(&path, &grid(indices, w, h, &colors), scale).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
-        assert!(write_atomic(&dir, &[0], 1, 1, &palette, 1).is_err());
+        assert!(write_atomic(&dir, &grid(&[0], 1, 1, &colors), 1).is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        write_atomic(&path, &[1], 1, 1, &palette, 1).unwrap();
+        write_atomic(&path, &grid(&[1], 1, 1, &colors), 1).unwrap();
         assert_eq!(image::open(&path).unwrap().width(), 1);
     }
 }

@@ -7,8 +7,6 @@ publish = false
 [dependencies]
 rthid-dither = { path = "../rthid-dither" }
 image.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [lints]

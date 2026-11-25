@@ -8,30 +8,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-// TODO: `tempfile::Builder` with `NamedTempFile::persist` covers this guard and the unique
-//       name loop once tempfile is a normal dependency.
-struct Temp(Option<PathBuf>);
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 /// Replaces the resolved destination after a successful write, keeping symlinks intact.
 /// The caller syncs the file inside the write closure when durability is needed.
 pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = resolve(path, false)?;
     let parent = path
         .parent()
@@ -56,27 +40,37 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
             }
         }
     }
-    let (temp, mut file) = loop {
-        let temp = parent.join(format!(
-            ".rthid-{}-{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(file) => break (temp, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let mut temp = Temp(Some(temp));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".rthid-").suffix(".tmp");
+    // New files get the usual 0o666 minus umask instead of the private tempfile default.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let mut temp = builder.tempfile_in(parent)?;
     if let Ok(metadata) = fs::metadata(&path) {
-        let _ = file.set_permissions(metadata.permissions());
+        let _ = temp.as_file().set_permissions(metadata.permissions());
     }
-    write(&mut file)?;
-    drop(file);
-    fs::rename(temp.0.as_ref().unwrap(), &path)?;
-    temp.0 = None;
+    write(temp.as_file_mut())?;
+    temp.persist(&path)?;
     Ok(())
+}
+
+/// Reads a config file, returning `None` when it is missing.
+/// Refuses anything other than a regular file so FIFOs and directories are never read.
+pub fn read_regular(path: &Path) -> io::Result<Option<String>> {
+    let read = || {
+        if !fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "config is not a regular file",
+            ));
+        }
+        fs::read_to_string(path)
+    };
+    match read() {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn resolve(path: &Path, create_parent: bool) -> io::Result<PathBuf> {
@@ -147,18 +141,7 @@ pub fn update<T>(
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
-    // TODO: `store::load` repeats this regular file check. Expose one reader from here for both.
-    let text = match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => Some(fs::read_to_string(&path)?),
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "config is not a regular file",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
+    let text = read_regular(&path)?;
     let (text, result) = transform(text)?;
     replace(&path, |file| {
         file.write_all(text.as_bytes())?;
@@ -229,6 +212,10 @@ mod tests {
         );
         assert!(path.with_extension("lock").exists());
         assert!(!alias.with_extension("lock").exists());
+        // A new destination is readable by others under the common umask, not private.
+        let fresh = dir.path().join("fresh.png");
+        replace(&fresh, |_| Ok(())).unwrap();
+        assert_ne!(fs::metadata(&fresh).unwrap().permissions().mode() & 0o044, 0);
     }
 
     #[test]

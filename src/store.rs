@@ -5,7 +5,7 @@ use rthid_dither::dither::{Mode, Tone};
 use rthid_io::atomic;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -222,18 +222,9 @@ impl From<FileTone> for Tone {
 
 /// Loads valid entries while retaining diagnostics and preventing unsafe replacement.
 pub fn load(path: &Path) -> Loaded {
-    let read = || {
-        if !fs::metadata(path)?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "config is not a regular file",
-            ));
-        }
-        fs::read_to_string(path)
-    };
-    let text = match read() {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Loaded::default(),
+    let text = match atomic::read_regular(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Loaded::default(),
         Err(error) => {
             return Loaded {
                 save_blocked: Some(error.to_string()),
@@ -414,6 +405,7 @@ fn path_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn store_round_trip_preserves_entries_and_defaults() {
