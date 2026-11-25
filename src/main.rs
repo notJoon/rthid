@@ -34,6 +34,8 @@ mod grid;
 mod memo;
 /// Modal input and preset editing.
 mod modal;
+/// Paths carried by terminal paste events.
+mod paste;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -54,11 +56,19 @@ use clap::{Parser, ValueEnum};
 use image::{RgbaImage, imageops};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, MouseEventKind,
+    },
     execute,
 };
 
-use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
+use crate::{
+    app::{App, Request},
+    cells::Glyphs,
+    graphics::Mode as Graphics,
+    ui::Renderer,
+};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -66,6 +76,15 @@ struct MouseCapture;
 impl Drop for MouseCapture {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
+
+/// Disables bracketed paste even when the terminal session fails.
+struct BracketedPaste;
+
+impl Drop for BracketedPaste {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
 
@@ -194,7 +213,7 @@ fn main() -> std::io::Result<()> {
     let notice = (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")));
     let mut app = App::new(
         source,
-        preview_png,
+        preview_png.clone(),
         loaded.palettes,
         loaded.templates,
         notice,
@@ -203,17 +222,20 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
+    let bracketed_paste = BracketedPaste;
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
-        execute!(io::stdout(), EnableMouseCapture)?;
+        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         event_loop(
             terminal,
             &mut app,
             &mut renderer,
             debug_log.as_mut(),
             config_path.as_deref(),
+            preview_png.as_deref(),
         )
     });
+    drop(bracketed_paste);
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)
@@ -227,6 +249,7 @@ fn event_loop(
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
+    preview_png: Option<&Path>,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
@@ -240,6 +263,19 @@ fn event_loop(
             if let Some(log) = &mut debug_log {
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
+        }
+        if let Some(Request::Open(path)) = app.take_request() {
+            match check_not_source(&path, preview_png)
+                .map_err(|error| error.to_string())
+                .and_then(|()| load_image(&path))
+            {
+                Ok(image) => app.open_image(path, image),
+                Err(error) => {
+                    app.set_notice(format!("open: {error}"));
+                }
+            }
+            redraw = true;
+            continue;
         }
         redraw = false;
         // With a companion PNG, wake periodically so background write results reach the status line.
@@ -257,6 +293,7 @@ fn event_loop(
             match event {
                 Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
                 Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
+                Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(width, height) => {
                     layout = ui::layout(ratatui::layout::Size::new(width, height));
                     app.clamp_viewport(layout.preview);

@@ -315,6 +315,19 @@ impl Editor {
 }
 
 impl Modal {
+    /// Active text field, excluding prompts behind a confirmation.
+    pub fn text_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self {
+            Self::Templates {
+                prompt,
+                confirm: None,
+                ..
+            } => prompt.as_mut(),
+            Self::Editor(editor) => editor.input.as_mut(),
+            _ => None,
+        }
+    }
+
     /// Opens on the current preset, or the first preset for detached colors.
     pub fn presets(settings: &Settings, palettes: &Palettes) -> Self {
         let list = ListPicker::new(palettes.find(&settings.palette_name).unwrap_or(0));

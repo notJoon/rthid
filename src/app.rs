@@ -17,6 +17,13 @@ use ratatui::layout::Rect;
 use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
+/// File operations performed by the event loop.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Request {
+    /// Load a replacement source image.
+    Open(PathBuf),
+}
+
 /// All interactive state: settings, focus, preview viewport, grid caches and
 /// the optional companion PNG.
 pub struct App {
@@ -24,6 +31,7 @@ pub struct App {
     source_path: Option<PathBuf>,
     notice: Option<String>,
     save_blocked: Option<String>,
+    request: Option<Request>,
     /// Whether palette or template changes need persistence.
     pub(crate) save_requested: bool,
     /// Active dialog, which receives input before global bindings.
@@ -77,8 +85,9 @@ impl App {
             },
             palettes,
             templates,
-            notice,
+            notice: None,
             save_blocked,
+            request: None,
             save_requested: false,
             modal: None,
             settings: Settings::default(),
@@ -89,6 +98,7 @@ impl App {
         if let Some((path, image)) = source {
             app.open_image(path, image);
         }
+        app.notice = notice;
         app
     }
 
@@ -125,6 +135,7 @@ impl App {
 
     /// Replaces the source and resets preview navigation while retaining settings.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
+        self.notice = None;
         self.source_path = Some(path);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
@@ -149,6 +160,35 @@ impl App {
     /// Consumes a pending save unless configuration loading blocked writes.
     pub fn take_save(&mut self) -> bool {
         std::mem::take(&mut self.save_requested) && self.save_blocked.is_none()
+    }
+
+    /// Consumes the pending file operation.
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// Queues an image load and shows its file name while loading.
+    pub fn request_open(&mut self, path: PathBuf) {
+        self.set_notice(format!(
+            "Loading {}",
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+        ));
+        self.request = Some(Request::Open(path));
+    }
+
+    /// Inserts pasted text into the active field or requests a dropped image.
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(modal) = &mut self.modal {
+            if let Some(input) = modal.text_input_mut() {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    input.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+            }
+        } else if let Some(path) = crate::paste::dropped_path(text) {
+            self.request_open(path);
+        }
     }
 
     /// Grid size for the current settings after rotation, known before `sync`
@@ -488,6 +528,41 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    #[test]
+    fn paste_edits_active_fields_or_requests_an_image() {
+        let mut app = App::empty();
+        for code in [KeyCode::Char('P'), KeyCode::Char('n'), KeyCode::Enter] {
+            press(&mut app, code);
+        }
+        app.handle_paste("My\n Pa\tlette猫\u{1b}");
+        assert_eq!(
+            app.modal.as_mut().unwrap().text_input_mut().unwrap().text(),
+            "My Palette猫"
+        );
+        assert!(app.take_request().is_none());
+        press(&mut app, KeyCode::Esc);
+        app.handle_paste("'/tmp/ignored.jpg'");
+        assert!(app.take_request().is_none());
+
+        app.modal = Some(Modal::templates());
+        press(&mut app, KeyCode::Char('n'));
+        app.handle_paste("Template");
+        assert_eq!(
+            app.modal.as_mut().unwrap().text_input_mut().unwrap().text(),
+            "Template"
+        );
+        app.modal = None;
+        app.handle_paste("ordinary text");
+        assert!(app.take_request().is_none());
+        app.handle_paste("'/tmp/My Photo.jpg'");
+        assert_eq!(app.notice(), Some("Loading My Photo.jpg"));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Open(PathBuf::from("/tmp/My Photo.jpg")))
+        );
+        assert!(app.take_request().is_none());
+    }
 
     #[test]
     fn empty_preview_ignores_navigation_but_keeps_panel_edits() {
