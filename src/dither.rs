@@ -1,16 +1,26 @@
+/// A palette color in byte and normalized channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
+    /// RGB channels for rendering.
     pub rgb: [u8; 3],
+    /// Normalized RGB channels for dithering.
     pub f: [f64; 3],
 }
 
+/// Tone adjustments applied before dithering.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
+    /// Brightness offset.
     pub brightness: f64,
+    /// Contrast adjustment around middle gray.
     pub contrast: f64,
+    /// Gamma divisor.
     pub gamma: f64,
+    /// Black point after gamma.
     pub black: f64,
+    /// White point after gamma.
     pub white: f64,
+    /// Sharpening strength before tone mapping.
     pub sharpen: f64,
 }
 
@@ -27,19 +37,28 @@ impl Default for Tone {
     }
 }
 
+/// Color space used to diffuse quantization error.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Mode {
+    /// Luminance error diffusion.
     #[default]
     Tone,
+    /// RGB error diffusion.
     Color,
 }
 
+/// Palette and processing settings for dithering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
+    /// Colors sorted from darkest to lightest.
     pub palette: Vec<PaletteColor>,
+    /// Error diffusion color model.
     pub mode: Mode,
+    /// Whether adjacent rows alternate direction.
     pub serpentine: bool,
+    /// Fraction of quantization error to diffuse.
     pub strength: f64,
+    /// Adjustments applied before quantization.
     pub tone: Tone,
 }
 
@@ -99,8 +118,8 @@ fn to_channels(rgba: &[u8], w: usize, h: usize, tone: &Tone) -> [Vec<f32>; 3] {
     let span = (tone.white - tone.black).max(0.02);
     let g = 1.0 / tone.gamma;
     for (c, channel) in channels.iter_mut().enumerate() {
-        for (i, value) in channel.iter_mut().enumerate() {
-            *value = (f64::from(rgba[i * 4 + c]) / 255.0) as f32;
+        for (value, pixel) in channel.iter_mut().zip(rgba.chunks_exact(4)) {
+            *value = (f64::from(pixel[c]) / 255.0) as f32;
         }
         if tone.sharpen > 0.0 {
             let blurred = box_blur3(channel, w, h);
@@ -135,6 +154,7 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
+/// Converts RGBA pixels to palette indices with error diffusion.
 pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let palette = &options.palette;
     assert!(
@@ -210,6 +230,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     out
 }
 
+/// Expands palette indices into RGBA pixels at the requested dimensions.
 pub fn rasterize(
     idx: &[u8],
     gw: usize,

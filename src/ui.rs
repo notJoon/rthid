@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::app::{App, PALETTES, PARAMS, Param, Params};
+use crate::app::{App, Param};
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,8 @@ impl Renderer {
     }
 }
 
+// TODO: Use Glyphs { approximate } and Image { protocol, error } variants alongside
+// the PreviewGeometry enum when the slider lands.
 #[derive(Default)]
 struct PreviewReport {
     approximate: bool,
@@ -109,13 +111,8 @@ pub fn log_minimap(
     log.flush()
 }
 
-/// Draws into the supplied regions and returns the preview coordinates without changing App.
-pub fn draw(
-    frame: &mut Frame,
-    app: &App,
-    layout: &Layout,
-    renderer: &mut Renderer,
-) -> view::PreviewGeometry {
+/// Draws into the supplied regions without changing App.
+pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
     let block = Block::bordered()
@@ -124,7 +121,7 @@ pub fn draw(
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let list = List::new(PARAMS.map(|param| label(&app.params, param)))
+    let list = List::new(Param::ALL.map(|param| param.label(&app.params)))
         .block(
             Block::bordered()
                 .title("Parameters")
@@ -146,7 +143,6 @@ pub fn draw(
         Paragraph::new(status(app, &geometry, report)),
         layout.status,
     );
-    geometry
 }
 
 fn draw_preview(
@@ -227,22 +223,9 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
         .unwrap_or_else(|| {
             format!(
                 "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
-                u16::from(app.params.rotation) * 90,
+                app.params.rotation.degrees(),
             )
         })
-}
-
-fn label(params: &Params, param: Param) -> String {
-    let o = &params.options;
-    match param {
-        Param::Scale => format!("Scale: {}%", params.scale),
-        Param::Mode => format!("Mode: {:?}", o.mode),
-        Param::Palette => format!("Palette: {}", PALETTES[params.palette].0),
-        Param::Strength => format!("Strength: {:.1}", o.strength),
-        Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
-        Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
-        Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
-    }
 }
 
 #[cfg(test)]
@@ -315,7 +298,7 @@ mod tests {
         }
         assert_eq!(renderer.overviews.full.version(), 1);
         assert_eq!(renderer.overviews.inset.version(), 1);
-        app.params.rotation = 2;
+        app.params.rotation = crate::app::Rotation::R180;
         app.sync(layout(terminal.size().unwrap()).preview);
         for exact in [false, true] {
             app.view.exact = exact;
@@ -403,13 +386,12 @@ mod tests {
         app.view.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
-        let mut geometry = None;
+        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
         let frame = terminal
             .draw(|f| {
-                geometry = Some(draw(f, &app, &layout(f.area()), &mut renderer));
+                draw(f, &app, &layout(f.area()), &mut renderer);
             })
             .unwrap();
-        let geometry = geometry.unwrap();
         log_minimap(&app, &mut log, &frame, &geometry).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.starts_with("[minimap] frame=0 grid=180x180"));

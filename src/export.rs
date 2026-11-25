@@ -2,7 +2,10 @@ use rthid::{
     dither::PaletteColor,
     png::{Job, Worker},
 };
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 /// Companion PNG destination, background writer and latest status.
 pub struct Export {
@@ -18,13 +21,11 @@ impl Export {
             Ok(worker) => (Some(worker), None),
             Err(error) => (None, Some(error)),
         };
-        let mut export = Self {
+        Self {
             worker,
-            error: None,
+            error: message(&path, error),
             path,
-        };
-        export.set_error(error);
-        export
+        }
     }
 
     /// Whether a writer needs dithered pixels even when the preview shows RGB.
@@ -49,9 +50,9 @@ impl Export {
     /// Collects the latest write result and reports a status change.
     pub fn poll(&mut self) -> bool {
         if let Some(worker) = &self.worker
-            && let Some(error) = worker.poll()
+            && let Some(result) = worker.poll()
         {
-            return self.set_error(error);
+            return self.set_error(result.err());
         }
         false
     }
@@ -73,11 +74,15 @@ impl Export {
     }
 
     fn set_error(&mut self, error: Option<io::Error>) -> bool {
-        let error = error.map(|error| format!("PNG {}: {error}", self.path.display()));
+        let error = message(&self.path, error);
         let changed = self.error != error;
         self.error = error;
         changed
     }
+}
+
+fn message(path: &Path, error: Option<io::Error>) -> Option<String> {
+    error.map(|error| format!("PNG {}: {error}", path.display()))
 }
 
 #[cfg(test)]

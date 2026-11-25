@@ -39,6 +39,7 @@ pub enum Pixels<'a> {
         palette: &'a [PaletteColor],
     },
     /// Original grid and its build version.
+    // TODO: Name the fields { image, version }.
     Rgb(&'a RgbaImage, u64),
 }
 
@@ -136,9 +137,8 @@ pub struct View {
     pub y: u32,
 }
 
-// TODO: Make this an enum with `Overview { target }`, `Exact { visible, origin, minimap }`
-// and `Empty` variants when the slider lands. Render, input and status code would then
-// match on the mode once instead of checking `view.exact` and empty areas separately.
+// TODO: Use Overview { target }, Exact { visible, origin, minimap } and Empty variants
+// with the PreviewReport enum when the slider lands.
 /// Preview coordinates shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreviewGeometry {
@@ -171,15 +171,11 @@ pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
     let mut view = *view;
     view.clamp(w, h, area);
     let visible = view.visible(w, h, area);
-    let minimap = if w == 0 || h == 0 {
-        None
-    } else {
-        view.minimap(w, h, area).map(|(frame, map)| Minimap {
-            frame,
-            map,
-            viewport: view.viewport_rect(w, h, visible, map),
-        })
-    };
+    let minimap = view.minimap(w, h, area).map(|(frame, map)| Minimap {
+        frame,
+        map,
+        viewport: view.viewport_rect(w, h, visible, map),
+    });
     PreviewGeometry {
         grid,
         area,
@@ -196,7 +192,13 @@ impl View {
         let fw = (area.width / 3).min(18);
         let frame = Rect::new(area.right() - fw, area.y, fw, (area.height / 3).min(10));
         let inner = Block::bordered().inner(frame);
-        if !self.exact || self.hide_minimap || inner.width < 3 || inner.height < 3 {
+        if w == 0
+            || h == 0
+            || !self.exact
+            || self.hide_minimap
+            || inner.width < 3
+            || inner.height < 3
+        {
             return None;
         }
         let (mw, mh) = fit_aspect(w, h, inner, CELL_ASPECT);
@@ -346,22 +348,23 @@ fn draw_minimap(
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
 ) {
-    if let Some(Minimap {
+    let Some(Minimap {
         frame,
         map,
         viewport,
     }) = geometry.minimap
-    {
-        view.render_minimap(pixels, geometry, buffer, cache);
-        Block::bordered()
-            .border_style(Color::Gray)
-            .render(frame, buffer);
-        for pos in map.positions().filter(|&pos| !viewport.contains(pos)) {
-            let cell = &mut buffer[pos];
-            for color in [&mut cell.fg, &mut cell.bg] {
-                if let Color::Rgb(r, g, b) = *color {
-                    *color = Color::Rgb(r / 2, g / 2, b / 2);
-                }
+    else {
+        return;
+    };
+    view.render_minimap(pixels, geometry, buffer, cache);
+    Block::bordered()
+        .border_style(Color::Gray)
+        .render(frame, buffer);
+    for pos in map.positions().filter(|&pos| !viewport.contains(pos)) {
+        let cell = &mut buffer[pos];
+        for color in [&mut cell.fg, &mut cell.bg] {
+            if let Color::Rgb(r, g, b) = *color {
+                *color = Color::Rgb(r / 2, g / 2, b / 2);
             }
         }
     }
@@ -378,21 +381,54 @@ fn render_overview(
     let (w, h) = grid;
     let (cw, ch) = fit_aspect(w, h, area, CELL_ASPECT);
     let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
-    let (indices, palette) = match pixels {
+    match pixels {
         Pixels::Rgb(pixels, version) => {
-            let colors = cache.get_or_build(
-                OverviewKey {
-                    grid: version,
-                    cols: cw,
-                    rows: ch,
-                },
-                || average_rgb(pixels, cw, ch),
-            );
-            render_overview_rgb(colors, target, buffer);
-            return false;
+            render_overview_rgb(pixels, version, target, buffer, cache);
+            false
         }
-        Pixels::Indexed { indices, palette } => (indices, palette),
-    };
+        Pixels::Indexed { indices, palette } => {
+            render_overview_indexed(indices, palette, grid, glyphs, target, buffer)
+        }
+    }
+}
+
+fn render_overview_rgb(
+    pixels: &RgbaImage,
+    version: u64,
+    target: Rect,
+    buffer: &mut Buffer,
+    cache: &mut OverviewCache,
+) {
+    let colors = cache.get_or_build(
+        OverviewKey {
+            grid: version,
+            cols: target.width,
+            rows: target.height,
+        },
+        || average_rgb(pixels, target.width, target.height),
+    );
+    let cw = usize::from(target.width);
+    for cy in 0..target.height {
+        for cx in 0..target.width {
+            let index = usize::from(cy) * 2 * cw + usize::from(cx);
+            buffer[(target.x + cx, target.y + cy)]
+                .set_symbol("▀")
+                .set_fg(colors[index])
+                .set_bg(colors[index + cw]);
+        }
+    }
+}
+
+fn render_overview_indexed(
+    indices: &[u8],
+    palette: &[PaletteColor],
+    grid: (u32, u32),
+    glyphs: Glyphs,
+    target: Rect,
+    buffer: &mut Buffer,
+) -> bool {
+    let (w, h) = grid;
+    let (cw, ch) = (target.width, target.height);
     let color = |i: u8| Color::from(palette[usize::from(i)].rgb);
     let (cols, rows) = glyphs.subcells();
     let mut approximate = false;
@@ -409,36 +445,8 @@ fn render_overview(
                     / (u64::from(ch) * u64::from(rows) * 2)) as u32;
                 *sample = indices[(y * w + x) as usize];
             }
-            let mut counts = [0u8; 256];
-            for &i in samples.iter() {
-                counts[usize::from(i)] += 1;
-            }
-            let mut ranked = [0u8; 6];
-            let ranked = &mut ranked[..samples.len()];
-            ranked.copy_from_slice(samples);
-            ranked.sort_by_key(|&i| (std::cmp::Reverse(counts[usize::from(i)]), i));
-            let bg = ranked[0];
-            let fg = ranked.iter().copied().find(|&i| i != bg).unwrap_or(bg);
-            let distance = |a: u8, b: u8| -> i32 {
-                palette[usize::from(a)]
-                    .rgb
-                    .iter()
-                    .zip(palette[usize::from(b)].rgb)
-                    .map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2))
-                    .sum()
-            };
-            let mut mask = 0u32;
-            for (n, &i) in samples.iter().enumerate() {
-                let kept = if i == fg || (i != bg && distance(i, fg) < distance(i, bg)) {
-                    fg
-                } else {
-                    bg
-                };
-                approximate |= palette[usize::from(i)].rgb != palette[usize::from(kept)].rgb;
-                if kept == fg && fg != bg {
-                    mask |= 1 << n;
-                }
-            }
+            let (mask, fg, bg, reduced) = reduce_cell(samples, palette);
+            approximate |= reduced;
             let glyph = glyphs.glyph(mask);
             buffer[(target.x + cx, target.y + cy)]
                 .set_char(glyph)
@@ -447,6 +455,41 @@ fn render_overview(
         }
     }
     approximate
+}
+
+fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) {
+    let mut approximate = false;
+    let mut counts = [0u8; 256];
+    for &i in samples {
+        counts[usize::from(i)] += 1;
+    }
+    let mut ranked = [0u8; 6];
+    let ranked = &mut ranked[..samples.len()];
+    ranked.copy_from_slice(samples);
+    ranked.sort_unstable_by_key(|&i| (std::cmp::Reverse(counts[usize::from(i)]), i));
+    let bg = ranked[0];
+    let fg = ranked.iter().copied().find(|&i| i != bg).unwrap_or(bg);
+    let distance = |a: u8, b: u8| -> i32 {
+        palette[usize::from(a)]
+            .rgb
+            .iter()
+            .zip(palette[usize::from(b)].rgb)
+            .map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2))
+            .sum()
+    };
+    let mut mask = 0u32;
+    for (n, &i) in samples.iter().enumerate() {
+        let kept = if i == fg || (i != bg && distance(i, fg) < distance(i, bg)) {
+            fg
+        } else {
+            bg
+        };
+        approximate |= palette[usize::from(i)].rgb != palette[usize::from(kept)].rgb;
+        if kept == fg && fg != bg {
+            mask |= 1 << n;
+        }
+    }
+    (mask, fg, bg, approximate)
 }
 
 fn average_rgb(pixels: &RgbaImage, cw: u16, ch: u16) -> Vec<Color> {
@@ -459,12 +502,10 @@ fn average_rgb(pixels: &RgbaImage, cw: u16, ch: u16) -> Vec<Color> {
         let mut sum = [0u64; 3];
         for y in y0..y1 {
             for x in x0..x1 {
-                for (total, channel) in sum
-                    .iter_mut()
-                    .zip(pixels.get_pixel(x as u32, y as u32).0[..3].iter().copied())
-                {
-                    *total += u64::from(channel);
-                }
+                let [r, g, b, _] = pixels.get_pixel(x as u32, y as u32).0;
+                sum[0] += u64::from(r);
+                sum[1] += u64::from(g);
+                sum[2] += u64::from(b);
             }
         }
         Color::from(sum.map(|total| (total / ((x1 - x0) * (y1 - y0))) as u8))
@@ -474,25 +515,27 @@ fn average_rgb(pixels: &RgbaImage, cw: u16, ch: u16) -> Vec<Color> {
         .collect()
 }
 
-fn render_overview_rgb(colors: &[Color], target: Rect, buffer: &mut Buffer) {
-    let cw = usize::from(target.width);
-    for cy in 0..target.height {
-        for cx in 0..target.width {
-            let index = usize::from(cy) * 2 * cw + usize::from(cx);
-            buffer[(target.x + cx, target.y + cy)]
-                .set_symbol("▀")
-                .set_fg(colors[index])
-                .set_bg(colors[index + cw]);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid::dither::make_palette;
+
+    #[test]
+    fn cell_reduction_preserves_ties_masks_and_color_approximation() {
+        let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
+        for (samples, expected) in [
+            (&[1, 1, 1, 1][..], (0, 1, 1, false)),
+            (&[1, 0, 1, 0][..], (5, 1, 0, false)),
+            (&[0, 2, 0, 2, 1, 2][..], (21, 0, 2, true)),
+            (&[0, 1, 2, 2][..], (3, 0, 2, true)),
+        ] {
+            assert_eq!(reduce_cell(samples, &palette), expected);
+        }
+        let duplicate = make_palette(&["#000", "#000", "#fff"]).unwrap();
+        assert_eq!(reduce_cell(&[0, 1, 2, 2], &duplicate), (3, 0, 2, false));
+    }
 
     #[test]
     fn geometry_preserves_visible_size_and_minimap_coordinates() {

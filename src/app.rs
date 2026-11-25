@@ -11,12 +11,90 @@ use ratatui::layout::Rect;
 use rthid::dither::{self, Mode, Options};
 use std::path::PathBuf;
 
+/// Named colors available in the parameter panel.
+pub struct Preset {
+    /// Label shown for the preset.
+    pub name: &'static str,
+    /// Hex colors used to build the palette.
+    pub colors: &'static [&'static str],
+}
+
 /// Palette presets available in the parameter panel.
-pub const PALETTES: [(&str, &[&str]); 3] = [
-    ("Black/white", &["#000", "#fff"]),
-    ("4-gray", &["#000", "#555", "#aaa", "#fff"]),
-    ("Warm inks", &["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"]),
+pub const PALETTES: [Preset; 3] = [
+    Preset {
+        name: "Black/white",
+        colors: &["#000", "#fff"],
+    },
+    Preset {
+        name: "4-gray",
+        colors: &["#000", "#555", "#aaa", "#fff"],
+    },
+    Preset {
+        name: "Warm inks",
+        colors: &["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"],
+    },
 ];
+
+/// Clockwise rotation of the source image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    /// Original orientation.
+    #[default]
+    R0,
+    /// One clockwise quarter turn.
+    R90,
+    /// Half turn.
+    R180,
+    /// Three clockwise quarter turns.
+    R270,
+}
+
+impl Rotation {
+    /// Turns clockwise by ninety degrees.
+    pub fn cw(self) -> Self {
+        match self {
+            Self::R0 => Self::R90,
+            Self::R90 => Self::R180,
+            Self::R180 => Self::R270,
+            Self::R270 => Self::R0,
+        }
+    }
+
+    /// Turns counterclockwise by ninety degrees.
+    pub fn ccw(self) -> Self {
+        match self {
+            Self::R0 => Self::R270,
+            Self::R90 => Self::R0,
+            Self::R180 => Self::R90,
+            Self::R270 => Self::R180,
+        }
+    }
+
+    /// Whether rotation exchanges width and height.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Self::R90 | Self::R270)
+    }
+
+    /// Clockwise angle for display.
+    pub fn degrees(self) -> u16 {
+        match self {
+            Self::R0 => 0,
+            Self::R90 => 90,
+            Self::R180 => 180,
+            Self::R270 => 270,
+        }
+    }
+
+    /// Rotates the image into this orientation.
+    pub fn apply(self, image: RgbaImage) -> RgbaImage {
+        match self {
+            Self::R0 => image,
+            Self::R90 => imageops::rotate90(&image),
+            Self::R180 => imageops::rotate180(&image),
+            Self::R270 => imageops::rotate270(&image),
+        }
+    }
+}
 
 /// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,26 +115,57 @@ pub enum Param {
     Contrast,
 }
 
-/// Parameter panel order.
-pub const PARAMS: [Param; 7] = [
-    Param::Scale,
-    Param::Mode,
-    Param::Palette,
-    Param::Strength,
-    Param::Serpentine,
-    Param::Brightness,
-    Param::Contrast,
-];
+impl Param {
+    /// Parameter panel order.
+    pub const ALL: [Self; 7] = [
+        Self::Scale,
+        Self::Mode,
+        Self::Palette,
+        Self::Strength,
+        Self::Serpentine,
+        Self::Brightness,
+        Self::Contrast,
+    ];
+
+    /// Label including the current value.
+    pub fn label(self, params: &Params) -> String {
+        let o = &params.options;
+        match self {
+            Param::Scale => format!("Scale: {}%", params.scale),
+            Param::Mode => format!("Mode: {:?}", o.mode),
+            Param::Palette => format!("Palette: {}", params.palette_name()),
+            Param::Strength => format!("Strength: {:.1}", o.strength),
+            Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
+            Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
+            Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
+        }
+    }
+
+    /// Steps per unit and inclusive bounds for numeric parameters.
+    pub fn range(self) -> Option<(f64, f64, f64)> {
+        match self {
+            Self::Scale => Some((0.1, 10.0, 200.0)),
+            Self::Strength => Some((10.0, 0.0, 1.0)),
+            Self::Brightness => Some((20.0, -0.5, 0.5)),
+            Self::Contrast => Some((20.0, -0.5, 1.0)),
+            Self::Mode | Self::Palette | Self::Serpentine => None,
+        }
+    }
+
+    /// Whether changing this parameter selects the dithered preview.
+    pub fn shows_dithered(self) -> bool {
+        self != Self::Scale
+    }
+}
 
 /// Editable values restored by the reset keys.
 #[derive(Clone, PartialEq)]
 pub struct Params {
     /// Source size as a percentage.
     pub scale: i32,
-    /// Clockwise quarter turns.
-    pub rotation: u8,
-    /// Selected palette preset.
-    pub palette: usize,
+    /// Source image orientation.
+    pub rotation: Rotation,
+    palette: usize,
     /// Dither and tone settings.
     pub options: Options,
 }
@@ -65,7 +174,7 @@ impl Default for Params {
     fn default() -> Self {
         let mut params = Self {
             scale: 100,
-            rotation: 0,
+            rotation: Rotation::R0,
             palette: 0,
             options: Options::default(),
         };
@@ -75,9 +184,60 @@ impl Default for Params {
 }
 
 impl Params {
+    /// Name of the selected palette preset.
+    pub fn palette_name(&self) -> &'static str {
+        PALETTES[self.palette].name
+    }
+
     fn set_palette(&mut self, i: usize) {
         self.palette = i;
-        self.options.palette = dither::make_palette(PALETTES[i].1).expect("valid preset");
+        self.options.palette = dither::make_palette(PALETTES[i].colors).expect("valid preset");
+    }
+
+    /// Returns settings with one parameter restored to its default.
+    pub fn with_default(&self, param: Param) -> Self {
+        let mut next = self.clone();
+        let defaults = Self::default();
+        match param {
+            Param::Scale => next.scale = defaults.scale,
+            Param::Mode => next.options.mode = defaults.options.mode,
+            Param::Palette => next.set_palette(defaults.palette),
+            Param::Strength => next.options.strength = defaults.options.strength,
+            Param::Serpentine => next.options.serpentine = defaults.options.serpentine,
+            Param::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
+            Param::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
+        }
+        next
+    }
+
+    /// Returns settings adjusted by the requested number of steps.
+    pub fn adjusted(&self, param: Param, dir: i32) -> Self {
+        let mut next = self.clone();
+        let step = |value: f64| {
+            let (steps, low, high) = param.range().expect("numeric parameter");
+            (((value * steps).round() + f64::from(dir)) / steps).clamp(low, high)
+        };
+        match param {
+            Param::Scale => {
+                let (steps, low, high) = param.range().expect("numeric parameter");
+                next.scale =
+                    (f64::from(self.scale) + f64::from(dir) / steps).clamp(low, high) as i32;
+            }
+            Param::Mode => {
+                next.options.mode = match self.options.mode {
+                    Mode::Tone => Mode::Color,
+                    Mode::Color => Mode::Tone,
+                }
+            }
+            Param::Palette => next.set_palette(
+                (self.palette as i32 + dir).rem_euclid(PALETTES.len() as i32) as usize,
+            ),
+            Param::Strength => next.options.strength = step(self.options.strength),
+            Param::Serpentine => next.options.serpentine = !self.options.serpentine,
+            Param::Brightness => next.options.tone.brightness = step(self.options.tone.brightness),
+            Param::Contrast => next.options.tone.contrast = step(self.options.tone.contrast),
+        }
+        next
     }
 }
 
@@ -86,7 +246,7 @@ impl Params {
 struct GridKey {
     width: u32,
     height: u32,
-    rotation: u8,
+    rotation: Rotation,
 }
 
 /// Processed grid version and settings used to dither it.
@@ -125,12 +285,7 @@ impl Pipeline {
             || {
                 let scaled =
                     imageops::resize(&self.source, width, height, imageops::FilterType::Triangle);
-                match params.rotation {
-                    1 => imageops::rotate90(&scaled),
-                    2 => imageops::rotate180(&scaled),
-                    3 => imageops::rotate270(&scaled),
-                    _ => scaled,
-                }
+                params.rotation.apply(scaled)
             },
         );
         if !need_dither {
@@ -215,10 +370,10 @@ impl App {
     /// Returns scaled dimensions after rotation.
     pub fn grid_size(&self) -> (u32, u32) {
         let (w, h) = self.pipeline.scaled_size(&self.params);
-        if self.params.rotation.is_multiple_of(2) {
-            (w, h)
-        } else {
+        if self.params.rotation.swaps_axes() {
             (h, w)
+        } else {
+            (w, h)
         }
     }
 
@@ -287,10 +442,7 @@ impl App {
     pub fn finish_png(&mut self) -> std::io::Result<()> {
         // A change and quit can arrive in the same input batch.
         self.refresh();
-        match &mut self.export {
-            Some(export) => export.finish(),
-            None => Ok(()),
-        }
+        self.export.as_mut().map_or(Ok(()), Export::finish)
     }
 
     /// Applies mouse input using the current preview coordinates.
@@ -328,6 +480,7 @@ impl App {
         }
     }
 
+    // TODO: Introduce an Action enum with a pure key mapping once more bindings arrive.
     /// Applies a key using the current preview coordinates for panning.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
@@ -352,10 +505,7 @@ impl App {
             return;
         }
         if self.preview_focus {
-            let (vw, vh) = geometry.visible;
-            let page_x = i64::from(vw.saturating_sub(2).max(1));
-            let page_y = i64::from(vh.saturating_sub(2).max(1));
-            let pan = match key.code {
+            match key.code {
                 KeyCode::Char('m') => {
                     self.view.hide_minimap = !self.view.hide_minimap;
                     return;
@@ -365,16 +515,9 @@ impl App {
                     self.last_drag = None;
                     return;
                 }
-                KeyCode::Char('H') => Some((-page_x, 0)),
-                KeyCode::Char('L') => Some((page_x, 0)),
-                KeyCode::Char('K') => Some((0, -page_y)),
-                KeyCode::Char('J') => Some((0, page_y)),
-                KeyCode::Left | KeyCode::Char('h') => Some((-1, 0)),
-                KeyCode::Right | KeyCode::Char('l') => Some((1, 0)),
-                KeyCode::Up | KeyCode::Char('k') => Some((0, -1)),
-                KeyCode::Down | KeyCode::Char('j') => Some((0, 1)),
-                _ => None,
-            };
+                _ => {}
+            }
+            let pan = pan_delta(key.code, geometry.visible);
             if let Some((dx, dy)) = pan {
                 if self.view.exact {
                     self.view.pan(dx, dy, geometry);
@@ -386,79 +529,42 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(PARAMS.len() - 1);
+                self.selected = (self.selected + 1).min(Param::ALL.len() - 1);
             }
-            KeyCode::Char('r') => self.rotate(1),
-            KeyCode::Char('R') => self.rotate(3),
-            KeyCode::Char('d') => self.reset(false),
-            KeyCode::Char('D') => self.reset(true),
+            KeyCode::Char('r') => self.params.rotation = self.params.rotation.cw(),
+            KeyCode::Char('R') => self.params.rotation = self.params.rotation.ccw(),
+            KeyCode::Char('d') => self.params = self.params.with_default(Param::ALL[self.selected]),
+            KeyCode::Char('D') => self.params = Params::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
             _ => {}
         }
     }
 
-    fn rotate(&mut self, quarter_turns: u8) {
-        self.params.rotation = (self.params.rotation + quarter_turns) % 4;
-    }
-
-    // Restores the selected parameter, or every parameter and the rotation when `all` is set.
-    fn reset(&mut self, all: bool) {
-        let defaults = Params::default();
-        let (p, d) = (&mut self.params, &defaults.options);
-        match PARAMS[self.selected] {
-            _ if all => *p = defaults.clone(),
-            Param::Scale => p.scale = defaults.scale,
-            Param::Mode => p.options.mode = d.mode,
-            Param::Palette => p.set_palette(defaults.palette),
-            Param::Strength => p.options.strength = d.strength,
-            Param::Serpentine => p.options.serpentine = d.serpentine,
-            Param::Brightness => p.options.tone.brightness = d.tone.brightness,
-            Param::Contrast => p.options.tone.contrast = d.tone.contrast,
-        }
-    }
-
     fn adjust(&mut self, direction: i32) {
-        let p = &mut self.params;
-        let o = &mut p.options;
+        let param = Param::ALL[self.selected];
+        let next = self.params.adjusted(param, direction);
         // Clamped presses preserve the current preview selection.
-        let step = |value: &mut f64, steps: f64, low: f64, high: f64| {
-            let next = (((*value * steps).round() + f64::from(direction)) / steps).clamp(low, high);
-            let changed = next != *value;
-            *value = next;
-            changed
-        };
-        let param = PARAMS[self.selected];
-        let changed = match param {
-            Param::Scale => {
-                let next = (p.scale + direction * 10).clamp(10, 200);
-                let changed = next != p.scale;
-                p.scale = next;
-                changed
-            }
-            Param::Mode => {
-                o.mode = match o.mode {
-                    Mode::Tone => Mode::Color,
-                    Mode::Color => Mode::Tone,
-                };
-                true
-            }
-            Param::Palette => {
-                let i = (p.palette as i32 + direction).rem_euclid(PALETTES.len() as i32);
-                p.set_palette(i as usize);
-                true
-            }
-            Param::Strength => step(&mut o.strength, 10.0, 0.0, 1.0),
-            Param::Serpentine => {
-                o.serpentine = !o.serpentine;
-                true
-            }
-            Param::Brightness => step(&mut o.tone.brightness, 20.0, -0.5, 0.5),
-            Param::Contrast => step(&mut o.tone.contrast, 20.0, -0.5, 1.0),
-        };
-        if changed && param != Param::Scale {
+        if next != self.params && param.shows_dithered() {
             self.show_original = false;
         }
+        self.params = next;
+    }
+}
+
+fn pan_delta(code: KeyCode, visible: (u32, u32)) -> Option<(i64, i64)> {
+    let page_x = i64::from(visible.0.saturating_sub(2).max(1));
+    let page_y = i64::from(visible.1.saturating_sub(2).max(1));
+    match code {
+        KeyCode::Char('H') => Some((-page_x, 0)),
+        KeyCode::Char('L') => Some((page_x, 0)),
+        KeyCode::Char('K') => Some((0, -page_y)),
+        KeyCode::Char('J') => Some((0, page_y)),
+        KeyCode::Left | KeyCode::Char('h') => Some((-1, 0)),
+        KeyCode::Right | KeyCode::Char('l') => Some((1, 0)),
+        KeyCode::Up | KeyCode::Char('k') => Some((0, -1)),
+        KeyCode::Down | KeyCode::Char('j') => Some((0, 1)),
+        _ => None,
     }
 }
 
@@ -467,6 +573,82 @@ mod tests {
     use super::*;
     use crate::ui::Layout;
     use ratatui::layout::Rect;
+
+    #[test]
+    fn rotation_preserves_pixels_and_cycles() {
+        let image = RgbaImage::from_raw(2, 3, (0..24).collect()).unwrap();
+        for (rotation, degrees, expected) in [
+            (Rotation::R0, 0, image.clone()),
+            (Rotation::R90, 90, imageops::rotate90(&image)),
+            (Rotation::R180, 180, imageops::rotate180(&image)),
+            (Rotation::R270, 270, imageops::rotate270(&image)),
+        ] {
+            assert_eq!(rotation.cw().ccw(), rotation);
+            assert_eq!(rotation.ccw().cw(), rotation);
+            assert_eq!(rotation.cw().cw().cw().cw(), rotation);
+            assert_eq!(rotation.degrees(), degrees);
+            let rotated = rotation.apply(image.clone());
+            assert_eq!(rotated, expected);
+            assert_eq!(
+                rotated.dimensions() != image.dimensions(),
+                rotation.swaps_axes()
+            );
+        }
+    }
+
+    #[test]
+    fn adjustments_and_defaults_leave_the_input_unchanged() {
+        let params = Params {
+            scale: 105,
+            ..Params::default()
+        };
+        let next = params.adjusted(Param::Scale, 1);
+        assert_eq!(params.scale, 105);
+        assert_eq!(next.scale, 115);
+        assert_eq!(next.with_default(Param::Scale).scale, 100);
+        for param in Param::ALL {
+            let next = params.adjusted(param, -1);
+            let reset = next.with_default(param);
+            assert_eq!(param.label(&reset), param.label(&Params::default()));
+            assert_eq!(param.shows_dithered(), param != Param::Scale);
+            if param == Param::Palette {
+                assert_eq!(next.palette_name(), PALETTES[2].name);
+                assert_eq!(
+                    next.options.palette,
+                    dither::make_palette(PALETTES[2].colors).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pan_keys_use_pixels_and_visible_pages() {
+        for (codes, expected) in [
+            ([KeyCode::Left, KeyCode::Char('h')], (-1, 0)),
+            ([KeyCode::Right, KeyCode::Char('l')], (1, 0)),
+            ([KeyCode::Up, KeyCode::Char('k')], (0, -1)),
+            ([KeyCode::Down, KeyCode::Char('j')], (0, 1)),
+        ] {
+            for code in codes {
+                assert_eq!(pan_delta(code, (20, 12)), Some(expected));
+            }
+        }
+        for (code, expected) in [
+            ('H', (-18, 0)),
+            ('L', (18, 0)),
+            ('K', (0, -10)),
+            ('J', (0, 10)),
+        ] {
+            assert_eq!(pan_delta(KeyCode::Char(code), (20, 12)), Some(expected));
+        }
+        for visible in [(0, 0), (1, 1), (2, 2)] {
+            assert_eq!(pan_delta(KeyCode::Char('H'), visible), Some((-1, 0)));
+            assert_eq!(pan_delta(KeyCode::Char('J'), visible), Some((0, 1)));
+        }
+        for code in ['m', 'z', 'q'] {
+            assert_eq!(pan_delta(KeyCode::Char(code), (20, 12)), None);
+        }
+    }
 
     fn test_layout() -> Layout {
         crate::ui::layout(Rect::new(0, 0, 41, 9))
@@ -485,7 +667,7 @@ mod tests {
 
     fn app_at(param: Param) -> App {
         let mut app = App::new(RgbaImage::new(4, 4), None);
-        app.selected = PARAMS.iter().position(|&p| p == param).unwrap();
+        app.selected = Param::ALL.iter().position(|&p| p == param).unwrap();
         app
     }
 
@@ -505,7 +687,7 @@ mod tests {
         assert_eq!(app.pipeline.grid.version(), 1);
         assert_eq!(app.pipeline.dithered.version(), 2);
         app.show_original = true;
-        app.params.rotation = 2;
+        app.params.rotation = Rotation::R180;
         app.sync(test_layout().preview);
         assert_eq!(app.pipeline.grid.version(), 2);
         assert_eq!(app.pipeline.dithered.version(), 2);
@@ -518,10 +700,10 @@ mod tests {
     fn sync_clamps_after_layout_and_grid_changes() {
         let mut app = App::new(RgbaImage::new(120, 80), None);
         for (screen, scale, rotation, expected) in [
-            (Rect::new(0, 0, 41, 9), 100, 0, (110, 70)),
-            (Rect::new(0, 0, 100, 40), 100, 0, (51, 8)),
-            (Rect::new(0, 0, 100, 40), 50, 0, (0, 0)),
-            (Rect::new(0, 0, 100, 40), 100, 1, (11, 48)),
+            (Rect::new(0, 0, 41, 9), 100, Rotation::R0, (110, 70)),
+            (Rect::new(0, 0, 100, 40), 100, Rotation::R0, (51, 8)),
+            (Rect::new(0, 0, 100, 40), 50, Rotation::R0, (0, 0)),
+            (Rect::new(0, 0, 100, 40), 100, Rotation::R90, (11, 48)),
         ] {
             app.params.scale = scale;
             app.params.rotation = rotation;
@@ -539,7 +721,10 @@ mod tests {
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
-        app.selected = PARAMS.iter().position(|&p| p == Param::Strength).unwrap();
+        app.selected = Param::ALL
+            .iter()
+            .position(|&p| p == Param::Strength)
+            .unwrap();
         assert!(app.show_original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
@@ -610,20 +795,21 @@ mod tests {
         for _ in 0..10 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(PARAMS[app.selected], Param::Contrast);
+        assert_eq!(Param::ALL[app.selected], Param::Contrast);
         assert!(!press(&mut app, KeyCode::Char('x')));
     }
 
     #[test]
     fn numeric_params_clamp_without_redither() {
         type Getter = fn(&Params) -> f64;
-        let cases: [(Param, Getter, f64, f64); 4] = [
-            (Param::Scale, |p| f64::from(p.scale), 10.0, 200.0),
-            (Param::Strength, |p| p.options.strength, 0.0, 1.0),
-            (Param::Brightness, |p| p.options.tone.brightness, -0.5, 0.5),
-            (Param::Contrast, |p| p.options.tone.contrast, -0.5, 1.0),
+        let cases: [(Param, Getter); 4] = [
+            (Param::Scale, |p| f64::from(p.scale)),
+            (Param::Strength, |p| p.options.strength),
+            (Param::Brightness, |p| p.options.tone.brightness),
+            (Param::Contrast, |p| p.options.tone.contrast),
         ];
-        for (param, get, low, high) in cases {
+        for (param, get) in cases {
+            let (_, low, high) = param.range().unwrap();
             let mut app = app_at(param);
             for (key, limit) in [(KeyCode::Left, low), (KeyCode::Right, high)] {
                 for _ in 0..50 {
@@ -661,21 +847,24 @@ mod tests {
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.params.options.mode, Mode::Tone));
-        assert_eq!((app.params.scale, app.params.rotation), (110, 1));
+        assert_eq!(
+            (app.params.scale, app.params.rotation),
+            (110, Rotation::R90)
+        );
         app.selected = 2;
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.params;
-        assert_eq!((p.scale, p.rotation, p.palette), (100, 0, 0));
+        assert_eq!((p.scale, p.rotation, p.palette), (100, Rotation::R0, 0));
         assert_eq!(p.options.palette.len(), 2);
         assert_eq!(app.pipeline.dithered.get().unwrap().len(), 16);
     }
 
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
-        for param in PARAMS {
+        for param in Param::ALL {
             let mut app = App::new(RgbaImage::new(20, 10), None);
-            app.selected = PARAMS.iter().position(|&p| p == param).unwrap();
+            app.selected = Param::ALL.iter().position(|&p| p == param).unwrap();
             assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
             assert!(press(&mut app, KeyCode::Left));
@@ -748,10 +937,10 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.params.rotation, 1);
+        assert_eq!(app.params.rotation, Rotation::R90);
         press(&mut app, KeyCode::Char('R'));
         press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.params.rotation, 3);
+        assert_eq!(app.params.rotation, Rotation::R270);
         assert_eq!(app.grid_size(), (128, 256));
         let mut app = App::new(RgbaImage::new(15, 1), None);
         app.show_original = false;

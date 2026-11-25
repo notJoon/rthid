@@ -366,7 +366,7 @@ mod tests {
         app.view.exact = false;
         assert_eq!(draw(&mut app, &mut terminal), 1);
         app.view.exact = true;
-        app.params.rotation = 2;
+        app.params.rotation = crate::app::Rotation::R180;
         assert_eq!(draw(&mut app, &mut terminal), 1);
         app.view.exact = false;
         assert_eq!(draw(&mut app, &mut terminal), 2);

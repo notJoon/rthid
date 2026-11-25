@@ -55,6 +55,8 @@ struct Args {
     graphics: CliGraphics,
 }
 
+// TODO: These enums mirror view::Glyphs and graphics::Mode to keep clap out of lower modules.
+// Revisit deriving ValueEnum on domain enums if that separation stops mattering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CliGlyphs {
     Sextant,
@@ -110,24 +112,25 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = match image::open(&path) {
-        Ok(image) if image.width().max(image.height()) > MAX_SOURCE_SIDE => image
-            .resize(
-                MAX_SOURCE_SIDE,
-                MAX_SOURCE_SIDE,
-                imageops::FilterType::Triangle,
-            )
-            .to_rgba8(),
-        Ok(image) => image.to_rgba8(),
-        Err(error) => {
-            eprintln!("Could not load {}: {error}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let source = image::open(&path).unwrap_or_else(|error| {
+        eprintln!("Could not load {}: {error}", path.display());
+        std::process::exit(1);
+    });
+    let source = if source.width().max(source.height()) > MAX_SOURCE_SIDE {
+        source.resize(
+            MAX_SOURCE_SIDE,
+            MAX_SOURCE_SIDE,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        source
+    }
+    .to_rgba8();
     let mut app = App::new(source, preview_png);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
+    // TODO: Extract an event_loop function that takes its dependencies explicitly.
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
@@ -137,12 +140,11 @@ fn main() -> std::io::Result<()> {
             if redraw {
                 app.poll_export();
                 app.sync(layout.preview);
-                let mut geometry = None;
                 let frame = terminal.draw(|frame| {
-                    geometry = Some(ui::draw(frame, &app, &layout, &mut renderer));
+                    ui::draw(frame, &app, &layout, &mut renderer);
                 })?;
                 if let Some(log) = &mut debug_log {
-                    ui::log_minimap(&app, log, &frame, &geometry.unwrap())?;
+                    ui::log_minimap(&app, log, &frame, &app.geometry(layout.preview))?;
                 }
             }
             redraw = false;
