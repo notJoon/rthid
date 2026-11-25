@@ -9,7 +9,6 @@ pub struct Export {
     path: PathBuf,
     worker: Option<Worker>,
     error: Option<String>,
-    submitted: Option<u64>,
 }
 
 impl Export {
@@ -19,12 +18,13 @@ impl Export {
             Ok(worker) => (Some(worker), None),
             Err(error) => (None, Some(error)),
         };
-        Self {
+        let mut export = Self {
             worker,
-            error: error.map(|error| format!("PNG {}: {error}", path.display())),
+            error: None,
             path,
-            submitted: None,
-        }
+        };
+        export.set_error(error);
+        export
     }
 
     /// Whether a writer needs dithered pixels even when the preview shows RGB.
@@ -32,21 +32,17 @@ impl Export {
         self.worker.is_some()
     }
 
-    /// Submits each dithered version once.
-    pub fn sync(&mut self, indices: &[u8], w: u32, h: u32, palette: &[PaletteColor], version: u64) {
-        if self.submitted == Some(version) {
-            return;
-        }
-        if let Some(worker) = &mut self.worker {
-            self.submitted = Some(version);
-            if let Err(error) = worker.submit(Job {
+    /// Submits the refreshed dithered pixels.
+    pub fn sync(&mut self, indices: &[u8], w: u32, h: u32, palette: &[PaletteColor]) {
+        if let Some(worker) = &mut self.worker
+            && let Err(error) = worker.submit(Job {
                 indices: indices.to_vec(),
                 w,
                 h,
                 palette: palette.to_vec(),
-            }) {
-                self.set_error(Some(error));
-            }
+            })
+        {
+            self.set_error(Some(error));
         }
     }
 
@@ -89,13 +85,12 @@ mod tests {
     use super::*;
     use rthid::dither::make_palette;
 
-    fn sync(export: &mut Export, w: u32, h: u32, version: u64) {
+    fn sync(export: &mut Export, w: u32, h: u32) {
         export.sync(
             &vec![0; (w * h) as usize],
             w,
             h,
             &make_palette(&["#000", "#fff"]).unwrap(),
-            version,
         )
     }
 
@@ -115,14 +110,14 @@ mod tests {
     }
 
     #[test]
-    fn sync_submits_each_version_once() {
+    fn sync_submits_latest_pixels() {
         let path =
             std::env::temp_dir().join(format!("rthid-version-test-{}.png", std::process::id()));
         let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2, 1);
-        sync(&mut export, 2, 4, 1);
+        sync(&mut export, 4, 2);
+        sync(&mut export, 2, 4);
         export.finish().unwrap();
-        assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (16, 8));
+        assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
         assert!(export.status().is_none());
         std::fs::remove_file(path).unwrap();
     }
@@ -132,7 +127,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rthid-status-test-{}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2, 1);
+        sync(&mut export, 4, 2);
         let wait_for_change = |export: &mut Export| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !export.poll() {
@@ -152,7 +147,7 @@ mod tests {
         );
         assert!(!export.poll());
         std::fs::remove_dir(&path).unwrap();
-        sync(&mut export, 4, 2, 2);
+        sync(&mut export, 4, 2);
         wait_for_change(&mut export);
         assert!(export.status().is_none());
         assert!(!export.poll());
@@ -167,11 +162,11 @@ mod tests {
         let path = dir.join("preview.png");
         std::fs::create_dir(&path).unwrap();
         let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2, 1);
+        sync(&mut export, 4, 2);
         wait_for(&mut export, |export| export.status().is_some());
         std::fs::remove_dir(&path).unwrap();
         let error = export.status().unwrap().to_owned();
-        sync(&mut export, 4, 2, 2);
+        sync(&mut export, 4, 2);
         assert_eq!(export.status(), Some(error.as_str()));
         export.finish().unwrap();
         assert!(export.status().is_none());
@@ -184,25 +179,22 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("preview.png");
         let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2, 1);
+        sync(&mut export, 4, 2);
         wait_for(&mut export, |_| {
             image::open(&path).is_ok_and(|image| image.width() == 16)
         });
-        sync(&mut export, 2, 4, 2);
+        sync(&mut export, 2, 4);
         wait_for(&mut export, |_| {
             image::open(&path).is_ok_and(|image| image.width() == 8)
         });
         std::fs::remove_file(&path).unwrap();
-        sync(&mut export, 2, 4, 2);
-        assert!(!path.exists());
-        assert_eq!(export.submitted, Some(2));
         std::fs::create_dir(&path).unwrap();
-        sync(&mut export, 2, 4, 3);
+        sync(&mut export, 2, 4);
         wait_for(&mut export, |export| export.status().is_some());
         export.poll();
         assert!(export.status().is_some());
         std::fs::remove_dir(&path).unwrap();
-        sync(&mut export, 2, 4, 4);
+        sync(&mut export, 2, 4);
         wait_for(&mut export, |export| export.status().is_none());
         export.finish().unwrap();
         std::fs::remove_dir_all(dir).unwrap();

@@ -138,13 +138,15 @@ impl Pipeline {
         }
         let grid = self.grid.get().expect("processed grid");
         let (w, h) = grid.dimensions();
-        let key = DitherKey {
-            grid: self.grid_version(),
-            options: params.options.clone(),
-        };
-        self.dithered.update(key, || {
-            dither::dither(grid.as_raw(), w as usize, h as usize, &params.options)
-        })
+        let version = self.grid_version();
+        self.dithered.update_by(
+            |key| key.grid == version && key.options == params.options,
+            || DitherKey {
+                grid: version,
+                options: params.options.clone(),
+            },
+            || dither::dither(grid.as_raw(), w as usize, h as usize, &params.options),
+        )
     }
 
     /// Processed image after scaling and rotation.
@@ -165,12 +167,6 @@ impl Pipeline {
     /// Loaded dimensions before scaling and rotation.
     pub fn source_size(&self) -> (u32, u32) {
         self.source.dimensions()
-    }
-
-    /// Mutable indices for rendering fixtures.
-    #[cfg(test)]
-    pub fn dithered_mut(&mut self) -> &mut Vec<u8> {
-        self.dithered.get_mut().unwrap()
     }
 }
 
@@ -229,13 +225,22 @@ impl App {
     /// Refreshes image consumers and clamps the view to the preview area.
     pub fn sync(&mut self, preview: Rect) {
         self.refresh();
+        self.clamp_view(preview);
+    }
+
+    /// Coordinates shared by preview input and rendering.
+    pub fn geometry(&self, area: Rect) -> PreviewGeometry {
+        crate::view::geometry(&self.view, self.grid_size(), area)
+    }
+
+    /// Keeps the view within the current grid and preview area.
+    pub fn clamp_view(&mut self, area: Rect) {
         let (w, h) = self.grid_size();
-        self.view.clamp(w, h, preview);
+        self.view.clamp(w, h, area);
     }
 
     fn refresh(&mut self) {
-        let need_dither =
-            !self.show_original || self.export.as_ref().is_some_and(Export::needs_dither);
+        let need_dither = !self.show_original || self.has_export();
         if self.pipeline.refresh(&self.params, need_dither)
             && let Some(export) = &mut self.export
         {
@@ -245,14 +250,13 @@ impl App {
                 w,
                 h,
                 &self.params.options.palette,
-                self.pipeline.dithered.version(),
             );
         }
     }
 
-    /// Whether a companion PNG destination was requested.
+    /// Whether a companion PNG writer needs dithered pixels.
     pub fn has_export(&self) -> bool {
-        self.export.is_some()
+        self.export.as_ref().is_some_and(Export::needs_dither)
     }
 
     /// Collects PNG results and reports whether the status changed.
@@ -296,14 +300,12 @@ impl App {
         if !self.view.exact || !geometry.area.contains(point.into()) {
             return;
         }
-        let (w, h) = geometry.grid;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(minimap) = geometry.minimap
                     && minimap.map.contains(point.into())
                 {
-                    self.view
-                        .center_on_minimap(point, w, h, geometry.area, minimap.map);
+                    self.view.center_on_minimap(point, geometry);
                 } else {
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
                         && let Some((x, y)) = prev
@@ -311,19 +313,17 @@ impl App {
                         self.view.pan(
                             i64::from(x) - i64::from(mouse.column),
                             (i64::from(y) - i64::from(mouse.row)) * 2,
-                            w,
-                            h,
-                            geometry.area,
+                            geometry,
                         );
                     }
                     self.last_drag = Some(point);
                 }
             }
-            MouseEventKind::ScrollUp => self.view.pan(0, -6, w, h, geometry.area),
-            MouseEventKind::ScrollDown => self.view.pan(0, 6, w, h, geometry.area),
+            MouseEventKind::ScrollUp => self.view.pan(0, -6, geometry),
+            MouseEventKind::ScrollDown => self.view.pan(0, 6, geometry),
             // Trackpads send horizontal swipes as sideways scrolls.
-            MouseEventKind::ScrollLeft => self.view.pan(-6, 0, w, h, geometry.area),
-            MouseEventKind::ScrollRight => self.view.pan(6, 0, w, h, geometry.area),
+            MouseEventKind::ScrollLeft => self.view.pan(-6, 0, geometry),
+            MouseEventKind::ScrollRight => self.view.pan(6, 0, geometry),
             _ => {}
         }
     }
@@ -352,7 +352,6 @@ impl App {
             return;
         }
         if self.preview_focus {
-            let (w, h) = geometry.grid;
             let (vw, vh) = geometry.visible;
             let page_x = i64::from(vw.saturating_sub(2).max(1));
             let page_y = i64::from(vh.saturating_sub(2).max(1));
@@ -378,7 +377,7 @@ impl App {
             };
             if let Some((dx, dy)) = pan {
                 if self.view.exact {
-                    self.view.pan(dx, dy, w, h, geometry.area);
+                    self.view.pan(dx, dy, geometry);
                 }
                 return;
             }
@@ -473,16 +472,12 @@ mod tests {
         crate::ui::layout(Rect::new(0, 0, 41, 9))
     }
 
-    fn preview_geometry(app: &App, area: Rect) -> PreviewGeometry {
-        crate::view::geometry(&app.view, app.grid_size(), area)
-    }
-
     // Compares build versions after applying the key.
     fn press(app: &mut App, code: KeyCode) -> bool {
         let before = (app.pipeline.grid.version(), app.pipeline.dithered.version());
         app.handle_key(
             KeyEvent::new(code, KeyModifiers::NONE),
-            &preview_geometry(app, test_layout().preview),
+            &app.geometry(test_layout().preview),
         );
         app.sync(test_layout().preview);
         before != (app.pipeline.grid.version(), app.pipeline.dithered.version())
@@ -517,9 +512,6 @@ mod tests {
         app.show_original = false;
         app.sync(test_layout().preview);
         assert_eq!(app.pipeline.dithered.version(), 3);
-        app.pipeline.dithered.clear();
-        app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.dithered.version(), 4);
     }
 
     #[test]
@@ -582,7 +574,7 @@ mod tests {
         assert_eq!(app.pipeline.dithered.version(), 0);
         app.handle_key(
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            &preview_geometry(&app, test_layout().preview),
+            &app.geometry(test_layout().preview),
         );
         assert_eq!(app.pipeline.dithered.version(), 0);
         app.sync(test_layout().preview);
@@ -704,11 +696,11 @@ mod tests {
         assert_eq!(app.params.options.tone.gamma, 1.0);
         app.handle_key(
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
-            &preview_geometry(&app, test_layout().preview),
+            &app.geometry(test_layout().preview),
         );
         app.handle_key(
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            &preview_geometry(&app, test_layout().preview),
+            &app.geometry(test_layout().preview),
         );
         let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
         app.refresh();
@@ -731,17 +723,17 @@ mod tests {
         let mut app = app_at(Param::Scale);
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
-        app.handle_key(release, &preview_geometry(&app, test_layout().preview));
+        app.handle_key(release, &app.geometry(test_layout().preview));
         assert!(!app.quit);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
-        app.handle_key(ctrl('r'), &preview_geometry(&app, test_layout().preview));
+        app.handle_key(ctrl('r'), &app.geometry(test_layout().preview));
         app.refresh();
         assert_eq!(
             (app.pipeline.grid.version(), app.pipeline.dithered.version()),
             version
         );
-        app.handle_key(ctrl('c'), &preview_geometry(&app, test_layout().preview));
+        app.handle_key(ctrl('c'), &app.geometry(test_layout().preview));
         assert!(app.quit);
     }
 
@@ -817,13 +809,14 @@ mod tests {
             app.view.exact = true;
             app.view.glyphs = glyphs;
             let mut buffer = Buffer::empty(area);
-            let geometry = preview_geometry(&app, area);
+            let geometry = app.geometry(area);
             let map = geometry.minimap.unwrap().map;
-            app.view.render_minimap(
+            crate::view::render(
                 app.displayed(),
+                &app.view,
                 &geometry,
                 &mut buffer,
-                &mut Memo::default(),
+                &mut crate::view::OverviewCaches::default(),
             );
             assert_eq!(map, expected);
             assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);
@@ -855,7 +848,7 @@ mod tests {
                         row,
                         modifiers: KeyModifiers::NONE,
                     },
-                    &preview_geometry(&app, area),
+                    &app.geometry(area),
                 );
                 assert_eq!((app.view.x, app.view.y), expected, "{glyphs:?}");
                 app.refresh();
@@ -872,7 +865,7 @@ mod tests {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
         app.view.exact = true;
-        let map = preview_geometry(&app, area).minimap.unwrap().map;
+        let map = app.geometry(area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
             let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
             app.handle_mouse(
@@ -882,7 +875,7 @@ mod tests {
                     row,
                     modifiers: KeyModifiers::NONE,
                 },
-                &preview_geometry(app, area),
+                &app.geometry(area),
             );
             app.refresh();
             assert_eq!(
@@ -962,7 +955,7 @@ mod tests {
         for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
             app.handle_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
-                &preview_geometry(&app, test_layout().preview),
+                &app.geometry(test_layout().preview),
             );
         }
         assert!(app.quit);

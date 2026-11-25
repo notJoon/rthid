@@ -35,6 +35,25 @@ impl<K: PartialEq, V> Memo<K, V> {
 }
 
 impl<K, V> Memo<K, V> {
+    /// Compares in place so the owned key is built only when stale.
+    /// Drops the previous value before building.
+    pub fn update_by(
+        &mut self,
+        is_current: impl FnOnce(&K) -> bool,
+        key: impl FnOnce() -> K,
+        build: impl FnOnce() -> V,
+    ) -> bool {
+        if self.entry.as_ref().is_some_and(|(old, _)| is_current(old)) {
+            return false;
+        }
+        let key = key();
+        self.clear();
+        let value = build();
+        self.entry = Some((key, value));
+        self.version += 1;
+        true
+    }
+
     /// The most recently built value.
     pub fn get(&self) -> Option<&V> {
         self.entry.as_ref().map(|(_, value)| value)
@@ -50,8 +69,7 @@ impl<K, V> Memo<K, V> {
         self.version
     }
 
-    /// Drops the cached key and value without resetting the version.
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.entry = None;
     }
 }
@@ -79,6 +97,28 @@ mod tests {
         assert!(memo.get().is_none());
         assert_eq!(memo.version(), 2);
         assert_eq!(*memo.get_or_build(2, || 30), 30);
+        assert_eq!(memo.version(), 3);
+    }
+
+    #[test]
+    fn update_by_builds_the_owned_key_only_when_stale() {
+        let mut memo = Memo::default();
+        assert!(memo.update_by(
+            |_: &String| panic!("empty memo compared"),
+            || "a".into(),
+            || 1
+        ));
+        assert!(!memo.update_by(
+            |key| key == "a",
+            || panic!("current key rebuilt"),
+            || panic!("current value rebuilt")
+        ));
+        assert_eq!(memo.version(), 1);
+        assert!(memo.update_by(|key| key == "b", || "b".into(), || 2));
+        assert_eq!(memo.get(), Some(&2));
+        assert_eq!(memo.version(), 2);
+        assert!(memo.update_by(|_| false, || "b".into(), || 3));
+        assert_eq!(memo.get(), Some(&3));
         assert_eq!(memo.version(), 3);
     }
 

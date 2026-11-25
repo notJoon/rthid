@@ -121,10 +121,6 @@ fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
 }
 
-fn terminal_layout(size: ratatui::layout::Size) -> ui::Layout {
-    ui::layout(ratatui::layout::Rect::new(0, 0, size.width, size.height))
-}
-
 fn main() -> std::io::Result<()> {
     let (path, preview_png, glyphs, graphics) = parse_args(std::env::args_os().skip(1))?;
     check_not_source(&path, preview_png.as_deref())?;
@@ -154,19 +150,21 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
-    let mut renderer = ui::Renderer::new(None);
     let terminal_result = ratatui::run(|terminal| {
-        renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
+        let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut layout = terminal_layout(terminal.size()?);
+        let mut layout = ui::layout(terminal.size()?);
         let mut redraw = true;
         while !app.quit {
             if redraw {
                 app.poll_export();
                 app.sync(layout.preview);
-                let frame = terminal.draw(|frame| ui::draw(frame, &app, &layout, &mut renderer))?;
+                let mut geometry = None;
+                let frame = terminal.draw(|frame| {
+                    geometry = Some(ui::draw(frame, &app, &layout, &mut renderer));
+                })?;
                 if let Some(log) = &mut debug_log {
-                    ui::log_minimap(&app, log, &frame, &layout, &mut renderer)?;
+                    ui::log_minimap(&app, log, &frame, &geometry.unwrap())?;
                 }
             }
             redraw = false;
@@ -182,14 +180,12 @@ fn main() -> std::io::Result<()> {
                     writeln!(log, "event {event:?}")?;
                 }
                 redraw |= needs_redraw(&event);
-                let geometry = view::geometry(&app.view, app.grid_size(), layout.preview);
                 match event {
-                    Event::Key(key) => app.handle_key(key, &geometry),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse, &geometry),
+                    Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
                     Event::Resize(width, height) => {
-                        layout = terminal_layout(ratatui::layout::Size::new(width, height));
-                        let (w, h) = app.grid_size();
-                        app.view.clamp(w, h, layout.preview);
+                        layout = ui::layout(ratatui::layout::Size::new(width, height));
+                        app.clamp_view(layout.preview);
                     }
                     _ => {}
                 }
@@ -200,7 +196,6 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     });
-    drop(renderer);
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)

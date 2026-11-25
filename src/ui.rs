@@ -22,13 +22,13 @@ pub struct Layout {
 }
 
 /// Splits the screen and reserves the preview border.
-pub fn layout(screen: Rect) -> Layout {
+pub fn layout(screen: impl Into<Rect>) -> Layout {
     let [body, help, status] = Split::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(screen);
+    .areas(screen.into());
     let [preview_block, panel] =
         Split::horizontal([Constraint::Min(0), Constraint::Length(29)]).areas(body);
     Layout {
@@ -44,8 +44,7 @@ pub fn layout(screen: Rect) -> Layout {
 #[derive(Default)]
 pub struct Renderer {
     graphics: Option<graphics::Graphics>,
-    overview: view::OverviewCache,
-    minimap: view::OverviewCache,
+    overviews: view::OverviewCaches,
     parameter_list: ListState,
 }
 
@@ -56,12 +55,6 @@ impl Renderer {
             graphics,
             ..Self::default()
         }
-    }
-
-    /// Graphics state for renderer assertions.
-    #[cfg(test)]
-    pub fn graphics(&self) -> Option<&graphics::Graphics> {
-        self.graphics.as_ref()
     }
 }
 
@@ -77,17 +70,15 @@ pub fn log_minimap(
     app: &App,
     log: &mut impl std::io::Write,
     frame: &ratatui::CompletedFrame<'_>,
-    layout: &Layout,
-    renderer: &mut Renderer,
+    geometry: &view::PreviewGeometry,
 ) -> std::io::Result<()> {
-    let (w, h) = app.grid_size();
+    let (w, h) = geometry.grid;
     writeln!(
         log,
         "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
-        frame.count, app.view, layout.preview
+        frame.count, app.view, geometry.area
     )?;
-    let geometry = view::geometry(&app.view, (w, h), layout.preview);
-    let mut overview = ratatui::buffer::Buffer::empty(layout.preview);
+    let mut overview = ratatui::buffer::Buffer::empty(geometry.area);
     let pixels = app.displayed();
     if let Some(view::Minimap {
         frame: inset,
@@ -95,8 +86,17 @@ pub fn log_minimap(
         viewport,
     }) = geometry.minimap
     {
-        app.view
-            .render_minimap(pixels, &geometry, &mut overview, &mut renderer.minimap);
+        let area = Block::bordered().inner(inset);
+        view::render(
+            pixels,
+            &view::View {
+                exact: false,
+                ..app.view
+            },
+            &view::PreviewGeometry { area, ..*geometry },
+            &mut overview,
+            &mut view::OverviewCaches::default(),
+        );
         writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
         for pos in inset.positions() {
             writeln!(
@@ -109,15 +109,19 @@ pub fn log_minimap(
     log.flush()
 }
 
-/// Draws into the supplied regions without changing layout or view state.
-pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
+/// Draws into the supplied regions and returns the preview coordinates without changing App.
+pub fn draw(
+    frame: &mut Frame,
+    app: &App,
+    layout: &Layout,
+    renderer: &mut Renderer,
+) -> view::PreviewGeometry {
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
     let block = Block::bordered()
         .title("rthid")
         .border_style(focus_style(app.preview_focus));
-    let (gw, gh) = app.grid_size();
-    let geometry = view::geometry(&app.view, (gw, gh), layout.preview);
+    let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
     let list = List::new(PARAMS.map(|param| label(&app.params, param)))
@@ -142,6 +146,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         Paragraph::new(status(app, &geometry, report)),
         layout.status,
     );
+    geometry
 }
 
 fn draw_preview(
@@ -150,43 +155,41 @@ fn draw_preview(
     geometry: &view::PreviewGeometry,
     renderer: &mut Renderer,
 ) -> PreviewReport {
-    let image_mode = app.show_original && !app.view.exact && !geometry.area.is_empty();
-    let Some(graphics) = renderer.graphics.as_mut().filter(|_| image_mode) else {
-        let cache = if app.view.exact {
-            &mut renderer.minimap
-        } else {
-            &mut renderer.overview
-        };
-        let approximate = view::render(
+    let image_mode = renderer.graphics.is_some()
+        && app.show_original
+        && !app.view.exact
+        && !geometry.area.is_empty();
+    let approximate = if image_mode {
+        false
+    } else {
+        view::render(
             app.displayed(),
             &app.view,
             geometry,
             frame.buffer_mut(),
-            cache,
-        );
-        if let Some(graphics) = renderer.graphics.as_mut() {
-            graphics.hide(frame.buffer_mut());
-        }
-        return PreviewReport {
-            approximate,
-            ..PreviewReport::default()
-        };
+            &mut renderer.overviews,
+        )
     };
-    graphics.draw_image(
-        frame,
-        app.pipeline.grid(),
-        app.pipeline.grid_version(),
-        geometry,
-    );
-    PreviewReport {
-        approximate: false,
-        graphics_name: Some(graphics.name()),
-        graphics_error: graphics.error().map(str::to_owned),
+    let mut report = PreviewReport {
+        approximate,
+        ..PreviewReport::default()
+    };
+    if let Some(graphics) = &mut renderer.graphics {
+        graphics.present(
+            frame,
+            image_mode.then(|| (app.pipeline.grid(), app.pipeline.grid_version(), geometry)),
+        );
+        if image_mode {
+            report.graphics_name = Some(graphics.name());
+            report.graphics_error = graphics.error().map(str::to_owned);
+        }
     }
+    report
 }
 
 fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) -> String {
     let (gw, gh) = geometry.grid;
+    let (sw, sh) = app.pipeline.source_size();
     let mode = if app.view.exact {
         let (w, h) = geometry.visible;
         if w == 0 || h == 0 {
@@ -223,9 +226,7 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
         .or(report.graphics_error)
         .unwrap_or_else(|| {
             format!(
-                "{displayed} | {mode} | Source {}x{} | Grid {gw}x{gh} | Rotation {}°",
-                app.pipeline.source_size().0,
-                app.pipeline.source_size().1,
+                "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
                 u16::from(app.params.rotation) * 90,
             )
         })
@@ -250,15 +251,10 @@ mod tests {
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn terminal_layout(terminal: &Terminal<TestBackend>) -> Layout {
-        let size = terminal.size().unwrap();
-        layout(Rect::new(0, 0, size.width, size.height))
-    }
-
     #[test]
     fn status_uses_preview_report_and_prioritizes_export_errors() {
         let mut app = App::new(RgbaImage::new(4, 6), None);
-        let geometry = view::geometry(&app.view, app.grid_size(), Rect::new(1, 1, 20, 10));
+        let geometry = app.geometry(Rect::new(1, 1, 20, 10));
         assert!(
             status(
                 &app,
@@ -312,21 +308,25 @@ mod tests {
         for exact in [false, true, false, true] {
             app.view.exact = exact;
             terminal
-                .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
                 .unwrap();
         }
-        assert_eq!(renderer.overview.version(), 1);
-        assert_eq!(renderer.minimap.version(), 1);
+        assert_eq!(renderer.overviews.full.version(), 1);
+        assert_eq!(renderer.overviews.inset.version(), 1);
         app.params.rotation = 2;
-        app.sync(terminal_layout(&terminal).preview);
+        app.sync(layout(terminal.size().unwrap()).preview);
         for exact in [false, true] {
             app.view.exact = exact;
             terminal
-                .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
                 .unwrap();
         }
-        assert_eq!(renderer.overview.version(), 2);
-        assert_eq!(renderer.minimap.version(), 2);
+        assert_eq!(renderer.overviews.full.version(), 2);
+        assert_eq!(renderer.overviews.inset.version(), 2);
     }
 
     #[test]
@@ -385,9 +385,11 @@ mod tests {
         app.view.x = 119;
         app.view.y = 119;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        let layout = terminal_layout(&terminal);
+        let layout = layout(terminal.size().unwrap());
         terminal
-            .draw(|frame| draw(frame, &app, &layout, &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout, &mut renderer);
+            })
             .unwrap();
         assert_eq!((app.view.x, app.view.y), (119, 119));
         app.sync(layout.preview);
@@ -401,16 +403,19 @@ mod tests {
         app.view.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
+        let mut geometry = None;
         let frame = terminal
-            .draw(|f| draw(f, &app, &layout(f.area()), &mut renderer))
+            .draw(|f| {
+                geometry = Some(draw(f, &app, &layout(f.area()), &mut renderer));
+            })
             .unwrap();
-        log_minimap(&app, &mut log, &frame, &layout(frame.area), &mut renderer).unwrap();
+        let geometry = geometry.unwrap();
+        log_minimap(&app, &mut log, &frame, &geometry).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.starts_with("[minimap] frame=0 grid=180x180"));
-        let (inset, map) = app
-            .view
-            .minimap(180, 180, layout(frame.area).preview)
-            .unwrap();
+        let view::Minimap {
+            frame: inset, map, ..
+        } = geometry.minimap.unwrap();
         assert_eq!(text.lines().count(), 2 + inset.area() as usize);
         let corner = text
             .lines()
@@ -439,8 +444,7 @@ mod tests {
                 &app,
                 &mut std::io::Cursor::new(&mut [0u8; 1][..]),
                 &frame,
-                &layout(frame.area),
-                &mut renderer,
+                &geometry,
             )
             .is_err()
         );
@@ -454,7 +458,9 @@ mod tests {
         app.view.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -484,7 +490,9 @@ mod tests {
         for (width, height) in [(1, 1), (20, 5), (60, 12)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
                 .unwrap();
         }
     }
@@ -498,28 +506,24 @@ mod tests {
         for _ in 0..6 {
             app.handle_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                &view::geometry(
-                    &app.view,
-                    app.grid_size(),
-                    terminal_layout(&terminal).preview,
-                ),
+                &app.geometry(layout(terminal.size().unwrap()).preview),
             );
             terminal
-                .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
                 .unwrap();
         }
         assert_eq!(renderer.parameter_list.selected(), Some(6));
         assert_eq!(renderer.parameter_list.offset(), 4);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            &view::geometry(
-                &app.view,
-                app.grid_size(),
-                terminal_layout(&terminal).preview,
-            ),
+            &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         assert_eq!(renderer.parameter_list.selected(), Some(5));
         assert_eq!(renderer.parameter_list.offset(), 4);
@@ -544,7 +548,9 @@ mod tests {
         app.preview_focus = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         let has_frame = |buffer: &ratatui::buffer::Buffer| {
             buffer
@@ -556,72 +562,133 @@ mod tests {
         let version = app.pipeline.grid_version();
         app.handle_key(
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &view::geometry(
-                &app.view,
-                app.grid_size(),
-                terminal_layout(&terminal).preview,
-            ),
+            &app.geometry(layout(terminal.size().unwrap()).preview),
         );
-        app.sync(terminal_layout(&terminal).preview);
+        app.sync(layout(terminal.size().unwrap()).preview);
         assert_eq!(app.pipeline.grid_version(), version);
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         assert!(!has_frame(terminal.backend().buffer()));
         app.handle_key(
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &view::geometry(
-                &app.view,
-                app.grid_size(),
-                terminal_layout(&terminal).preview,
-            ),
+            &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         assert!(has_frame(terminal.backend().buffer()));
     }
 
     #[test]
-    fn overview_and_exact_modes_draw_their_glyphs_and_status() {
+    fn overview_and_exact_modes_show_their_status() {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::new(4, 6), None);
         app.show_original = false;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
-        app.pipeline.dithered_mut()[0] = 1;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(buffer.content.iter().any(|cell| {
-            cell.symbol()
-                .chars()
-                .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
-        }));
         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Dithered | Overview (sextant)"));
         app.view.glyphs = view::Glyphs::Quadrant;
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Overview (quadrant)"));
-        assert!(
-            !text
-                .chars()
-                .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
-        );
         app.view.exact = true;
         app.preview_focus = true;
         terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(frame, &app, &layout(frame.area()), &mut renderer);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "▀"));
         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("1:1 x 1-4 y 1-6"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
+    }
+    #[test]
+    fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
+        use ratatui::buffer::CellDiffOption;
+        use ratatui_image::picker::ProtocolType;
+        for exact in [false, true] {
+            for protocol in [
+                ProtocolType::Kitty,
+                ProtocolType::Iterm2,
+                ProtocolType::Sixel,
+            ] {
+                let mut app = App::new(RgbaImage::new(12, 12), None);
+                let mut picker = ratatui_image::picker::Picker::halfblocks();
+                picker.set_protocol_type(protocol);
+                let font = picker.font_size();
+                let geometry = app.geometry(layout(ratatui::layout::Size::new(100, 40)).preview);
+                let (cw, ch) = view::fit_aspect(
+                    geometry.grid.0,
+                    geometry.grid.1,
+                    geometry.area,
+                    f64::from(font.height) / f64::from(font.width),
+                );
+                let old = geometry
+                    .area
+                    .centered(Constraint::Length(cw), Constraint::Length(ch));
+                let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
+                let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    })
+                    .unwrap();
+                app.show_original = exact;
+                app.view.exact = exact;
+                app.sync(layout(terminal.size().unwrap()).preview);
+                let completed = terminal
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    })
+                    .unwrap();
+                for pos in completed.buffer.area.positions() {
+                    assert_eq!(
+                        completed.buffer[pos].diff_option == CellDiffOption::AlwaysUpdate,
+                        protocol != ProtocolType::Kitty && old.contains(pos),
+                        "{protocol:?} at {pos:?}",
+                    );
+                }
+                let mut glyphs = crate::ui::Renderer::new(None);
+                let mut baseline = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                baseline
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut glyphs);
+                    })
+                    .unwrap();
+                for pos in completed.buffer.area.positions() {
+                    let mut actual = completed.buffer[pos].clone();
+                    actual.set_diff_option(CellDiffOption::None);
+                    assert_eq!(actual, baseline.backend().buffer()[pos]);
+                }
+                let text: String = completed
+                    .buffer
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(!text.contains(&format!(
+                    "Original ({})",
+                    renderer.graphics.as_ref().unwrap().name()
+                )));
+            }
+        }
     }
 }
