@@ -23,9 +23,10 @@ use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
 struct OpenRequest {
-    /// Worker id, known once the job is submitted.
-    id: Option<u64>,
-    from_dialog: bool,
+    /// Tag the result echoes, unique to this request.
+    token: u64,
+    /// Generation of the dialog that asked, if any.
+    dialog: Option<u64>,
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -39,9 +40,12 @@ pub struct App {
     //       `loading()` guard could go.
     deferred_notice: Option<String>,
     save_blocked: Option<String>,
-    outbox: Vec<Job>,
+    outbox: Vec<(Job, u64)>,
     pending: Vec<Change>,
     open_request: Option<OpenRequest>,
+    // Last value handed out as a dialog generation or Open token.
+    // Zero tags requests without a dialog.
+    last_token: u64,
     save_error: Option<String>,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
@@ -99,6 +103,7 @@ impl App {
             outbox: Vec::new(),
             pending: Vec::new(),
             open_request: None,
+            last_token: 0,
             save_error: None,
             modal: None,
             settings: Settings::default(),
@@ -222,39 +227,46 @@ impl App {
         }
     }
 
-    /// Drains filesystem jobs for submission after sync.
-    pub fn take_jobs(&mut self) -> Vec<Job> {
+    /// Drains filesystem jobs for submission after sync, each with the tag its result echoes.
+    pub fn take_jobs(&mut self) -> Vec<(Job, u64)> {
         std::mem::take(&mut self.outbox)
     }
 
     /// Applies a finished job and reports whether the display changed.
     pub fn complete(&mut self, done: Done) -> bool {
         let mut changed = false;
-        let mut from_dialog = false;
+        // Dialog that asked for the result. Listings always come from one.
+        let mut requester = Some(done.tag);
         let opened = matches!(done.outcome, IoOutcome::Opened(_));
         if opened {
-            match &self.open_request {
-                Some(request) if request.id == Some(done.id) => from_dialog = request.from_dialog,
-                _ => return false,
-            }
-            self.open_request = None;
+            let Some(request) = self
+                .open_request
+                .take_if(|request| request.token == done.tag)
+            else {
+                return false;
+            };
+            requester = request.dialog;
             self.notice = None;
             changed = true;
         }
         match done.outcome {
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
-                if from_dialog && matches!(self.modal, Some(Modal::OpenFile(_))) {
-                    // TODO: A dialog generation counter would keep an earlier load from closing a reopened dialog.
+                if requester.is_some() && requester == self.dialog() {
                     self.modal = None;
                 }
                 self.open_image(path, image);
                 changed = true;
             }
             IoOutcome::Opened(Ok(Opened::Dir(listing))) | IoOutcome::Listed(Ok(listing)) => {
-                if opened && self.modal.is_none() && !from_dialog {
-                    self.modal = Some(Modal::open_file(listing.dir.clone()));
+                if requester.is_none() && self.modal.is_none() {
+                    self.open_dialog(listing.dir.clone());
                 }
-                if matches!(self.modal, Some(Modal::OpenFile(_))) {
+                // Opens without a dialog fill whichever dialog is open.
+                let routed = match requester {
+                    Some(generation) => self.dialog() == Some(generation),
+                    None => self.dialog().is_some(),
+                };
+                if routed {
                     self.set_listing(listing.dir, listing.entries);
                     changed = true;
                 }
@@ -293,21 +305,30 @@ impl App {
         self.open_request.is_some()
     }
 
-    // TODO: Let jobs carry a requester token that `Done` echoes back, stored on
-    //       `Modal::OpenFile` as a dialog generation. Opened and Listed results would then route
-    //       by token, removing this handshake and the Open branch in the main event loop.
-    /// Associates the worker id with the origin captured when Open was requested.
-    pub fn open_submitted(&mut self, id: u64) {
-        if let Some(request) = &mut self.open_request {
-            request.id = Some(id);
+    fn next_token(&mut self) -> u64 {
+        self.last_token += 1;
+        self.last_token
+    }
+
+    // Generation of the open file dialog, if one is open.
+    fn dialog(&self) -> Option<u64> {
+        match &self.modal {
+            Some(Modal::OpenFile(picker)) => Some(picker.generation),
+            _ => None,
         }
+    }
+
+    fn open_dialog(&mut self, start: PathBuf) {
+        let generation = self.next_token();
+        self.modal = Some(Modal::open_file(start, generation));
     }
 
     /// Queues an image load and shows its file name while loading.
     pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
+        let token = self.next_token();
         self.open_request = Some(OpenRequest {
-            id: None,
-            from_dialog: matches!(self.modal, Some(Modal::OpenFile(_))),
+            token,
+            dialog: self.dialog(),
         });
         self.notice = Some(format!(
             "Loading {}",
@@ -315,18 +336,20 @@ impl App {
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy()
         ));
-        self.outbox.push(Job::Open {
+        let job = Job::Open {
             path,
             dir,
             protect: self
                 .export
                 .as_ref()
                 .map(|export| export.path().to_path_buf()),
-        });
+        };
+        self.outbox.push((job, token));
     }
 
     fn request_list(&mut self, path: PathBuf) {
-        self.outbox.push(Job::List(path));
+        let tag = self.dialog().unwrap_or(0);
+        self.outbox.push((Job::List(path), tag));
     }
 
     /// Inserts pasted text into the active field or requests a dropped image.
@@ -393,12 +416,13 @@ impl App {
             && let Some(export) = &mut self.export
         {
             let (w, h) = self.grid_cache.grid().expect("processed grid").dimensions();
-            self.outbox.push(export.job(
+            let job = export.job(
                 self.grid_cache.dithered().expect("dithered grid"),
                 w,
                 h,
                 &self.settings.options.palette,
-            ));
+            );
+            self.outbox.push((job, 0));
         }
     }
 
@@ -562,7 +586,7 @@ impl App {
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
             self.last_drag = None;
-            self.modal = Some(Modal::open_file(start.clone()));
+            self.open_dialog(start.clone());
             self.request_list(start);
             return;
         }
@@ -723,12 +747,23 @@ mod tests {
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
 
-    fn done(outcome: IoOutcome) -> Done {
+    // Echoes the tag of the newest matching request, as the worker would.
+    fn done(app: &App, outcome: IoOutcome) -> Done {
+        let tag = match outcome {
+            IoOutcome::Opened(_) => app.open_request.as_ref().map_or(0, |r| r.token),
+            IoOutcome::Listed(_) => app.dialog().unwrap_or(0),
+            IoOutcome::Exported(_) => 0,
+        };
         Done {
             id: 1,
+            tag,
             elapsed: std::time::Duration::ZERO,
             outcome,
         }
+    }
+
+    fn jobs(app: &mut App) -> Vec<Job> {
+        app.take_jobs().into_iter().map(|(job, _)| job).collect()
     }
 
     fn failure(op: rthid_io::io::Op) -> rthid_io::io::IoError {
@@ -748,12 +783,11 @@ mod tests {
         };
         let mut app = App::empty();
         app.set_notice("retained".into());
-        assert!(!app.complete(done(IoOutcome::Listed(Ok(listing())))));
+        assert!(!app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
         assert_eq!(app.notice(), Some("retained"));
         assert!(app.modal.is_none());
         app.request_open("/images".into(), None);
-        app.open_submitted(1);
-        assert!(app.complete(done(IoOutcome::Opened(Ok(Opened::Dir(listing()))))));
+        assert!(app.complete(done(&app, IoOutcome::Opened(Ok(Opened::Dir(listing()))))));
         assert!(app.notice().is_none());
         let Some(Modal::OpenFile(picker)) = &app.modal else {
             panic!("open dialog expected")
@@ -765,24 +799,25 @@ mod tests {
         ] {
             if matches!(outcome, IoOutcome::Opened(_)) {
                 app.request_open("failed.png".into(), None);
-                app.open_submitted(1);
             }
             let expected = match &outcome {
                 IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => error.to_string(),
                 _ => unreachable!(),
             };
-            assert!(app.complete(done(outcome)));
+            assert!(app.complete(done(&app, outcome)));
             assert_eq!(app.notice(), Some(expected.as_str()));
             assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
         }
-        assert!(app.complete(done(IoOutcome::Listed(Ok(listing())))));
+        assert!(app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
         assert!(app.notice().is_none());
         app.request_open("photo.png".into(), None);
-        app.open_submitted(1);
-        assert!(app.complete(done(IoOutcome::Opened(Ok(Opened::Image {
-            path: "photo.png".into(),
-            image: RgbaImage::new(2, 3),
-        })))));
+        assert!(app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "photo.png".into(),
+                image: RgbaImage::new(2, 3),
+            }))
+        )));
         assert!(app.modal.is_none());
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
@@ -807,7 +842,6 @@ mod tests {
         let mut app = App::empty();
         let original = app.settings.clone();
         app.request_open("/images".into(), None);
-        app.open_submitted(1);
         for key in [KeyCode::Char('P'), KeyCode::Char('n')] {
             press(&mut app, key);
         }
@@ -815,7 +849,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         app.handle_paste("draft");
         assert_eq!(app.notice(), Some("Loading images"));
-        assert!(app.complete(done(listing())));
+        assert!(app.complete(done(&app, listing())));
         let Some(Modal::Editor(editor)) = &app.modal else {
             panic!("editor expected")
         };
@@ -827,29 +861,78 @@ mod tests {
         assert!(app.show_original);
 
         for outcome in [listing(), image()] {
-            app.modal = Some(Modal::open_file("/images".into()));
+            app.open_dialog("/images".into());
             app.request_open("late.png".into(), Some("/images".into()));
-            app.open_submitted(1);
             press(&mut app, KeyCode::Esc);
             assert_eq!(app.notice(), Some("Loading late.png"));
-            app.complete(done(outcome));
+            app.complete(done(&app, outcome));
             assert!(app.modal.is_none());
         }
+        app.request_open("early.png".into(), None);
+        let early = done(&app, image());
         app.request_open("late.png".into(), None);
-        app.open_submitted(2);
-        assert!(!app.complete(done(image())));
+        assert!(!app.complete(early));
         assert_eq!(app.notice(), Some("Loading late.png"));
-        app.modal = Some(Modal::open_file("/images".into()));
-        let mut latest = done(image());
-        latest.id = 2;
-        assert!(app.complete(latest));
+        app.open_dialog("/images".into());
+        assert!(app.complete(done(&app, image())));
         assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+    }
+
+    #[test]
+    fn results_for_a_closed_dialog_leave_a_reopened_dialog_alone() {
+        use rthid_io::dir::Listing;
+        let reply = |tag, outcome| Done {
+            id: 1,
+            tag,
+            elapsed: std::time::Duration::ZERO,
+            outcome,
+        };
+        let listing = |dir: &str| Listing {
+            dir: dir.into(),
+            entries: vec![Entry {
+                file_name: "a.png".into(),
+                name: "a.png".into(),
+                dir: false,
+            }],
+        };
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('o'));
+        app.apply(Effect::ListDir("/first".into())).unwrap();
+        app.apply(Effect::Open("a.png".into(), "/first".into()))
+            .unwrap();
+        let tags: Vec<u64> = app.take_jobs().into_iter().map(|(_, tag)| tag).collect();
+        let [_, listed, opened] = tags[..] else {
+            panic!("list, list and open expected")
+        };
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('o'));
+        let before = app.dialog();
+        assert!(before.is_some_and(|generation| generation != listed));
+        assert!(!app.complete(reply(listed, IoOutcome::Listed(Ok(listing("/first"))))));
+        assert!(app.complete(reply(
+            opened,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "/first/a.png".into(),
+                image: RgbaImage::new(2, 3),
+            })),
+        )));
+        assert!(!app.loading());
+        assert_eq!(
+            app.source_path(),
+            Some(std::path::Path::new("/first/a.png"))
+        );
+        assert_eq!(app.dialog(), before);
+        let Some(Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert_eq!(picker.dir, PathBuf::from("."));
+        assert!(picker.entries.is_empty());
     }
 
     #[test]
     fn pasted_text_respects_field_limits_and_marks_the_path_as_typed() {
         let mut app = App::empty();
-        app.modal = Some(Modal::open_file("/images".into()));
+        app.open_dialog("/images".into());
         app.handle_paste(&"猫\n".repeat(100_000));
         let Some(Modal::OpenFile(picker)) = &app.modal else {
             panic!("open dialog expected")
@@ -876,37 +959,36 @@ mod tests {
         let path = PathBuf::from("preview.png");
         let mut app = App::builtin(RgbaImage::new(4, 2), Some(path.clone()));
         app.request_open("photo.png".into(), Some("/images".into()));
-        let jobs = app.take_jobs();
+        let queued = jobs(&mut app);
         assert!(
-            matches!(jobs.as_slice(), [Job::Export { path: output, grid }, Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
+            matches!(queued.as_slice(), [Job::Export { path: output, grid }, Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
             if output == &path && protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images")
                 && (grid.w, grid.h) == (4, 2) && grid.indices.len() == 8 && grid.palette == app.settings.options.palette)
         );
-        app.open_submitted(1);
-        app.complete(done(IoOutcome::Opened(Err(failure(Op::Decode)))));
-        assert!(app.complete(done(IoOutcome::Exported(Err(failure(Op::Encode))))));
+        app.complete(done(&app, IoOutcome::Opened(Err(failure(Op::Decode)))));
+        assert!(app.complete(done(&app, IoOutcome::Exported(Err(failure(Op::Encode))))));
         let error = app.export_status().unwrap().to_owned();
         assert_eq!(app.notice(), Some(error.as_str()));
         assert!(app.export_result().is_err());
         app.settings.rotation = Rotation::R90;
         app.finish();
-        assert!(matches!(app.take_jobs().as_slice(), [Job::Export { .. }]));
+        assert!(matches!(jobs(&mut app).as_slice(), [Job::Export { .. }]));
         assert_eq!(app.export_status(), Some(error.as_str()));
-        assert!(!app.complete(done(IoOutcome::Exported(Err(failure(Op::Encode))))));
+        assert!(!app.complete(done(&app, IoOutcome::Exported(Err(failure(Op::Encode))))));
         let mut timeout = failure(Op::Encode);
         timeout.cause = rthid_io::io::Cause::TimedOut;
-        assert!(app.complete(done(IoOutcome::Exported(Err(timeout)))));
+        assert!(app.complete(done(&app, IoOutcome::Exported(Err(timeout)))));
         assert!(
             app.export_result()
                 .unwrap_err()
                 .to_string()
                 .contains("did not finish before quitting")
         );
-        assert!(app.complete(done(IoOutcome::Exported(Ok(path.clone())))));
+        assert!(app.complete(done(&app, IoOutcome::Exported(Ok(path.clone())))));
         assert!(app.export_status().is_none());
         assert!(app.notice().is_none());
         assert!(app.export_result().is_ok());
-        assert!(!app.complete(done(IoOutcome::Exported(Ok(path)))));
+        assert!(!app.complete(done(&app, IoOutcome::Exported(Ok(path)))));
     }
 
     #[test]
@@ -934,7 +1016,7 @@ mod tests {
             press(&mut app, KeyCode::Char('o'));
             let dir = if source.is_some() { "/images" } else { "." };
             assert!(
-                matches!(app.take_jobs().as_slice(), [Job::List(path)] if path == &PathBuf::from(dir))
+                matches!(jobs(&mut app).as_slice(), [Job::List(path)] if path == &PathBuf::from(dir))
             );
             app.set_listing(
                 PathBuf::from(dir),
@@ -946,17 +1028,17 @@ mod tests {
             );
             press(&mut app, KeyCode::Enter);
             assert!(
-                matches!(app.take_jobs().as_slice(), [Job::Open { path, dir: Some(base), protect: None }]
+                matches!(jobs(&mut app).as_slice(), [Job::Open { path, dir: Some(base), protect: None }]
                 if path == &PathBuf::from("bad.png") && base == &PathBuf::from(dir))
             );
-            app.open_submitted(1);
-            app.complete(done(IoOutcome::Opened(Err(failure(
-                rthid_io::io::Op::Decode,
-            )))));
+            app.complete(done(
+                &app,
+                IoOutcome::Opened(Err(failure(rthid_io::io::Op::Decode))),
+            ));
             assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
             assert!(app.notice().unwrap().starts_with("open:"));
             app.handle_paste("'file:///tmp/My%20Photo.png'");
-            assert!(app.take_jobs().is_empty());
+            assert!(jobs(&mut app).is_empty());
             let Some(Modal::OpenFile(picker)) = &app.modal else {
                 panic!("open dialog expected")
             };
@@ -971,7 +1053,7 @@ mod tests {
                 app.handle_paste(path);
                 press(&mut app, KeyCode::Enter);
                 assert!(
-                    matches!(app.take_jobs().as_slice(), [Job::Open { path: entered, dir: Some(base), protect: None }]
+                    matches!(jobs(&mut app).as_slice(), [Job::Open { path: entered, dir: Some(base), protect: None }]
                     if entered == &PathBuf::from(path) && base == &PathBuf::from(dir))
                 );
             }
@@ -989,10 +1071,10 @@ mod tests {
             app.modal.as_mut().unwrap().text_input_mut().unwrap().text(),
             "My Palette猫"
         );
-        assert!(app.take_jobs().is_empty());
+        assert!(jobs(&mut app).is_empty());
         press(&mut app, KeyCode::Esc);
         app.handle_paste("'/tmp/ignored.jpg'");
-        assert!(app.take_jobs().is_empty());
+        assert!(jobs(&mut app).is_empty());
 
         app.modal = Some(Modal::templates());
         press(&mut app, KeyCode::Char('n'));
@@ -1004,15 +1086,15 @@ mod tests {
         app.modal = None;
         app.handle_paste("ordinary text");
         app.handle_paste("notes.txt");
-        assert!(app.take_jobs().is_empty());
+        assert!(jobs(&mut app).is_empty());
         app.handle_paste("'/tmp/My Photo.jpg'");
         assert_eq!(app.notice(), Some("Loading My Photo.jpg"));
         press(&mut app, KeyCode::Char('o'));
         app.apply(Effect::ListDir(PathBuf::from("/other"))).unwrap();
-        assert!(matches!(app.take_jobs().as_slice(), [
+        assert!(matches!(jobs(&mut app).as_slice(), [
             Job::Open { path, dir: None, protect: None }, Job::List(_), Job::List(listed)
         ] if path == &PathBuf::from("/tmp/My Photo.jpg") && listed == &PathBuf::from("/other")));
-        assert!(app.take_jobs().is_empty());
+        assert!(jobs(&mut app).is_empty());
     }
 
     #[test]
@@ -1079,7 +1161,7 @@ mod tests {
         let output = dir.path().join("preview.png");
         let mut app = App::builtin(RgbaImage::new(4, 2), Some(output.clone()));
         assert!(
-            matches!(app.take_jobs().as_slice(), [Job::Export { path, grid }]
+            matches!(jobs(&mut app).as_slice(), [Job::Export { path, grid }]
             if path == &output && (grid.w, grid.h) == (4, 2))
         );
         app.settings = app.settings.with_preset(app.palettes.get(1).unwrap());
@@ -1107,7 +1189,7 @@ mod tests {
         assert_eq!(app.grid_size(), (3, 5));
         assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
         assert!(
-            matches!(app.take_jobs().last(), Some(Job::Export { path, grid })
+            matches!(jobs(&mut app).last(), Some(Job::Export { path, grid })
             if path == &output && (grid.w, grid.h) == (3, 5))
         );
     }
@@ -1203,7 +1285,6 @@ mod tests {
                 app.set_notice("Loading is only text".into());
                 assert!(!app.loading());
                 app.request_open("photo.png".into(), None);
-                app.open_submitted(1);
                 assert!(app.loading());
                 app.set_notice("earlier notice".into());
                 let expected = match notice_kind {
@@ -1216,7 +1297,7 @@ mod tests {
                     1 => {
                         let error = failure(Op::List);
                         let expected = error.to_string();
-                        app.complete(done(IoOutcome::Listed(Err(error))));
+                        app.complete(done(&app, IoOutcome::Listed(Err(error))));
                         expected
                     }
                     _ => {
@@ -1243,7 +1324,7 @@ mod tests {
                 } else {
                     expected
                 };
-                assert!(app.complete(done(outcome)));
+                assert!(app.complete(done(&app, outcome)));
                 assert!(!app.loading());
                 assert_eq!(app.notice(), Some(expected.as_str()));
                 assert!(app.deferred_notice.is_none());
@@ -1922,12 +2003,12 @@ mod tests {
         }
         assert!(app.quit);
         assert_eq!(app.grid_cache.grid.version(), 1);
-        app.take_jobs();
+        jobs(&mut app);
         app.finish();
         assert!(
-            matches!(app.take_jobs().as_slice(), [Job::Export { path: output, grid }]
+            matches!(jobs(&mut app).as_slice(), [Job::Export { path: output, grid }]
             if output == &path && (grid.w, grid.h) == (2, 4))
         );
-        assert!(app.take_jobs().is_empty());
+        assert!(jobs(&mut app).is_empty());
     }
 }

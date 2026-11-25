@@ -223,6 +223,8 @@ pub struct FilePicker {
     pub entries: Vec<Entry>,
     /// Whether Enter submits the field instead of the selected entry.
     pub typed: bool,
+    /// Number the app gave this dialog when it opened, matched against IO results.
+    pub generation: u64,
 }
 
 impl FilePicker {
@@ -631,13 +633,15 @@ impl Modal {
     }
 
     /// Opens a path field while the event loop loads the starting directory.
-    pub fn open_file(start: PathBuf) -> Self {
+    /// `generation` tells this dialog apart from earlier ones for late IO results.
+    pub fn open_file(start: PathBuf, generation: u64) -> Self {
         Self::OpenFile(Box::new(FilePicker {
             input: TextInput::new(start.join("").to_string_lossy(), PATH_MAX_CHARS),
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
             typed: false,
+            generation,
         }))
     }
 
@@ -868,7 +872,7 @@ mod tests {
         let templates = Templates::default();
         let settings = Settings::default();
         let context = || ctx(&palettes, &templates, &settings);
-        let mut modal = Modal::open_file("/images".into());
+        let mut modal = Modal::open_file("/images".into(), 1);
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
@@ -979,7 +983,7 @@ mod tests {
         let palettes = Palettes::builtin();
         let templates = Templates::default();
         let settings = Settings::default();
-        let mut modal = Modal::open_file(PathBuf::from("/images"));
+        let mut modal = Modal::open_file(PathBuf::from("/images"), 1);
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
@@ -1064,7 +1068,7 @@ mod tests {
         {
             use std::os::unix::ffi::OsStringExt;
             let file_name = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
-            let mut modal = Modal::open_file("/images".into());
+            let mut modal = Modal::open_file("/images".into(), 1);
             let Modal::OpenFile(picker) = &mut modal else {
                 unreachable!()
             };

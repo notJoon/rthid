@@ -245,8 +245,8 @@ fn main() -> std::io::Result<()> {
         &mut debug_log.as_mut(),
     ));
     app.finish();
-    for job in app.take_jobs() {
-        io.submit(job);
+    for (job, tag) in app.take_jobs() {
+        io.submit(job, tag);
     }
     for done in io.finish() {
         terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
@@ -318,12 +318,8 @@ fn event_loop(
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
         }
-        for job in app.take_jobs() {
-            let open = matches!(job, rthid_io::io::Job::Open { .. });
-            let id = io.submit(job);
-            if open {
-                app.open_submitted(id);
-            }
+        for (job, tag) in app.take_jobs() {
+            io.submit(job, tag);
         }
         redraw = false;
         // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
@@ -461,6 +457,7 @@ mod tests {
             log_done(
                 &Done {
                     id: 1,
+                    tag: 0,
                     elapsed: Duration::from_millis(7),
                     outcome,
                 },

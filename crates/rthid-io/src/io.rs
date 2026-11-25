@@ -115,6 +115,8 @@ pub enum Opened {
 pub struct Done {
     /// Submission id shared across all kinds.
     pub id: u64,
+    /// Caller value given to `submit`, returned unchanged.
+    pub tag: u64,
     /// Measured duration of the work or wait before stopping.
     pub elapsed: Duration,
     /// Typed result of the work.
@@ -247,6 +249,7 @@ impl std::error::Error for IoError {
 
 struct Pending {
     id: u64,
+    tag: u64,
     op: Op,
     path: PathBuf,
     submitted: Instant,
@@ -256,6 +259,7 @@ impl Pending {
     fn fail(&self, kind: Kind, cause: Cause) -> Done {
         failure(
             self.id,
+            self.tag,
             kind,
             self.submitted.elapsed(),
             self.op,
@@ -281,7 +285,7 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 struct Queue {
-    slots: Mutex<[Option<(u64, Job)>; 3]>,
+    slots: Mutex<[Option<(u64, u64, Job)>; 3]>,
     ready: Condvar,
 }
 
@@ -332,13 +336,15 @@ impl IO {
     }
 
     /// Queues work without waiting, returning an id that increases across kinds.
-    pub fn submit(&mut self, job: Job) -> u64 {
+    /// The result echoes `tag` so callers can tell who asked for it.
+    pub fn submit(&mut self, job: Job, tag: u64) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         let kind = job.kind();
         let (op, path) = job.context();
         self.pending[kind as usize] = Some(Pending {
             id,
+            tag,
             op,
             path,
             submitted: Instant::now(),
@@ -351,7 +357,7 @@ impl IO {
                     .fail(kind, Cause::Stopped),
             );
         } else {
-            self.jobs.slots.lock().unwrap()[kind as usize] = Some((id, job));
+            self.jobs.slots.lock().unwrap()[kind as usize] = Some((id, tag, job));
             self.jobs.ready.notify_one();
         }
         id
@@ -432,10 +438,19 @@ impl Drop for IO {
     }
 }
 
-fn failure(id: u64, kind: Kind, elapsed: Duration, op: Op, path: PathBuf, cause: Cause) -> Done {
+fn failure(
+    id: u64,
+    tag: u64,
+    kind: Kind,
+    elapsed: Duration,
+    op: Op,
+    path: PathBuf,
+    cause: Cause,
+) -> Done {
     let error = IoError { op, path, cause };
     Done {
         id,
+        tag,
         elapsed,
         outcome: match kind {
             Kind::Open => Outcome::Opened(Err(error)),
@@ -449,13 +464,13 @@ fn failure(id: u64, kind: Kind, elapsed: Duration, op: Op, path: PathBuf, cause:
 //       Give each kind its own thread on the same slots, or at least split Export off.
 fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: Arc<AtomicBool>) {
     loop {
-        let (id, job) = {
+        let (id, tag, job) = {
             let mut slots = queued.slots.lock().unwrap();
             loop {
                 if let Some(index) = slots
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, job)| job.as_ref().map(|(id, _)| (index, *id)))
+                    .filter_map(|(index, job)| job.as_ref().map(|(id, ..)| (index, *id)))
                     .min_by_key(|(_, id)| *id)
                     .map(|(index, _)| index)
                 {
@@ -481,10 +496,11 @@ fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: 
         let outcome = match result {
             Ok(outcome) => Done {
                 id,
+                tag,
                 elapsed: started.elapsed(),
                 outcome,
             },
-            Err(cause) => failure(id, kind, started.elapsed(), op, path, cause),
+            Err(cause) => failure(id, tag, kind, started.elapsed(), op, path, cause),
         };
         if finished.send(outcome).is_err() {
             break;
@@ -571,7 +587,7 @@ mod tests {
     fn pause(worker: &mut IO) -> Sender<()> {
         let (entered, started) = mpsc::channel();
         let (resume, paused) = mpsc::channel();
-        worker.submit(Job::Pause(entered, paused));
+        worker.submit(Job::Pause(entered, paused), 0);
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         resume
     }
@@ -591,7 +607,7 @@ mod tests {
         let resume = pause(&mut worker);
         let mut last = 0;
         for n in 0..100 {
-            last = worker.submit(export(dir.path().join(format!("{n}.png")), n == 99));
+            last = worker.submit(export(dir.path().join(format!("{n}.png")), n == 99), 0);
         }
         assert!(worker.busy());
         assert_eq!(
@@ -622,27 +638,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(Some(dir.path().to_path_buf())).unwrap();
         let resume = pause(&mut worker);
-        let opened = worker.submit(open(PathBuf::from("~")));
-        let listed = worker.submit(Job::List(dir.path().to_path_buf()));
+        let opened = worker.submit(open(PathBuf::from("~")), 7);
+        let listed = worker.submit(Job::List(dir.path().to_path_buf()), 8);
         resume.send(()).unwrap();
         let done = wait(&mut worker);
-        assert_eq!(done.id, opened);
+        assert_eq!((done.id, done.tag), (opened, 7));
         assert_eq!(done.kind(), Kind::Open);
         assert_eq!(done.op().to_string(), "list");
         assert_eq!(done.path(), dir.path().canonicalize().unwrap());
         assert!(matches!(done.outcome, Outcome::Opened(Ok(Opened::Dir(_)))));
         let done = wait(&mut worker);
-        assert_eq!(done.id, listed);
+        assert_eq!((done.id, done.tag), (listed, 8));
         assert!(matches!(done.outcome, Outcome::Listed(Ok(_))));
         assert!(!worker.busy());
 
         let path = dir.path().join("source.png");
         RgbaImage::new(2048, 2).save(&path).unwrap();
-        worker.submit(Job::Open {
-            path: "source.png".into(),
-            dir: Some(dir.path().to_path_buf()),
-            protect: None,
-        });
+        worker.submit(
+            Job::Open {
+                path: "source.png".into(),
+                dir: Some(dir.path().to_path_buf()),
+                protect: None,
+            },
+            0,
+        );
         let done = wait(&mut worker);
         assert_eq!(done.op(), Op::Decode);
         assert_eq!(done.path(), path);
@@ -650,11 +669,14 @@ mod tests {
             panic!("expected decoded image");
         };
         assert_eq!(image.dimensions(), (1024, 1));
-        worker.submit(Job::Open {
-            path: path.clone(),
-            dir: None,
-            protect: Some(path),
-        });
+        worker.submit(
+            Job::Open {
+                path: path.clone(),
+                dir: None,
+                protect: Some(path),
+            },
+            0,
+        );
         assert!(matches!(
             wait(&mut worker).outcome,
             Outcome::Opened(Err(IoError {
@@ -668,13 +690,13 @@ mod tests {
     fn panic_is_reported_and_the_thread_runs_the_next_job() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        let id = worker.submit(Job::Panic(dir.path().join("panic")));
+        let id = worker.submit(Job::Panic(dir.path().join("panic")), 0);
         let done = wait(&mut worker);
         assert_eq!(done.id, id);
         assert!(matches!(done.outcome, Outcome::Opened(Err(IoError {
             cause: Cause::Panicked(message), ..
         })) if message == "test job panicked"));
-        let id = worker.submit(Job::List(dir.path().to_path_buf()));
+        let id = worker.submit(Job::List(dir.path().to_path_buf()), 0);
         let done = wait(&mut worker);
         assert_eq!(done.id, id);
         assert!(matches!(done.outcome, Outcome::Listed(Ok(_))));
@@ -685,10 +707,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
-        let opened = worker.submit(open(dir.path().to_path_buf()));
-        let listed = worker.submit(Job::List(dir.path().to_path_buf()));
-        worker.submit(export(dir.path().join("old.png"), false));
-        let exported = worker.submit(export(dir.path().join("final.png"), true));
+        let opened = worker.submit(open(dir.path().to_path_buf()), 0);
+        let listed = worker.submit(Job::List(dir.path().to_path_buf()), 0);
+        worker.submit(export(dir.path().join("old.png"), false), 0);
+        let exported = worker.submit(export(dir.path().join("final.png"), true), 0);
         let stopping = Arc::clone(&worker.stopping);
         let release = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -727,9 +749,9 @@ mod tests {
     fn stale_results_are_discarded_and_a_stopped_thread_still_returns_ids() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        worker.submit(export(dir.path().join("old.png"), false));
+        worker.submit(export(dir.path().join("old.png"), false), 0);
         let resume = pause(&mut worker);
-        let latest = worker.submit(export(dir.path().join("latest.png"), true));
+        let latest = worker.submit(export(dir.path().join("latest.png"), true), 0);
         // The earlier Export completed before Pause began and must still be discarded.
         assert!(worker.poll().is_none());
         resume.send(()).unwrap();
@@ -737,10 +759,10 @@ mod tests {
         assert_eq!(wait(&mut worker).id, latest);
         worker.stop_timeout(SHUTDOWN_WAIT);
         for _ in 0..2 {
-            let id = worker.submit(open(dir.path().to_path_buf()));
+            let id = worker.submit(open(dir.path().to_path_buf()), 3);
             assert!(worker.busy());
             let done = wait(&mut worker);
-            assert_eq!(done.id, id);
+            assert_eq!((done.id, done.tag), (id, 3));
             assert!(matches!(
                 done.outcome,
                 Outcome::Opened(Err(IoError {
@@ -767,11 +789,11 @@ mod tests {
             drop(finished);
             panic!("worker failed outside a job");
         }));
-        let id = worker.submit(Job::List("missing".into()));
+        let id = worker.submit(Job::List("missing".into()), 5);
         release.send(()).unwrap();
         let done = worker.finish();
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].id, id);
+        assert_eq!((done[0].id, done[0].tag), (id, 5));
         assert!(matches!(
             done[0].outcome,
             Outcome::Listed(Err(IoError {
@@ -785,15 +807,15 @@ mod tests {
     fn finish_detaches_a_blocked_worker_at_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        let opened = worker.submit(open(dir.path().to_path_buf()));
+        let opened = worker.submit(open(dir.path().to_path_buf()), 0);
         let resume = pause(&mut worker);
-        let exported = worker.submit(export("unused.png".into(), false));
+        let exported = worker.submit(export("unused.png".into(), false), 6);
         let started = Instant::now();
         let done = worker.finish_timeout(Duration::from_millis(50));
         assert_eq!(done.len(), 3);
         assert_eq!(done[0].id, opened);
         assert!(matches!(done[0].outcome, Outcome::Opened(Ok(_))));
-        assert_eq!(done[2].id, exported);
+        assert_eq!((done[2].id, done[2].tag), (exported, 6));
         assert!(matches!(
             done[2].outcome,
             Outcome::Exported(Err(IoError {
@@ -840,7 +862,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let path = dir.path().join("missing.png");
-        worker.submit(open(path.clone()));
+        worker.submit(open(path.clone()), 0);
         let done = wait(&mut worker);
         assert_eq!(done.path(), path);
         assert!(matches!(

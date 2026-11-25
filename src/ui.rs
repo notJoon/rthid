@@ -743,6 +743,7 @@ mod tests {
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
                 app.complete(rthid_io::io::Done {
                     id: 1,
+                    tag: 0,
                     elapsed: std::time::Duration::ZERO,
                     outcome: rthid_io::io::Outcome::Exported(Err(rthid_io::io::IoError {
                         op: rthid_io::io::Op::Encode,
@@ -920,7 +921,7 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use rthid_io::dir::Entry;
         let mut app = App::empty();
-        app.modal = Some(Modal::open_file("/images".into()));
+        app.modal = Some(Modal::open_file("/images".into(), 1));
         app.set_listing(
             "/images".into(),
             (0..30)
