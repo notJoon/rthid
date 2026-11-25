@@ -245,7 +245,9 @@ fn main() -> std::io::Result<()> {
     }
     for done in io.finish() {
         terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
-        app.complete(done);
+        if matches!(done.outcome, rthid_io::io::Outcome::Exported(_)) {
+            app.complete(done);
+        }
     }
     if debug_log.is_none()
         && let Some(message) = worker_panic.lock().unwrap().as_ref()
@@ -314,7 +316,11 @@ fn event_loop(
             }
         }
         for job in app.take_jobs() {
-            io.submit(job);
+            let open = matches!(job, rthid_io::io::Job::Open { .. });
+            let id = io.submit(job);
+            if open {
+                app.open_submitted(id);
+            }
         }
         redraw = false;
         let timeout = retry_at.map(|deadline| deadline.saturating_duration_since(Instant::now()));

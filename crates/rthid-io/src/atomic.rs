@@ -1,4 +1,7 @@
 //! Shared file replacement for PNG exports and configuration.
+//!
+//! Saving splits hard links and replaces read only destinations when the parent permits it.
+//! A config bind mounted as a single file cannot be replaced and fails to save.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -19,15 +22,15 @@ impl Drop for Temp {
     }
 }
 
-/// Creates missing parent directories and replaces the destination after a successful write.
+/// Replaces the resolved destination after a successful write, keeping symlinks intact.
 /// The caller syncs the file inside the write closure when durability is needed.
 pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = resolve(path, false)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -58,29 +61,22 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
         }
     };
     let mut temp = Temp(Some(temp));
-    if let Ok(metadata) = fs::metadata(path) {
+    if let Ok(metadata) = fs::metadata(&path) {
         let _ = file.set_permissions(metadata.permissions());
     }
     write(&mut file)?;
     drop(file);
-    fs::rename(temp.0.as_ref().unwrap(), path)?;
+    fs::rename(temp.0.as_ref().unwrap(), &path)?;
     temp.0 = None;
     Ok(())
 }
 
-/// Updates fresh text under an advisory sibling lock and syncs the replacement file.
-/// Resolves the destination once so symlink aliases share the lock and keep the symlink.
-/// Lock errors, including unsupported filesystem locking, never permit unlocked writes.
-/// The persistent lock file survives config replacement.
-pub fn update<T>(
-    path: &Path,
-    transform: impl FnOnce(Option<String>) -> io::Result<(String, T)>,
-) -> io::Result<T> {
+fn resolve(path: &Path, create_parent: bool) -> io::Result<PathBuf> {
     let mut path = path.to_path_buf();
     let mut hops = 0;
     while let Ok(target) = fs::read_link(&path) {
         if hops == 40 {
-            return Err(io::Error::other("config symlink loop or too many links"));
+            return Err(io::Error::other("symlink loop or too many links"));
         }
         hops += 1;
         path = if target.is_absolute() {
@@ -89,21 +85,35 @@ pub fn update<T>(
             path.parent().unwrap_or(Path::new(".")).join(target)
         };
     }
-    let path = match path.canonicalize() {
-        Ok(path) => path,
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let parent = path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            fs::create_dir_all(parent)?;
-            parent.canonicalize()?.join(
+            if create_parent {
+                fs::create_dir_all(parent)?;
+            }
+            Ok(parent.canonicalize()?.join(
                 path.file_name()
-                    .ok_or_else(|| io::Error::other("config has no file name"))?,
-            )
+                    .ok_or_else(|| io::Error::other("destination has no file name"))?,
+            ))
         }
-        Err(error) => return Err(error),
-    };
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates missing parents and updates fresh text under an advisory sibling lock.
+/// Syncs the replacement file before returning.
+/// Resolves the destination once so symlink aliases share the lock and keep the symlink.
+/// Lock errors, including unsupported filesystem locking, never permit unlocked writes.
+/// The persistent lock file survives config replacement.
+pub fn update<T>(
+    path: &Path,
+    transform: impl FnOnce(Option<String>) -> io::Result<(String, T)>,
+) -> io::Result<T> {
+    let path = resolve(path, true)?;
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock = OpenOptions::new()
@@ -128,8 +138,14 @@ pub fn update<T>(
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => Some(text),
+    let text = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Some(fs::read_to_string(&path)?),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "config is not a regular file",
+            ));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
@@ -266,6 +282,8 @@ mod tests {
     fn failed_writes_leave_destination_and_remove_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/file");
+        assert!(replace(&path, |file| file.write_all(b"original")).is_err());
+        fs::create_dir(path.parent().unwrap()).unwrap();
         replace(&path, |file| file.write_all(b"original")).unwrap();
         assert!(
             replace(&path, |file| {

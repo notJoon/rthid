@@ -22,6 +22,11 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
+enum OpenRequest {
+    Queued { from_dialog: bool },
+    Submitted { id: u64, from_dialog: bool },
+}
+
 /// All interactive state: settings, focus, preview viewport, grid caches and
 /// the optional companion PNG.
 pub struct App {
@@ -31,6 +36,8 @@ pub struct App {
     save_blocked: Option<String>,
     outbox: Vec<Job>,
     pending: Vec<Change>,
+    open_request: Option<OpenRequest>,
+    save_error: Option<String>,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
     /// Saved settings with independent palette colors.
@@ -85,6 +92,8 @@ impl App {
             save_blocked,
             outbox: Vec::new(),
             pending: Vec::new(),
+            open_request: None,
+            save_error: None,
             modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
@@ -131,10 +140,6 @@ impl App {
 
     /// Replaces the source and resets preview navigation while retaining settings.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
-        self.notice = None;
-        if matches!(self.modal, Some(Modal::OpenFile(_))) {
-            self.modal = None;
-        }
         self.source_path = Some(path);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
@@ -149,7 +154,9 @@ impl App {
         if let Some(Modal::OpenFile(picker)) = &mut self.modal {
             picker.set_listing(dir, entries);
         }
-        self.notice = None;
+        if !self.loading() {
+            self.notice = None;
+        }
     }
 
     /// Current configuration diagnostic for the status line.
@@ -157,8 +164,11 @@ impl App {
         self.notice.as_deref()
     }
 
-    /// Reports a validation or configuration error and whether the status changed.
+    /// Reports an error unless an Open is loading, returning whether the status changed.
     pub fn set_notice(&mut self, notice: String) -> bool {
+        if self.loading() {
+            return false;
+        }
         let changed = self.notice.as_ref() != Some(&notice);
         self.notice = Some(notice);
         changed
@@ -175,7 +185,17 @@ impl App {
 
     /// Replaces saved lists while retaining the current palette selection by name.
     pub fn saved(&mut self, loaded: Loaded) {
-        self.notice = loaded.notice();
+        let notice = loaded.notice();
+        if !self.loading()
+            && (notice.is_some()
+                || self
+                    .notice
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("config:")))
+        {
+            self.notice = notice;
+        }
+        self.save_error = None;
         self.palettes = loaded.palettes;
         self.templates = loaded.templates;
         self.save_blocked = loaded.save_blocked;
@@ -185,7 +205,10 @@ impl App {
     pub fn save_failed(&mut self, mut changes: Vec<Change>, error: String) {
         changes.append(&mut self.pending);
         self.pending = changes;
-        self.notice = Some(format!("config: {error}"));
+        if self.save_error.as_ref() != Some(&error) {
+            self.set_notice(format!("config: {error}"));
+            self.save_error = Some(error);
+        }
     }
 
     /// Drains filesystem jobs for submission after sync.
@@ -196,25 +219,42 @@ impl App {
     /// Applies a finished job and reports whether the display changed.
     pub fn complete(&mut self, done: Done) -> bool {
         let mut changed = false;
-        if self
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.starts_with("Loading "))
-        {
-            self.notice = None;
-            changed = true;
+        let mut from_dialog = false;
+        if matches!(done.outcome, IoOutcome::Opened(_)) {
+            let Some(OpenRequest::Submitted {
+                id,
+                from_dialog: origin,
+            }) = self.open_request
+            else {
+                return false;
+            };
+            if id != done.id {
+                return false;
+            }
+            from_dialog = origin;
+            self.open_request = None;
+            if self.loading() {
+                self.notice = None;
+                changed = true;
+            }
         }
         match done.outcome {
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
+                if from_dialog && matches!(self.modal, Some(Modal::OpenFile(_))) {
+                    self.modal = None;
+                }
                 self.open_image(path, image);
                 true
             }
             IoOutcome::Opened(Ok(Opened::Dir(listing))) => {
-                if !matches!(self.modal, Some(Modal::OpenFile(_))) {
+                if self.modal.is_none() && !from_dialog {
                     self.modal = Some(Modal::open_file(listing.dir.clone()));
                 }
-                self.set_listing(listing.dir, listing.entries);
-                true
+                if matches!(self.modal, Some(Modal::OpenFile(_))) {
+                    self.set_listing(listing.dir, listing.entries);
+                    changed = true;
+                }
+                changed
             }
             IoOutcome::Listed(Ok(listing)) => {
                 if matches!(self.modal, Some(Modal::OpenFile(_))) {
@@ -247,9 +287,28 @@ impl App {
         }
     }
 
+    fn loading(&self) -> bool {
+        self.notice
+            .as_deref()
+            .is_some_and(|n| n.starts_with("Loading "))
+    }
+
+    /// Associates the worker id with the origin captured when Open was requested.
+    pub fn open_submitted(&mut self, id: u64) {
+        if let Some(
+            OpenRequest::Queued { from_dialog } | OpenRequest::Submitted { from_dialog, .. },
+        ) = self.open_request
+        {
+            self.open_request = Some(OpenRequest::Submitted { id, from_dialog });
+        }
+    }
+
     /// Queues an image load and shows its file name while loading.
     pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
-        self.set_notice(format!(
+        self.open_request = Some(OpenRequest::Queued {
+            from_dialog: matches!(self.modal, Some(Modal::OpenFile(_))),
+        });
+        self.notice = Some(format!(
             "Loading {}",
             path.file_name()
                 .unwrap_or(path.as_os_str())
@@ -275,21 +334,14 @@ impl App {
             if let Modal::OpenFile(picker) = modal
                 && let Some(path) = rthid_io::paste::dropped_path(text)
             {
-                picker.input = rthid_widgets::TextInput::new(path.to_string_lossy(), usize::MAX);
+                picker.input = rthid_widgets::TextInput::new(path.to_string_lossy(), 4096);
                 picker.typed = true;
                 return;
             }
-            if modal.text_input_mut().is_some() {
-                for c in text.chars().filter(|c| !c.is_control()) {
-                    modal.handle_key(
-                        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-                        Ctx {
-                            palettes: &self.palettes,
-                            templates: &self.templates,
-                            settings: &self.settings,
-                            show_original: self.show_original,
-                        },
-                    );
+            if let Some(input) = modal.text_input_mut() {
+                input.insert_str(text);
+                if let Modal::OpenFile(picker) = modal {
+                    picker.typed = true;
                 }
             }
         } else if let Some(path) = rthid_io::paste::dropped_path(text) {
@@ -458,7 +510,7 @@ impl App {
     }
 
     fn apply_step(&mut self, step: Step) {
-        if step.effect.is_some() {
+        if step.effect.is_some() && !self.loading() {
             self.notice = None;
         }
         if let Some(effect) = step.effect
@@ -479,7 +531,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        self.notice = None;
+        if !self.loading() {
+            self.notice = None;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -707,6 +761,7 @@ mod tests {
         assert_eq!(app.notice(), Some("retained"));
         assert!(app.modal.is_none());
         app.request_open("/images".into(), None);
+        app.open_submitted(1);
         assert!(app.complete(done(IoOutcome::Opened(Ok(Opened::Dir(listing()))))));
         assert!(app.notice().is_none());
         let Some(Modal::OpenFile(picker)) = &app.modal else {
@@ -717,7 +772,10 @@ mod tests {
             IoOutcome::Opened(Err(failure(Op::Decode))),
             IoOutcome::Listed(Err(failure(Op::List))),
         ] {
-            app.request_open("failed.png".into(), None);
+            if matches!(outcome, IoOutcome::Opened(_)) {
+                app.request_open("failed.png".into(), None);
+                app.open_submitted(1);
+            }
             let expected = match &outcome {
                 IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => error.to_string(),
                 _ => unreachable!(),
@@ -729,6 +787,7 @@ mod tests {
         assert!(app.complete(done(IoOutcome::Listed(Ok(listing())))));
         assert!(app.notice().is_none());
         app.request_open("photo.png".into(), None);
+        app.open_submitted(1);
         assert!(app.complete(done(IoOutcome::Opened(Ok(Opened::Image {
             path: "photo.png".into(),
             image: RgbaImage::new(2, 3),
@@ -737,6 +796,87 @@ mod tests {
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
         assert_eq!(app.grid_size(), (2, 3));
+    }
+
+    #[test]
+    fn late_opens_preserve_dialogs_and_editor_restore_state() {
+        use rthid_io::io::Listing;
+        let listing = || {
+            IoOutcome::Opened(Ok(Opened::Dir(Listing {
+                dir: "/images".into(),
+                entries: vec![],
+            })))
+        };
+        let image = || {
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "late.png".into(),
+                image: RgbaImage::new(2, 3),
+            }))
+        };
+        let mut app = App::empty();
+        let original = app.settings.clone();
+        app.request_open("/images".into(), None);
+        app.open_submitted(1);
+        for key in [KeyCode::Char('P'), KeyCode::Char('n')] {
+            press(&mut app, key);
+        }
+        assert!(matches!(app.modal, Some(Modal::Editor(_))));
+        press(&mut app, KeyCode::Enter);
+        app.handle_paste("draft");
+        assert_eq!(app.notice(), Some("Loading images"));
+        assert!(app.complete(done(listing())));
+        let Some(Modal::Editor(editor)) = &app.modal else {
+            panic!("editor expected")
+        };
+        assert_eq!(editor.input.as_ref().unwrap().text(), "draft");
+        assert!(app.notice().is_none());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.settings == original);
+        assert!(app.show_original);
+
+        for outcome in [listing(), image()] {
+            app.modal = Some(Modal::open_file("/images".into()));
+            app.request_open("late.png".into(), Some("/images".into()));
+            app.open_submitted(1);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.notice(), Some("Loading late.png"));
+            app.complete(done(outcome));
+            assert!(app.modal.is_none());
+        }
+        app.request_open("late.png".into(), None);
+        app.open_submitted(2);
+        assert!(!app.complete(done(image())));
+        assert_eq!(app.notice(), Some("Loading late.png"));
+        app.modal = Some(Modal::open_file("/images".into()));
+        let mut latest = done(image());
+        latest.id = 2;
+        assert!(app.complete(latest));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+    }
+
+    #[test]
+    fn pasted_text_respects_field_limits_and_marks_the_path_as_typed() {
+        let mut app = App::empty();
+        app.modal = Some(Modal::open_file("/images".into()));
+        app.handle_paste(&"猫\n".repeat(100_000));
+        let Some(Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert!(picker.typed);
+        assert_eq!(picker.input.text().chars().count(), 4096);
+        app.handle_paste(&format!("/{}.png", "a".repeat(5000)));
+        assert_eq!(
+            app.modal
+                .as_mut()
+                .unwrap()
+                .text_input_mut()
+                .unwrap()
+                .text()
+                .chars()
+                .count(),
+            4096
+        );
     }
 
     #[test]
@@ -751,6 +891,8 @@ mod tests {
             if output == &path && protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images")
                 && (grid.w, grid.h) == (4, 2) && grid.indices.len() == 8 && grid.palette == app.settings.options.palette)
         );
+        app.open_submitted(1);
+        app.complete(done(IoOutcome::Opened(Err(failure(Op::Decode)))));
         assert!(app.complete(done(IoOutcome::Exported(Err(failure(Op::Encode))))));
         let error = app.export_status().unwrap().to_owned();
         assert_eq!(app.notice(), Some(error.as_str()));
@@ -806,6 +948,7 @@ mod tests {
             app.set_listing(
                 PathBuf::from(dir),
                 vec![Entry {
+                    file_name: "bad.png".into(),
                     name: "bad.png".into(),
                     dir: false,
                 }],
@@ -815,9 +958,12 @@ mod tests {
                 matches!(app.take_jobs().as_slice(), [Job::Open { path, dir: Some(base), protect: None }]
                 if path == &PathBuf::from("bad.png") && base == &PathBuf::from(dir))
             );
-            app.set_notice("open: invalid image".into());
+            app.open_submitted(1);
+            app.complete(done(IoOutcome::Opened(Err(failure(
+                rthid_io::io::Op::Decode,
+            )))));
             assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
-            assert_eq!(app.notice(), Some("open: invalid image"));
+            assert!(app.notice().unwrap().starts_with("open:"));
             app.handle_paste("'file:///tmp/My%20Photo.png'");
             assert!(app.take_jobs().is_empty());
             let Some(Modal::OpenFile(picker)) = &app.modal else {
@@ -1050,6 +1196,15 @@ mod tests {
         assert_eq!(app.notice(), Some("config: busy"));
         assert_eq!(app.take_changes(), expected);
         assert!(app.take_changes().is_empty());
+        app.set_notice("open: failed".into());
+        app.save_failed(vec![], "busy".into());
+        assert_eq!(app.notice(), Some("open: failed"));
+        app.saved(Loaded::default());
+        assert_eq!(app.notice(), Some("open: failed"));
+        app.save_failed(vec![], "denied".into());
+        assert_eq!(app.notice(), Some("config: denied"));
+        app.saved(Loaded::default());
+        assert!(app.notice().is_none());
     }
 
     #[test]

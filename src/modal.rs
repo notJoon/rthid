@@ -225,7 +225,7 @@ pub struct FilePicker {
 impl FilePicker {
     /// Replaces the directory and resets the field, selection and scroll.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
-        self.input = TextInput::new(dir.join("").to_string_lossy(), usize::MAX);
+        self.input = TextInput::new(dir.join("").to_string_lossy(), 4096);
         self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
         self.dir = dir;
         self.entries = entries;
@@ -249,13 +249,13 @@ impl FilePicker {
             }
             Outcome::Submit(()) => {
                 if let Some(entry) = self.entries.get(self.list.selected()) {
-                    let path = self.dir.join(&entry.name);
+                    let path = self.dir.join(&entry.file_name);
                     return Step::effect(
                         Next::Stay,
                         if entry.dir {
                             Effect::ListDir(path)
                         } else {
-                            Effect::Open(PathBuf::from(&entry.name), self.dir.clone())
+                            Effect::Open(PathBuf::from(&entry.file_name), self.dir.clone())
                         },
                     );
                 }
@@ -630,7 +630,7 @@ impl Modal {
     /// Opens a path field while the event loop loads the starting directory.
     pub fn open_file(start: PathBuf) -> Self {
         Self::OpenFile(Box::new(FilePicker {
-            input: TextInput::new(start.join("").to_string_lossy(), usize::MAX),
+            input: TextInput::new(start.join("").to_string_lossy(), 4096),
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
@@ -873,10 +873,12 @@ mod tests {
             "/images".into(),
             vec![
                 Entry {
+                    file_name: "album".into(),
                     name: "album".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "photo.png".into(),
                     name: "photo.png".into(),
                     dir: false,
                 },
@@ -982,14 +984,17 @@ mod tests {
             PathBuf::from("/images"),
             vec![
                 Entry {
+                    file_name: "..".into(),
                     name: "..".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "album".into(),
                     name: "album".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "photo.png".into(),
                     name: "photo.png".into(),
                     dir: false,
                 },
@@ -1018,7 +1023,7 @@ mod tests {
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
-        picker.input = TextInput::new("~/raw path.png", usize::MAX);
+        picker.input = TextInput::new("~/raw path.png", 4096);
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(
@@ -1035,6 +1040,7 @@ mod tests {
         picker.set_listing(
             PathBuf::from("/empty"),
             vec![Entry {
+                file_name: "..".into(),
                 name: "..".into(),
                 dir: true,
             }],
@@ -1051,6 +1057,27 @@ mod tests {
             modal.handle_key(key(KeyCode::Esc), context()).next,
             Next::Close
         ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let file_name = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
+            let mut modal = Modal::open_file("/images".into());
+            let Modal::OpenFile(picker) = &mut modal else {
+                unreachable!()
+            };
+            picker.set_listing(
+                "/images".into(),
+                vec![Entry {
+                    name: file_name.to_string_lossy().into_owned(),
+                    file_name: file_name.clone(),
+                    dir: false,
+                }],
+            );
+            let step = modal.handle_key(key(KeyCode::Enter), context());
+            assert!(
+                matches!(step.effect, Some(Effect::Open(path, _)) if path.as_os_str() == file_name)
+            );
+        }
     }
 
     fn ctx<'a>(

@@ -68,6 +68,72 @@ mod tests {
     use rthid_dither::dither::make_palette;
 
     #[test]
+    #[cfg(unix)]
+    fn filesystem_boundaries_preserve_links_and_refuse_unsafe_inputs() {
+        use std::{fs, os::unix::fs::symlink, process::Command};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("actual.jpg");
+        let alias = dir.path().join("link.png");
+        symlink("actual.jpg", &alias).unwrap();
+        let palette = make_palette(&["#000"]).unwrap();
+        write_atomic(&alias, &[0], 1, 1, &palette, 1).unwrap();
+        assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+        assert_eq!(
+            crate::image::load_image(&target).unwrap().dimensions(),
+            (1, 1)
+        );
+        assert!(
+            write_atomic(&dir.path().join("missing/out.png"), &[0], 1, 1, &palette, 1).is_err()
+        );
+        assert!(!dir.path().join("missing").exists());
+
+        let huge = dir.path().join("huge.bmp");
+        let mut header = [0u8; 54];
+        header[..2].copy_from_slice(b"BM");
+        header[2..6].copy_from_slice(&54u32.to_le_bytes());
+        header[10..14].copy_from_slice(&54u32.to_le_bytes());
+        header[14..18].copy_from_slice(&40u32.to_le_bytes());
+        header[18..22].copy_from_slice(&16385u32.to_le_bytes());
+        header[22..26].copy_from_slice(&1u32.to_le_bytes());
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[28..30].copy_from_slice(&24u16.to_le_bytes());
+        fs::write(&huge, header).unwrap();
+        assert!(matches!(
+            crate::image::load_image(&huge),
+            Err(image::ImageError::Limits(_))
+        ));
+
+        let fifo = dir.path().join("config");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error =
+            crate::atomic::update::<()>(&fifo, |_| panic!("must not read a FIFO")).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+
+        // APFS refuses invalid UTF-8 file names.
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
+            let raw_path = dir.path().join(&raw);
+            fs::copy(&target, &raw_path).unwrap();
+            let (base, entries) = crate::dir::list_dir(dir.path()).unwrap();
+            let entry = entries.iter().find(|entry| entry.file_name == raw).unwrap();
+            assert_eq!(
+                crate::image::load_image(&base.join(&entry.file_name))
+                    .unwrap()
+                    .dimensions(),
+                (1, 1)
+            );
+        }
+    }
+
+    #[test]
     fn preview_scale_bounds_the_long_side_with_exact_integer_dots() {
         for (w, h, expected) in [
             (1, 1, 4),

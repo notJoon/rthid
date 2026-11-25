@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `TextInput::insert_str` inserts printable paste text in one pass within the character limit
+
 - `ListPicker::select`, `index_at` and `handle_mouse` for selection, scroll aware
   hit testing and clicking the selected item to submit
 

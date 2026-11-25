@@ -206,7 +206,16 @@ impl From<FileTone> for Tone {
 
 /// Loads valid entries while retaining diagnostics and preventing unsafe replacement.
 pub fn load(path: &Path) -> Loaded {
-    let text = match fs::read_to_string(path) {
+    let read = || {
+        if !fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "config is not a regular file",
+            ));
+        }
+        fs::read_to_string(path)
+    };
+    let text = match read() {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Loaded::default(),
         Err(error) => {
@@ -629,6 +638,19 @@ mod tests {
         assert_eq!(loaded.templates.len(), 1);
         assert!(loaded.save_blocked.is_some());
         assert!(load(dir.path()).save_blocked.is_some());
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let loaded = load(&fifo);
+            assert!(loaded.save_blocked.unwrap().contains("not a regular file"));
+        }
     }
 
     #[test]

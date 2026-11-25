@@ -1,6 +1,7 @@
 //! Visible directories and supported image files.
 
 use std::{
+    ffi::OsString,
     io,
     path::{Path, PathBuf},
 };
@@ -8,7 +9,9 @@ use std::{
 /// Visible directory entry supplied by the event loop.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// File name relative to the listed directory.
+    /// Original file name for joining with the listed directory.
+    pub file_name: OsString,
+    /// File name with invalid UTF-8 replaced for display.
     pub name: String,
     /// Whether selecting this entry lists a directory.
     pub dir: bool,
@@ -20,7 +23,8 @@ pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
@@ -33,7 +37,11 @@ pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
                 && image::ImageFormat::from_path(entry.path())
                     .is_ok_and(|format| format.reading_enabled()))
         {
-            entries.push(Entry { name, dir: is_dir });
+            entries.push(Entry {
+                file_name,
+                name,
+                dir: is_dir,
+            });
         }
     }
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
@@ -41,6 +49,7 @@ pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
         entries.insert(
             0,
             Entry {
+                file_name: "..".into(),
                 name: "..".into(),
                 dir: true,
             },
@@ -87,10 +96,12 @@ mod tests {
             let (_, entries) = list_dir(temp.path()).unwrap();
             assert_eq!(entries.len(), 7);
             assert!(entries.contains(&Entry {
+                file_name: "linked".into(),
                 name: "linked".into(),
                 dir: true
             }));
             assert!(entries.contains(&Entry {
+                file_name: "linked.png".into(),
                 name: "linked.png".into(),
                 dir: false
             }));

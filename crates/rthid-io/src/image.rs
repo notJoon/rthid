@@ -7,6 +7,10 @@ use std::{io, path::Path};
 // Offering a full resolution export would require keeping the unshrunk original.
 const MAX_SOURCE_SIDE: u32 = 1024;
 
+// Reject oversized sources before decoding can exhaust memory.
+const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+const MAX_DECODE_SIDE: u32 = 16384;
+
 /// Rejects a companion PNG destination that resolves to the source image.
 pub fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
     if let Some(preview) = preview
@@ -28,7 +32,13 @@ pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
             io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file").into(),
         );
     }
-    let source = image::open(path)?;
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits.max_image_width = Some(MAX_DECODE_SIDE);
+    limits.max_image_height = Some(MAX_DECODE_SIDE);
+    reader.limits(limits);
+    let source = reader.decode()?;
     Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
         source.resize(
             MAX_SOURCE_SIDE,
