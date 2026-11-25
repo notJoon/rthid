@@ -34,8 +34,6 @@ mod grid;
 mod memo;
 /// Modal input and preset editing.
 mod modal;
-/// Paths carried by terminal paste events.
-mod paste;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -46,14 +44,15 @@ mod ui;
 mod viewport;
 
 use std::{
+    fmt::Display,
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, ValueEnum};
-use image::{RgbaImage, imageops};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{
@@ -62,14 +61,12 @@ use ratatui::crossterm::{
     },
     execute,
 };
-
-use crate::{
-    app::{App, Request},
-    cells::Glyphs,
-    graphics::Mode as Graphics,
-    modal::Entry,
-    ui::Renderer,
+use rthid_io::{
+    image::{check_not_source, load_image},
+    io::{Done, IO, Outcome},
 };
+
+use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -88,10 +85,6 @@ impl Drop for BracketedPaste {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
-
-// Sources are shrunk on load to bound dither work per keypress.
-// Offering a full resolution export would require keeping the unshrunk original.
-const MAX_SOURCE_SIDE: u32 = 1024;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -126,127 +119,25 @@ enum CliGraphics {
     Off,
 }
 
-// The companion PNG is replaced on every re-dither, so it must never be the source image.
-// A missing destination cannot be the source, which has to exist to load.
-fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
-    if let Some(preview) = preview
-        && let (Ok(a), Ok(b)) = (source.canonicalize(), preview.canonicalize())
-        && a == b
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--preview-png must not point at the source image",
-        ));
+// Writes one timing line in milliseconds, followed by the path when there is one.
+fn log_timing(
+    debug_log: &mut Option<&mut File>,
+    op: impl Display,
+    elapsed: Duration,
+    path: Option<&Path>,
+) -> io::Result<()> {
+    if let Some(log) = debug_log {
+        let ms = elapsed.as_millis();
+        match path {
+            Some(path) => writeln!(log, "[timing] {op} {ms} {}", path.display())?,
+            None => writeln!(log, "[timing] {op} {ms}")?,
+        }
     }
     Ok(())
 }
 
-// Shrinks sources on load to bound processing work.
-fn load_image(path: &Path) -> Result<RgbaImage, String> {
-    let source =
-        image::open(path).map_err(|error| format!("Could not load {}: {error}", path.display()))?;
-    Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
-        source.resize(
-            MAX_SOURCE_SIDE,
-            MAX_SOURCE_SIDE,
-            imageops::FilterType::Triangle,
-        )
-    } else {
-        source
-    }
-    .to_rgba8())
-}
-
-fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
-    let dir = dir.canonicalize()?;
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        let is_dir = metadata.is_dir();
-        if is_dir
-            || (metadata.is_file()
-                && image::ImageFormat::from_path(entry.path())
-                    .is_ok_and(|format| format.reading_enabled()))
-        {
-            entries.push(Entry { name, dir: is_dir });
-        }
-    }
-    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
-    if dir.parent().is_some() {
-        entries.insert(
-            0,
-            Entry {
-                name: "..".into(),
-                dir: true,
-            },
-        );
-    }
-    Ok((dir, entries))
-}
-
-fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(home) = home {
-        if text == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = text.strip_prefix("~/") {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(text)
-}
-
-fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
-    let request = match request {
-        Request::Open(path, dir) => {
-            let home_path = path == Path::new("~") || path.starts_with("~/");
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let path = path
-                .to_str()
-                .map(|text| expand_tilde(text, home.as_deref()))
-                .unwrap_or(path);
-            let path = if path.is_relative() && !home_path {
-                dir.map_or_else(|| path.clone(), |dir| dir.join(&path))
-            } else {
-                path
-            };
-            if path.is_dir() {
-                if !matches!(app.modal, Some(modal::Modal::OpenFile(_))) {
-                    app.modal = Some(modal::Modal::open_file(path.clone()));
-                }
-                Request::List(path)
-            } else {
-                Request::Open(path, None)
-            }
-        }
-        request => request,
-    };
-    match request {
-        Request::List(path) => match list_dir(&path) {
-            Ok((dir, entries)) => app.set_listing(dir, entries),
-            Err(error) => {
-                app.set_notice(format!("open: {}: {error}", path.display()));
-            }
-        },
-        Request::Open(path, _) => {
-            match check_not_source(&path, preview_png)
-                .map_err(|error| error.to_string())
-                .and_then(|()| load_image(&path))
-            {
-                Ok(image) => app.open_image(path, image),
-                Err(error) => {
-                    app.set_notice(format!("open: {error}"));
-                }
-            }
-        }
-    }
+fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
+    log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
 }
 
 // Pointer motion alone changes nothing on screen.
@@ -271,7 +162,8 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Off => Graphics::Off,
     };
     if let Some(path) = &path {
-        check_not_source(path, preview_png.as_deref())?;
+        check_not_source(path, preview_png.as_deref())
+            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause.to_string()))?;
     }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -281,29 +173,26 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = path.map(|path| {
-        let image = load_image(&path).unwrap_or_else(|error| {
-            eprintln!("{error}");
+    let source = if let Some(path) = path {
+        let started = Instant::now();
+        let image = load_image(&path);
+        log_timing(
+            &mut debug_log.as_mut(),
+            "decode",
+            started.elapsed(),
+            Some(&path),
+        )?;
+        let image = image.unwrap_or_else(|error| {
+            eprintln!("Could not load {}: {error}", path.display());
             std::process::exit(1);
         });
-        (path, image)
-    });
+        Some((path, image))
+    } else {
+        None
+    };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut messages = Vec::new();
-    if let Some(first) = loaded.warnings.first() {
-        messages.push(format!(
-            "{} entries skipped: {first}",
-            loaded.warnings.len()
-        ));
-    }
-    if let Some(reason) = &loaded.save_blocked {
-        messages.push(format!(
-            "saving disabled: {}",
-            reason.lines().next().unwrap_or(reason)
-        ));
-    }
-    let notice = (!messages.is_empty()).then(|| format!("config: {}", messages.join(" | ")));
+    let notice = loaded.notice();
     let mut app = App::new(
         source,
         preview_png.clone(),
@@ -314,9 +203,27 @@ fn main() -> std::io::Result<()> {
     );
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
-    let terminal_result = ratatui::run(|terminal| {
+    let worker_panic = Arc::new(Mutex::new(None::<String>));
+    let mut terminal_result = ratatui::run(|terminal| {
+        let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
+        let worker_panic = Arc::clone(&worker_panic);
+        let previous = std::panic::take_hook();
+        // TODO: Worker panics already arrive as `Cause::Panicked` in `Done`. Keep this hook only to
+        //       silence stderr for the worker thread and report the panic from that result.
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().name() == Some(rthid_io::io::WORKER_NAME) {
+                let message = rthid_io::io::panic_message(info.payload());
+                *worker_panic.lock().unwrap() = Some(message.lines().next().unwrap_or("").into());
+                if let Some(mut log) = panic_log.as_ref() {
+                    let _ = writeln!(log, "IO worker panic: {info}");
+                }
+            } else {
+                previous(info);
+            }
+        }));
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         event_loop(
@@ -325,13 +232,49 @@ fn main() -> std::io::Result<()> {
             &mut renderer,
             debug_log.as_mut(),
             config_path.as_deref(),
-            preview_png.as_deref(),
+            &mut io,
         )
     });
     drop(bracketed_paste);
     drop(mouse_capture);
-    let png_result = app.finish_png();
-    terminal_result.and(png_result)
+    app.finish();
+    for (job, tag) in app.take_jobs() {
+        io.submit(job, tag);
+    }
+    for done in io.finish() {
+        terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
+        if matches!(done.outcome, Outcome::Exported(_) | Outcome::Updated(_)) {
+            app.complete(done);
+        }
+    }
+    // Edits whose background save did not finish are saved here.
+    terminal_result = terminal_result.and(save_on_quit(
+        config_path.as_deref(),
+        app.unsaved(),
+        &mut debug_log.as_mut(),
+    ));
+    if debug_log.is_none()
+        && let Some(message) = worker_panic.lock().unwrap().as_ref()
+    {
+        eprintln!("IO worker panicked: {message}");
+    }
+    terminal_result.and(app.export_result())
+}
+
+fn save_on_quit(
+    path: Option<&Path>,
+    pending: &[store::Change],
+    debug_log: &mut Option<&mut File>,
+) -> io::Result<()> {
+    if !pending.is_empty()
+        && let Some(path) = path
+    {
+        let started = Instant::now();
+        let result = store::save(path, Duration::from_secs(1), pending);
+        log_timing(debug_log, "save", started.elapsed(), Some(path))?;
+        result?;
+    }
+    Ok(())
 }
 
 // Syncs and draws when something changed, then waits for input and applies
@@ -342,14 +285,21 @@ fn event_loop(
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
-    preview_png: Option<&Path>,
+    io: &mut IO,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
     while !app.quit {
+        while let Some(done) = io.poll() {
+            log_done(&done, &mut debug_log)?;
+            redraw |= app.complete(done);
+        }
         if redraw {
-            app.poll_export();
-            app.sync(layout.preview);
+            let started = Instant::now();
+            let rebuilt = app.sync(layout.preview);
+            if rebuilt {
+                log_timing(&mut debug_log, "sync", started.elapsed(), None)?;
+            }
             let frame = terminal.draw(|frame| {
                 ui::draw(frame, app, &layout, renderer);
             })?;
@@ -357,45 +307,50 @@ fn event_loop(
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
         }
-        if let Some(request) = app.take_request() {
-            handle_request(app, request, preview_png);
-            redraw = true;
-            continue;
+        for (job, tag) in app.take_jobs() {
+            io.submit(job, tag);
         }
         redraw = false;
-        // With a companion PNG, wake periodically so background write results reach the status line.
-        if app.has_export() && !event::poll(Duration::from_millis(50))? {
-            redraw = app.poll_export();
-            continue;
-        }
-        // Drain queued input so held-down repeats cost one re-dither, not one each.
-        loop {
-            let event = event::read()?;
-            if let Some(log) = &mut debug_log {
-                writeln!(log, "event {event:?}")?;
-            }
-            redraw |= needs_redraw(&event);
-            match event {
-                Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+        // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
+        //       when a job finishes instead.
+        let timeout = [
+            app.save_retry()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            io.busy().then_some(Duration::from_millis(30)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if timeout.map_or(Ok(true), event::poll)? {
+            // Drain queued input so held-down repeats cost one re-dither, not one each.
+            loop {
+                let event = event::read()?;
+                if let Some(log) = &mut debug_log {
+                    writeln!(log, "event {event:?}")?;
                 }
-                Event::Paste(text) => app.handle_paste(&text),
-                Event::Resize(width, height) => {
-                    layout = ui::layout(ratatui::layout::Size::new(width, height));
-                    app.clamp_viewport(layout.preview);
+                redraw |= needs_redraw(&event);
+                match event {
+                    Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+                    }
+                    Event::Paste(text) => app.handle_paste(&text),
+                    Event::Resize(width, height) => {
+                        layout = ui::layout(ratatui::layout::Size::new(width, height));
+                        app.clamp_viewport(layout.preview);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if !event::poll(Duration::ZERO)? {
-                break;
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
-        if app.take_save()
+        // Quitting saves synchronously instead, so no job is left behind.
+        if !app.quit
             && let Some(path) = config_path
-            && let Err(error) = store::save(path, &app.palettes, &app.templates)
         {
-            redraw |= app.set_notice(format!("config: {error}"));
+            app.queue_save(path, Instant::now());
         }
     }
     Ok(())
@@ -407,112 +362,56 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn directory_listing_filters_and_sorts() {
-        let temp = tempfile::tempdir().unwrap();
-        for name in [".hidden.png", "z.png", "b.png", "notes.txt"] {
-            std::fs::write(temp.path().join(name), b"").unwrap();
-        }
-        for name in ["c", "a"] {
-            std::fs::create_dir(temp.path().join(name)).unwrap();
-        }
-        let (dir, entries) = list_dir(temp.path()).unwrap();
-        assert_eq!(dir, temp.path().canonicalize().unwrap());
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.name.as_str(), entry.dir))
-                .collect::<Vec<_>>(),
-            [
-                ("..", true),
-                ("a", true),
-                ("c", true),
-                ("b.png", false),
-                ("z.png", false)
-            ]
-        );
-        assert!(list_dir(&temp.path().join("missing")).is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(temp.path().join("a"), temp.path().join("linked")).unwrap();
-            symlink(temp.path().join("b.png"), temp.path().join("linked.png")).unwrap();
-            symlink(temp.path().join("missing"), temp.path().join("broken.png")).unwrap();
-            let (_, entries) = list_dir(temp.path()).unwrap();
-            assert_eq!(entries.len(), 7);
-            assert!(entries.contains(&Entry {
-                name: "linked".into(),
-                dir: true
-            }));
-            assert!(entries.contains(&Entry {
-                name: "linked.png".into(),
-                dir: false
-            }));
-        }
+    fn quit_retries_pending_changes_and_returns_save_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let changes = vec![store::Change::UpsertTemplate(settings::Template::capture(
+            "Pending".into(),
+            &settings::Settings::default(),
+        ))];
+        std::fs::write(&path, "version = [").unwrap();
+        assert!(store::save(&path, Duration::from_millis(50), &changes).is_err());
+        assert!(save_on_quit(Some(&path), &changes, &mut None).is_err());
+        std::fs::write(&path, "version = 1").unwrap();
+        save_on_quit(Some(&path), &changes, &mut None).unwrap();
+        assert!(store::load(&path).templates.find("Pending").is_some());
     }
 
     #[test]
-    fn tilde_expansion_only_uses_a_home_prefix() {
-        for (text, home, expected) in [
-            ("~", Some(Path::new("/home/me")), "/home/me"),
-            (
-                "~/photo.png",
-                Some(Path::new("/home/me")),
-                "/home/me/photo.png",
-            ),
-            (
-                "~other/photo.png",
-                Some(Path::new("/home/me")),
-                "~other/photo.png",
-            ),
-            ("photo~.png", Some(Path::new("/home/me")), "photo~.png"),
-            ("~/photo.png", None, "~/photo.png"),
-            ("~", None, "~"),
-        ] {
-            assert_eq!(expand_tilde(text, home), PathBuf::from(expected));
-        }
-    }
-
-    #[test]
-    fn open_requests_list_directories_and_keep_failures_open() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = App::empty();
-        app.handle_paste(&format!("'{}'", temp.path().display()));
-        assert!(app.modal.is_none());
-        assert!(app.notice().unwrap().starts_with("Loading "));
-        let request = app.take_request().unwrap();
-        handle_request(&mut app, request, None);
-        assert!(app.notice().is_none());
-        let Some(modal::Modal::OpenFile(picker)) = &app.modal else {
-            panic!("open dialog expected")
+    fn completion_timings_include_operation_duration_and_path() {
+        use rthid_io::{
+            dir::Listing,
+            io::{Opened, Updated},
         };
-        assert_eq!(picker.dir, temp.path().canonicalize().unwrap());
-        handle_request(
-            &mut app,
-            Request::Open(
-                PathBuf::from("missing.png"),
-                Some(temp.path().to_path_buf()),
-            ),
-            None,
-        );
-        assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
-        assert!(app.notice().unwrap().contains("Could not load"));
-        assert!(
-            app.notice()
-                .unwrap()
-                .contains(&temp.path().display().to_string())
-        );
-        let photo = temp.path().join("photo.png");
-        RgbaImage::new(2, 2).save(&photo).unwrap();
-        for path in [PathBuf::from("photo.png"), photo.clone()] {
-            handle_request(
-                &mut app,
-                Request::Open(path, Some(temp.path().to_path_buf())),
-                None,
-            );
-            assert_eq!(app.source_path(), Some(photo.as_path()));
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("debug.log");
+        let mut log = File::create(&log_path).unwrap();
+        let path = PathBuf::from("photo.png");
+        for outcome in [
+            Outcome::Listed(Ok(Listing {
+                dir: path.clone(),
+                entries: vec![],
+            })),
+            Outcome::Opened(Ok(Opened::Image {
+                path: path.clone(),
+                image: image::RgbaImage::new(1, 1),
+            })),
+            Outcome::Exported(Ok(path.clone())),
+            Outcome::Updated(Ok(Updated {
+                path,
+                text: String::new(),
+            })),
+        ] {
+            log_done(
+                &Done::new(0, Duration::from_millis(7), outcome),
+                &mut Some(&mut log),
+            )
+            .unwrap();
         }
-        assert!(app.modal.is_none());
-        assert!(app.notice().is_none());
+        assert_eq!(
+            std::fs::read_to_string(log_path).unwrap(),
+            "[timing] list 7 photo.png\n[timing] decode 7 photo.png\n[timing] encode 7 photo.png\n[timing] save 7 photo.png\n"
+        );
     }
 
     #[test]
@@ -595,16 +494,5 @@ mod tests {
         ] {
             assert!(needs_redraw(&event));
         }
-    }
-
-    #[test]
-    fn preview_png_may_not_overwrite_the_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("photo.png");
-        std::fs::write(&source, b"image").unwrap();
-        let aliased = dir.path().join(".").join("photo.png");
-        assert!(check_not_source(&source, Some(&aliased)).is_err());
-        assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
-        assert!(check_not_source(&source, None).is_ok());
     }
 }

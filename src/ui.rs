@@ -464,7 +464,7 @@ fn draw_preview(
 
 // PNG errors, config notices and graphics errors replace the normal status line.
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
-    if let Some(message) = app.export_status().or_else(|| app.notice()) {
+    if let Some(message) = app.notice().or_else(|| app.export_status()) {
         return message.to_owned();
     }
     let Some((sw, sh)) = app.grid_cache.source_size() else {
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn status_uses_preview_report_and_prioritizes_export_errors() {
+    fn status_uses_preview_report_and_prioritizes_notices() {
         let mut app = App::builtin(RgbaImage::new(4, 6), None);
         let geometry = app.geometry(Rect::new(1, 1, 20, 10));
         assert!(
@@ -741,7 +741,16 @@ mod tests {
             if with_export {
                 app = App::builtin(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
-                assert!(app.finish_png().is_err());
+                app.complete(rthid_io::io::Done::new(
+                    0,
+                    std::time::Duration::ZERO,
+                    rthid_io::io::Outcome::Exported(Err(rthid_io::io::IoError {
+                        op: rthid_io::io::Op::Encode,
+                        path: dir.path().to_path_buf(),
+                        cause: rthid_io::io::Cause::Io(std::io::Error::other("denied")),
+                    })),
+                ));
+                assert!(app.export_result().is_err());
             }
             app.set_notice("Config notice".into());
             assert_eq!(
@@ -753,7 +762,7 @@ mod tests {
                         ..PreviewReport::default()
                     },
                 ),
-                app.export_status().unwrap_or("Config notice"),
+                "Config notice",
             );
         }
     }
@@ -908,14 +917,15 @@ mod tests {
     }
     #[test]
     fn open_dialog_keeps_path_above_scrolled_entries() {
-        use crate::modal::Entry;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use rthid_io::dir::Entry;
         let mut app = App::empty();
-        app.modal = Some(Modal::open_file("/images".into()));
+        app.modal = Some(Modal::open_file("/images".into(), 1));
         app.set_listing(
             "/images".into(),
             (0..30)
                 .map(|i| Entry {
+                    file_name: format!("folder{i:02}").into(),
                     name: format!("folder{i:02}"),
                     dir: true,
                 })

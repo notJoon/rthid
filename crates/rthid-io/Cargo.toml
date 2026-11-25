@@ -1,0 +1,16 @@
+[package]
+name = "rthid-io"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rthid-dither = { path = "../rthid-dither" }
+image.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -12,7 +12,11 @@ use ratatui::{
     widgets::Block,
 };
 use rthid_dither::dither::Mode;
+use rthid_io::dir::Entry;
 use rthid_widgets::{Confirm, Dialog, ListPicker, Outcome, TextInput};
+
+/// Character limit of the open dialog's path field.
+pub const PATH_MAX_CHARS: usize = 4096;
 
 const OPEN_HINTS: &[(&str, &str)] = &[
     ("Up/Down", "select"),
@@ -142,19 +146,19 @@ pub enum Effect {
         base: Settings,
     },
     /// Remove a user preset and request persistence.
-    RemovePreset(usize),
+    RemovePreset(String),
     /// Capture current settings under this name and request persistence.
     SaveTemplate(String),
     /// Remove a saved snapshot and request persistence.
-    RemoveTemplate(usize),
+    RemoveTemplate(String),
 }
 
 /// Action held while a confirmation captures keys.
 pub enum OnYes {
     /// Remove the selected user preset.
-    RemovePreset(usize),
+    RemovePreset(String),
     /// Remove the selected snapshot.
-    RemoveTemplate(usize),
+    RemoveTemplate(String),
     /// Save current settings under an existing name.
     OverwriteTemplate(String),
 }
@@ -207,15 +211,6 @@ pub struct ModalLayout {
     pub list: Option<Rect>,
 }
 
-/// Visible directory entry supplied by the event loop.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// File name relative to the listed directory.
-    pub name: String,
-    /// Whether selecting this entry lists a directory.
-    pub dir: bool,
-}
-
 /// Path field and directory selection for opening an image.
 pub struct FilePicker {
     /// Editable path submitted after a text edit.
@@ -228,12 +223,14 @@ pub struct FilePicker {
     pub entries: Vec<Entry>,
     /// Whether Enter submits the field instead of the selected entry.
     pub typed: bool,
+    /// Number the app gave this dialog when it opened, matched against IO results.
+    pub generation: u64,
 }
 
 impl FilePicker {
     /// Replaces the directory and resets the field, selection and scroll.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
-        self.input = TextInput::new(dir.join("").to_string_lossy(), usize::MAX);
+        self.input = TextInput::new(dir.join("").to_string_lossy(), PATH_MAX_CHARS);
         self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
         self.dir = dir;
         self.entries = entries;
@@ -257,13 +254,13 @@ impl FilePicker {
             }
             Outcome::Submit(()) => {
                 if let Some(entry) = self.entries.get(self.list.selected()) {
-                    let path = self.dir.join(&entry.name);
+                    let path = self.dir.join(&entry.file_name);
                     return Step::effect(
                         Next::Stay,
                         if entry.dir {
                             Effect::ListDir(path)
                         } else {
-                            Effect::Open(PathBuf::from(&entry.name), self.dir.clone())
+                            Effect::Open(PathBuf::from(&entry.file_name), self.dir.clone())
                         },
                     );
                 }
@@ -636,13 +633,15 @@ impl Modal {
     }
 
     /// Opens a path field while the event loop loads the starting directory.
-    pub fn open_file(start: PathBuf) -> Self {
+    /// `generation` tells this dialog apart from earlier ones for late IO results.
+    pub fn open_file(start: PathBuf, generation: u64) -> Self {
         Self::OpenFile(Box::new(FilePicker {
-            input: TextInput::new(start.join("").to_string_lossy(), usize::MAX),
+            input: TextInput::new(start.join("").to_string_lossy(), PATH_MAX_CHARS),
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
             typed: false,
+            generation,
         }))
     }
 
@@ -775,7 +774,9 @@ impl Modal {
                         }
                         *confirm = Some((
                             Confirm::new("Delete preset?"),
-                            OnYes::RemovePreset(list.selected()),
+                            OnYes::RemovePreset(
+                                ctx.palettes.get(list.selected()).unwrap().name.clone(),
+                            ),
                         ));
                     }
                     _ => {}
@@ -828,7 +829,9 @@ impl Modal {
                             KeyCode::Char('x') if !ctx.templates.is_empty() => {
                                 *confirm = Some((
                                     Confirm::new("Delete template?"),
-                                    OnYes::RemoveTemplate(list.selected()),
+                                    OnYes::RemoveTemplate(
+                                        ctx.templates.get(list.selected()).unwrap().name.clone(),
+                                    ),
                                 ));
                             }
                             _ => {}
@@ -869,7 +872,7 @@ mod tests {
         let templates = Templates::default();
         let settings = Settings::default();
         let context = || ctx(&palettes, &templates, &settings);
-        let mut modal = Modal::open_file("/images".into());
+        let mut modal = Modal::open_file("/images".into(), 1);
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
@@ -877,10 +880,12 @@ mod tests {
             "/images".into(),
             vec![
                 Entry {
+                    file_name: "album".into(),
                     name: "album".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "photo.png".into(),
                     name: "photo.png".into(),
                     dir: false,
                 },
@@ -957,7 +962,10 @@ mod tests {
         let Modal::Presets { confirm, .. } = &mut modal else {
             unreachable!()
         };
-        *confirm = Some((Confirm::new("Delete preset?"), OnYes::RemovePreset(1)));
+        *confirm = Some((
+            Confirm::new("Delete preset?"),
+            OnYes::RemovePreset("Paper".into()),
+        ));
         let step = modal.handle_mouse(click, &layout, context());
         assert!(step.effect.is_none());
         assert!(matches!(step.next, Next::Stay));
@@ -975,7 +983,7 @@ mod tests {
         let palettes = Palettes::builtin();
         let templates = Templates::default();
         let settings = Settings::default();
-        let mut modal = Modal::open_file(PathBuf::from("/images"));
+        let mut modal = Modal::open_file(PathBuf::from("/images"), 1);
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
@@ -983,14 +991,17 @@ mod tests {
             PathBuf::from("/images"),
             vec![
                 Entry {
+                    file_name: "..".into(),
                     name: "..".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "album".into(),
                     name: "album".into(),
                     dir: true,
                 },
                 Entry {
+                    file_name: "photo.png".into(),
                     name: "photo.png".into(),
                     dir: false,
                 },
@@ -1019,7 +1030,7 @@ mod tests {
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
-        picker.input = TextInput::new("~/raw path.png", usize::MAX);
+        picker.input = TextInput::new("~/raw path.png", PATH_MAX_CHARS);
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(
@@ -1036,6 +1047,7 @@ mod tests {
         picker.set_listing(
             PathBuf::from("/empty"),
             vec![Entry {
+                file_name: "..".into(),
                 name: "..".into(),
                 dir: true,
             }],
@@ -1052,6 +1064,27 @@ mod tests {
             modal.handle_key(key(KeyCode::Esc), context()).next,
             Next::Close
         ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let file_name = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
+            let mut modal = Modal::open_file("/images".into(), 1);
+            let Modal::OpenFile(picker) = &mut modal else {
+                unreachable!()
+            };
+            picker.set_listing(
+                "/images".into(),
+                vec![Entry {
+                    name: file_name.to_string_lossy().into_owned(),
+                    file_name: file_name.clone(),
+                    dir: false,
+                }],
+            );
+            let step = modal.handle_key(key(KeyCode::Enter), context());
+            assert!(
+                matches!(step.effect, Some(Effect::Open(path, _)) if path.as_os_str() == file_name)
+            );
+        }
     }
 
     fn ctx<'a>(
@@ -1272,7 +1305,7 @@ mod tests {
             &settings,
         );
         assert!(
-            matches!(press(&mut modal, KeyCode::Char('y'), &palettes, &templates, &settings).effect, Some(Effect::RemovePreset(i)) if i == index)
+            matches!(press(&mut modal, KeyCode::Char('y'), &palettes, &templates, &settings).effect, Some(Effect::RemovePreset(name)) if name == "Paper")
         );
     }
 
@@ -1377,7 +1410,7 @@ mod tests {
                 &settings
             )
             .effect,
-            Some(Effect::RemoveTemplate(1))
+            Some(Effect::RemoveTemplate(name)) if name == "Zine"
         ));
     }
 }
