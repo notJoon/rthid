@@ -1,3 +1,4 @@
+/// Interactive state and image processing.
 mod app;
 /// Companion PNG export and status.
 mod export;
@@ -5,7 +6,9 @@ mod export;
 mod graphics;
 /// Single entry caches with build versions.
 mod memo;
+/// Terminal layout and rendering.
 mod ui;
+/// Preview coordinates and cell rendering.
 mod view;
 
 use std::{
@@ -118,6 +121,10 @@ fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
 }
 
+fn terminal_layout(size: ratatui::layout::Size) -> ui::Layout {
+    ui::layout(ratatui::layout::Rect::new(0, 0, size.width, size.height))
+}
+
 fn main() -> std::io::Result<()> {
     let (path, preview_png, glyphs, graphics) = parse_args(std::env::args_os().skip(1))?;
     check_not_source(&path, preview_png.as_deref())?;
@@ -147,19 +154,16 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
-    let mut renderer = ui::Renderer::default();
+    let mut renderer = ui::Renderer::new(None);
     let terminal_result = ratatui::run(|terminal| {
-        if let Some((graphics, cleanup)) = graphics::detect(graphics, term_program.as_deref()) {
-            renderer.graphics = Some(graphics);
-            renderer.kitty_cleanup = cleanup;
-        }
+        renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
-        let size = terminal.size()?;
-        let mut layout = ui::layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+        let mut layout = terminal_layout(terminal.size()?);
         let mut redraw = true;
         while !app.quit {
             if redraw {
-                app.sync(&layout);
+                app.poll_export();
+                app.sync(layout.preview);
                 let frame = terminal.draw(|frame| ui::draw(frame, &app, &layout, &mut renderer))?;
                 if let Some(log) = &mut debug_log {
                     ui::log_minimap(&app, log, &frame, &layout, &mut renderer)?;
@@ -167,8 +171,8 @@ fn main() -> std::io::Result<()> {
             }
             redraw = false;
             // With a companion PNG, wake periodically so background write results reach the status line.
-            if app.export.is_some() && !event::poll(Duration::from_millis(50))? {
-                redraw = app.export.as_mut().is_some_and(export::Export::poll);
+            if app.has_export() && !event::poll(Duration::from_millis(50))? {
+                redraw = app.poll_export();
                 continue;
             }
             // Drain queued input so held-down repeats cost one re-dither, not one each.
@@ -183,7 +187,9 @@ fn main() -> std::io::Result<()> {
                     Event::Key(key) => app.handle_key(key, &geometry),
                     Event::Mouse(mouse) => app.handle_mouse(mouse, &geometry),
                     Event::Resize(width, height) => {
-                        layout = ui::layout(ratatui::layout::Rect::new(0, 0, width, height));
+                        layout = terminal_layout(ratatui::layout::Size::new(width, height));
+                        let (w, h) = app.grid_size();
+                        app.view.clamp(w, h, layout.preview);
                     }
                     _ => {}
                 }

@@ -19,14 +19,12 @@ impl Export {
             Ok(worker) => (Some(worker), None),
             Err(error) => (None, Some(error)),
         };
-        let mut export = Self {
-            path,
+        Self {
             worker,
-            error: None,
+            error: error.map(|error| format!("PNG {}: {error}", path.display())),
+            path,
             submitted: None,
-        };
-        export.set_error(error);
-        export
+        }
     }
 
     /// Whether a writer needs dithered pixels even when the preview shows RGB.
@@ -34,17 +32,10 @@ impl Export {
         self.worker.is_some()
     }
 
-    /// Submits changed dithered pixels and reports a status change.
-    pub fn sync(
-        &mut self,
-        indices: &[u8],
-        w: u32,
-        h: u32,
-        palette: &[PaletteColor],
-        version: u64,
-    ) -> bool {
+    /// Submits each dithered version once.
+    pub fn sync(&mut self, indices: &[u8], w: u32, h: u32, palette: &[PaletteColor], version: u64) {
         if self.submitted == Some(version) {
-            return false;
+            return;
         }
         if let Some(worker) = &mut self.worker {
             self.submitted = Some(version);
@@ -54,10 +45,9 @@ impl Export {
                 h,
                 palette: palette.to_vec(),
             }) {
-                return self.set_error(Some(error));
+                self.set_error(Some(error));
             }
         }
-        false
     }
 
     /// Collects the latest write result and reports a status change.
@@ -99,7 +89,7 @@ mod tests {
     use super::*;
     use rthid::dither::make_palette;
 
-    fn sync(export: &mut Export, w: u32, h: u32, version: u64) -> bool {
+    fn sync(export: &mut Export, w: u32, h: u32, version: u64) {
         export.sync(
             &vec![0; (w * h) as usize],
             w,
@@ -129,8 +119,8 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("rthid-version-test-{}.png", std::process::id()));
         let mut export = Export::new(path.clone());
-        assert!(!sync(&mut export, 4, 2, 1));
-        assert!(!sync(&mut export, 2, 4, 1));
+        sync(&mut export, 4, 2, 1);
+        sync(&mut export, 2, 4, 1);
         export.finish().unwrap();
         assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (16, 8));
         assert!(export.status().is_none());
@@ -162,7 +152,7 @@ mod tests {
         );
         assert!(!export.poll());
         std::fs::remove_dir(&path).unwrap();
-        assert!(!sync(&mut export, 4, 2, 2));
+        sync(&mut export, 4, 2, 2);
         wait_for_change(&mut export);
         assert!(export.status().is_none());
         assert!(!export.poll());
@@ -181,7 +171,7 @@ mod tests {
         wait_for(&mut export, |export| export.status().is_some());
         std::fs::remove_dir(&path).unwrap();
         let error = export.status().unwrap().to_owned();
-        assert!(!sync(&mut export, 4, 2, 2));
+        sync(&mut export, 4, 2, 2);
         assert_eq!(export.status(), Some(error.as_str()));
         export.finish().unwrap();
         assert!(export.status().is_none());
@@ -203,7 +193,7 @@ mod tests {
             image::open(&path).is_ok_and(|image| image.width() == 8)
         });
         std::fs::remove_file(&path).unwrap();
-        assert!(!sync(&mut export, 2, 4, 2));
+        sync(&mut export, 2, 4, 2);
         assert!(!path.exists());
         assert_eq!(export.submitted, Some(2));
         std::fs::create_dir(&path).unwrap();

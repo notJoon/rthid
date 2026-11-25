@@ -1,14 +1,12 @@
 use crate::{
     export::Export,
     memo::Memo,
-    ui::Layout,
     view::{Pixels, PreviewGeometry, View},
 };
 use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-#[cfg(test)]
 use ratatui::layout::Rect;
 use rthid::dither::{self, Mode, Options};
 use std::path::PathBuf;
@@ -23,12 +21,19 @@ pub const PALETTES: [(&str, &[&str]); 3] = [
 /// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Param {
+    /// Source size percentage.
     Scale,
+    /// Dither color model.
     Mode,
+    /// Palette preset.
     Palette,
+    /// Dither error strength.
     Strength,
+    /// Alternating row direction.
     Serpentine,
+    /// Tone brightness offset.
     Brightness,
+    /// Tone contrast adjustment.
     Contrast,
 }
 
@@ -76,20 +81,102 @@ impl Params {
     }
 }
 
+/// Scaled size before rotation and clockwise quarter turns.
+#[derive(PartialEq)]
+struct GridKey {
+    width: u32,
+    height: u32,
+    rotation: u8,
+}
+
+/// Processed grid version and settings used to dither it.
+#[derive(PartialEq)]
+struct DitherKey {
+    grid: u64,
+    options: Options,
+}
+
 /// Source image and versioned image processing results.
 pub struct Pipeline {
-    /// Loaded image before scaling and rotation.
-    pub source: RgbaImage,
-    /// Scaled and rotated image keyed by size and rotation.
-    pub grid: Memo<(u32, u32, u8), RgbaImage>,
-    /// Palette indices keyed by grid version and dither options.
-    pub dithered: Memo<(u64, Options), Vec<u8>>,
+    source: RgbaImage,
+    grid: Memo<GridKey, RgbaImage>,
+    dithered: Memo<DitherKey, Vec<u8>>,
+}
+
+impl Pipeline {
+    fn scaled_size(&self, params: &Params) -> (u32, u32) {
+        let scaled = |n| {
+            (f64::from(n) * f64::from(params.scale) / 100.0)
+                .round()
+                .max(1.0) as u32
+        };
+        (scaled(self.source.width()), scaled(self.source.height()))
+    }
+
+    /// Refreshes required results and reports whether the dithered result rebuilt.
+    pub fn refresh(&mut self, params: &Params, need_dither: bool) -> bool {
+        let (width, height) = self.scaled_size(params);
+        self.grid.update(
+            GridKey {
+                width,
+                height,
+                rotation: params.rotation,
+            },
+            || {
+                let scaled =
+                    imageops::resize(&self.source, width, height, imageops::FilterType::Triangle);
+                match params.rotation {
+                    1 => imageops::rotate90(&scaled),
+                    2 => imageops::rotate180(&scaled),
+                    3 => imageops::rotate270(&scaled),
+                    _ => scaled,
+                }
+            },
+        );
+        if !need_dither {
+            return false;
+        }
+        let grid = self.grid.get().expect("processed grid");
+        let (w, h) = grid.dimensions();
+        let key = DitherKey {
+            grid: self.grid_version(),
+            options: params.options.clone(),
+        };
+        self.dithered.update(key, || {
+            dither::dither(grid.as_raw(), w as usize, h as usize, &params.options)
+        })
+    }
+
+    /// Processed image after scaling and rotation.
+    pub fn grid(&self) -> &RgbaImage {
+        self.grid.get().expect("processed grid")
+    }
+
+    /// Build version for downstream preview caches.
+    pub fn grid_version(&self) -> u64 {
+        self.grid.version()
+    }
+
+    /// Palette indices when a consumer has requested dithering.
+    pub fn dithered(&self) -> Option<&Vec<u8>> {
+        self.dithered.get()
+    }
+
+    /// Loaded dimensions before scaling and rotation.
+    pub fn source_size(&self) -> (u32, u32) {
+        self.source.dimensions()
+    }
+
+    /// Mutable indices for rendering fixtures.
+    #[cfg(test)]
+    pub fn dithered_mut(&mut self) -> &mut Vec<u8> {
+        self.dithered.get_mut().unwrap()
+    }
 }
 
 /// Interactive parameters, preview state and image consumers.
 pub struct App {
-    /// Optional companion PNG export.
-    pub export: Option<Export>,
+    export: Option<Export>,
     /// Preview position and display mode.
     pub view: View,
     /// Whether keys control the preview.
@@ -103,8 +190,6 @@ pub struct App {
     pub selected: usize,
     /// Whether the preview shows RGB pixels.
     pub show_original: bool,
-    /// Input change signal cleared by refresh, independent of memo validity.
-    pub dirty: bool,
     /// Whether the event loop should exit.
     pub quit: bool,
 }
@@ -125,29 +210,15 @@ impl App {
             params: Params::default(),
             selected: 0,
             show_original: true,
-            dirty: true,
             quit: false,
         };
         app.refresh();
         app
     }
 
-    // Source size after scaling, before rotation.
-    fn scaled_size(&self) -> (u32, u32) {
-        let scaled = |n| {
-            (f64::from(n) * f64::from(self.params.scale) / 100.0)
-                .round()
-                .max(1.0) as u32
-        };
-        (
-            scaled(self.pipeline.source.width()),
-            scaled(self.pipeline.source.height()),
-        )
-    }
-
     /// Returns scaled dimensions after rotation.
     pub fn grid_size(&self) -> (u32, u32) {
-        let (w, h) = self.scaled_size();
+        let (w, h) = self.pipeline.scaled_size(&self.params);
         if self.params.rotation.is_multiple_of(2) {
             (w, h)
         } else {
@@ -155,67 +226,54 @@ impl App {
         }
     }
 
-    /// Refreshes image consumers and clamps the view to the current layout.
-    pub fn sync(&mut self, layout: &Layout) -> bool {
-        let status_changed = self.refresh();
+    /// Refreshes image consumers and clamps the view to the preview area.
+    pub fn sync(&mut self, preview: Rect) {
+        self.refresh();
         let (w, h) = self.grid_size();
-        self.view.clamp(w, h, layout.preview);
-        status_changed
+        self.view.clamp(w, h, preview);
     }
 
-    // Rebuilds the grid when needed and dithers only when a consumer needs it.
-    fn refresh(&mut self) -> bool {
-        let mut status_changed = self.export.as_mut().is_some_and(Export::poll);
-        self.dirty = false;
-        let (w, h) = self.scaled_size();
-        let pipeline = &mut self.pipeline;
-        pipeline.grid.update((w, h, self.params.rotation), || {
-            let scaled = imageops::resize(&pipeline.source, w, h, imageops::FilterType::Triangle);
-            match self.params.rotation {
-                1 => imageops::rotate90(&scaled),
-                2 => imageops::rotate180(&scaled),
-                3 => imageops::rotate270(&scaled),
-                _ => scaled,
-            }
-        });
-        if self.show_original && !self.export.as_ref().is_some_and(Export::needs_dither) {
-            return status_changed;
-        }
-        let grid = pipeline.grid.get().expect("processed grid");
-        let (gw, gh) = grid.dimensions();
-        pipeline.dithered.update(
-            (pipeline.grid.version(), self.params.options.clone()),
-            || {
-                dither::dither(
-                    grid.as_raw(),
-                    gw as usize,
-                    gh as usize,
-                    &self.params.options,
-                )
-            },
-        );
-        if let Some(export) = &mut self.export {
-            status_changed |= export.sync(
-                pipeline.dithered.get().expect("dithered grid"),
-                gw,
-                gh,
+    fn refresh(&mut self) {
+        let need_dither =
+            !self.show_original || self.export.as_ref().is_some_and(Export::needs_dither);
+        if self.pipeline.refresh(&self.params, need_dither)
+            && let Some(export) = &mut self.export
+        {
+            let (w, h) = self.pipeline.grid().dimensions();
+            export.sync(
+                self.pipeline.dithered().expect("dithered grid"),
+                w,
+                h,
                 &self.params.options.palette,
-                pipeline.dithered.version(),
+                self.pipeline.dithered.version(),
             );
         }
-        status_changed
     }
 
-    /// Returns the selected preview pixels after synchronization.
+    /// Whether a companion PNG destination was requested.
+    pub fn has_export(&self) -> bool {
+        self.export.is_some()
+    }
+
+    /// Collects PNG results and reports whether the status changed.
+    pub fn poll_export(&mut self) -> bool {
+        self.export.as_mut().is_some_and(Export::poll)
+    }
+
+    /// Latest companion PNG error for the status line.
+    pub fn export_status(&self) -> Option<&str> {
+        self.export.as_ref().and_then(Export::status)
+    }
+
+    /// Selected preview pixels after sync.
+    ///
+    /// Panics in dithered mode if its result was never built.
     pub fn displayed(&self) -> Pixels<'_> {
         if self.show_original {
-            Pixels::Rgb(
-                self.pipeline.grid.get().expect("processed grid"),
-                self.pipeline.grid.version(),
-            )
+            Pixels::Rgb(self.pipeline.grid(), self.pipeline.grid_version())
         } else {
             Pixels::Indexed {
-                indices: self.pipeline.dithered.get().expect("dithered grid"),
+                indices: self.pipeline.dithered().expect("dithered grid"),
                 palette: &self.params.options.palette,
             }
         }
@@ -343,12 +401,10 @@ impl App {
 
     fn rotate(&mut self, quarter_turns: u8) {
         self.params.rotation = (self.params.rotation + quarter_turns) % 4;
-        self.dirty = true;
     }
 
     // Restores the selected parameter, or every parameter and the rotation when `all` is set.
     fn reset(&mut self, all: bool) {
-        let before = self.params.clone();
         let defaults = Params::default();
         let (p, d) = (&mut self.params, &defaults.options);
         match PARAMS[self.selected] {
@@ -361,7 +417,6 @@ impl App {
             Param::Brightness => p.options.tone.brightness = d.tone.brightness,
             Param::Contrast => p.options.tone.contrast = d.tone.contrast,
         }
-        self.dirty |= self.params != before;
     }
 
     fn adjust(&mut self, direction: i32) {
@@ -402,7 +457,6 @@ impl App {
             Param::Brightness => step(&mut o.tone.brightness, 20.0, -0.5, 0.5),
             Param::Contrast => step(&mut o.tone.contrast, 20.0, -0.5, 1.0),
         };
-        self.dirty |= changed;
         if changed && param != Param::Scale {
             self.show_original = false;
         }
@@ -412,6 +466,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Layout;
+    use ratatui::layout::Rect;
 
     fn test_layout() -> Layout {
         crate::ui::layout(Rect::new(0, 0, 41, 9))
@@ -421,15 +477,15 @@ mod tests {
         crate::view::geometry(&app.view, app.grid_size(), area)
     }
 
-    // Returns whether the key asked for a re-dither, then performs it.
+    // Compares build versions after applying the key.
     fn press(app: &mut App, code: KeyCode) -> bool {
+        let before = (app.pipeline.grid.version(), app.pipeline.dithered.version());
         app.handle_key(
             KeyEvent::new(code, KeyModifiers::NONE),
             &preview_geometry(app, test_layout().preview),
         );
-        let dirty = app.dirty;
-        app.sync(&test_layout());
-        dirty
+        app.sync(test_layout().preview);
+        before != (app.pipeline.grid.version(), app.pipeline.dithered.version())
     }
 
     fn app_at(param: Param) -> App {
@@ -439,31 +495,30 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_keys_control_builds_without_dirty() {
+    fn pipeline_keys_control_builds() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
         assert_eq!(app.pipeline.grid.version(), 1);
         assert_eq!(app.pipeline.dithered.version(), 0);
         app.show_original = false;
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.dithered.version(), 1);
-        app.dirty = true;
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.grid.version(), 1);
         assert_eq!(app.pipeline.dithered.version(), 1);
         app.params.options.strength = 0.5;
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.grid.version(), 1);
         assert_eq!(app.pipeline.dithered.version(), 2);
         app.show_original = true;
         app.params.rotation = 2;
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.grid.version(), 2);
         assert_eq!(app.pipeline.dithered.version(), 2);
         app.show_original = false;
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.dithered.version(), 3);
         app.pipeline.dithered.clear();
-        app.sync(&test_layout());
+        app.sync(test_layout().preview);
         assert_eq!(app.pipeline.dithered.version(), 4);
     }
 
@@ -478,10 +533,9 @@ mod tests {
         ] {
             app.params.scale = scale;
             app.params.rotation = rotation;
-            app.dirty = true;
             app.view.x = 999;
             app.view.y = 999;
-            app.sync(&crate::ui::layout(screen));
+            app.sync(crate::ui::layout(screen).preview);
             assert_eq!((app.view.x, app.view.y), expected);
             assert_eq!(
                 app.pipeline.grid.get().unwrap().dimensions(),
@@ -492,11 +546,12 @@ mod tests {
 
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
-        let mut app = app_at(Param::Strength);
+        let mut app = App::new(RgbaImage::new(20, 10), None);
+        app.selected = PARAMS.iter().position(|&p| p == Param::Strength).unwrap();
         assert!(app.show_original);
-        for focus in [false, true] {
+        for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
-            assert!(!press(&mut app, KeyCode::Char(' ')));
+            assert_eq!(press(&mut app, KeyCode::Char(' ')), rebuilt);
             assert!(!app.show_original);
             assert!(!press(&mut app, KeyCode::Char(' ')));
             assert!(app.show_original);
@@ -529,8 +584,8 @@ mod tests {
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             &preview_geometry(&app, test_layout().preview),
         );
-        assert!(!app.dirty);
-        app.sync(&test_layout());
+        assert_eq!(app.pipeline.dithered.version(), 0);
+        app.sync(test_layout().preview);
         let (w, h) = app.grid_size();
         assert_eq!(app.pipeline.dithered.get().unwrap().len(), (w * h) as usize);
         assert_eq!(app.pipeline.dithered.version(), 1);
@@ -627,7 +682,8 @@ mod tests {
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
         for param in PARAMS {
-            let mut app = app_at(param);
+            let mut app = App::new(RgbaImage::new(20, 10), None);
+            app.selected = PARAMS.iter().position(|&p| p == param).unwrap();
             assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
             assert!(press(&mut app, KeyCode::Left));
@@ -642,6 +698,8 @@ mod tests {
         assert!(!press(&mut app, KeyCode::Char('d')));
         assert!(press(&mut app, KeyCode::Char('D')));
         app.params.options.tone.gamma = 2.0;
+        app.show_original = false;
+        app.sync(test_layout().preview);
         assert!(press(&mut app, KeyCode::Char('D')));
         assert_eq!(app.params.options.tone.gamma, 1.0);
         app.handle_key(
@@ -652,7 +710,12 @@ mod tests {
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
             &preview_geometry(&app, test_layout().preview),
         );
-        assert!(app.dirty);
+        let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
+        app.refresh();
+        assert_eq!(
+            (app.pipeline.grid.version(), app.pipeline.dithered.version()),
+            version
+        );
     }
 
     #[test]
@@ -671,8 +734,13 @@ mod tests {
         app.handle_key(release, &preview_geometry(&app, test_layout().preview));
         assert!(!app.quit);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
         app.handle_key(ctrl('r'), &preview_geometry(&app, test_layout().preview));
-        assert!(!app.dirty);
+        app.refresh();
+        assert_eq!(
+            (app.pipeline.grid.version(), app.pipeline.dithered.version()),
+            version
+        );
         app.handle_key(ctrl('c'), &preview_geometry(&app, test_layout().preview));
         assert!(app.quit);
     }
@@ -779,6 +847,7 @@ mod tests {
                     (0, 0),
                 ),
             ] {
+                let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
                 app.handle_mouse(
                     MouseEvent {
                         kind,
@@ -789,7 +858,11 @@ mod tests {
                     &preview_geometry(&app, area),
                 );
                 assert_eq!((app.view.x, app.view.y), expected, "{glyphs:?}");
-                assert!(!app.dirty);
+                app.refresh();
+                assert_eq!(
+                    (app.pipeline.grid.version(), app.pipeline.dithered.version()),
+                    version
+                );
             }
         }
     }
@@ -801,6 +874,7 @@ mod tests {
         app.view.exact = true;
         let map = preview_geometry(&app, area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
+            let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
             app.handle_mouse(
                 MouseEvent {
                     kind,
@@ -810,7 +884,11 @@ mod tests {
                 },
                 &preview_geometry(app, area),
             );
-            assert!(!app.dirty);
+            app.refresh();
+            assert_eq!(
+                (app.pipeline.grid.version(), app.pipeline.dithered.version()),
+                version
+            );
             assert!(!app.preview_focus);
         };
         mouse(
@@ -888,7 +966,7 @@ mod tests {
             );
         }
         assert!(app.quit);
-        assert!(app.dirty);
+        assert_eq!(app.pipeline.grid.version(), 1);
         app.finish_png().unwrap();
         assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
         std::fs::remove_file(path).unwrap();

@@ -1,10 +1,10 @@
-use crate::{graphics, memo::Memo, view};
+use crate::{graphics, view};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::app::{App, PALETTES, PARAMS, Param};
+use crate::app::{App, PALETTES, PARAMS, Param, Params};
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,13 +43,26 @@ pub fn layout(screen: Rect) -> Layout {
 /// Terminal graphics, RGB overview caches and parameter panel scroll state.
 #[derive(Default)]
 pub struct Renderer {
-    /// Image protocol state when terminal graphics are available.
-    pub graphics: Option<graphics::Graphics>,
-    /// Deletes the Kitty image after terminal teardown.
-    pub kitty_cleanup: Option<graphics::KittyCleanup>,
-    overview: Memo<(u64, u16, u16), Vec<Color>>,
-    minimap: Memo<(u64, u16, u16), Vec<Color>>,
+    graphics: Option<graphics::Graphics>,
+    overview: view::OverviewCache,
+    minimap: view::OverviewCache,
     parameter_list: ListState,
+}
+
+impl Renderer {
+    /// Initializes rendering state with the detected graphics protocol.
+    pub fn new(graphics: Option<graphics::Graphics>) -> Self {
+        Self {
+            graphics,
+            ..Self::default()
+        }
+    }
+
+    /// Graphics state for renderer assertions.
+    #[cfg(test)]
+    pub fn graphics(&self) -> Option<&graphics::Graphics> {
+        self.graphics.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -107,7 +120,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = view::geometry(&app.view, (gw, gh), layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let list = List::new(PARAMS.map(|param| app.label(param)))
+    let list = List::new(PARAMS.map(|param| label(&app.params, param)))
         .block(
             Block::bordered()
                 .title("Parameters")
@@ -137,8 +150,7 @@ fn draw_preview(
     geometry: &view::PreviewGeometry,
     renderer: &mut Renderer,
 ) -> PreviewReport {
-    let (gw, gh) = geometry.grid;
-    let image_mode = app.show_original && !geometry.area.is_empty();
+    let image_mode = app.show_original && !app.view.exact && !geometry.area.is_empty();
     let Some(graphics) = renderer.graphics.as_mut().filter(|_| image_mode) else {
         let cache = if app.view.exact {
             &mut renderer.minimap
@@ -147,10 +159,8 @@ fn draw_preview(
         };
         let approximate = view::render(
             app.displayed(),
-            gw,
-            gh,
             &app.view,
-            geometry.area,
+            geometry,
             frame.buffer_mut(),
             cache,
         );
@@ -164,11 +174,9 @@ fn draw_preview(
     };
     graphics.draw_image(
         frame,
-        app.pipeline.grid.get().expect("processed grid"),
-        app.pipeline.grid.version(),
-        &app.view,
+        app.pipeline.grid(),
+        app.pipeline.grid_version(),
         geometry,
-        &mut renderer.minimap,
     );
     PreviewReport {
         approximate: false,
@@ -210,33 +218,29 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
     } else {
         "Dithered".into()
     };
-    app.export
-        .as_ref()
-        .and_then(crate::export::Export::status)
+    app.export_status()
         .map(str::to_owned)
         .or(report.graphics_error)
         .unwrap_or_else(|| {
             format!(
                 "{displayed} | {mode} | Source {}x{} | Grid {gw}x{gh} | Rotation {}°",
-                app.pipeline.source.width(),
-                app.pipeline.source.height(),
+                app.pipeline.source_size().0,
+                app.pipeline.source_size().1,
                 u16::from(app.params.rotation) * 90,
             )
         })
 }
 
-impl App {
-    fn label(&self, param: Param) -> String {
-        let o = &self.params.options;
-        match param {
-            Param::Scale => format!("Scale: {}%", self.params.scale),
-            Param::Mode => format!("Mode: {:?}", o.mode),
-            Param::Palette => format!("Palette: {}", PALETTES[self.params.palette].0),
-            Param::Strength => format!("Strength: {:.1}", o.strength),
-            Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
-            Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
-            Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
-        }
+fn label(params: &Params, param: Param) -> String {
+    let o = &params.options;
+    match param {
+        Param::Scale => format!("Scale: {}%", params.scale),
+        Param::Mode => format!("Mode: {:?}", o.mode),
+        Param::Palette => format!("Palette: {}", PALETTES[params.palette].0),
+        Param::Strength => format!("Strength: {:.1}", o.strength),
+        Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
+        Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
+        Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
     }
 }
 
@@ -281,9 +285,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         for with_export in [false, true] {
             if with_export {
-                app.export = Some(crate::export::Export::new(dir.clone()));
-                app.sync(&layout(Rect::new(0, 0, 80, 24)));
-                assert!(app.export.as_mut().unwrap().finish().is_err());
+                app = App::new(RgbaImage::new(4, 6), Some(dir.clone()));
+                app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
+                assert!(app.finish_png().is_err());
             }
             assert_eq!(
                 status(
@@ -294,10 +298,7 @@ mod tests {
                         ..PreviewReport::default()
                     },
                 ),
-                app.export
-                    .as_ref()
-                    .and_then(crate::export::Export::status)
-                    .unwrap_or("Graphics failed"),
+                app.export_status().unwrap_or("Graphics failed"),
             );
         }
         std::fs::remove_dir(dir).unwrap();
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(renderer.overview.version(), 1);
         assert_eq!(renderer.minimap.version(), 1);
         app.params.rotation = 2;
-        app.sync(&terminal_layout(&terminal));
+        app.sync(terminal_layout(&terminal).preview);
         for exact in [false, true] {
             app.view.exact = exact;
             terminal
@@ -389,7 +390,7 @@ mod tests {
             .draw(|frame| draw(frame, &app, &layout, &mut renderer))
             .unwrap();
         assert_eq!((app.view.x, app.view.y), (119, 119));
-        app.sync(&layout);
+        app.sync(layout.preview);
         assert_eq!((app.view.x, app.view.y), (51, 48));
     }
 
@@ -552,6 +553,7 @@ mod tests {
                 .any(|c| c.fg == Color::Gray && c.symbol() == "┌")
         };
         assert!(has_frame(terminal.backend().buffer()));
+        let version = app.pipeline.grid_version();
         app.handle_key(
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
             &view::geometry(
@@ -560,7 +562,8 @@ mod tests {
                 terminal_layout(&terminal).preview,
             ),
         );
-        assert!(!app.dirty);
+        app.sync(terminal_layout(&terminal).preview);
+        assert_eq!(app.pipeline.grid_version(), version);
         terminal
             .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
             .unwrap();
@@ -584,8 +587,8 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::new(4, 6), None);
         app.show_original = false;
-        app.sync(&layout(Rect::new(0, 0, 100, 24)));
-        app.pipeline.dithered.get_mut().unwrap()[0] = 1;
+        app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
+        app.pipeline.dithered_mut()[0] = 1;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))

@@ -14,7 +14,8 @@ impl<K, V> Default for Memo<K, V> {
 }
 
 impl<K: PartialEq, V> Memo<K, V> {
-    /// Replaces the value when the key differs, dropping it before building.
+    /// Rebuilds when the key differs and returns whether it rebuilt.
+    /// Drops the previous value before building.
     pub fn update(&mut self, key: K, build: impl FnOnce() -> V) -> bool {
         if self.entry.as_ref().is_some_and(|(old, _)| *old == key) {
             return false;
@@ -34,12 +35,12 @@ impl<K: PartialEq, V> Memo<K, V> {
 }
 
 impl<K, V> Memo<K, V> {
-    /// Returns the cached value when present.
+    /// The most recently built value.
     pub fn get(&self) -> Option<&V> {
         self.entry.as_ref().map(|(_, value)| value)
     }
 
-    /// Returns the cached value for in place updates.
+    /// Access to the cached value for in place updates.
     pub fn get_mut(&mut self) -> Option<&mut V> {
         self.entry.as_mut().map(|(_, value)| value)
     }
