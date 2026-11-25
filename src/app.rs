@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -28,8 +29,8 @@ pub struct App {
     pub grid_cache: GridCache,
     /// Current image settings.
     pub settings: Settings,
-    /// Index into `Setting::ALL` of the highlighted row.
-    pub selected: usize,
+    /// Parameter selection and retained scroll offset.
+    pub panel: ListPicker,
     /// Whether the preview shows Original (the scaled grid) instead of Dithered.
     /// Starts true.
     pub show_original: bool,
@@ -52,7 +53,7 @@ impl App {
                 dithered: Memo::default(),
             },
             settings: Settings::default(),
-            selected: 0,
+            panel: ListPicker::new(0),
             show_original: true,
             quit: false,
         };
@@ -233,16 +234,18 @@ impl App {
             self.viewport.pan(dx, dy, geometry);
             return;
         }
+        match self.panel.handle_key(key, Setting::ALL.len()) {
+            Outcome::Ignored => {}
+            Outcome::Consumed | Outcome::Submit(_) | Outcome::Cancel => return,
+        }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(Setting::ALL.len() - 1);
-            }
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
-                self.settings = self.settings.with_default(Setting::ALL[self.selected])
+                self.settings = self
+                    .settings
+                    .with_default(Setting::ALL[self.panel.selected()])
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -252,7 +255,7 @@ impl App {
     }
 
     fn adjust(&mut self, direction: i32) {
-        let setting = Setting::ALL[self.selected];
+        let setting = Setting::ALL[self.panel.selected()];
         let next = self.settings.adjusted(setting, direction);
         // Clamped presses preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
@@ -345,7 +348,7 @@ mod tests {
 
     fn app_at(setting: Setting) -> App {
         let mut app = App::new(RgbaImage::new(4, 4), None);
-        app.selected = Setting::ALL.iter().position(|&p| p == setting).unwrap();
+        app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
         app
     }
 
@@ -433,10 +436,12 @@ mod tests {
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
-        app.selected = Setting::ALL
-            .iter()
-            .position(|&p| p == Setting::Strength)
-            .unwrap();
+        app.panel = ListPicker::new(
+            Setting::ALL
+                .iter()
+                .position(|&p| p == Setting::Strength)
+                .unwrap(),
+        );
         assert!(app.show_original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
@@ -451,7 +456,7 @@ mod tests {
         assert!(press(&mut app, KeyCode::Left));
         assert!(!app.show_original);
         assert!(!press(&mut app, KeyCode::Char(' ')));
-        app.selected = 0;
+        app.panel = ListPicker::new(0);
         assert!(press(&mut app, KeyCode::Left));
         assert!(app.show_original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
@@ -483,12 +488,16 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Setting::Scale);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.panel.selected(), 0);
         for _ in 0..10 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(Setting::ALL[app.selected], Setting::Contrast);
-        assert!(!press(&mut app, KeyCode::Char('x')));
+        assert_eq!(Setting::ALL[app.panel.selected()], Setting::Contrast);
+        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
+            assert!(!press(&mut app, code));
+            assert_eq!(app.panel.selected(), Setting::ALL.len() - 1);
+            assert!(!app.quit);
+        }
     }
 
     #[test]
@@ -538,7 +547,7 @@ mod tests {
         let mut app = app_at(Setting::Scale);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
-        app.selected = 1;
+        app.panel = ListPicker::new(1);
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.settings.options.mode, Mode::Tone));
@@ -546,7 +555,7 @@ mod tests {
             (app.settings.scale, app.settings.rotation),
             (110, Rotation::R90)
         );
-        app.selected = 2;
+        app.panel = ListPicker::new(2);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.settings;
@@ -559,7 +568,7 @@ mod tests {
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
         for setting in Setting::ALL {
             let mut app = App::new(RgbaImage::new(20, 10), None);
-            app.selected = Setting::ALL.iter().position(|&p| p == setting).unwrap();
+            app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
             assert!(press(&mut app, KeyCode::Left));
