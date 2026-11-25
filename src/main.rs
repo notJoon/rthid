@@ -1,9 +1,9 @@
 //! rthid previews dithering of an image in the terminal.
 //!
-//! The source is loaded and shrunk once. `pipeline::Pipeline` scales and rotates it into
+//! The source is loaded and shrunk once. `grid::GridCache` scales and rotates it into
 //! the grid and, when Dithered or a companion PNG needs it, dithers the grid
-//! into palette indices. `app::App` holds `params::Params` and the `view::View`. `ui::draw`
-//! turns them into a frame through `render` (cell glyphs) or `graphics`
+//! into palette indices. `app::App` holds `settings::Settings` and the
+//! `viewport::Viewport`. `ui::draw` turns them into a frame through `cells` (cell glyphs) or `graphics`
 //! (terminal images), and `Export` writes the dithered grid to the companion PNG.
 //!
 //! Glossary:
@@ -13,7 +13,7 @@
 //! - Sextant and Quadrant: glyph sets for the dithered Overview and minimap that split a
 //!   cell into 2x3 or 2x2 subcells painted in the cell fg or bg color.
 //! - Overview: the whole grid fitted to the preview.
-//! - 1:1 (`exact` in code): one dot per half cell, panned from the view origin.
+//! - 1:1 (`exact` in code): one dot per half cell, panned from the viewport origin.
 //! - Minimap: an Overview inset shown in 1:1, dimmed outside the visible region.
 //! - Approximate: some Overview cell sampled more than two palette colors, so
 //!   the extra samples took the nearer kept color.
@@ -21,25 +21,25 @@
 
 /// Interactive state and input handling.
 mod app;
+/// Cell rendering for Overview, 1:1 and the minimap.
+mod cells;
 /// Companion PNG writer and its status.
 mod export;
 /// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for the Original Overview.
 mod graphics;
+/// Source image, scaled grid and dithered indices caches.
+mod grid;
 /// Single entry caches with build versions.
 mod memo;
 /// Editable settings and palette presets.
-mod params;
-/// Image pipeline from source to grid to dithered indices.
-mod pipeline;
-/// Cell rendering for Overview, 1:1 and the minimap.
-mod render;
-/// Shared test fixtures.
+mod settings;
+/// Temporary directories for tests.
 #[cfg(test)]
-mod test_support;
+mod temp_dir;
 /// Screen layout, panels and status line.
 mod ui;
 /// Preview coordinates for Overview, 1:1 and the minimap.
-mod view;
+mod viewport;
 
 use std::{
     fs::File,
@@ -56,7 +56,7 @@ use ratatui::crossterm::{
     execute,
 };
 
-use crate::{app::App, graphics::Mode as Graphics, render::Glyphs, ui::Renderer};
+use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -88,7 +88,7 @@ struct Args {
     graphics: CliGraphics,
 }
 
-// TODO: These enums mirror render::Glyphs and graphics::Mode to keep clap out of lower modules.
+// TODO: These enums mirror cells::Glyphs and graphics::Mode to keep clap out of lower modules.
 // Revisit deriving ValueEnum on domain enums if that separation stops mattering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CliGlyphs {
@@ -162,7 +162,7 @@ fn main() -> std::io::Result<()> {
     .to_rgba8();
     let mut app = App::new(source, preview_png);
     let term_program = std::env::var("TERM_PROGRAM").ok();
-    app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    app.viewport.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
@@ -213,7 +213,7 @@ fn event_loop(
                 Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
                 Event::Resize(width, height) => {
                     layout = ui::layout(ratatui::layout::Size::new(width, height));
-                    app.clamp_view(layout.preview);
+                    app.clamp_viewport(layout.preview);
                 }
                 _ => {}
             }
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn preview_png_may_not_overwrite_the_source() {
-        let dir = crate::test_support::TempDir::new();
+        let dir = crate::temp_dir::TempDir::new();
         let source = dir.join("photo.png");
         std::fs::write(&source, b"image").unwrap();
         let aliased = dir.join(".").join("photo.png");

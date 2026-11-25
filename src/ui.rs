@@ -4,13 +4,13 @@
 //! Drawing never mutates App. State that must change while drawing, such as caches
 //! and scroll offsets, lives in Renderer.
 
-use crate::{graphics, render, view};
+use crate::{cells, graphics, viewport};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::{app::App, params::Param};
+use crate::{app::App, settings::Setting};
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,8 +54,8 @@ pub fn layout(screen: impl Into<Rect>) -> Layout {
 #[derive(Default)]
 pub struct Renderer {
     graphics: Option<graphics::Graphics>,
-    overviews: render::OverviewCaches,
-    parameter_list: ListState,
+    overviews: cells::OverviewCaches,
+    setting_list: ListState,
 }
 
 impl Renderer {
@@ -87,32 +87,32 @@ pub fn log_minimap(
     app: &App,
     log: &mut impl std::io::Write,
     frame: &ratatui::CompletedFrame<'_>,
-    geometry: &view::PreviewGeometry,
+    geometry: &viewport::PreviewGeometry,
 ) -> std::io::Result<()> {
     let (w, h) = geometry.grid;
     writeln!(
         log,
         "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
-        frame.count, app.view, geometry.area
+        frame.count, app.viewport, geometry.area
     )?;
     let mut overview = ratatui::buffer::Buffer::empty(geometry.area);
     let pixels = app.displayed();
-    if let Some(view::Minimap {
+    if let Some(viewport::Minimap {
         frame: inset,
         map,
         viewport,
     }) = geometry.minimap
     {
         let area = Block::bordered().inner(inset);
-        render::render(
+        cells::render(
             pixels,
-            &view::View {
+            &viewport::Viewport {
                 exact: false,
-                ..app.view
+                ..app.viewport
             },
-            &view::PreviewGeometry { area, ..*geometry },
+            &viewport::PreviewGeometry { area, ..*geometry },
             &mut overview,
-            &mut render::OverviewCaches::default(),
+            &mut cells::OverviewCaches::default(),
         );
         writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
         for pos in inset.positions() {
@@ -137,7 +137,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let list = List::new(Param::ALL.map(|param| param.label(&app.params)))
+    let list = List::new(Setting::ALL.map(|setting| setting.label(&app.settings)))
         .block(
             Block::bordered()
                 .title("Parameters")
@@ -145,8 +145,8 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         )
         .highlight_symbol("> ")
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-    renderer.parameter_list.select(Some(app.selected));
-    frame.render_stateful_widget(list, layout.panel, &mut renderer.parameter_list);
+    renderer.setting_list.select(Some(app.selected));
+    frame.render_stateful_widget(list, layout.panel, &mut renderer.setting_list);
     frame.render_widget(
             Paragraph::new(if app.preview_focus {
                 "Tab: focus | Space: original/dithered | z: overview/1:1 | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
@@ -166,19 +166,19 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
 fn draw_preview(
     frame: &mut Frame,
     app: &App,
-    geometry: &view::PreviewGeometry,
+    geometry: &viewport::PreviewGeometry,
     renderer: &mut Renderer,
 ) -> PreviewReport {
     let image_mode = renderer.graphics.is_some()
         && app.show_original
-        && !app.view.exact
+        && !app.viewport.exact
         && !geometry.area.is_empty();
     let approximate = if image_mode {
         false
     } else {
-        render::render(
+        cells::render(
             app.displayed(),
-            &app.view,
+            &app.viewport,
             geometry,
             frame.buffer_mut(),
             &mut renderer.overviews,
@@ -191,7 +191,13 @@ fn draw_preview(
     if let Some(graphics) = &mut renderer.graphics {
         graphics.present(
             frame,
-            image_mode.then(|| (app.pipeline.grid(), app.pipeline.grid_version(), geometry)),
+            image_mode.then(|| {
+                (
+                    app.grid_cache.grid(),
+                    app.grid_cache.grid_version(),
+                    geometry,
+                )
+            }),
         );
         if image_mode {
             report.graphics_name = Some(graphics.name());
@@ -202,10 +208,10 @@ fn draw_preview(
 }
 
 // A companion PNG error, then a graphics error, replaces the normal status line.
-fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) -> String {
+fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
     let (gw, gh) = geometry.grid;
-    let (sw, sh) = app.pipeline.source_size();
-    let mode = if app.view.exact {
+    let (sw, sh) = app.grid_cache.source_size();
+    let mode = if app.viewport.exact {
         let (w, h) = geometry.visible;
         if w == 0 || h == 0 {
             "1:1 empty".into()
@@ -221,7 +227,7 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
     } else {
         format!(
             "Overview ({}){}",
-            app.view.glyphs.name(),
+            app.viewport.glyphs.name(),
             if report.approximate {
                 " approximate"
             } else {
@@ -242,7 +248,7 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
         .unwrap_or_else(|| {
             format!(
                 "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
-                app.params.rotation.degrees(),
+                app.settings.rotation.degrees(),
             )
         })
 }
@@ -296,7 +302,7 @@ mod tests {
             )
             .starts_with("Original (kitty) | Overview (sextant) |")
         );
-        let dir = crate::test_support::TempDir::new();
+        let dir = crate::temp_dir::TempDir::new();
         for with_export in [false, true] {
             if with_export {
                 app = App::new(RgbaImage::new(4, 6), Some(dir.to_path_buf()));
@@ -369,7 +375,7 @@ mod tests {
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
-        app.view.exact = true;
+        app.viewport.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
         let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
@@ -381,7 +387,7 @@ mod tests {
         log_minimap(&app, &mut log, &frame, &geometry).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.starts_with("[minimap] frame=0 grid=180x180"));
-        let view::Minimap {
+        let viewport::Minimap {
             frame: inset, map, ..
         } = geometry.minimap.unwrap();
         assert_eq!(text.lines().count(), 2 + inset.area() as usize);
@@ -417,11 +423,11 @@ mod tests {
     }
 
     #[test]
-    fn draws_parameters_and_truecolor_half_blocks() {
+    fn draws_settings_and_truecolor_half_blocks() {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
-        app.view.exact = true;
+        app.viewport.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
@@ -458,7 +464,7 @@ mod tests {
         }
     }
     #[test]
-    fn parameter_list_keeps_scroll_offset_when_moving_within_visible_rows() {
+    fn setting_list_keeps_scroll_offset_when_moving_within_visible_rows() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut renderer = Renderer::default();
@@ -475,15 +481,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(renderer.parameter_list.selected(), Some(6));
-        assert_eq!(renderer.parameter_list.offset(), 4);
+        assert_eq!(renderer.setting_list.selected(), Some(6));
+        assert_eq!(renderer.setting_list.offset(), 4);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(renderer.parameter_list.selected(), Some(5));
-        assert_eq!(renderer.parameter_list.offset(), 4);
+        assert_eq!(renderer.setting_list.selected(), Some(5));
+        assert_eq!(renderer.setting_list.offset(), 4);
         for label in ["Serpentine", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
@@ -498,10 +504,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Overview (sextant)"));
-        app.view.glyphs = render::Glyphs::Quadrant;
+        app.viewport.glyphs = cells::Glyphs::Quadrant;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Overview (quadrant)"));
-        app.view.exact = true;
+        app.viewport.exact = true;
         app.preview_focus = true;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
@@ -523,7 +529,7 @@ mod tests {
                 picker.set_protocol_type(protocol);
                 let font = picker.font_size();
                 let geometry = app.geometry(layout(ratatui::layout::Size::new(100, 40)).preview);
-                let (cw, ch) = view::fit_aspect(
+                let (cw, ch) = viewport::fit_aspect(
                     geometry.grid.0,
                     geometry.grid.1,
                     geometry.area,
@@ -540,7 +546,7 @@ mod tests {
                     })
                     .unwrap();
                 app.show_original = exact;
-                app.view.exact = exact;
+                app.viewport.exact = exact;
                 app.sync(layout(terminal.size().unwrap()).preview);
                 let completed = terminal
                     .draw(|frame| {

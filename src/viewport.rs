@@ -3,7 +3,7 @@
 //! A dot is one grid pixel. The 1:1 view (`exact` in code) shows two dots per cell,
 //! one above the other.
 
-use crate::render::Glyphs;
+use crate::cells::Glyphs;
 use ratatui::{
     layout::{Constraint, Rect},
     widgets::Block,
@@ -28,7 +28,7 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
 
 /// User controlled preview state: glyph set, Overview or 1:1, minimap, and 1:1 origin.
 #[derive(Default, Clone, Copy, Debug)]
-pub struct View {
+pub struct Viewport {
     /// Glyph set for the Dithered Overview and minimap.
     pub glyphs: Glyphs,
     /// 1:1 view, one dot per half cell, instead of the Overview.
@@ -45,8 +45,8 @@ pub struct View {
 // with the PreviewReport enum when the slider lands.
 /// Preview coordinates shared by input handling and rendering.
 ///
-/// Rebuilt from the View for each frame and input event. The origin is clamped here
-/// without changing the View.
+/// Rebuilt from the Viewport for each frame and input event. The origin is clamped here
+/// without changing the Viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreviewGeometry {
     /// Grid size in dots, after scaling and rotation.
@@ -56,7 +56,7 @@ pub struct PreviewGeometry {
     /// Dots that fit in the preview at 1:1, two per cell row, capped by the grid size.
     /// Computed in every mode but only used by the 1:1 view.
     pub visible: (u32, u32),
-    /// Clamped View origin, the grid dot at the top left of the 1:1 view.
+    /// Clamped Viewport origin, the grid dot at the top left of the 1:1 view.
     pub origin: (u32, u32),
     /// Present only in 1:1 when the minimap is shown and fits.
     pub minimap: Option<Minimap>,
@@ -73,27 +73,27 @@ pub struct Minimap {
     pub viewport: Rect,
 }
 
-/// Builds the PreviewGeometry for `view` over a grid of `grid` dots in `area`.
-pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
+/// Builds the PreviewGeometry for `viewport` over a grid of `grid` dots in `area`.
+pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeometry {
     let (w, h) = grid;
-    let mut view = *view;
-    view.clamp(w, h, area);
-    let visible = view.visible(w, h, area);
-    let minimap = view.minimap(w, h, area).map(|(frame, map)| Minimap {
+    let mut viewport = *viewport;
+    viewport.clamp(w, h, area);
+    let visible = viewport.visible(w, h, area);
+    let minimap = viewport.minimap(w, h, area).map(|(frame, map)| Minimap {
         frame,
         map,
-        viewport: view.viewport_rect(w, h, visible, map),
+        viewport: viewport.viewport_rect(w, h, visible, map),
     });
     PreviewGeometry {
         grid,
         area,
         visible,
-        origin: (view.x, view.y),
+        origin: (viewport.x, viewport.y),
         minimap,
     }
 }
 
-impl View {
+impl Viewport {
     /// Minimap frame and map cells, in that order.
     ///
     /// None in the Overview, when the minimap is hidden, when the grid is empty, or
@@ -233,15 +233,15 @@ mod tests {
                 }),
             ),
         ] {
-            let view = View {
+            let viewport = Viewport {
                 exact,
                 hide_minimap: hidden,
                 x: 999,
                 y: 999,
-                ..View::default()
+                ..Viewport::default()
             };
             assert_eq!(
-                geometry(&view, grid, area),
+                geometry(&viewport, grid, area),
                 PreviewGeometry {
                     grid,
                     area,
@@ -250,19 +250,22 @@ mod tests {
                     minimap: expected_minimap,
                 },
             );
-            assert_eq!((view.x, view.y), (999, 999));
+            assert_eq!((viewport.x, viewport.y), (999, 999));
         }
     }
 
     #[test]
     fn glyph_set_does_not_change_fitted_shape() {
         let map = |glyphs| {
-            let view = View {
+            let viewport = Viewport {
                 glyphs,
                 exact: true,
-                ..View::default()
+                ..Viewport::default()
             };
-            view.minimap(120, 120, Rect::new(0, 0, 48, 18)).unwrap().1
+            viewport
+                .minimap(120, 120, Rect::new(0, 0, 48, 18))
+                .unwrap()
+                .1
         };
         assert_eq!(map(Glyphs::Quadrant), map(Glyphs::Sextant));
         assert_eq!(
@@ -292,25 +295,25 @@ mod tests {
     }
     #[test]
     fn clamps_pan_and_projects_minimap_viewport() {
-        let mut view = View {
+        let mut viewport = Viewport {
             exact: true,
             hide_minimap: false,
             x: 99,
             y: 99,
-            ..View::default()
+            ..Viewport::default()
         };
-        view.clamp(100, 80, Rect::new(0, 0, 20, 10));
-        assert_eq!((view.x, view.y), (80, 60));
-        assert_eq!(view.visible(100, 80, Rect::new(0, 0, 20, 10)), (20, 20));
+        viewport.clamp(100, 80, Rect::new(0, 0, 20, 10));
+        assert_eq!((viewport.x, viewport.y), (80, 60));
+        assert_eq!(viewport.visible(100, 80, Rect::new(0, 0, 20, 10)), (20, 20));
         assert_eq!(
-            view.viewport_rect(100, 80, (20, 20), Rect::new(3, 4, 10, 8)),
+            viewport.viewport_rect(100, 80, (20, 20), Rect::new(3, 4, 10, 8)),
             Rect::new(11, 10, 2, 2)
         );
         assert_eq!(
-            view.viewport_rect(10_000, 10_000, (1, 1), Rect::new(3, 4, 10, 8)),
+            viewport.viewport_rect(10_000, 10_000, (1, 1), Rect::new(3, 4, 10, 8)),
             Rect::new(3, 4, 1, 1)
         );
-        view.clamp(2, 3, Rect::new(0, 0, 20, 10));
-        assert_eq!((view.x, view.y), (0, 0));
+        viewport.clamp(2, 3, Rect::new(0, 0, 20, 10));
+        assert_eq!((viewport.x, viewport.y), (0, 0));
     }
 }

@@ -5,7 +5,7 @@
 
 use crate::{
     memo::Memo,
-    view::{CELL_ASPECT, Minimap, PreviewGeometry, View, fit_aspect},
+    viewport::{CELL_ASPECT, Minimap, PreviewGeometry, Viewport, fit_aspect},
 };
 use image::RgbaImage;
 use ratatui::{
@@ -122,7 +122,7 @@ impl Glyphs {
     }
 }
 
-impl View {
+impl Viewport {
     // Clears the minimap frame and paints the fitted overview inside its border.
     // The border and dimming are drawn by draw_minimap.
     fn render_minimap(
@@ -154,7 +154,7 @@ impl View {
 /// approximation.
 pub fn render(
     pixels: Pixels<'_>,
-    view: &View,
+    viewport: &Viewport,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     caches: &mut OverviewCaches,
@@ -163,14 +163,14 @@ pub fn render(
     if area.is_empty() {
         return false;
     }
-    if view.exact {
-        render_exact(pixels, view, geometry, buffer, &mut caches.inset);
+    if viewport.exact {
+        render_exact(pixels, viewport, geometry, buffer, &mut caches.inset);
         false
     } else {
         render_overview(
             pixels,
             geometry.grid,
-            view.glyphs,
+            viewport.glyphs,
             area,
             buffer,
             &mut caches.full,
@@ -180,7 +180,7 @@ pub fn render(
 
 fn render_exact(
     pixels: Pixels<'_>,
-    view: &View,
+    viewport: &Viewport,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
@@ -204,14 +204,14 @@ fn render_exact(
                 .set_bg(bg);
         }
     }
-    draw_minimap(pixels, view, geometry, buffer, cache);
+    draw_minimap(pixels, viewport, geometry, buffer, cache);
 }
 
 // Draws the minimap overview and its gray border, then dims map cells outside the
 // viewport to half brightness.
 fn draw_minimap(
     pixels: Pixels<'_>,
-    view: &View,
+    viewport: &Viewport,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
@@ -219,16 +219,16 @@ fn draw_minimap(
     let Some(Minimap {
         frame,
         map,
-        viewport,
+        viewport: viewport_rect,
     }) = geometry.minimap
     else {
         return;
     };
-    view.render_minimap(pixels, geometry, buffer, cache);
+    viewport.render_minimap(pixels, geometry, buffer, cache);
     Block::bordered()
         .border_style(Color::Gray)
         .render(frame, buffer);
-    for pos in map.positions().filter(|&pos| !viewport.contains(pos)) {
+    for pos in map.positions().filter(|&pos| !viewport_rect.contains(pos)) {
         let cell = &mut buffer[pos];
         for color in [&mut cell.fg, &mut cell.bg] {
             if let Color::Rgb(r, g, b) = *color {
@@ -399,7 +399,7 @@ fn average_rgb(pixels: &RgbaImage, cw: u16, ch: u16) -> Vec<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::geometry;
+    use crate::viewport::geometry;
     use image::Rgba;
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid::dither::make_palette;
@@ -461,15 +461,15 @@ mod tests {
 
     #[test]
     fn quadrant_overview_and_minimap_use_only_block_elements() {
-        let (w, h, palette, indices, mut view) = minimap_fixture();
-        view.glyphs = Glyphs::Quadrant;
+        let (w, h, palette, indices, mut viewport) = minimap_fixture();
+        viewport.glyphs = Glyphs::Quadrant;
         let area = Rect::new(2, 3, 60, 30);
         let mut buffer = Buffer::empty(area);
-        view.exact = false;
+        viewport.exact = false;
         render(
             indexed(&indices, &palette),
-            &view,
-            &crate::view::geometry(&view, (w, h), area),
+            &viewport,
+            &crate::viewport::geometry(&viewport, (w, h), area),
             &mut buffer,
             &mut OverviewCaches::default(),
         );
@@ -480,10 +480,10 @@ mod tests {
         };
         assert!(buffer.content.iter().all(is_block));
         assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
-        view.exact = true;
-        let geometry = geometry(&view, (w, h), area);
+        viewport.exact = true;
+        let geometry = geometry(&viewport, (w, h), area);
         let Minimap { map, .. } = geometry.minimap.unwrap();
-        view.render_minimap(
+        viewport.render_minimap(
             indexed(&indices, &palette),
             &geometry,
             &mut buffer,
@@ -493,27 +493,27 @@ mod tests {
         assert!(map.positions().any(|pos| buffer[pos].symbol() != " "));
     }
 
-    fn minimap_fixture() -> (u32, u32, Vec<PaletteColor>, Vec<u8>, View) {
+    fn minimap_fixture() -> (u32, u32, Vec<PaletteColor>, Vec<u8>, Viewport) {
         let (w, h) = (180, 180);
         let palette = make_palette(&["#123", "#abc", "#e64", "#fff"]).unwrap();
         let indices = (0..w * h)
             .map(|i| ((i * 17 + i / w * 13 + i / 7) % 4) as u8)
             .collect();
-        let view = View {
+        let viewport = Viewport {
             exact: true,
-            ..View::default()
+            ..Viewport::default()
         };
-        (w, h, palette, indices, view)
+        (w, h, palette, indices, viewport)
     }
 
     #[test]
     fn minimap_pan_preserves_symbols_and_dims_only_outside_viewport() {
         let area = Rect::new(2, 3, 60, 30);
-        let (w, h, palette, indices, mut view) = minimap_fixture();
+        let (w, h, palette, indices, mut viewport) = minimap_fixture();
         let mut baseline = Buffer::empty(area);
-        let geometry = geometry(&view, (w, h), area);
+        let geometry = geometry(&viewport, (w, h), area);
         let Minimap { frame, map, .. } = geometry.minimap.unwrap();
-        view.render_minimap(
+        viewport.render_minimap(
             indexed(&indices, &palette),
             &geometry,
             &mut baseline,
@@ -524,13 +524,13 @@ mod tests {
             .render(frame, &mut baseline);
         let mut current = Buffer::empty(area);
         for (x, y) in [(0, 0), (60, 60), (1, 1), (120, 120), (0, 0), (1, 0), (1, 1)] {
-            view.x = x;
-            view.y = y;
-            let viewport = view.viewport_rect(w, h, view.visible(w, h, area), map);
+            viewport.x = x;
+            viewport.y = y;
+            let viewport_rect = viewport.viewport_rect(w, h, viewport.visible(w, h, area), map);
             render(
                 indexed(&indices, &palette),
-                &view,
-                &crate::view::geometry(&view, (w, h), area),
+                &viewport,
+                &crate::viewport::geometry(&viewport, (w, h), area),
                 &mut current,
                 &mut OverviewCaches::default(),
             );
@@ -543,7 +543,7 @@ mod tests {
                     "symbol at {pos:?}, pan {x},{y}"
                 );
                 let mut expected = original.clone();
-                if map.contains(pos) && !viewport.contains(pos) {
+                if map.contains(pos) && !viewport_rect.contains(pos) {
                     let dim = |color| match color {
                         Color::Rgb(17, 34, 51) => Color::Rgb(8, 17, 25),
                         Color::Rgb(170, 187, 204) => Color::Rgb(85, 93, 102),
@@ -609,16 +609,16 @@ mod tests {
                 255,
             ),
         ] {
-            let view = View {
+            let viewport = Viewport {
                 glyphs,
-                ..View::default()
+                ..Viewport::default()
             };
             let mut buffer = Buffer::empty(area);
             assert_eq!(
                 render(
                     indexed(&indices, &palette),
-                    &view,
-                    &geometry(&view, size, area),
+                    &viewport,
+                    &geometry(&viewport, size, area),
                     &mut buffer,
                     &mut OverviewCaches::default(),
                 ),
@@ -641,8 +641,8 @@ mod tests {
         for (version, expected) in [(1, 1), (1, 1), (2, 2)] {
             render(
                 Pixels::Rgb(&pixels, version),
-                &View::default(),
-                &crate::view::geometry(&View::default(), (1, 2), area),
+                &Viewport::default(),
+                &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
                 &mut buffer,
                 &mut cache,
             );
@@ -651,8 +651,8 @@ mod tests {
         let area = Rect::new(0, 0, 2, 2);
         render(
             Pixels::Rgb(&pixels, 2),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (1, 2), area),
+            &Viewport::default(),
+            &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
             &mut cache,
         );
@@ -661,8 +661,8 @@ mod tests {
         let updated = rgb(1, 2, &[[0; 3], [255; 3]]);
         render(
             Pixels::Rgb(&updated, 3),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (1, 2), area),
+            &Viewport::default(),
+            &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
             &mut cache,
         );
@@ -680,14 +680,14 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&pixels, 1),
-            &View {
+            &Viewport {
                 exact: true,
-                ..View::default()
+                ..Viewport::default()
             },
-            &crate::view::geometry(
-                &View {
+            &crate::viewport::geometry(
+                &Viewport {
                     exact: true,
-                    ..View::default()
+                    ..Viewport::default()
                 },
                 (1, 2),
                 area
@@ -710,8 +710,8 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             assert!(!render(
                 Pixels::Rgb(&rgb(4, 4, &pixels), 1),
-                &View::default(),
-                &crate::view::geometry(&View::default(), (4, 4), area),
+                &Viewport::default(),
+                &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
                 &mut buffer,
                 &mut OverviewCaches::default()
             ));
@@ -739,8 +739,8 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&rgb(1, 4, &pixels), 1),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (1, 4), area),
+            &Viewport::default(),
+            &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
             &mut buffer,
             &mut OverviewCaches::default()
         ));
@@ -756,8 +756,8 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&rgb(1, 2, &pixels), 1),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (1, 2), area),
+            &Viewport::default(),
+            &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut buffer,
             &mut OverviewCaches::default()
         ));
@@ -782,14 +782,14 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             indexed(&[0, 1, 2], &palette),
-            &View {
+            &Viewport {
                 exact: true,
-                ..View::default()
+                ..Viewport::default()
             },
-            &crate::view::geometry(
-                &View {
+            &crate::viewport::geometry(
+                &Viewport {
                     exact: true,
-                    ..View::default()
+                    ..Viewport::default()
                 },
                 (1, 3),
                 area
@@ -808,14 +808,14 @@ mod tests {
         let area = Rect::new(0, 0, 48, 18);
         let mut buffer = Buffer::empty(area);
         let palette = make_palette(&["#000", "#fff"]).unwrap();
-        let view = View {
+        let viewport = Viewport {
             exact: true,
-            ..View::default()
+            ..Viewport::default()
         };
         render(
             indexed(&vec![0; 120 * 120], &palette),
-            &view,
-            &crate::view::geometry(&view, (120, 120), area),
+            &viewport,
+            &crate::viewport::geometry(&viewport, (120, 120), area),
             &mut buffer,
             &mut OverviewCaches::default(),
         );
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(buffer[(47, 5)].symbol(), "┘");
         assert_eq!(buffer[(33, 2)].symbol(), " ");
         assert_eq!(buffer[(33, 2)].bg, Color::Reset);
-        let (_, map) = view.minimap(120, 120, area).unwrap();
+        let (_, map) = viewport.minimap(120, 120, area).unwrap();
         assert_eq!(buffer[(map.x, map.y)].fg, Color::Rgb(0, 0, 0));
     }
     #[test]
@@ -834,14 +834,14 @@ mod tests {
         let mut caches = OverviewCaches::default();
         for version in [1, 2] {
             for exact in [false, true, false, true] {
-                let view = View {
+                let viewport = Viewport {
                     exact,
-                    ..View::default()
+                    ..Viewport::default()
                 };
                 render(
                     Pixels::Rgb(&pixels, version),
-                    &view,
-                    &geometry(&view, pixels.dimensions(), area),
+                    &viewport,
+                    &geometry(&viewport, pixels.dimensions(), area),
                     &mut Buffer::empty(area),
                     &mut caches,
                 );

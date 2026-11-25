@@ -1,8 +1,8 @@
-//! Image pipeline from source to grid to dithered indices.
+//! Source image, scaled grid and dithered indices caches.
 
 use crate::{
     memo::Memo,
-    params::{Params, Rotation},
+    settings::{Rotation, Settings},
 };
 use image::{RgbaImage, imageops};
 use rthid::dither::{self, Options};
@@ -24,7 +24,7 @@ pub(crate) struct DitherKey {
 
 /// Source image, grid (scaled then rotated) and dithered indices. Each stage
 /// rebuilds only when its key changes.
-pub struct Pipeline {
+pub struct GridCache {
     /// Loaded image before scaling and rotation.
     pub(crate) source: RgbaImage,
     /// Scaled and rotated image cache.
@@ -33,11 +33,11 @@ pub struct Pipeline {
     pub(crate) dithered: Memo<DitherKey, Vec<u8>>,
 }
 
-impl Pipeline {
+impl GridCache {
     /// Grid dimensions before rotation for the current scale.
-    pub(crate) fn scaled_size(&self, params: &Params) -> (u32, u32) {
+    pub(crate) fn scaled_size(&self, settings: &Settings) -> (u32, u32) {
         let scaled = |n| {
-            (f64::from(n) * f64::from(params.scale) / 100.0)
+            (f64::from(n) * f64::from(settings.scale) / 100.0)
                 .round()
                 .max(1.0) as u32
         };
@@ -47,18 +47,18 @@ impl Pipeline {
     /// Rebuilds the grid when the scaled size or rotation changed and, if
     /// `need_dither` is set, the indices when the grid or dither options changed.
     /// Returns true when new indices were built.
-    pub fn refresh(&mut self, params: &Params, need_dither: bool) -> bool {
-        let (width, height) = self.scaled_size(params);
+    pub fn refresh(&mut self, settings: &Settings, need_dither: bool) -> bool {
+        let (width, height) = self.scaled_size(settings);
         self.grid.update(
             GridKey {
                 width,
                 height,
-                rotation: params.rotation,
+                rotation: settings.rotation,
             },
             || {
                 let scaled =
                     imageops::resize(&self.source, width, height, imageops::FilterType::Triangle);
-                params.rotation.apply(scaled)
+                settings.rotation.apply(scaled)
             },
         );
         if !need_dither {
@@ -68,12 +68,12 @@ impl Pipeline {
         let (w, h) = grid.dimensions();
         let version = self.grid_version();
         self.dithered.update_by(
-            |key| key.grid == version && key.options == params.options,
+            |key| key.grid == version && key.options == settings.options,
             || DitherKey {
                 grid: version,
-                options: params.options.clone(),
+                options: settings.options.clone(),
             },
-            || dither::dither(grid.as_raw(), w as usize, h as usize, &params.options),
+            || dither::dither(grid.as_raw(), w as usize, h as usize, &settings.options),
         )
     }
 

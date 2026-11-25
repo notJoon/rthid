@@ -91,7 +91,7 @@ impl Rotation {
 
 /// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Param {
+pub enum Setting {
     /// Grid size as a percentage of the source.
     Scale,
     /// Dither color model.
@@ -108,7 +108,7 @@ pub enum Param {
     Contrast,
 }
 
-impl Param {
+impl Setting {
     /// Parameter panel order.
     pub const ALL: [Self; 7] = [
         Self::Scale,
@@ -121,16 +121,18 @@ impl Param {
     ];
 
     /// Label including the current value.
-    pub fn label(self, params: &Params) -> String {
-        let o = &params.options;
+    pub fn label(self, settings: &Settings) -> String {
+        let o = &settings.options;
         match self {
-            Param::Scale => format!("Scale: {}%", params.scale),
-            Param::Mode => format!("Mode: {:?}", o.mode),
-            Param::Palette => format!("Palette: {}", params.palette_name()),
-            Param::Strength => format!("Strength: {:.1}", o.strength),
-            Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
-            Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
-            Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
+            Setting::Scale => format!("Scale: {}%", settings.scale),
+            Setting::Mode => format!("Mode: {:?}", o.mode),
+            Setting::Palette => format!("Palette: {}", settings.palette_name()),
+            Setting::Strength => format!("Strength: {:.1}", o.strength),
+            Setting::Serpentine => {
+                format!("Serpentine: {}", if o.serpentine { "on" } else { "off" })
+            }
+            Setting::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
+            Setting::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
         }
     }
 
@@ -157,7 +159,7 @@ impl Param {
 /// Everything that affects the grid or the dither. d resets the selected row and
 /// D resets everything, including rotation and tone values without a row.
 #[derive(Clone, PartialEq)]
-pub struct Params {
+pub struct Settings {
     /// Grid size as a percentage of the source, 10 to 200.
     pub scale: i32,
     /// Rotation applied after scaling.
@@ -168,20 +170,20 @@ pub struct Params {
     pub options: Options,
 }
 
-impl Default for Params {
+impl Default for Settings {
     fn default() -> Self {
-        let mut params = Self {
+        let mut settings = Self {
             scale: 100,
             rotation: Rotation::R0,
             palette: 0,
             options: Options::default(),
         };
-        params.set_palette(0);
-        params
+        settings.set_palette(0);
+        settings
     }
 }
 
-impl Params {
+impl Settings {
     /// Name of the selected palette preset.
     pub fn palette_name(&self) -> &'static str {
         PALETTES[self.palette].name
@@ -193,48 +195,50 @@ impl Params {
     }
 
     /// Returns settings with one parameter restored to its default.
-    pub fn with_default(&self, param: Param) -> Self {
+    pub fn with_default(&self, setting: Setting) -> Self {
         let mut next = self.clone();
         let defaults = Self::default();
-        match param {
-            Param::Scale => next.scale = defaults.scale,
-            Param::Mode => next.options.mode = defaults.options.mode,
-            Param::Palette => next.set_palette(defaults.palette),
-            Param::Strength => next.options.strength = defaults.options.strength,
-            Param::Serpentine => next.options.serpentine = defaults.options.serpentine,
-            Param::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
-            Param::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
+        match setting {
+            Setting::Scale => next.scale = defaults.scale,
+            Setting::Mode => next.options.mode = defaults.options.mode,
+            Setting::Palette => next.set_palette(defaults.palette),
+            Setting::Strength => next.options.strength = defaults.options.strength,
+            Setting::Serpentine => next.options.serpentine = defaults.options.serpentine,
+            Setting::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
+            Setting::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
         }
         next
     }
 
     /// Returns settings moved `dir` steps and clamped to the range. Mode and
     /// Serpentine toggle, Palette wraps around the presets.
-    pub fn adjusted(&self, param: Param, dir: i32) -> Self {
+    pub fn adjusted(&self, setting: Setting, dir: i32) -> Self {
         let mut next = self.clone();
         let step = |value: f64| {
-            let (steps, low, high) = param.range().expect("numeric parameter");
+            let (steps, low, high) = setting.range().expect("numeric parameter");
             (((value * steps).round() + f64::from(dir)) / steps).clamp(low, high)
         };
-        match param {
-            Param::Scale => {
-                let (steps, low, high) = param.range().expect("numeric parameter");
+        match setting {
+            Setting::Scale => {
+                let (steps, low, high) = setting.range().expect("numeric parameter");
                 next.scale =
                     (f64::from(self.scale) + f64::from(dir) / steps).clamp(low, high) as i32;
             }
-            Param::Mode => {
+            Setting::Mode => {
                 next.options.mode = match self.options.mode {
                     Mode::Tone => Mode::Color,
                     Mode::Color => Mode::Tone,
                 }
             }
-            Param::Palette => next.set_palette(
+            Setting::Palette => next.set_palette(
                 (self.palette as i32 + dir).rem_euclid(PALETTES.len() as i32) as usize,
             ),
-            Param::Strength => next.options.strength = step(self.options.strength),
-            Param::Serpentine => next.options.serpentine = !self.options.serpentine,
-            Param::Brightness => next.options.tone.brightness = step(self.options.tone.brightness),
-            Param::Contrast => next.options.tone.contrast = step(self.options.tone.contrast),
+            Setting::Strength => next.options.strength = step(self.options.strength),
+            Setting::Serpentine => next.options.serpentine = !self.options.serpentine,
+            Setting::Brightness => {
+                next.options.tone.brightness = step(self.options.tone.brightness)
+            }
+            Setting::Contrast => next.options.tone.contrast = step(self.options.tone.contrast),
         }
         next
     }
@@ -262,17 +266,17 @@ mod tests {
 
     #[test]
     fn adjustments_use_unsnapped_steps_and_restore_each_default() {
-        let params = Params {
+        let settings = Settings {
             scale: 105,
-            ..Params::default()
+            ..Settings::default()
         };
-        let next = params.adjusted(Param::Scale, 1);
+        let next = settings.adjusted(Setting::Scale, 1);
         assert_eq!(next.scale, 115);
-        assert_eq!(next.with_default(Param::Scale).scale, 100);
-        for param in Param::ALL {
-            let next = params.adjusted(param, -1);
-            let reset = next.with_default(param);
-            assert_eq!(param.label(&reset), param.label(&Params::default()));
+        assert_eq!(next.with_default(Setting::Scale).scale, 100);
+        for setting in Setting::ALL {
+            let next = settings.adjusted(setting, -1);
+            let reset = next.with_default(setting);
+            assert_eq!(setting.label(&reset), setting.label(&Settings::default()));
         }
     }
 }

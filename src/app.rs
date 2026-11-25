@@ -1,12 +1,12 @@
 //! Interactive state and the key and mouse handling that changes it.
 
 use crate::{
+    cells::Pixels,
     export::Export,
+    grid::GridCache,
     memo::Memo,
-    params::{Param, Params},
-    pipeline::Pipeline,
-    render::Pixels,
-    view::{PreviewGeometry, View},
+    settings::{Setting, Settings},
+    viewport::{PreviewGeometry, Viewport},
 };
 use image::RgbaImage;
 use ratatui::crossterm::event::{
@@ -15,20 +15,20 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use std::path::PathBuf;
 
-/// All interactive state: settings, focus, preview view, pipeline caches and
+/// All interactive state: settings, focus, preview viewport, grid caches and
 /// the optional companion PNG.
 pub struct App {
     export: Option<Export>,
     /// Preview mode (Overview or 1:1), glyphs, minimap and image origin.
-    pub view: View,
+    pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
     last_drag: Option<(u16, u16)>,
     /// Image processing caches.
-    pub pipeline: Pipeline,
+    pub grid_cache: GridCache,
     /// Current image settings.
-    pub params: Params,
-    /// Index into `Param::ALL` of the highlighted row.
+    pub settings: Settings,
+    /// Index into `Setting::ALL` of the highlighted row.
     pub selected: usize,
     /// Whether the preview shows Original (the scaled grid) instead of Dithered.
     /// Starts true.
@@ -43,15 +43,15 @@ impl App {
     pub fn new(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
-            view: View::default(),
+            viewport: Viewport::default(),
             preview_focus: false,
             last_drag: None,
-            pipeline: Pipeline {
+            grid_cache: GridCache {
                 source,
                 grid: Memo::default(),
                 dithered: Memo::default(),
             },
-            params: Params::default(),
+            settings: Settings::default(),
             selected: 0,
             show_original: true,
             quit: false,
@@ -63,8 +63,8 @@ impl App {
     /// Grid size for the current settings after rotation, known before `sync`
     /// rebuilds the grid.
     pub fn grid_size(&self) -> (u32, u32) {
-        let (w, h) = self.pipeline.scaled_size(&self.params);
-        if self.params.rotation.swaps_axes() {
+        let (w, h) = self.grid_cache.scaled_size(&self.settings);
+        if self.settings.rotation.swaps_axes() {
             (h, w)
         } else {
             (w, h)
@@ -72,34 +72,34 @@ impl App {
     }
 
     /// Rebuilds the grid and dither if settings changed, sends a new dither to the
-    /// companion PNG and clamps the view to the preview area. Call before each draw.
+    /// companion PNG and clamps the viewport to the preview area. Call before each draw.
     pub fn sync(&mut self, preview: Rect) {
         self.refresh();
-        self.clamp_view(preview);
+        self.clamp_viewport(preview);
     }
 
     /// Coordinates shared by preview input and rendering.
     pub fn geometry(&self, area: Rect) -> PreviewGeometry {
-        crate::view::geometry(&self.view, self.grid_size(), area)
+        crate::viewport::geometry(&self.viewport, self.grid_size(), area)
     }
 
-    /// Keeps the view within the current grid and preview area.
-    pub fn clamp_view(&mut self, area: Rect) {
+    /// Keeps the viewport within the current grid and preview area.
+    pub fn clamp_viewport(&mut self, area: Rect) {
         let (w, h) = self.grid_size();
-        self.view.clamp(w, h, area);
+        self.viewport.clamp(w, h, area);
     }
 
     fn refresh(&mut self) {
         let need_dither = !self.show_original || self.has_export();
-        if self.pipeline.refresh(&self.params, need_dither)
+        if self.grid_cache.refresh(&self.settings, need_dither)
             && let Some(export) = &mut self.export
         {
-            let (w, h) = self.pipeline.grid().dimensions();
+            let (w, h) = self.grid_cache.grid().dimensions();
             export.sync(
-                self.pipeline.dithered().expect("dithered grid"),
+                self.grid_cache.dithered().expect("dithered grid"),
                 w,
                 h,
-                &self.params.options.palette,
+                &self.settings.options.palette,
             );
         }
     }
@@ -125,11 +125,11 @@ impl App {
     /// Panics in dithered mode if its result was never built.
     pub fn displayed(&self) -> Pixels<'_> {
         if self.show_original {
-            Pixels::Rgb(self.pipeline.grid(), self.pipeline.grid_version())
+            Pixels::Rgb(self.grid_cache.grid(), self.grid_cache.grid_version())
         } else {
             Pixels::Indexed {
-                indices: self.pipeline.dithered().expect("dithered grid"),
-                palette: &self.params.options.palette,
+                indices: self.grid_cache.dithered().expect("dithered grid"),
+                palette: &self.settings.options.palette,
             }
         }
     }
@@ -148,7 +148,7 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
-        if !self.view.exact || !geometry.area.contains(point.into()) {
+        if !self.viewport.exact || !geometry.area.contains(point.into()) {
             return;
         }
         match mouse.kind {
@@ -156,12 +156,12 @@ impl App {
                 if let Some(minimap) = geometry.minimap
                     && minimap.map.contains(point.into())
                 {
-                    self.view.center_on_minimap(point, geometry);
+                    self.viewport.center_on_minimap(point, geometry);
                 } else {
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
                         && let Some((x, y)) = prev
                     {
-                        self.view.pan(
+                        self.viewport.pan(
                             i64::from(x) - i64::from(mouse.column),
                             (i64::from(y) - i64::from(mouse.row)) * 2,
                             geometry,
@@ -170,18 +170,18 @@ impl App {
                     self.last_drag = Some(point);
                 }
             }
-            MouseEventKind::ScrollUp => self.view.pan(0, -6, geometry),
-            MouseEventKind::ScrollDown => self.view.pan(0, 6, geometry),
+            MouseEventKind::ScrollUp => self.viewport.pan(0, -6, geometry),
+            MouseEventKind::ScrollDown => self.viewport.pan(0, 6, geometry),
             // Trackpads send horizontal swipes as sideways scrolls.
-            MouseEventKind::ScrollLeft => self.view.pan(-6, 0, geometry),
-            MouseEventKind::ScrollRight => self.view.pan(6, 0, geometry),
+            MouseEventKind::ScrollLeft => self.viewport.pan(-6, 0, geometry),
+            MouseEventKind::ScrollRight => self.viewport.pan(6, 0, geometry),
             _ => {}
         }
     }
 
     // TODO: Introduce an Action enum with a pure key mapping once more bindings arrive.
     /// Global keys come first (Ctrl+C, Tab, Space, Esc). With preview focus, m, z
-    /// and the pan keys act on the view, and pans do nothing in Overview. All other
+    /// and the pan keys act on the viewport, and pans do nothing in Overview. All other
     /// keys fall through to the quit, row, rotation, reset and adjust keys.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
@@ -208,11 +208,11 @@ impl App {
         if self.preview_focus {
             match key.code {
                 KeyCode::Char('m') => {
-                    self.view.hide_minimap = !self.view.hide_minimap;
+                    self.viewport.hide_minimap = !self.viewport.hide_minimap;
                     return;
                 }
                 KeyCode::Char('z') => {
-                    self.view.exact = !self.view.exact;
+                    self.viewport.exact = !self.viewport.exact;
                     self.last_drag = None;
                     return;
                 }
@@ -220,8 +220,8 @@ impl App {
             }
             let pan = pan_delta(key.code, geometry.visible);
             if let Some((dx, dy)) = pan {
-                if self.view.exact {
-                    self.view.pan(dx, dy, geometry);
+                if self.viewport.exact {
+                    self.viewport.pan(dx, dy, geometry);
                 }
                 return;
             }
@@ -230,12 +230,14 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(Param::ALL.len() - 1);
+                self.selected = (self.selected + 1).min(Setting::ALL.len() - 1);
             }
-            KeyCode::Char('r') => self.params.rotation = self.params.rotation.cw(),
-            KeyCode::Char('R') => self.params.rotation = self.params.rotation.ccw(),
-            KeyCode::Char('d') => self.params = self.params.with_default(Param::ALL[self.selected]),
-            KeyCode::Char('D') => self.params = Params::default(),
+            KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
+            KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
+            KeyCode::Char('d') => {
+                self.settings = self.settings.with_default(Setting::ALL[self.selected])
+            }
+            KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
             _ => {}
@@ -243,13 +245,13 @@ impl App {
     }
 
     fn adjust(&mut self, direction: i32) {
-        let param = Param::ALL[self.selected];
-        let next = self.params.adjusted(param, direction);
+        let setting = Setting::ALL[self.selected];
+        let next = self.settings.adjusted(setting, direction);
         // Clamped presses preserve the current preview selection.
-        if next != self.params && param.shows_dithered() {
+        if next != self.settings && setting.shows_dithered() {
             self.show_original = false;
         }
-        self.params = next;
+        self.settings = next;
     }
 }
 
@@ -272,7 +274,7 @@ fn pan_delta(code: KeyCode, visible: (u32, u32)) -> Option<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{params::Rotation, ui::Layout};
+    use crate::{settings::Rotation, ui::Layout};
     use ratatui::layout::Rect;
     use rthid::dither::Mode;
 
@@ -310,7 +312,10 @@ mod tests {
     }
 
     fn versions(app: &App) -> (u64, u64) {
-        (app.pipeline.grid.version(), app.pipeline.dithered.version())
+        (
+            app.grid_cache.grid.version(),
+            app.grid_cache.dithered.version(),
+        )
     }
 
     // Compares build versions after applying the key.
@@ -324,39 +329,42 @@ mod tests {
         before != versions(app)
     }
 
-    fn app_at(param: Param) -> App {
+    fn app_at(setting: Setting) -> App {
         let mut app = App::new(RgbaImage::new(4, 4), None);
-        app.selected = Param::ALL.iter().position(|&p| p == param).unwrap();
+        app.selected = Setting::ALL.iter().position(|&p| p == setting).unwrap();
         app
     }
 
     #[test]
-    fn pipeline_rebuilds_only_stale_stages() {
+    fn grid_cache_rebuilds_only_stale_stages() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
-        assert_eq!(app.pipeline.grid.version(), 1);
-        assert_eq!(app.pipeline.dithered.version(), 0);
+        assert_eq!(app.grid_cache.grid.version(), 1);
+        assert_eq!(app.grid_cache.dithered.version(), 0);
         app.show_original = false;
         app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.dithered.version(), 1);
+        assert_eq!(app.grid_cache.dithered.version(), 1);
         app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.grid.version(), 1);
-        assert_eq!(app.pipeline.dithered.version(), 1);
-        app.params.options.strength = 0.5;
+        assert_eq!(app.grid_cache.grid.version(), 1);
+        assert_eq!(app.grid_cache.dithered.version(), 1);
+        app.settings.options.strength = 0.5;
         app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.grid.version(), 1);
-        assert_eq!(app.pipeline.dithered.version(), 2);
+        assert_eq!(app.grid_cache.grid.version(), 1);
+        assert_eq!(app.grid_cache.dithered.version(), 2);
         app.show_original = true;
-        app.params.rotation = Rotation::R180;
-        app.params.scale = 110;
+        app.settings.rotation = Rotation::R180;
+        app.settings.scale = 110;
         app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.grid.version(), 2);
-        assert_eq!(app.pipeline.dithered.version(), 2);
+        assert_eq!(app.grid_cache.grid.version(), 2);
+        assert_eq!(app.grid_cache.dithered.version(), 2);
         app.show_original = false;
         app.sync(test_layout().preview);
-        assert_eq!(app.pipeline.dithered.version(), 3);
+        assert_eq!(app.grid_cache.dithered.version(), 3);
         assert_eq!(app.grid_size(), (22, 11));
         let (w, h) = app.grid_size();
-        assert_eq!(app.pipeline.dithered.get().unwrap().len(), (w * h) as usize);
+        assert_eq!(
+            app.grid_cache.dithered.get().unwrap().len(),
+            (w * h) as usize
+        );
     }
 
     #[test]
@@ -368,14 +376,14 @@ mod tests {
             (Rect::new(0, 0, 100, 40), 50, Rotation::R0, (0, 0)),
             (Rect::new(0, 0, 100, 40), 100, Rotation::R90, (11, 48)),
         ] {
-            app.params.scale = scale;
-            app.params.rotation = rotation;
-            app.view.x = 999;
-            app.view.y = 999;
+            app.settings.scale = scale;
+            app.settings.rotation = rotation;
+            app.viewport.x = 999;
+            app.viewport.y = 999;
             app.sync(crate::ui::layout(screen).preview);
-            assert_eq!((app.view.x, app.view.y), expected);
+            assert_eq!((app.viewport.x, app.viewport.y), expected);
             assert_eq!(
-                app.pipeline.grid.get().unwrap().dimensions(),
+                app.grid_cache.grid.get().unwrap().dimensions(),
                 app.grid_size()
             );
         }
@@ -384,9 +392,9 @@ mod tests {
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
-        app.selected = Param::ALL
+        app.selected = Setting::ALL
             .iter()
-            .position(|&p| p == Param::Strength)
+            .position(|&p| p == Setting::Strength)
             .unwrap();
         assert!(app.show_original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
@@ -427,105 +435,108 @@ mod tests {
             pixels.as_raw(),
             &[255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255]
         );
-        assert_eq!(app.pipeline.grid.get().unwrap(), pixels);
+        assert_eq!(app.grid_cache.grid.get().unwrap(), pixels);
     }
 
     #[test]
     fn navigation_stays_in_range_and_skips_redither() {
-        let mut app = app_at(Param::Scale);
+        let mut app = app_at(Setting::Scale);
         assert!(!press(&mut app, KeyCode::Up));
         assert_eq!(app.selected, 0);
         for _ in 0..10 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(Param::ALL[app.selected], Param::Contrast);
+        assert_eq!(Setting::ALL[app.selected], Setting::Contrast);
         assert!(!press(&mut app, KeyCode::Char('x')));
     }
 
     #[test]
-    fn numeric_params_clamp_without_redither() {
-        type Getter = fn(&Params) -> f64;
-        let cases: [(Param, Getter); 4] = [
-            (Param::Scale, |p| f64::from(p.scale)),
-            (Param::Strength, |p| p.options.strength),
-            (Param::Brightness, |p| p.options.tone.brightness),
-            (Param::Contrast, |p| p.options.tone.contrast),
+    fn numeric_settings_clamp_without_redither() {
+        type Getter = fn(&Settings) -> f64;
+        let cases: [(Setting, Getter); 4] = [
+            (Setting::Scale, |p| f64::from(p.scale)),
+            (Setting::Strength, |p| p.options.strength),
+            (Setting::Brightness, |p| p.options.tone.brightness),
+            (Setting::Contrast, |p| p.options.tone.contrast),
         ];
-        for (param, get) in cases {
-            let (_, low, high) = param.range().unwrap();
-            let mut app = app_at(param);
+        for (setting, get) in cases {
+            let (_, low, high) = setting.range().unwrap();
+            let mut app = app_at(setting);
             for (key, limit) in [(KeyCode::Left, low), (KeyCode::Right, high)] {
                 for _ in 0..50 {
                     press(&mut app, key);
                 }
-                assert_eq!(get(&app.params), limit, "{param:?}");
-                assert!(!press(&mut app, key), "{param:?} re-dithered at its limit");
+                assert_eq!(get(&app.settings), limit, "{setting:?}");
+                assert!(
+                    !press(&mut app, key),
+                    "{setting:?} re-dithered at its limit"
+                );
             }
         }
     }
 
     #[test]
     fn toggles_and_palette_cycle() {
-        let mut app = app_at(Param::Mode);
+        let mut app = app_at(Setting::Mode);
         assert!(press(&mut app, KeyCode::Char('l')));
-        assert!(matches!(app.params.options.mode, Mode::Color));
-        let mut app = app_at(Param::Serpentine);
+        assert!(matches!(app.settings.options.mode, Mode::Color));
+        let mut app = app_at(Setting::Serpentine);
         press(&mut app, KeyCode::Right);
-        assert!(!app.params.options.serpentine);
-        let mut app = app_at(Param::Palette);
+        assert!(!app.settings.options.serpentine);
+        let mut app = app_at(Setting::Palette);
         press(&mut app, KeyCode::Left);
-        assert_eq!(app.params.palette, 2);
-        assert_eq!(app.params.options.palette.len(), 4);
+        assert_eq!(app.settings.palette, 2);
+        assert_eq!(app.settings.options.palette.len(), 4);
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.params.palette, 0);
-        assert_eq!(app.params.options.palette.len(), 2);
+        assert_eq!(app.settings.palette, 0);
+        assert_eq!(app.settings.options.palette.len(), 2);
     }
 
     #[test]
     fn reset_restores_selected_or_all_defaults() {
-        let mut app = app_at(Param::Scale);
+        let mut app = app_at(Setting::Scale);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
         app.selected = 1;
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
-        assert!(matches!(app.params.options.mode, Mode::Tone));
+        assert!(matches!(app.settings.options.mode, Mode::Tone));
         assert_eq!(
-            (app.params.scale, app.params.rotation),
+            (app.settings.scale, app.settings.rotation),
             (110, Rotation::R90)
         );
         app.selected = 2;
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
-        let p = &app.params;
+        let p = &app.settings;
         assert_eq!((p.scale, p.rotation, p.palette), (100, Rotation::R0, 0));
         assert_eq!(p.options.palette.len(), 2);
-        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 16);
+        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 16);
     }
 
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
-        for param in Param::ALL {
+        for setting in Setting::ALL {
             let mut app = App::new(RgbaImage::new(20, 10), None);
-            app.selected = Param::ALL.iter().position(|&p| p == param).unwrap();
-            assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
-            assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
+            app.selected = Setting::ALL.iter().position(|&p| p == setting).unwrap();
+            assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
+            assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
             assert!(press(&mut app, KeyCode::Left));
-            assert!(press(&mut app, KeyCode::Char('d')), "{param:?}");
-            assert!(!press(&mut app, KeyCode::Char('d')), "{param:?}");
+            assert!(press(&mut app, KeyCode::Char('d')), "{setting:?}");
+            assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(press(&mut app, KeyCode::Left));
-            assert!(press(&mut app, KeyCode::Char('D')), "{param:?}");
-            assert!(!press(&mut app, KeyCode::Char('D')), "{param:?}");
+            assert!(press(&mut app, KeyCode::Char('D')), "{setting:?}");
+            assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
         }
-        let mut app = app_at(Param::Scale);
+        let mut app = app_at(Setting::Scale);
         press(&mut app, KeyCode::Char('r'));
         assert!(!press(&mut app, KeyCode::Char('d')));
         assert!(press(&mut app, KeyCode::Char('D')));
-        app.params.options.tone.gamma = 2.0;
+        app.settings.options.tone.gamma = 2.0;
         app.show_original = false;
         app.sync(test_layout().preview);
         assert!(press(&mut app, KeyCode::Char('D')));
-        assert_eq!(app.params.options.tone.gamma, 1.0);
+        assert_eq!(app.settings.options.tone.gamma, 1.0);
         app.handle_key(
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &app.geometry(test_layout().preview),
@@ -541,7 +552,7 @@ mod tests {
 
     #[test]
     fn quit_keys_and_ctrl_chords() {
-        let mut app = app_at(Param::Scale);
+        let mut app = app_at(Setting::Scale);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Esc);
         assert!(!app.preview_focus);
@@ -549,7 +560,7 @@ mod tests {
         assert!(!app.quit);
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
-        let mut app = app_at(Param::Scale);
+        let mut app = app_at(Setting::Scale);
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         app.handle_key(release, &app.geometry(test_layout().preview));
@@ -570,14 +581,14 @@ mod tests {
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (128, 256));
-        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 128 * 256);
+        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 128 * 256);
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.grid_size(), (256, 128));
         press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.params.rotation, Rotation::R90);
+        assert_eq!(app.settings.rotation, Rotation::R90);
         press(&mut app, KeyCode::Char('R'));
         press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.params.rotation, Rotation::R270);
+        assert_eq!(app.settings.rotation, Rotation::R270);
         assert_eq!(app.grid_size(), (128, 256));
         let mut app = App::new(RgbaImage::new(15, 1), None);
         app.show_original = false;
@@ -585,43 +596,43 @@ mod tests {
             press(&mut app, KeyCode::Left);
         }
         assert_eq!(app.grid_size(), (2, 1));
-        assert_eq!(app.pipeline.dithered.get().unwrap().len(), 2);
+        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 2);
     }
     #[test]
-    fn tab_and_preview_keys_change_view_without_redithering() {
+    fn tab_and_preview_keys_change_viewport_without_redithering() {
         let mut app = App::new(RgbaImage::new(40, 40), None);
         assert!(!press(&mut app, KeyCode::Char('z')));
-        assert!(!app.view.exact);
+        assert!(!app.viewport.exact);
         assert!(!press(&mut app, KeyCode::Tab));
         assert!(app.preview_focus);
         assert!(!press(&mut app, KeyCode::Char('z')));
-        assert!(app.view.exact);
+        assert!(app.viewport.exact);
         assert!(!press(&mut app, KeyCode::Char('L')));
-        assert_eq!(app.view.x, 8);
+        assert_eq!(app.viewport.x, 8);
         assert!(!press(&mut app, KeyCode::Right));
-        assert_eq!((app.view.x, app.view.y), (9, 0));
+        assert_eq!((app.viewport.x, app.viewport.y), (9, 0));
         assert_eq!(app.selected, 0);
         for _ in 0..100 {
             press(&mut app, KeyCode::Right);
             press(&mut app, KeyCode::Down);
         }
-        assert_eq!((app.view.x, app.view.y), (30, 30));
+        assert_eq!((app.viewport.x, app.viewport.y), (30, 30));
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Up);
-        assert_eq!((app.view.x, app.view.y), (29, 29));
+        assert_eq!((app.viewport.x, app.viewport.y), (29, 29));
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.view.x, 29);
+        assert_eq!(app.viewport.x, 29);
         press(&mut app, KeyCode::Tab);
         assert!(press(&mut app, KeyCode::Right));
-        assert_eq!(app.params.scale, 110);
+        assert_eq!(app.settings.scale, 110);
     }
 
     #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
-        app.view.exact = true;
+        app.viewport.exact = true;
         let map = app.geometry(area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
             let version = versions(app);
@@ -644,26 +655,26 @@ mod tests {
             map.x + 4,
             map.y + 1,
         );
-        assert_eq!((app.view.x, app.view.y), (36, 27));
+        assert_eq!((app.viewport.x, app.viewport.y), (36, 27));
         mouse(
             &mut app,
             MouseEventKind::Drag(MouseButton::Left),
             map.right() - 1,
             map.bottom() - 1,
         );
-        assert_eq!((app.view.x, app.view.y), (72, 84));
+        assert_eq!((app.viewport.x, app.viewport.y), (72, 84));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 10, 10);
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 10);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 13, 12);
-        assert_eq!((app.view.x, app.view.y), (69, 80));
+        assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
         mouse(&mut app, MouseEventKind::ScrollUp, 13, 12);
-        assert_eq!(app.view.y, 74);
+        assert_eq!(app.viewport.y, 74);
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
-        assert_eq!(app.view.y, 80);
+        assert_eq!(app.viewport.y, 80);
         mouse(&mut app, MouseEventKind::ScrollLeft, 13, 12);
-        assert_eq!(app.view.x, 63);
+        assert_eq!(app.viewport.x, 63);
         mouse(&mut app, MouseEventKind::ScrollRight, 13, 12);
-        assert_eq!(app.view.x, 69);
+        assert_eq!(app.viewport.x, 69);
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Right),
@@ -672,8 +683,8 @@ mod tests {
         );
         mouse(&mut app, MouseEventKind::ScrollDown, 0, 0);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 14, 13);
-        assert_eq!((app.view.x, app.view.y), (69, 80));
-        app.view.exact = false;
+        assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
+        app.viewport.exact = false;
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -681,8 +692,8 @@ mod tests {
             map.y,
         );
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
-        assert_eq!((app.view.x, app.view.y), (69, 80));
-        app.view.exact = true;
+        assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
+        app.viewport.exact = true;
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),
@@ -695,18 +706,18 @@ mod tests {
             map.x,
             map.y,
         );
-        assert_eq!((app.view.x, app.view.y), (0, 0));
+        assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
     }
 
     #[test]
     fn minimap_toggle_changes_visibility_without_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         app.preview_focus = true;
-        app.view.exact = true;
+        app.viewport.exact = true;
         assert!(press(&mut app, KeyCode::Char(' ')));
         for hidden in [true, false] {
             assert!(!press(&mut app, KeyCode::Char('m')));
-            assert_eq!(app.view.hide_minimap, hidden);
+            assert_eq!(app.viewport.hide_minimap, hidden);
         }
     }
 
@@ -721,7 +732,7 @@ mod tests {
             );
         }
         assert!(app.quit);
-        assert_eq!(app.pipeline.grid.version(), 1);
+        assert_eq!(app.grid_cache.grid.version(), 1);
         app.finish_png().unwrap();
         assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
         std::fs::remove_file(path).unwrap();

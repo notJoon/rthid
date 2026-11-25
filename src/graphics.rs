@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     memo::Memo,
-    view::{PreviewGeometry, fit_aspect},
+    viewport::{PreviewGeometry, fit_aspect},
 };
 use image::{
     RgbaImage,
@@ -259,7 +259,7 @@ fn original_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::View;
+    use crate::viewport::Viewport;
     use image::Rgba;
     fn checkerboard(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_fn(w, h, |x, y| {
@@ -276,8 +276,8 @@ mod tests {
         let pixels = checkerboard(4, 4);
         let (rect, image) = original_image(
             &pixels,
-            &crate::view::geometry(
-                &View::default(),
+            &crate::viewport::geometry(
+                &Viewport::default(),
                 pixels.dimensions(),
                 Rect::new(2, 3, 20, 10),
             ),
@@ -292,8 +292,8 @@ mod tests {
         );
         let (rect, image) = original_image(
             &pixels,
-            &crate::view::geometry(
-                &View::default(),
+            &crate::viewport::geometry(
+                &Viewport::default(),
                 pixels.dimensions(),
                 Rect::new(2, 3, 20, 10),
             ),
@@ -308,7 +308,11 @@ mod tests {
         let grid = RgbaImage::from_raw(1, 2, vec![25, 26, 128, 0, 231, 47, 93, 128]).unwrap();
         let (_, image) = original_image(
             &grid,
-            &crate::view::geometry(&View::default(), grid.dimensions(), Rect::new(0, 0, 1, 1)),
+            &crate::viewport::geometry(
+                &Viewport::default(),
+                grid.dimensions(),
+                Rect::new(0, 0, 1, 1),
+            ),
             (1, 2),
         );
         assert_eq!(image.as_raw(), &[25, 26, 128, 255, 231, 47, 93, 255]);
@@ -319,8 +323,8 @@ mod tests {
         let pixels = RgbaImage::from_pixel(300, 100, Rgba([10, 20, 30, 255]));
         let (rect, image) = original_image(
             &pixels,
-            &crate::view::geometry(
-                &View::default(),
+            &crate::viewport::geometry(
+                &Viewport::default(),
                 pixels.dimensions(),
                 Rect::new(2, 3, 11, 10),
             ),
@@ -341,7 +345,7 @@ mod tests {
         for area in [Rect::new(0, 0, 0, 3), Rect::new(0, 0, 3, 0)] {
             let (rect, image) = original_image(
                 &pixels,
-                &crate::view::geometry(&View::default(), pixels.dimensions(), area),
+                &crate::viewport::geometry(&Viewport::default(), pixels.dimensions(), area),
                 (7, 15),
             );
             assert!(rect.is_empty());
@@ -369,7 +373,8 @@ mod tests {
             (2, Rect::new(1, 1, 59, 31), 3),
             (2, Rect::new(1, 1, 59, 31), 3),
         ] {
-            let geometry = crate::view::geometry(&View::default(), pixels.dimensions(), area);
+            let geometry =
+                crate::viewport::geometry(&Viewport::default(), pixels.dimensions(), area);
             terminal
                 .draw(|frame| {
                     graphics.present(frame, Some((&pixels, grid_version, &geometry)));
@@ -398,8 +403,8 @@ mod tests {
                     Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
                 let completed = terminal
                     .draw(|frame| {
-                        let geometry = crate::view::geometry(
-                            &View::default(),
+                        let geometry = crate::viewport::geometry(
+                            &Viewport::default(),
                             image.dimensions(),
                             placement.unwrap_or_default(),
                         );
@@ -417,8 +422,8 @@ mod tests {
                 }
                 let completed = terminal
                     .draw(|frame| {
-                        let geometry = crate::view::geometry(
-                            &View::default(),
+                        let geometry = crate::viewport::geometry(
+                            &Viewport::default(),
                             image.dimensions(),
                             placement.unwrap_or_default(),
                         );
