@@ -230,17 +230,18 @@ mod tests {
 
     #[test]
     fn graphics_cache_tracks_grid_and_view() {
+        let mut renderer = crate::ui::Renderer::default();
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let mut picker = ratatui_image::picker::Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Kitty);
-        app.graphics = Some(Graphics::new(picker));
+        renderer.graphics = Some(Graphics::new(picker));
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+        let mut draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
             app.sync(&terminal_layout(terminal));
             terminal
-                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .draw(|frame| crate::ui::draw(frame, app, &layout(frame.area()), &mut renderer))
                 .unwrap();
-            app.graphics.as_ref().unwrap().cache.version()
+            renderer.graphics.as_ref().unwrap().cache.version()
         };
         assert_eq!(draw(&mut app, &mut terminal), 1);
         app.params.options.strength = 0.5;
@@ -312,19 +313,20 @@ mod tests {
             ProtocolType::Iterm2,
             ProtocolType::Sixel,
         ] {
+            let mut renderer = crate::ui::Renderer::default();
             let mut app = App::new(RgbaImage::new(12, 12), None);
             let mut picker = ratatui_image::picker::Picker::halfblocks();
             picker.set_protocol_type(protocol);
-            app.graphics = Some(Graphics::new(picker));
+            renderer.graphics = Some(Graphics::new(picker));
             let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
             terminal
-                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .draw(|frame| crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer))
                 .unwrap();
-            let (old, _) = app.graphics.as_ref().unwrap().placement.unwrap();
+            let (old, _) = renderer.graphics.as_ref().unwrap().placement.unwrap();
             app.show_original = false;
             app.sync(&terminal_layout(&terminal));
             let completed = terminal
-                .draw(|frame| app.draw(frame, &layout(frame.area())))
+                .draw(|frame| crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer))
                 .unwrap();
             for pos in completed.buffer.area.positions() {
                 assert_eq!(
@@ -333,7 +335,7 @@ mod tests {
                     "{protocol:?} at {pos:?}",
                 );
             }
-            assert!(app.graphics.as_ref().unwrap().placement.is_none());
+            assert!(renderer.graphics.as_ref().unwrap().placement.is_none());
         }
     }
 }

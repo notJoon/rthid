@@ -1,5 +1,4 @@
 use crate::{
-    graphics::Graphics,
     memo::Memo,
     ui::Layout,
     view::{Pixels, PreviewGeometry, View},
@@ -10,7 +9,6 @@ use ratatui::crossterm::event::{
 };
 #[cfg(test)]
 use ratatui::layout::Rect;
-use ratatui::widgets::ListState;
 use rthid::dither::{self, Mode, Options};
 use rthid::png::{Job, Worker};
 use std::path::PathBuf;
@@ -90,8 +88,6 @@ pub struct Pipeline {
 
 /// Interactive parameters, preview state and image consumers.
 pub struct App {
-    /// Terminal image rendering state when a graphics protocol is available.
-    pub graphics: Option<Graphics>,
     /// Optional companion PNG destination.
     pub preview_png: Option<PathBuf>,
     /// Most recent PNG worker error.
@@ -106,12 +102,8 @@ pub struct App {
     pub pipeline: Pipeline,
     /// Current image settings.
     pub params: Params,
-    /// Selected parameter and panel scroll position.
-    pub parameter_list: ListState,
-    /// Colors for the main RGB overview.
-    pub overview: Memo<(u64, u16, u16), Vec<ratatui::style::Color>>,
-    /// Colors for the RGB minimap.
-    pub minimap: Memo<(u64, u16, u16), Vec<ratatui::style::Color>>,
+    /// Selected parameter row.
+    pub selected: usize,
     /// Whether the preview shows RGB pixels.
     pub show_original: bool,
     /// Input change signal cleared by refresh, independent of memo validity.
@@ -130,7 +122,6 @@ impl App {
                 None => (None, None),
             };
         let mut app = Self {
-            graphics: None,
             preview_png,
             png_error: None,
             png_worker,
@@ -143,9 +134,7 @@ impl App {
                 dithered: Memo::default(),
             },
             params: Params::default(),
-            parameter_list: ListState::default().with_selected(Some(0)),
-            overview: Memo::default(),
-            minimap: Memo::default(),
+            selected: 0,
             show_original: true,
             dirty: true,
             quit: false,
@@ -380,13 +369,11 @@ impl App {
                 return;
             }
         }
-        let selected = self.parameter_list.selected().unwrap_or(0);
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => self.parameter_list.select_previous(),
+            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.parameter_list
-                    .select(Some((selected + 1).min(PARAMS.len() - 1)));
+                self.selected = (self.selected + 1).min(PARAMS.len() - 1);
             }
             KeyCode::Char('r') => self.rotate(1),
             KeyCode::Char('R') => self.rotate(3),
@@ -408,7 +395,7 @@ impl App {
         let before = self.params.clone();
         let defaults = Params::default();
         let (p, d) = (&mut self.params, &defaults.options);
-        match PARAMS[self.parameter_list.selected().unwrap_or(0)] {
+        match PARAMS[self.selected] {
             _ if all => *p = defaults.clone(),
             Param::Scale => p.scale = defaults.scale,
             Param::Mode => p.options.mode = d.mode,
@@ -431,7 +418,7 @@ impl App {
             *value = next;
             changed
         };
-        let param = PARAMS[self.parameter_list.selected().unwrap_or(0)];
+        let param = PARAMS[self.selected];
         let changed = match param {
             Param::Scale => {
                 let next = (p.scale + direction * 10).clamp(10, 200);
@@ -506,8 +493,7 @@ mod tests {
 
     fn app_at(param: Param) -> App {
         let mut app = App::new(RgbaImage::new(4, 4), None);
-        app.parameter_list
-            .select(PARAMS.iter().position(|&p| p == param));
+        app.selected = PARAMS.iter().position(|&p| p == param).unwrap();
         app
     }
 
@@ -580,7 +566,7 @@ mod tests {
         assert!(press(&mut app, KeyCode::Left));
         assert!(!app.show_original);
         assert!(!press(&mut app, KeyCode::Char(' ')));
-        app.parameter_list.select(Some(0));
+        app.selected = 0;
         assert!(press(&mut app, KeyCode::Left));
         assert!(app.show_original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
@@ -632,14 +618,11 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Param::Scale);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.parameter_list.selected(), Some(0));
+        assert_eq!(app.selected, 0);
         for _ in 0..10 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(
-            PARAMS[app.parameter_list.selected().unwrap()],
-            Param::Contrast
-        );
+        assert_eq!(PARAMS[app.selected], Param::Contrast);
         assert!(!press(&mut app, KeyCode::Char('x')));
     }
 
@@ -686,12 +669,12 @@ mod tests {
         let mut app = app_at(Param::Scale);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
-        app.parameter_list.select(Some(1));
+        app.selected = 1;
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.params.options.mode, Mode::Tone));
         assert_eq!((app.params.scale, app.params.rotation), (110, 1));
-        app.parameter_list.select(Some(2));
+        app.selected = 2;
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.params;
@@ -795,7 +778,7 @@ mod tests {
             assert!(!press(&mut app, key));
         }
         assert_eq!((app.view.x, app.view.y), (2, 2));
-        assert_eq!(app.parameter_list.selected(), Some(0));
+        assert_eq!(app.selected, 0);
         for _ in 0..100 {
             press(&mut app, KeyCode::Right);
             press(&mut app, KeyCode::Down);

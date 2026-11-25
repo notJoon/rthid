@@ -145,11 +145,11 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
-    let mut kitty_cleanup = None;
+    let mut renderer = ui::Renderer::default();
     let terminal_result = ratatui::run(|terminal| {
         if let Some((graphics, cleanup)) = graphics::detect(graphics, term_program.as_deref()) {
-            app.graphics = Some(graphics);
-            kitty_cleanup = cleanup;
+            renderer.graphics = Some(graphics);
+            renderer.kitty_cleanup = cleanup;
         }
         execute!(io::stdout(), EnableMouseCapture)?;
         let size = terminal.size()?;
@@ -158,9 +158,9 @@ fn main() -> std::io::Result<()> {
         while !app.quit {
             if redraw {
                 app.sync(&layout);
-                let frame = terminal.draw(|frame| app.draw(frame, &layout))?;
+                let frame = terminal.draw(|frame| ui::draw(frame, &app, &layout, &mut renderer))?;
                 if let Some(log) = &mut debug_log {
-                    app.log_minimap(log, &frame, &layout)?;
+                    ui::log_minimap(&app, log, &frame, &layout, &mut renderer)?;
                 }
             }
             redraw = false;
@@ -192,7 +192,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     });
-    drop(kitty_cleanup);
+    drop(renderer);
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)
