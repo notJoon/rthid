@@ -6,11 +6,11 @@ rust = { version = "1.100.0", components = "clippy,rustfmt,llvm-tools-preview" }
 run = "cargo run"
 
 [tasks.test]
-run = "cargo test"
+run = "cargo test --workspace"
 
 [tasks.lint]
-run = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
+run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings"]
 
 # Prints line and region coverage per file. Add --html for a browsable report in target/llvm-cov/html.
 [tasks.coverage]
-run = "cargo llvm-cov --summary-only"
+run = "cargo llvm-cov --workspace --summary-only"

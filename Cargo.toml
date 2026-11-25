@@ -3,10 +3,20 @@ name = "rthid"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/rthid-widgets"]
+
+[workspace.dependencies]
+ratatui = "0.30.2"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
 [dependencies]
 clap = { version = "4.6.10", features = ["derive"] }
 image = "0.25.10"
-ratatui = "0.30.2"
+ratatui.workspace = true
+rthid-widgets = { path = "crates/rthid-widgets" }
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 
 # Keep the dither loop responsive in dev builds
