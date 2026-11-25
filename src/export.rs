@@ -1,3 +1,6 @@
+//! Companion PNG wrapper. Submits each new dithered grid to the background
+//! writer and keeps the latest error for the status line.
+
 use rthid::{
     dither::PaletteColor,
     png::{Job, Worker},
@@ -28,12 +31,14 @@ impl Export {
         }
     }
 
-    /// Whether a writer needs dithered pixels even when the preview shows RGB.
+    /// Whether a writer needs dithered pixels even when the preview shows Original.
+    /// False when the writer failed to start.
     pub fn needs_dither(&self) -> bool {
         self.worker.is_some()
     }
 
-    /// Submits the refreshed dithered pixels.
+    /// Hands the dithered grid to the writer without blocking. Older pending grids are skipped.
+    /// Records an error if the writer has stopped.
     pub fn sync(&mut self, indices: &[u8], w: u32, h: u32, palette: &[PaletteColor]) {
         if let Some(worker) = &mut self.worker
             && let Err(error) = worker.submit(Job {
@@ -47,7 +52,7 @@ impl Export {
         }
     }
 
-    /// Collects the latest write result and reports a status change.
+    /// Collects the result of the latest submitted grid and returns whether the status changed.
     pub fn poll(&mut self) -> bool {
         if let Some(worker) = &self.worker
             && let Some(result) = worker.poll()
@@ -57,7 +62,7 @@ impl Export {
         false
     }
 
-    /// Waits for pending writes and reports the final status.
+    /// Waits for the last write and returns the final error, if any. Later syncs are ignored.
     pub fn finish(&mut self) -> io::Result<()> {
         if let Some(worker) = self.worker.take() {
             self.set_error(worker.finish().err());

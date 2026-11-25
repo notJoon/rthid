@@ -1,3 +1,8 @@
+//! Kitty, iTerm2 and Sixel output for the Original Overview.
+//!
+//! This is the only path that draws real device pixels. Every other view is drawn
+//! with cell glyphs.
+
 use std::{
     io::{self, Write},
     time::Duration,
@@ -42,20 +47,28 @@ struct ImageKey {
     area: Rect,
 }
 
-/// Terminal image protocol, cached image and placement state.
+/// Terminal image output for the Original Overview. Keeps one encoded image and
+/// the cell rectangle it last covered.
 pub struct Graphics {
     picker: Picker,
     kitty: bool,
     name: &'static str,
-    // The pinned Kitty id requires a single cached protocol.
+    // One fixed Kitty id means a second cached image would overwrite the first,
+    // so the cache must hold a single entry.
     cache: Memo<ImageKey, (Rect, StatefulProtocol)>,
     error: Option<String>,
+    // Cells covered by the last drawn image, None when no image is shown.
     placement: Option<Rect>,
 }
 
+/// Fixed Kitty image id ("rth" in ASCII), so each upload replaces the previous
+/// image and exit can delete it.
 const KITTY_IMAGE_ID: u32 = 0x727468;
 
-/// Queries supported terminal graphics unless disabled or running in Apple Terminal.
+/// Queries the terminal for an image protocol, blocking for up to 200 ms.
+///
+/// Returns None when graphics are off, the terminal is Apple Terminal, the query
+/// fails, or only half blocks are available.
 pub fn detect(mode: Mode, term_program: Option<&str>) -> Option<Graphics> {
     if mode == Mode::Off || term_program == Some("Apple_Terminal") {
         return None;
@@ -69,6 +82,7 @@ pub fn detect(mode: Mode, term_program: Option<&str>) -> Option<Graphics> {
     Some(Graphics::new(picker))
 }
 
+/// Deletes the pinned Kitty image so it does not linger after exit.
 impl Drop for Graphics {
     fn drop(&mut self) {
         if !self.kitty {
@@ -85,7 +99,9 @@ impl Drop for Graphics {
 }
 
 impl Graphics {
-    /// Initializes graphics after terminal protocol selection.
+    /// Wraps a picker that already selected Kitty, iTerm2 or Sixel.
+    ///
+    /// Panics for half blocks, which use cell rendering instead.
     pub(crate) fn new(picker: Picker) -> Self {
         let protocol = picker.protocol_type();
         let name = match protocol {
@@ -109,11 +125,16 @@ impl Graphics {
         self.name
     }
 
-    /// Returns the most recent encoding error.
+    /// Returns the last encoding error, formatted for the status line. Cleared when
+    /// the image is rebuilt or encodes successfully.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
 
+    // Forces a redraw of the cells under the previous iTerm2 or Sixel image when it
+    // moves or hides, since cell diffing cannot see image pixels. Kitty is skipped
+    // because its image is drawn through Unicode placeholder cells that a normal
+    // cell diff already replaces.
     fn repaint_previous(&mut self, placement: Option<Rect>, buffer: &mut Buffer) {
         if !self.kitty
             && self.placement != placement
@@ -126,7 +147,11 @@ impl Graphics {
         self.placement = placement;
     }
 
-    /// Presents an original overview or repaints its previous placement when absent.
+    /// Draws the Original Overview image centered in the preview area, or clears the
+    /// previous placement when `request` is None.
+    ///
+    /// Encodes again only when the grid version or preview area changes, and a rebuild
+    /// resets the stored error.
     pub fn present(
         &mut self,
         frame: &mut Frame,
@@ -145,7 +170,8 @@ impl Graphics {
             let font = picker.font_size();
             let (rect, image) = original_image(original, geometry, (font.width, font.height));
             let protocol = if self.kitty {
-                // Pin the image id so exit cleanup can delete it.
+                // Pin the image id so each upload replaces the previous image and
+                // exit cleanup can delete it.
                 StatefulProtocol::new(
                     image.into(),
                     font,
@@ -180,6 +206,9 @@ impl Graphics {
     }
 }
 
+// Returns the centered cell rectangle and an opaque image sized to its device
+// pixels. Upscaling uses nearest sampling to keep dots crisp, downscaling uses a
+// triangle filter, and padding left by rounding stays transparent.
 fn original_image(
     grid: &RgbaImage,
     geometry: &PreviewGeometry,

@@ -1,3 +1,10 @@
+//! Preview coordinates and cell rendering.
+//!
+//! Paints the Overview and the 1:1 view into a ratatui buffer with half blocks or
+//! Sextant and Quadrant glyphs, plus the minimap shown over the 1:1 view. A dot is
+//! one grid pixel. The 1:1 view (`exact` in code) draws two dots per cell, one above
+//! the other. The minimap is also called the inset.
+
 use crate::memo::Memo;
 use image::RgbaImage;
 use ratatui::{
@@ -19,26 +26,29 @@ pub struct OverviewKey {
 /// One RGB overview retained for its grid version and cell dimensions.
 pub type OverviewCache = Memo<OverviewKey, Vec<Color>>;
 
-/// Separate RGB overview memos for the full preview and its inset.
+/// RGB overview colors for the main Overview and the minimap.
+///
+/// They are kept separate so toggling 1:1 does not rebuild either one.
 #[derive(Default)]
 pub struct OverviewCaches {
-    /// Overview shown outside exact mode.
+    /// Main Overview, shown when 1:1 is off.
     pub full: OverviewCache,
-    /// Overview inset shown in exact mode.
+    /// Minimap overview, shown over the 1:1 view.
     pub inset: OverviewCache,
 }
 
-/// Borrowed preview pixels for either display mode.
+/// Borrowed pixels of the Original or Dithered layer.
 #[derive(Clone, Copy)]
 pub enum Pixels<'a> {
-    /// Dithered palette indices and their colors.
+    /// Dithered layer as palette indices and their colors.
     Indexed {
         /// One palette index per grid pixel.
         indices: &'a [u8],
         /// Colors referenced by the indices.
         palette: &'a [PaletteColor],
     },
-    /// Original grid and its build version.
+    /// Original layer as the scaled and rotated grid and its build version.
+    /// The version keys the RGB overview caches.
     // TODO: Name the fields { image, version }.
     Rgb(&'a RgbaImage, u64),
 }
@@ -52,18 +62,22 @@ impl Pixels<'_> {
     }
 }
 
-/// Glyph set used to sample indexed overviews.
+/// Glyph set for the Dithered Overview and the Dithered minimap.
+///
+/// The Original layer and the 1:1 view always use half blocks.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyphs {
-    /// Six samples per cell.
+    /// 2x3 subcells from Symbols for Legacy Computing (U+1FB00 block). Sharper, but
+    /// missing from some fonts.
     #[default]
     Sextant,
-    /// Four samples per cell.
+    /// 2x2 subcells from the standard block elements, supported almost everywhere.
     Quadrant,
 }
 
 impl Glyphs {
-    /// Selects the glyph set supported by the terminal.
+    /// Default glyph set for the terminal named by `TERM_PROGRAM`, used when the
+    /// command line does not pick one.
     pub fn for_terminal(program: Option<&str>) -> Self {
         if program == Some("Apple_Terminal") {
             Self::Quadrant
@@ -87,6 +101,7 @@ impl Glyphs {
         }
     }
 
+    // Glyph whose filled subcells match the mask. Bit n is subcell n in row major order.
     fn glyph(self, mask: u32) -> char {
         match self {
             Self::Quadrant => [
@@ -106,10 +121,11 @@ impl Glyphs {
     }
 }
 
-// Cells are about 2.25 times taller than wide, regardless of glyph set.
+// Typical terminal cell height divided by its width, regardless of glyph set.
 const CELL_ASPECT: f64 = 2.25;
 
-/// Fits a grid to the available cells using their height to width ratio.
+/// Largest (cols, rows) inside `area` that keeps the grid shape when a cell is
+/// `aspect` times taller than wide. Each is at least 1 unless `area` is empty.
 pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) {
     if area.is_empty() {
         return (0, 0);
@@ -122,50 +138,54 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
     )
 }
 
-/// Preview mode and image origin.
+/// User controlled preview state: glyph set, Overview or 1:1, minimap, and 1:1 origin.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct View {
-    /// Glyph set for indexed overviews.
+    /// Glyph set for the Dithered Overview and minimap.
     pub glyphs: Glyphs,
-    /// Whether one image pixel occupies one half cell.
+    /// 1:1 view, one dot per half cell, instead of the Overview.
     pub exact: bool,
-    /// Whether to suppress the exact mode inset.
+    /// Hides the minimap in the 1:1 view.
     pub hide_minimap: bool,
-    /// Horizontal image origin.
+    /// Grid column at the left edge in 1:1. May exceed the grid until the next clamp.
     pub x: u32,
-    /// Vertical image origin.
+    /// Grid row at the top edge in 1:1. May exceed the grid until the next clamp.
     pub y: u32,
 }
 
 // TODO: Use Overview { target }, Exact { visible, origin, minimap } and Empty variants
 // with the PreviewReport enum when the slider lands.
 /// Preview coordinates shared by input handling and rendering.
+///
+/// Rebuilt from the View for each frame and input event. The origin is clamped here
+/// without changing the View.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreviewGeometry {
-    /// Image dimensions after scaling and rotation.
+    /// Grid size in dots, after scaling and rotation.
     pub grid: (u32, u32),
     /// Terminal cells available for the preview.
     pub area: Rect,
-    /// Image dimensions visible in exact mode.
+    /// Dots that fit in the preview at 1:1, two per cell row, capped by the grid size.
+    /// Computed in every mode but only used by the 1:1 view.
     pub visible: (u32, u32),
-    /// Clamped image origin in exact mode.
+    /// Clamped View origin, the grid dot at the top left of the 1:1 view.
     pub origin: (u32, u32),
-    /// Overview inset when exact mode has room for it.
+    /// Present only in 1:1 when the minimap is shown and fits.
     pub minimap: Option<Minimap>,
 }
 
-/// Minimap border, fitted image, and visible image region.
+/// Minimap placement in the upper right corner of the 1:1 view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Minimap {
-    /// Border surrounding the overview.
+    /// Bordered inset, including the border.
     pub frame: Rect,
-    /// Image cells inside the border.
+    /// Cells of the fitted overview, centered inside the border.
     pub map: Rect,
-    /// Visible portion of the image projected onto the map.
+    /// Map cells covering the region visible at 1:1. They stay undimmed.
     pub viewport: Rect,
 }
 
-/// Computes preview coordinates with a clamped origin without changing the view.
+/// Builds the PreviewGeometry for `view` over a grid of `grid` dots in `area`.
 pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
     let (w, h) = grid;
     let mut view = *view;
@@ -186,7 +206,10 @@ pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
 }
 
 impl View {
-    /// Returns the border and map regions when the inset fits.
+    /// Minimap frame and map cells, in that order.
+    ///
+    /// None in the Overview, when the minimap is hidden, when the grid is empty, or
+    /// when the area inside the border is smaller than 3x3 cells.
     pub fn minimap(&self, w: u32, h: u32, area: Rect) -> Option<(Rect, Rect)> {
         // A bordered inset in the upper right corner contains the fitted overview.
         let fw = (area.width / 3).min(18);
@@ -215,14 +238,14 @@ impl View {
         )
     }
 
-    /// Keeps the origin within the visible image bounds.
+    /// Moves the origin so the 1:1 window stays inside the grid.
     pub fn clamp(&mut self, w: u32, h: u32, area: Rect) {
         let (vw, vh) = self.visible(w, h, area);
         self.x = self.x.min(w.saturating_sub(vw));
         self.y = self.y.min(h.saturating_sub(vh));
     }
 
-    /// Moves the origin within the visible image bounds.
+    /// Shifts the origin by whole dots and keeps the 1:1 window inside the grid.
     pub fn pan(&mut self, dx: i64, dy: i64, geometry: &PreviewGeometry) {
         self.x = i64::from(self.x)
             .saturating_add(dx)
@@ -233,6 +256,8 @@ impl View {
         self.clamp(geometry.grid.0, geometry.grid.1, geometry.area);
     }
 
+    // Clears the minimap frame and paints the fitted overview inside its border.
+    // The border and dimming are drawn by draw_minimap.
     fn render_minimap(
         &self,
         pixels: Pixels<'_>,
@@ -255,7 +280,8 @@ impl View {
         );
     }
 
-    /// Centers the preview on the selected map cell.
+    /// Centers the 1:1 window on the dots under a terminal cell inside the map.
+    /// Does nothing without a minimap.
     pub fn center_on_minimap(&mut self, point: (u16, u16), geometry: &PreviewGeometry) {
         let Some(Minimap { map, .. }) = geometry.minimap else {
             return;
@@ -272,6 +298,7 @@ impl View {
         );
     }
 
+    // Map cells covering the visible dots, at least one cell on each axis.
     fn viewport_rect(&self, w: u32, h: u32, visible: (u32, u32), map: Rect) -> Rect {
         let project = |start: u32, length: u32, total: u32, cells: u16| {
             let first = (u64::from(start) * u64::from(cells) / u64::from(total)) as u16;
@@ -285,7 +312,10 @@ impl View {
     }
 }
 
-/// Paints the preview and reports whether indexed overview colors were approximated.
+/// Paints the preview and reports whether the Dithered Overview approximated colors.
+///
+/// The 1:1 view draws one half block per two dots plus the minimap and never reports
+/// approximation.
 pub fn render(
     pixels: Pixels<'_>,
     view: &View,
@@ -341,6 +371,8 @@ fn render_exact(
     draw_minimap(pixels, view, geometry, buffer, cache);
 }
 
+// Draws the minimap overview and its gray border, then dims map cells outside the
+// viewport to half brightness.
 fn draw_minimap(
     pixels: Pixels<'_>,
     view: &View,
@@ -370,6 +402,8 @@ fn draw_minimap(
     }
 }
 
+// Draws the grid fitted and centered in `area`. Returns whether any Dithered cell
+// was approximated.
 fn render_overview(
     pixels: Pixels<'_>,
     grid: (u32, u32),
@@ -392,6 +426,8 @@ fn render_overview(
     }
 }
 
+// Draws averaged half blocks. Colors rebuild only when the grid version or target
+// size changes.
 fn render_overview_rgb(
     pixels: &RgbaImage,
     version: u64,
@@ -419,6 +455,8 @@ fn render_overview_rgb(
     }
 }
 
+// Samples one dot at each subcell center without averaging and draws one glyph per
+// cell. Returns whether any cell was approximated.
 fn render_overview_indexed(
     indices: &[u8],
     palette: &[PaletteColor],
@@ -457,6 +495,11 @@ fn render_overview_indexed(
     approximate
 }
 
+// Reduces a cell to two colors. The most frequent sample becomes the background and
+// the next ranked distinct one the foreground, with count ties going to the lower
+// palette index. Other samples map to the nearer of the two, ties to the background.
+// Returns the foreground mask, foreground, background, and whether any sample
+// changed its RGB color.
 fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) {
     let mut approximate = false;
     let mut counts = [0u8; 256];
@@ -492,6 +535,8 @@ fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) 
     (mask, fg, bg, approximate)
 }
 
+// Averages the dots under each half cell. Returns two color rows per cell row, in
+// row major order.
 fn average_rgb(pixels: &RgbaImage, cw: u16, ch: u16) -> Vec<Color> {
     let (w, h) = pixels.dimensions();
     let average = |cx: u16, half_row: u32| {

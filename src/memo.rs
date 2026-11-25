@@ -1,4 +1,9 @@
+//! Single entry caches. Build versions let downstream caches key on a number
+//! instead of comparing whole images.
+
 /// A single cached value whose version counts successful builds.
+///
+/// Downstream caches use the version as a cheap key instead of comparing values.
 pub struct Memo<K, V> {
     entry: Option<(K, V)>,
     version: u64,
@@ -54,12 +59,12 @@ impl<K, V> Memo<K, V> {
         true
     }
 
-    /// The most recently built value.
+    /// The most recently built value, if any.
     pub fn get(&self) -> Option<&V> {
         self.entry.as_ref().map(|(_, value)| value)
     }
 
-    /// Access to the cached value for in place updates.
+    /// The cached value for in place updates, which do not bump the version.
     pub fn get_mut(&mut self) -> Option<&mut V> {
         self.entry.as_mut().map(|(_, value)| value)
     }

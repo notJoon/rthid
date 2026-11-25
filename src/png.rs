@@ -1,3 +1,6 @@
+//! Background PNG writer for the dithered grid. Each dot becomes a solid square
+//! and the file is replaced only after a complete encode.
+
 use crate::dither::{self, PaletteColor};
 use image::ImageEncoder;
 use std::{
@@ -11,14 +14,15 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-/// Integer enlargement that bounds the preview size when possible.
+/// Integer dot size from 1 to 4 that keeps the long side within 2048 px,
+/// unless the grid is already larger.
 pub fn preview_scale(w: u32, h: u32) -> u32 {
     2048u32.checked_div(w.max(h)).unwrap_or(1).clamp(1, 4)
 }
 
 /// Owned grid submitted for background PNG encoding.
 pub struct Job {
-    /// One palette index per grid pixel.
+    /// One palette index per dot, row major.
     pub indices: Vec<u8>,
     /// Grid width in pixels.
     pub w: u32,
@@ -28,7 +32,7 @@ pub struct Job {
     pub palette: Vec<PaletteColor>,
 }
 
-/// Background PNG writer that retains the newest queued grid.
+/// Background PNG writer. When several grids are queued only the newest is written.
 pub struct Worker {
     jobs: Option<Sender<(u64, Job)>>,
     results: Receiver<(u64, Option<io::Error>)>,
@@ -37,7 +41,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Starts a writer for the destination path.
+    /// Spawns the writer thread for the destination path.
     pub fn new(path: PathBuf) -> io::Result<Self> {
         let (jobs, queued) = mpsc::channel::<(u64, Job)>();
         let (finished, results) = mpsc::channel();
@@ -73,7 +77,7 @@ impl Worker {
         })
     }
 
-    /// Queues a grid and makes it the latest requested result.
+    /// Queues a grid without blocking and makes it the latest requested result.
     pub fn submit(&mut self, job: Job) -> io::Result<()> {
         self.latest += 1;
         self.jobs
@@ -83,7 +87,7 @@ impl Worker {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PNG worker stopped"))
     }
 
-    /// Returns the latest requested completion, ignoring replaced grids.
+    /// Returns the result for the latest submitted grid once written, ignoring replaced grids.
     pub fn poll(&self) -> Option<io::Result<()>> {
         self.results
             .try_iter()
@@ -112,7 +116,8 @@ impl Drop for Worker {
     }
 }
 
-/// Writes an enlarged dot grid, replacing the destination only after PNG encoding succeeds.
+/// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
+/// file beside `path` and renames it over the destination only after encoding succeeds.
 pub fn write_atomic(
     path: &Path,
     indices: &[u8],

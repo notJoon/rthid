@@ -1,3 +1,9 @@
+//! Screen layout and per frame drawing of the preview, parameter panel, help line
+//! and status line.
+//!
+//! Drawing never mutates App. State that must change while drawing, such as caches
+//! and scroll offsets, lives in Renderer.
+
 use crate::{graphics, view};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
@@ -11,7 +17,8 @@ use crate::app::{App, Param};
 pub struct Layout {
     /// Preview border and title.
     pub preview_block: Rect,
-    /// Preview content inside the border.
+    /// Preview content inside the border, the area passed to App::sync and
+    /// App::geometry.
     pub preview: Rect,
     /// Parameter list including its border.
     pub panel: Rect,
@@ -21,7 +28,8 @@ pub struct Layout {
     pub status: Rect,
 }
 
-/// Splits the screen and reserves the preview border.
+/// Splits the screen into the preview and a fixed width parameter panel above
+/// one help row and one status row.
 pub fn layout(screen: impl Into<Rect>) -> Layout {
     let [body, help, status] = Split::vertical([
         Constraint::Min(0),
@@ -40,7 +48,9 @@ pub fn layout(screen: impl Into<Rect>) -> Layout {
     }
 }
 
-/// Terminal graphics, RGB overview caches and parameter panel scroll state.
+/// Drawing state that lives across frames, so draw can update caches while App
+/// stays borrowed immutably. Holds terminal graphics, RGB overview caches and the
+/// parameter panel scroll state.
 #[derive(Default)]
 pub struct Renderer {
     graphics: Option<graphics::Graphics>,
@@ -49,7 +59,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Initializes rendering state with the detected graphics protocol.
+    /// Pass None to draw every view with cell glyphs.
     pub fn new(graphics: Option<graphics::Graphics>) -> Self {
         Self {
             graphics,
@@ -60,6 +70,7 @@ impl Renderer {
 
 // TODO: Use Glyphs { approximate } and Image { protocol, error } variants alongside
 // the PreviewGeometry enum when the slider lands.
+/// What the preview draw learned for the status line.
 #[derive(Default)]
 struct PreviewReport {
     approximate: bool,
@@ -67,7 +78,11 @@ struct PreviewReport {
     graphics_error: Option<String>,
 }
 
-/// Records minimap cells from the completed frame and its undimmed overview.
+/// Writes a minimap record for RTHID_DEBUG_LOG. After a header line, each minimap
+/// cell is logged as drawn next to the same cell of an undimmed overview.
+///
+/// Only the header is written when no minimap is shown, which includes every
+/// frame outside 1:1.
 pub fn log_minimap(
     app: &App,
     log: &mut impl std::io::Write,
@@ -111,7 +126,8 @@ pub fn log_minimap(
     log.flush()
 }
 
-/// Draws into the supplied regions without changing App.
+/// Draws the preview, parameter panel, help line and status line without changing
+/// App. Expects App::sync to have run for this layout.
 pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
@@ -145,6 +161,8 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     );
 }
 
+// Uses terminal graphics only for Original in Overview and cell glyphs otherwise.
+// Calls present every frame so a hidden image is cleared.
 fn draw_preview(
     frame: &mut Frame,
     app: &App,
@@ -183,6 +201,7 @@ fn draw_preview(
     report
 }
 
+// A companion PNG error, then a graphics error, replaces the normal status line.
 fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) -> String {
     let (gw, gh) = geometry.grid;
     let (sw, sh) = app.pipeline.source_size();

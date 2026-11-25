@@ -9,7 +9,7 @@ rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|
 Use `rthid --help` for option details and `rthid --version` for the version.
 
 `image` defaults to `tests/fixtures/hsl.jpg`. Use a terminal with Unicode
-half-block support and support for the selected overview glyphs (sextants or
+half block support and support for the selected overview glyphs (sextants or
 quadrants).
 
 ## Display
@@ -21,7 +21,7 @@ shown. The preview starts with Original in Overview.
   via Kitty, iTerm2, or Sixel in Overview when supported. Otherwise, including
   in 1:1, it uses truecolor half blocks. The status line names the graphics protocol
   only while drawing an image. Graphics overview preserves aspect using the terminal's cell pixel size.
-  Half-block overview averages pixels per half cell. Press `Space` to toggle
+  Half block overview averages pixels per half cell. Press `Space` to toggle
   between original and dithered. Dithering is deferred while Original is shown
   unless a companion PNG is enabled.
   Changing a dither parameter reveals the dithered result; scale, rotation,

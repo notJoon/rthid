@@ -1,14 +1,35 @@
-/// Interactive state and image processing.
+//! rthid previews dithering of an image in the terminal.
+//!
+//! The source is loaded and shrunk once. `Pipeline` scales and rotates it into
+//! the grid and, when Dithered or a companion PNG needs it, dithers the grid
+//! into palette indices. `App` holds the settings and the `View`. `ui::draw`
+//! turns them into a frame through `view` (cell glyphs) or `graphics`
+//! (terminal images), and `Export` writes the dithered grid to the companion PNG.
+//!
+//! Glossary:
+//! - Grid: the scaled and rotated image. Its pixels are also called dots.
+//! - Cell: one terminal character position.
+//! - Half block: the `▀` glyph whose fg and bg colors show two stacked dots in one cell.
+//! - Sextant and Quadrant: glyph sets for the dithered Overview and minimap that split a
+//!   cell into 2x3 or 2x2 subcells painted in the cell fg or bg color.
+//! - Overview: the whole grid fitted to the preview.
+//! - 1:1 (`exact` in code): one dot per half cell, panned from the view origin.
+//! - Minimap: an Overview inset shown in 1:1, dimmed outside the visible region.
+//! - Approximate: some Overview cell sampled more than two palette colors, so
+//!   the extra samples took the nearer kept color.
+//! - Companion PNG: the optional `--preview-png` file, rewritten after each new dither.
+
+/// Settings, image pipeline and input handling.
 mod app;
-/// Companion PNG export and status.
+/// Companion PNG writer and its status.
 mod export;
-/// Terminal graphics detection, rendering and cleanup.
+/// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for the Original Overview.
 mod graphics;
 /// Single entry caches with build versions.
 mod memo;
-/// Terminal layout and rendering.
+/// Screen layout, panels and status line.
 mod ui;
-/// Preview coordinates and cell rendering.
+/// Preview geometry and cell rendering for Overview, 1:1 and the minimap.
 mod view;
 
 use std::{
@@ -28,6 +49,7 @@ use ratatui::crossterm::{
 
 use crate::{app::App, graphics::Mode as Graphics, ui::Renderer, view::Glyphs};
 
+/// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
 
 impl Drop for MouseCapture {
@@ -37,7 +59,7 @@ impl Drop for MouseCapture {
 }
 
 // Sources are shrunk on load to bound dither work per keypress.
-// Keep the original around once export needs full resolution.
+// Offering a full resolution export would require keeping the unshrunk original.
 const MAX_SOURCE_SIDE: u32 = 1024;
 
 #[derive(Parser)]
@@ -86,6 +108,7 @@ fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+// Pointer motion alone changes nothing on screen.
 fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
 }
@@ -142,6 +165,8 @@ fn main() -> std::io::Result<()> {
     terminal_result.and(png_result)
 }
 
+// Syncs and draws when something changed, then waits for input and applies
+// every queued event before the next draw. Runs until the app requests quit.
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,

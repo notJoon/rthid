@@ -1,26 +1,35 @@
+//! Atkinson error diffusion into palette indices.
+//!
+//! Each pixel snaps to a palette color and 1/8 of its error goes to each of six
+//! neighbors (two to the right, three below and one two rows down), so only 3/4
+//! of the error spreads and highlights and shadows stay clean. Tone mode diffuses
+//! luminance only. Color mode diffuses RGB and picks the nearest palette color.
+
 /// A palette color in byte and normalized channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
-    /// RGB channels for rendering.
+    /// Bytes used to paint the preview and the PNG.
     pub rgb: [u8; 3],
-    /// Normalized RGB channels for dithering.
+    /// The same channels scaled to 0..=1, compared against pixels in Color mode.
     pub f: [f64; 3],
 }
 
-/// Tone adjustments applied before dithering.
+/// Per channel adjustments applied before dithering, in the order sharpen,
+/// contrast, brightness, gamma, then black and white points. The defaults leave
+/// pixels unchanged.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
-    /// Brightness offset.
+    /// Offset added after contrast, with the result clipped to 0..=1.
     pub brightness: f64,
-    /// Contrast adjustment around middle gray.
+    /// Scales the distance from middle gray by `1 + contrast`, so 0 keeps it.
     pub contrast: f64,
-    /// Gamma divisor.
+    /// Channels are raised to the power `1 / gamma`, so values above 1 brighten midtones.
     pub gamma: f64,
-    /// Black point after gamma.
+    /// Level mapped to 0 after gamma. Darker values clip to black.
     pub black: f64,
-    /// White point after gamma.
+    /// Level mapped to 1 after gamma. Lighter values clip to white.
     pub white: f64,
-    /// Sharpening strength before tone mapping.
+    /// Unsharp mask strength against a 3x3 box blur. 0 disables it.
     pub sharpen: f64,
 }
 
@@ -40,23 +49,29 @@ impl Default for Tone {
 /// Color space used to diffuse quantization error.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Mode {
-    /// Luminance error diffusion.
+    /// Quantizes luminance to evenly spaced levels, one per palette index, and
+    /// diffuses luminance error. The palette colors themselves do not affect the
+    /// choice, so this suits palettes evenly spaced in brightness.
     #[default]
     Tone,
-    /// RGB error diffusion.
+    /// Diffuses RGB error and picks the nearest palette color by squared
+    /// distance weighted 2, 4 and 3 for red, green and blue.
     Color,
 }
 
 /// Palette and processing settings for dithering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
-    /// Colors sorted from darkest to lightest.
+    /// Colors sorted darkest first, as built by `make_palette`. Output indices
+    /// point into it, and Tone mode relies on the order.
     pub palette: Vec<PaletteColor>,
     /// Error diffusion color model.
     pub mode: Mode,
-    /// Whether adjacent rows alternate direction.
+    /// Whether odd rows run right to left, which hides the diagonal streaks of
+    /// diffusing in one direction.
     pub serpentine: bool,
-    /// Fraction of quantization error to diffuse.
+    /// Scales the diffused error. 1 is full Atkinson and 0 is plain nearest
+    /// color quantization.
     pub strength: f64,
     /// Adjustments applied before quantization.
     pub tone: Tone,
@@ -91,7 +106,8 @@ fn hex_to_rgb(hex: &str) -> Result<[u8; 3], &'static str> {
     }))
 }
 
-/// Sorted darkest first, so the last color acts as paper.
+/// Parses 1 to 256 hex colors (`#rgb` or `#rrggbb`, `#` optional) and sorts them
+/// darkest first by luma, so the last, lightest color acts as paper.
 pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, &'static str> {
     if hexes.is_empty() || hexes.len() > 256 {
         return Err("palette must have 1 to 256 colors");
@@ -154,7 +170,11 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
-/// Converts RGBA pixels to palette indices with error diffusion.
+/// Returns one index into `options.palette` per pixel, in row major order. Alpha
+/// is ignored.
+///
+/// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
+/// not exactly `w` by `h` pixels.
 pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let palette = &options.palette;
     assert!(
@@ -230,7 +250,10 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     out
 }
 
-/// Expands palette indices into RGBA pixels at the requested dimensions.
+/// Expands a `gw` by `gh` index grid into opaque `ow` by `oh` RGBA pixels by
+/// nearest neighbor sampling, coloring each index with `color_of`.
+///
+/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices.
 pub fn rasterize(
     idx: &[u8],
     gw: usize,

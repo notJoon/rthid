@@ -1,3 +1,6 @@
+//! Editable settings, the image pipeline (source to grid to dithered indices)
+//! and the key and mouse handling that changes them.
+
 use crate::{
     export::Export,
     memo::Memo,
@@ -11,15 +14,15 @@ use ratatui::layout::Rect;
 use rthid::dither::{self, Mode, Options};
 use std::path::PathBuf;
 
-/// Named colors available in the parameter panel.
+/// A named palette that the Palette row can select.
 pub struct Preset {
-    /// Label shown for the preset.
+    /// Label shown in the Palette row.
     pub name: &'static str,
-    /// Hex colors used to build the palette.
+    /// Hex colors in any order, sorted by `make_palette`.
     pub colors: &'static [&'static str],
 }
 
-/// Palette presets available in the parameter panel.
+/// Presets in the order the Palette row cycles through them. The first is the default.
 pub const PALETTES: [Preset; 3] = [
     Preset {
         name: "Black/white",
@@ -35,7 +38,8 @@ pub const PALETTES: [Preset; 3] = [
     },
 ];
 
-/// Clockwise rotation of the source image.
+/// Clockwise rotation applied to the grid after scaling. Not a panel row, the r
+/// and R keys change it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rotation {
     /// Original orientation.
@@ -70,7 +74,7 @@ impl Rotation {
         }
     }
 
-    /// Whether rotation exchanges width and height.
+    /// Whether rotation exchanges width and height (quarter and three quarter turns).
     pub fn swaps_axes(self) -> bool {
         matches!(self, Self::R90 | Self::R270)
     }
@@ -85,7 +89,7 @@ impl Rotation {
         }
     }
 
-    /// Rotates the image into this orientation.
+    /// Rotates an upright image into this orientation.
     pub fn apply(self, image: RgbaImage) -> RgbaImage {
         match self {
             Self::R0 => image,
@@ -99,15 +103,15 @@ impl Rotation {
 /// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Param {
-    /// Source size percentage.
+    /// Grid size as a percentage of the source.
     Scale,
     /// Dither color model.
     Mode,
     /// Palette preset.
     Palette,
-    /// Dither error strength.
+    /// Fraction of dither error diffused.
     Strength,
-    /// Alternating row direction.
+    /// Whether odd rows dither right to left.
     Serpentine,
     /// Tone brightness offset.
     Brightness,
@@ -141,7 +145,9 @@ impl Param {
         }
     }
 
-    /// Steps per unit and inclusive bounds for numeric parameters.
+    /// `(steps per unit, min, max)` for numeric parameters, with inclusive bounds.
+    /// Values snap to multiples of `1 / steps`, except Scale, which moves 10
+    /// percentage points per step.
     pub fn range(self) -> Option<(f64, f64, f64)> {
         match self {
             Self::Scale => Some((0.1, 10.0, 200.0)),
@@ -152,18 +158,20 @@ impl Param {
         }
     }
 
-    /// Whether changing this parameter selects the dithered preview.
+    /// Whether changing this parameter switches the preview to Dithered. Scale
+    /// leaves the current choice alone.
     pub fn shows_dithered(self) -> bool {
         self != Self::Scale
     }
 }
 
-/// Editable values restored by the reset keys.
+/// Everything that affects the grid or the dither. d resets the selected row and
+/// D resets everything, including rotation and tone values without a row.
 #[derive(Clone, PartialEq)]
 pub struct Params {
-    /// Source size as a percentage.
+    /// Grid size as a percentage of the source, 10 to 200.
     pub scale: i32,
-    /// Source image orientation.
+    /// Rotation applied after scaling.
     pub rotation: Rotation,
     palette: usize,
     /// Dither and tone settings.
@@ -210,7 +218,8 @@ impl Params {
         next
     }
 
-    /// Returns settings adjusted by the requested number of steps.
+    /// Returns settings moved `dir` steps and clamped to the range. Mode and
+    /// Serpentine toggle, Palette wraps around the presets.
     pub fn adjusted(&self, param: Param, dir: i32) -> Self {
         let mut next = self.clone();
         let step = |value: f64| {
@@ -241,7 +250,7 @@ impl Params {
     }
 }
 
-/// Scaled size before rotation and clockwise quarter turns.
+/// Scaled size before rotation, plus the rotation applied after scaling.
 #[derive(PartialEq)]
 struct GridKey {
     width: u32,
@@ -249,14 +258,15 @@ struct GridKey {
     rotation: Rotation,
 }
 
-/// Processed grid version and settings used to dither it.
+/// Grid build version and the settings the indices were dithered with.
 #[derive(PartialEq)]
 struct DitherKey {
     grid: u64,
     options: Options,
 }
 
-/// Source image and versioned image processing results.
+/// Source image, grid (scaled then rotated) and dithered indices. Each stage
+/// rebuilds only when its key changes.
 pub struct Pipeline {
     source: RgbaImage,
     grid: Memo<GridKey, RgbaImage>,
@@ -273,7 +283,9 @@ impl Pipeline {
         (scaled(self.source.width()), scaled(self.source.height()))
     }
 
-    /// Refreshes required results and reports whether the dithered result rebuilt.
+    /// Rebuilds the grid when the scaled size or rotation changed and, if
+    /// `need_dither` is set, the indices when the grid or dither options changed.
+    /// Returns true when new indices were built.
     pub fn refresh(&mut self, params: &Params, need_dither: bool) -> bool {
         let (width, height) = self.scaled_size(params);
         self.grid.update(
@@ -304,17 +316,18 @@ impl Pipeline {
         )
     }
 
-    /// Processed image after scaling and rotation.
+    /// The scaled and rotated image that is shown as Original and dithered.
     pub fn grid(&self) -> &RgbaImage {
         self.grid.get().expect("processed grid")
     }
 
-    /// Build version for downstream preview caches.
+    /// Number of grid builds, so preview caches can tell when the grid changed.
     pub fn grid_version(&self) -> u64 {
         self.grid.version()
     }
 
-    /// Palette indices when a consumer has requested dithering.
+    /// Indices from the last dither, `None` before the first. They match the
+    /// current grid only after a refresh that requested dithering.
     pub fn dithered(&self) -> Option<&Vec<u8>> {
         self.dithered.get()
     }
@@ -325,28 +338,31 @@ impl Pipeline {
     }
 }
 
-/// Interactive parameters, preview state and image consumers.
+/// All interactive state: settings, focus, preview view, pipeline caches and
+/// the optional companion PNG.
 pub struct App {
     export: Option<Export>,
-    /// Preview position and display mode.
+    /// Preview mode (Overview or 1:1), glyphs, minimap and image origin.
     pub view: View,
-    /// Whether keys control the preview.
+    /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
     last_drag: Option<(u16, u16)>,
     /// Image processing caches.
     pub pipeline: Pipeline,
     /// Current image settings.
     pub params: Params,
-    /// Selected parameter row.
+    /// Index into `Param::ALL` of the highlighted row.
     pub selected: usize,
-    /// Whether the preview shows RGB pixels.
+    /// Whether the preview shows Original (the scaled grid) instead of Dithered.
+    /// Starts true.
     pub show_original: bool,
     /// Whether the event loop should exit.
     pub quit: bool,
 }
 
 impl App {
-    /// Initializes image consumers and builds the initial preview grid.
+    /// Starts the companion PNG writer when a path is given and builds the
+    /// first grid. With a running writer it also dithers at once.
     pub fn new(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
@@ -367,7 +383,8 @@ impl App {
         app
     }
 
-    /// Returns scaled dimensions after rotation.
+    /// Grid size for the current settings after rotation, known before `sync`
+    /// rebuilds the grid.
     pub fn grid_size(&self) -> (u32, u32) {
         let (w, h) = self.pipeline.scaled_size(&self.params);
         if self.params.rotation.swaps_axes() {
@@ -377,7 +394,8 @@ impl App {
         }
     }
 
-    /// Refreshes image consumers and clamps the view to the preview area.
+    /// Rebuilds the grid and dither if settings changed, sends a new dither to the
+    /// companion PNG and clamps the view to the preview area. Call before each draw.
     pub fn sync(&mut self, preview: Rect) {
         self.refresh();
         self.clamp_view(preview);
@@ -409,12 +427,13 @@ impl App {
         }
     }
 
-    /// Whether a companion PNG writer needs dithered pixels.
+    /// Whether a running companion PNG writer needs every new dither, even while
+    /// Original is shown.
     pub fn has_export(&self) -> bool {
         self.export.as_ref().is_some_and(Export::needs_dither)
     }
 
-    /// Collects PNG results and reports whether the status changed.
+    /// Collects finished PNG writes and reports whether the status line changed.
     pub fn poll_export(&mut self) -> bool {
         self.export.as_mut().is_some_and(Export::poll)
     }
@@ -438,14 +457,17 @@ impl App {
         }
     }
 
-    /// Flushes pending image changes and waits for the PNG worker.
+    /// Runs on quit. Sends any pending dither, waits for the PNG writer and
+    /// returns its last error.
     pub fn finish_png(&mut self) -> std::io::Result<()> {
         // A change and quit can arrive in the same input batch.
         self.refresh();
         self.export.as_mut().map_or(Ok(()), Export::finish)
     }
 
-    /// Applies mouse input using the current preview coordinates.
+    /// Handles the mouse only in 1:1 over the preview, regardless of focus. A left
+    /// click or drag on the minimap recenters there, a drag elsewhere moves the
+    /// image with the pointer, and the wheel pans six dots (grid pixels).
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
@@ -481,7 +503,9 @@ impl App {
     }
 
     // TODO: Introduce an Action enum with a pure key mapping once more bindings arrive.
-    /// Applies a key using the current preview coordinates for panning.
+    /// Global keys come first (Ctrl+C, Tab, Space, Esc). With preview focus, m, z
+    /// and the pan keys act on the view, and pans do nothing in Overview. All other
+    /// keys fall through to the quit, row, rotation, reset and adjust keys.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
             return;
