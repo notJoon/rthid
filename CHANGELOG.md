@@ -58,6 +58,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Minimap toggle `m` now works in either focus. Mouse and keyboard navigation
   follow the current zoom, and terminal images are used only for Original at Fit
 - Preview status and help show zoom controls and inclusive dot ranges
+- Config saves run in the background, so the UI no longer waits on the config
+  lock or disk sync
 
 ### Fixed
 

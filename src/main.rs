@@ -63,7 +63,7 @@ use ratatui::crossterm::{
 };
 use rthid_io::{
     image::{check_not_source, load_image},
-    io::{Done, IO},
+    io::{Done, IO, Outcome},
 };
 
 use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
@@ -207,7 +207,6 @@ fn main() -> std::io::Result<()> {
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
-    let mut pending = Vec::new();
     let mut terminal_result = ratatui::run(|terminal| {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
@@ -234,26 +233,26 @@ fn main() -> std::io::Result<()> {
             debug_log.as_mut(),
             config_path.as_deref(),
             &mut io,
-            &mut pending,
         )
     });
     drop(bracketed_paste);
     drop(mouse_capture);
-    terminal_result = terminal_result.and(save_on_quit(
-        config_path.as_deref(),
-        &pending,
-        &mut debug_log.as_mut(),
-    ));
     app.finish();
     for (job, tag) in app.take_jobs() {
         io.submit(job, tag);
     }
     for done in io.finish() {
         terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
-        if matches!(done.outcome, rthid_io::io::Outcome::Exported(_)) {
+        if matches!(done.outcome, Outcome::Exported(_) | Outcome::Updated(_)) {
             app.complete(done);
         }
     }
+    // Edits whose background save did not finish are saved here.
+    terminal_result = terminal_result.and(save_on_quit(
+        config_path.as_deref(),
+        app.unsaved(),
+        &mut debug_log.as_mut(),
+    ));
     if debug_log.is_none()
         && let Some(message) = worker_panic.lock().unwrap().as_ref()
     {
@@ -272,18 +271,10 @@ fn save_on_quit(
     {
         let started = Instant::now();
         let result = store::save(path, Duration::from_secs(1), pending);
-        log_timing(debug_log, "save", started.elapsed(), None)?;
+        log_timing(debug_log, "save", started.elapsed(), Some(path))?;
         result?;
     }
     Ok(())
-}
-
-// Keep only the last edit for each list and name while a save is pending.
-fn queue_changes(pending: &mut Vec<store::Change>, changes: Vec<store::Change>) {
-    for change in changes {
-        pending.retain(|older| older.key() != change.key());
-        pending.push(change);
-    }
 }
 
 // Syncs and draws when something changed, then waits for input and applies
@@ -295,11 +286,9 @@ fn event_loop(
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
     io: &mut IO,
-    pending: &mut Vec<store::Change>,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
-    let mut retry_at: Option<Instant> = None;
     while !app.quit {
         while let Some(done) = io.poll() {
             log_done(&done, &mut debug_log)?;
@@ -325,7 +314,8 @@ fn event_loop(
         // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
         //       when a job finishes instead.
         let timeout = [
-            retry_at.map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            app.save_retry()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
             io.busy().then_some(Duration::from_millis(30)),
         ]
         .into_iter()
@@ -356,31 +346,11 @@ fn event_loop(
                 }
             }
         }
-        let changes = app.take_changes();
-        let new_changes = !changes.is_empty();
-        queue_changes(pending, changes);
-        if !pending.is_empty()
-            && (new_changes || retry_at.is_some_and(|deadline| Instant::now() >= deadline))
+        // Quitting saves synchronously instead, so no job is left behind.
+        if !app.quit
             && let Some(path) = config_path
         {
-            let started = Instant::now();
-            // TODO: This save blocks the event loop for up to the lock wait plus fsync. Run it as an IO
-            //       job that carries the full pending set and apply the result in `App::complete`. Keep
-            //       one queue of unsaved edits, either here or in App, not both.
-            let result = store::save(path, Duration::from_millis(50), pending);
-            log_timing(&mut debug_log, "save", started.elapsed(), None)?;
-            match result {
-                Ok(loaded) => {
-                    pending.clear();
-                    retry_at = None;
-                    app.saved(loaded);
-                }
-                Err(error) => {
-                    retry_at = Some(Instant::now() + Duration::from_secs(2));
-                    app.save_failed(error.to_string());
-                }
-            }
-            redraw = true;
+            app.queue_save(path, Instant::now());
         }
     }
     Ok(())
@@ -408,36 +378,10 @@ mod tests {
     }
 
     #[test]
-    fn pending_saves_keep_the_last_change_per_list_and_name() {
-        use store::Change;
-        let mut pending = vec![
-            Change::RemovePreset("Shared".into()),
-            Change::RemoveTemplate("Shared".into()),
-        ];
-        let last = Change::UpsertTemplate(settings::Template::capture(
-            "Shared".into(),
-            &settings::Settings::default(),
-        ));
-        queue_changes(
-            &mut pending,
-            vec![last.clone(), Change::RemovePreset("Other".into())],
-        );
-        queue_changes(&mut pending, vec![Change::RemovePreset("Other".into())]);
-        assert_eq!(
-            pending,
-            vec![
-                Change::RemovePreset("Shared".into()),
-                last,
-                Change::RemovePreset("Other".into())
-            ]
-        );
-    }
-
-    #[test]
     fn completion_timings_include_operation_duration_and_path() {
         use rthid_io::{
             dir::Listing,
-            io::{Opened, Outcome},
+            io::{Opened, Updated},
         };
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("debug.log");
@@ -452,22 +396,21 @@ mod tests {
                 path: path.clone(),
                 image: image::RgbaImage::new(1, 1),
             })),
-            Outcome::Exported(Ok(path)),
+            Outcome::Exported(Ok(path.clone())),
+            Outcome::Updated(Ok(Updated {
+                path,
+                text: String::new(),
+            })),
         ] {
             log_done(
-                &Done {
-                    id: 1,
-                    tag: 0,
-                    elapsed: Duration::from_millis(7),
-                    outcome,
-                },
+                &Done::new(0, Duration::from_millis(7), outcome),
                 &mut Some(&mut log),
             )
             .unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(log_path).unwrap(),
-            "[timing] list 7 photo.png\n[timing] decode 7 photo.png\n[timing] encode 7 photo.png\n"
+            "[timing] list 7 photo.png\n[timing] decode 7 photo.png\n[timing] encode 7 photo.png\n[timing] save 7 photo.png\n"
         );
     }
 

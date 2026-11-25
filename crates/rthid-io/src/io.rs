@@ -25,6 +25,15 @@ pub(crate) enum Kind {
     List,
     /// Write a PNG grid. Coalesces across paths because the companion path is fixed for a run.
     Export,
+    /// Replace a text file under its lock. Coalesces across paths, so each edit carries every
+    /// unsaved change.
+    Update,
+}
+
+/// Replacement text computed from the current file contents while its lock is held.
+pub trait Edit: Send {
+    /// Returns the new text for the current contents, which are `None` when the file is missing.
+    fn apply(&self, text: Option<String>) -> io::Result<String>;
 }
 
 /// Owned filesystem work for the shared thread.
@@ -47,6 +56,15 @@ pub enum Job {
         /// Pixels and palette to encode.
         grid: png::Grid,
     },
+    /// Rewrite a text file from its current contents under an advisory lock.
+    Update {
+        /// File to replace.
+        path: PathBuf,
+        /// Longest wait for the lock.
+        wait: Duration,
+        /// Computes the replacement text.
+        edit: Box<dyn Edit>,
+    },
     /// Trigger a panic to verify worker recovery.
     #[cfg(test)]
     Panic(PathBuf),
@@ -62,6 +80,7 @@ impl Job {
             Self::Open { .. } => Kind::Open,
             Self::List(_) => Kind::List,
             Self::Export { .. } => Kind::Export,
+            Self::Update { .. } => Kind::Update,
             #[cfg(test)]
             Self::Panic(_) => Kind::Open,
             #[cfg(test)]
@@ -77,6 +96,7 @@ impl Job {
             Self::Open { path, .. } => (Op::Decode, path.clone()),
             Self::List(path) => (Op::List, path.clone()),
             Self::Export { path, .. } => (Op::Encode, path.clone()),
+            Self::Update { path, .. } => (Op::Save, path.clone()),
             #[cfg(test)]
             Self::Panic(path) => (Op::Decode, path.clone()),
             #[cfg(test)]
@@ -94,6 +114,17 @@ pub enum Outcome {
     Listed(Result<Listing, IoError>),
     /// A PNG was exported.
     Exported(Result<PathBuf, IoError>),
+    /// A text file was replaced.
+    Updated(Result<Updated, IoError>),
+}
+
+/// The file replaced by an Update job.
+#[derive(Debug)]
+pub struct Updated {
+    /// Path given to the job.
+    pub path: PathBuf,
+    /// Text now stored in the file.
+    pub text: String,
 }
 
 /// The image or directory selected by an Open job.
@@ -113,8 +144,8 @@ pub enum Opened {
 /// A completed job and its measured duration.
 #[derive(Debug)]
 pub struct Done {
-    /// Submission id shared across all kinds.
-    pub id: u64,
+    /// Submission id shared across all kinds, used to drop superseded results.
+    pub(crate) id: u64,
     /// Caller value given to `submit`, returned unchanged.
     pub tag: u64,
     /// Measured duration of the work or wait before stopping.
@@ -124,12 +155,23 @@ pub struct Done {
 }
 
 impl Done {
+    /// Builds a result outside the worker, as tests of callers need.
+    pub fn new(tag: u64, elapsed: Duration, outcome: Outcome) -> Self {
+        Self {
+            id: 0,
+            tag,
+            elapsed,
+            outcome,
+        }
+    }
+
     /// Returns the kind carried by the outcome.
     pub(crate) fn kind(&self) -> Kind {
         match self.outcome {
             Outcome::Opened(_) => Kind::Open,
             Outcome::Listed(_) => Kind::List,
             Outcome::Exported(_) => Kind::Export,
+            Outcome::Updated(_) => Kind::Update,
         }
     }
 
@@ -150,9 +192,11 @@ impl Done {
                 (Op::List, &listing.dir)
             }
             Outcome::Exported(Ok(path)) => (Op::Encode, path),
+            Outcome::Updated(Ok(updated)) => (Op::Save, &updated.path),
             Outcome::Opened(Err(error))
             | Outcome::Listed(Err(error))
-            | Outcome::Exported(Err(error)) => (error.op, &error.path),
+            | Outcome::Exported(Err(error))
+            | Outcome::Updated(Err(error)) => (error.op, &error.path),
         }
     }
 }
@@ -166,6 +210,8 @@ pub enum Op {
     List,
     /// Encode a PNG.
     Encode,
+    /// Replace a text file.
+    Save,
 }
 
 impl fmt::Display for Op {
@@ -174,6 +220,7 @@ impl fmt::Display for Op {
             Self::Decode => "decode",
             Self::List => "list",
             Self::Encode => "encode",
+            Self::Save => "save",
         })
     }
 }
@@ -233,6 +280,7 @@ impl fmt::Display for IoError {
             ),
             Op::List => write!(f, "open: {}: {}", self.path.display(), self.cause),
             Op::Encode => write!(f, "PNG {}: {}", self.path.display(), self.cause),
+            Op::Save => write!(f, "save {}: {}", self.path.display(), self.cause),
         }
     }
 }
@@ -285,7 +333,7 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 struct Queue {
-    slots: Mutex<[Option<(u64, u64, Job)>; 3]>,
+    slots: Mutex<[Option<(u64, u64, Job)>; 4]>,
     ready: Condvar,
 }
 
@@ -295,7 +343,7 @@ pub struct IO {
     jobs: Arc<Queue>,
     results: Receiver<Done>,
     local: VecDeque<Done>,
-    pending: [Option<Pending>; 3],
+    pending: [Option<Pending>; 4],
     next_id: u64,
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -303,13 +351,13 @@ pub struct IO {
     exited: Receiver<()>,
 }
 
-const KINDS: [Kind; 3] = [Kind::Open, Kind::List, Kind::Export];
+const KINDS: [Kind; 4] = [Kind::Open, Kind::List, Kind::Export, Kind::Update];
 
 impl IO {
     /// Starts the worker. `home` expands `~` in Open paths without reading the environment.
     pub fn new(home: Option<PathBuf>) -> io::Result<Self> {
         let jobs = Arc::new(Queue {
-            slots: Mutex::new([None, None, None]),
+            slots: Mutex::new([None, None, None, None]),
             ready: Condvar::new(),
         });
         let queued = Arc::clone(&jobs);
@@ -327,7 +375,7 @@ impl IO {
             jobs,
             results,
             local: VecDeque::new(),
-            pending: [None, None, None],
+            pending: [None, None, None, None],
             next_id: 0,
             stopping,
             thread: Some(thread),
@@ -335,9 +383,13 @@ impl IO {
         })
     }
 
-    /// Queues work without waiting, returning an id that increases across kinds.
-    /// The result echoes `tag` so callers can tell who asked for it.
-    pub fn submit(&mut self, job: Job, tag: u64) -> u64 {
+    /// Queues work without waiting. The result echoes `tag` so callers can tell who asked for it.
+    pub fn submit(&mut self, job: Job, tag: u64) {
+        self.enqueue(job, tag);
+    }
+
+    // Returns the id, which increases across kinds.
+    fn enqueue(&mut self, job: Job, tag: u64) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         let kind = job.kind();
@@ -397,7 +449,7 @@ impl IO {
         self.pending.iter().any(Option::is_some)
     }
 
-    /// Skips queued reads and waits up to five seconds for the newest export.
+    /// Skips queued reads and updates and waits up to five seconds for the newest export.
     /// Returns available results and detaches a worker still running at the deadline.
     pub fn finish(self) -> Vec<Done> {
         self.finish_timeout(SHUTDOWN_WAIT)
@@ -456,6 +508,7 @@ fn failure(
             Kind::Open => Outcome::Opened(Err(error)),
             Kind::List => Outcome::Listed(Err(error)),
             Kind::Export => Outcome::Exported(Err(error)),
+            Kind::Update => Outcome::Updated(Err(error)),
         },
     }
 }
@@ -545,6 +598,17 @@ fn execute(
                 .map_err(Cause::Io)?;
             Ok(Outcome::Exported(Ok(path.clone())))
         }
+        Job::Update { wait, edit, .. } => {
+            let text = crate::atomic::update(path, wait, |text| {
+                let text = edit.apply(text)?;
+                Ok((text.clone(), text))
+            })
+            .map_err(Cause::Io)?;
+            Ok(Outcome::Updated(Ok(Updated {
+                path: path.clone(),
+                text,
+            })))
+        }
         #[cfg(test)]
         Job::Panic(_) => panic!("test job panicked"),
         #[cfg(test)]
@@ -587,7 +651,7 @@ mod tests {
     fn pause(worker: &mut IO) -> Sender<()> {
         let (entered, started) = mpsc::channel();
         let (resume, paused) = mpsc::channel();
-        worker.submit(Job::Pause(entered, paused), 0);
+        worker.enqueue(Job::Pause(entered, paused), 0);
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         resume
     }
@@ -607,7 +671,7 @@ mod tests {
         let resume = pause(&mut worker);
         let mut last = 0;
         for n in 0..100 {
-            last = worker.submit(export(dir.path().join(format!("{n}.png")), n == 99), 0);
+            last = worker.enqueue(export(dir.path().join(format!("{n}.png")), n == 99), 0);
         }
         assert!(worker.busy());
         assert_eq!(
@@ -633,13 +697,66 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    struct Append(&'static str);
+
+    impl Edit for Append {
+        fn apply(&self, text: Option<String>) -> io::Result<String> {
+            Ok(text.unwrap_or_default() + self.0)
+        }
+    }
+
+    struct Fail;
+
+    impl Edit for Fail {
+        fn apply(&self, _: Option<String>) -> io::Result<String> {
+            Err(io::Error::other("rejected"))
+        }
+    }
+
+    #[test]
+    fn updates_coalesce_and_return_the_stored_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config");
+        let update = |edit: &'static str| Job::Update {
+            path: path.clone(),
+            wait: Duration::from_secs(1),
+            edit: Box::new(Append(edit)),
+        };
+        let mut worker = IO::new(None).unwrap();
+        let resume = pause(&mut worker);
+        worker.enqueue(update("old"), 1);
+        let latest = worker.enqueue(update("new"), 2);
+        resume.send(()).unwrap();
+        assert_eq!(wait(&mut worker).kind(), Kind::List);
+        let done = wait(&mut worker);
+        assert_eq!((done.id, done.tag), (latest, 2));
+        assert_eq!((done.op(), done.path()), (Op::Save, path.as_path()));
+        assert!(matches!(&done.outcome, Outcome::Updated(Ok(updated)) if updated.text == "new"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::write(&path, "version = [").unwrap();
+        worker.enqueue(
+            Job::Update {
+                path: path.clone(),
+                wait: Duration::from_secs(1),
+                edit: Box::new(Fail),
+            },
+            3,
+        );
+        assert!(matches!(
+            wait(&mut worker).outcome,
+            Outcome::Updated(Err(IoError { op: Op::Save, cause: Cause::Io(error), .. }))
+                if error.to_string() == "rejected"
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = [");
+    }
+
     #[test]
     fn open_and_list_keep_separate_results_and_resolve_open_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(Some(dir.path().to_path_buf())).unwrap();
         let resume = pause(&mut worker);
-        let opened = worker.submit(open(PathBuf::from("~")), 7);
-        let listed = worker.submit(Job::List(dir.path().to_path_buf()), 8);
+        let opened = worker.enqueue(open(PathBuf::from("~")), 7);
+        let listed = worker.enqueue(Job::List(dir.path().to_path_buf()), 8);
         resume.send(()).unwrap();
         let done = wait(&mut worker);
         assert_eq!((done.id, done.tag), (opened, 7));
@@ -654,7 +771,7 @@ mod tests {
 
         let path = dir.path().join("source.png");
         RgbaImage::new(2048, 2).save(&path).unwrap();
-        worker.submit(
+        worker.enqueue(
             Job::Open {
                 path: "source.png".into(),
                 dir: Some(dir.path().to_path_buf()),
@@ -669,7 +786,7 @@ mod tests {
             panic!("expected decoded image");
         };
         assert_eq!(image.dimensions(), (1024, 1));
-        worker.submit(
+        worker.enqueue(
             Job::Open {
                 path: path.clone(),
                 dir: None,
@@ -690,13 +807,13 @@ mod tests {
     fn panic_is_reported_and_the_thread_runs_the_next_job() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        let id = worker.submit(Job::Panic(dir.path().join("panic")), 0);
+        let id = worker.enqueue(Job::Panic(dir.path().join("panic")), 0);
         let done = wait(&mut worker);
         assert_eq!(done.id, id);
         assert!(matches!(done.outcome, Outcome::Opened(Err(IoError {
             cause: Cause::Panicked(message), ..
         })) if message == "test job panicked"));
-        let id = worker.submit(Job::List(dir.path().to_path_buf()), 0);
+        let id = worker.enqueue(Job::List(dir.path().to_path_buf()), 0);
         let done = wait(&mut worker);
         assert_eq!(done.id, id);
         assert!(matches!(done.outcome, Outcome::Listed(Ok(_))));
@@ -707,10 +824,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
-        let opened = worker.submit(open(dir.path().to_path_buf()), 0);
-        let listed = worker.submit(Job::List(dir.path().to_path_buf()), 0);
-        worker.submit(export(dir.path().join("old.png"), false), 0);
-        let exported = worker.submit(export(dir.path().join("final.png"), true), 0);
+        let opened = worker.enqueue(open(dir.path().to_path_buf()), 0);
+        let listed = worker.enqueue(Job::List(dir.path().to_path_buf()), 0);
+        worker.enqueue(export(dir.path().join("old.png"), false), 0);
+        let exported = worker.enqueue(export(dir.path().join("final.png"), true), 0);
         let stopping = Arc::clone(&worker.stopping);
         let release = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -749,9 +866,9 @@ mod tests {
     fn stale_results_are_discarded_and_a_stopped_thread_still_returns_ids() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        worker.submit(export(dir.path().join("old.png"), false), 0);
+        worker.enqueue(export(dir.path().join("old.png"), false), 0);
         let resume = pause(&mut worker);
-        let latest = worker.submit(export(dir.path().join("latest.png"), true), 0);
+        let latest = worker.enqueue(export(dir.path().join("latest.png"), true), 0);
         // The earlier Export completed before Pause began and must still be discarded.
         assert!(worker.poll().is_none());
         resume.send(()).unwrap();
@@ -759,7 +876,7 @@ mod tests {
         assert_eq!(wait(&mut worker).id, latest);
         worker.stop_timeout(SHUTDOWN_WAIT);
         for _ in 0..2 {
-            let id = worker.submit(open(dir.path().to_path_buf()), 3);
+            let id = worker.enqueue(open(dir.path().to_path_buf()), 3);
             assert!(worker.busy());
             let done = wait(&mut worker);
             assert_eq!((done.id, done.tag), (id, 3));
@@ -789,7 +906,7 @@ mod tests {
             drop(finished);
             panic!("worker failed outside a job");
         }));
-        let id = worker.submit(Job::List("missing".into()), 5);
+        let id = worker.enqueue(Job::List("missing".into()), 5);
         release.send(()).unwrap();
         let done = worker.finish();
         assert_eq!(done.len(), 1);
@@ -807,9 +924,9 @@ mod tests {
     fn finish_detaches_a_blocked_worker_at_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        let opened = worker.submit(open(dir.path().to_path_buf()), 0);
+        let opened = worker.enqueue(open(dir.path().to_path_buf()), 0);
         let resume = pause(&mut worker);
-        let exported = worker.submit(export("unused.png".into(), false), 6);
+        let exported = worker.enqueue(export("unused.png".into(), false), 6);
         let started = Instant::now();
         let done = worker.finish_timeout(Duration::from_millis(50));
         assert_eq!(done.len(), 3);
@@ -841,6 +958,7 @@ mod tests {
             (Op::Decode, "open: Could not load photo.png: failed"),
             (Op::List, "open: photo.png: failed"),
             (Op::Encode, "PNG photo.png: failed"),
+            (Op::Save, "save photo.png: failed"),
         ] {
             let error = IoError {
                 op,
@@ -862,7 +980,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let path = dir.path().join("missing.png");
-        worker.submit(open(path.clone()), 0);
+        worker.enqueue(open(path.clone()), 0);
         let done = wait(&mut worker);
         assert_eq!(done.path(), path);
         assert!(matches!(

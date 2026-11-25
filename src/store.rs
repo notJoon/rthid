@@ -327,55 +327,66 @@ fn parse_table(mut table: toml::Table) -> Loaded {
 /// Untouched raw values retain their array order, including entries this version cannot parse.
 /// Waits up to `wait` for the config lock. TOML comments and formatting are lost on save.
 pub fn save(path: &Path, wait: Duration, changes: &[Change]) -> io::Result<Loaded> {
-    atomic::update(path, wait, |text| {
-        let mut table: toml::Table = text
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .map(toml::from_str)
-            .transpose()
-            .map_err(io::Error::other)?
-            .unwrap_or_default();
-        let mut loaded = parse_table(table.clone());
-        if let Some(reason) = &loaded.save_blocked {
-            return Err(io::Error::other(reason.clone()));
-        }
-        table.entry("version").or_insert(toml::Value::Integer(1));
-        for change in changes {
-            // Rejects edits the UI would reject before touching raw entries.
-            change
-                .apply(&mut loaded.palettes, &mut loaded.templates)
-                .map_err(io::Error::other)?;
-            let replacement = match change {
-                Change::UpsertPreset(preset) => Some(toml::Value::try_from(FilePreset {
-                    name: preset.name.clone(),
-                    colors: preset.colors.clone(),
-                    mode: preset.mode.map(Into::into),
-                })),
-                Change::UpsertTemplate(template) => {
-                    Some(toml::Value::try_from(FileTemplate::from(template.clone())))
-                }
-                Change::RemovePreset(_) | Change::RemoveTemplate(_) => None,
-            }
-            .transpose()
+    atomic::update(path, wait, |text| merge(text.as_deref(), changes))
+}
+
+/// Unsaved edits that a background Update job merges into the latest configuration text.
+pub struct Merge(pub Vec<Change>);
+
+impl rthid_io::io::Edit for Merge {
+    fn apply(&self, text: Option<String>) -> io::Result<String> {
+        merge(text.as_deref(), &self.0).map(|(text, _)| text)
+    }
+}
+
+// Applies named edits to the current text, returning the new text and its parsed entries.
+fn merge(text: Option<&str>, changes: &[Change]) -> io::Result<(String, Loaded)> {
+    let mut table: toml::Table = text
+        .filter(|text| !text.trim().is_empty())
+        .map(toml::from_str)
+        .transpose()
+        .map_err(io::Error::other)?
+        .unwrap_or_default();
+    let mut loaded = parse_table(table.clone());
+    if let Some(reason) = &loaded.save_blocked {
+        return Err(io::Error::other(reason.clone()));
+    }
+    table.entry("version").or_insert(toml::Value::Integer(1));
+    for change in changes {
+        // Rejects edits the UI would reject before touching raw entries.
+        change
+            .apply(&mut loaded.palettes, &mut loaded.templates)
             .map_err(io::Error::other)?;
-            let (kind, name) = change.key();
-            let entries = table
-                .entry(kind)
-                .or_insert(toml::Value::Array(Vec::new()))
-                .as_array_mut()
-                .unwrap();
-            let position = entries
-                .iter()
-                .position(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name));
-            // The UI shows one entry per name, so edits replace or remove even invalid duplicates.
-            entries.retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some(name));
-            if let Some(value) = replacement {
-                entries.insert(position.unwrap_or(entries.len()).min(entries.len()), value);
+        let replacement = match change {
+            Change::UpsertPreset(preset) => Some(toml::Value::try_from(FilePreset {
+                name: preset.name.clone(),
+                colors: preset.colors.clone(),
+                mode: preset.mode.map(Into::into),
+            })),
+            Change::UpsertTemplate(template) => {
+                Some(toml::Value::try_from(FileTemplate::from(template.clone())))
             }
+            Change::RemovePreset(_) | Change::RemoveTemplate(_) => None,
         }
-        let text = toml::to_string_pretty(&table).map_err(io::Error::other)?;
-        Ok((text, parse_table(table)))
-    })
+        .transpose()
+        .map_err(io::Error::other)?;
+        let (kind, name) = change.key();
+        let entries = table
+            .entry(kind)
+            .or_insert(toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .unwrap();
+        let position = entries
+            .iter()
+            .position(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name));
+        // The UI shows one entry per name, so edits replace or remove even invalid duplicates.
+        entries.retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some(name));
+        if let Some(value) = replacement {
+            entries.insert(position.unwrap_or(entries.len()).min(entries.len()), value);
+        }
+    }
+    let text = toml::to_string_pretty(&table).map_err(io::Error::other)?;
+    Ok((text, parse_table(table)))
 }
 
 /// Resolves the explicit path before environment overrides and the home directory.
@@ -472,6 +483,25 @@ mod tests {
                 assert!(loaded.templates.find("Existing").is_some());
             }
         }
+    }
+
+    #[test]
+    fn background_merges_store_the_entries_a_direct_save_returns() {
+        use rthid_io::io::Edit;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let changes = vec![Change::UpsertTemplate(Template::capture(
+            "Zine".into(),
+            &Settings::default(),
+        ))];
+        let existing = "[[template]]\nname = 'Existing'\n";
+        let text = Merge(changes.clone()).apply(Some(existing.into())).unwrap();
+        fs::write(&path, existing).unwrap();
+        let saved = save(&path, Duration::from_secs(1), &changes).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(parse(&text).templates, saved.templates);
+        assert_eq!(parse(&text).palettes, saved.palettes);
+        assert!(Merge(changes).apply(Some("version = 2".into())).is_err());
     }
 
     #[test]

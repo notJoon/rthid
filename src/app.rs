@@ -7,7 +7,7 @@ use crate::{
     memo::Memo,
     modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
-    store::{Change, Loaded},
+    store::{Change, Loaded, Merge},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -20,7 +20,23 @@ use rthid_io::{
     io::{Done, Job, Opened, Outcome as IoOutcome},
 };
 use rthid_widgets::{ListPicker, Outcome};
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+/// Longest wait for the config lock during a background save.
+const SAVE_WAIT: Duration = Duration::from_millis(50);
+/// Delay before a failed save is tried again.
+const SAVE_RETRY: Duration = Duration::from_secs(2);
+
+// The edits carried by the newest save job.
+struct Saving {
+    /// Tag the result echoes.
+    token: u64,
+    /// Edits included in the job.
+    changes: Vec<Change>,
+}
 
 struct OpenRequest {
     /// Tag the result echoes, unique to this request.
@@ -41,7 +57,12 @@ pub struct App {
     deferred_notice: Option<String>,
     save_blocked: Option<String>,
     outbox: Vec<(Job, u64)>,
-    pending: Vec<Change>,
+    // Edits not yet confirmed saved, with only the last one for each list and name.
+    unsaved: Vec<Change>,
+    // Whether edits arrived since the last save job.
+    dirty: bool,
+    saving: Option<Saving>,
+    save_retry: Option<Instant>,
     open_request: Option<OpenRequest>,
     // Last value handed out as a dialog generation or Open token.
     // Zero tags requests without a dialog.
@@ -101,7 +122,10 @@ impl App {
             deferred_notice: None,
             save_blocked,
             outbox: Vec::new(),
-            pending: Vec::new(),
+            unsaved: Vec::new(),
+            dirty: false,
+            saving: None,
+            save_retry: None,
             open_request: None,
             last_token: 0,
             save_error: None,
@@ -186,17 +210,44 @@ impl App {
         changed
     }
 
-    /// Drains pending edits unless configuration loading blocked writes.
-    pub fn take_changes(&mut self) -> Vec<Change> {
+    /// Edits not yet confirmed saved, empty when configuration loading blocked writes.
+    pub fn unsaved(&self) -> &[Change] {
         if self.save_blocked.is_some() {
-            Vec::new()
+            &[]
         } else {
-            std::mem::take(&mut self.pending)
+            &self.unsaved
         }
     }
 
+    /// When a failed save is due to be tried again.
+    pub fn save_retry(&self) -> Option<Instant> {
+        self.save_retry
+    }
+
+    /// Queues a background save of every unsaved edit to `path` when edits arrived since the
+    /// last save or the retry deadline passed by `now`.
+    pub fn queue_save(&mut self, path: &Path, now: Instant) {
+        if !self.dirty && self.save_retry.is_none_or(|deadline| now < deadline) {
+            return;
+        }
+        self.dirty = false;
+        self.save_retry = None;
+        if self.unsaved().is_empty() {
+            return;
+        }
+        let token = self.next_token();
+        let changes = self.unsaved.clone();
+        let job = Job::Update {
+            path: path.to_path_buf(),
+            wait: SAVE_WAIT,
+            edit: Box::new(Merge(changes.clone())),
+        };
+        self.outbox.push((job, token));
+        self.saving = Some(Saving { token, changes });
+    }
+
     /// Replaces saved lists while retaining the current palette selection by name.
-    pub fn saved(&mut self, loaded: Loaded) {
+    fn saved(&mut self, loaded: Loaded) {
         let notice = loaded.notice();
         if let Some(notice) = notice {
             self.set_notice(notice);
@@ -220,7 +271,7 @@ impl App {
     }
 
     /// Reports the save error once per distinct message.
-    pub fn save_failed(&mut self, error: String) {
+    fn save_failed(&mut self, error: String) {
         if self.save_error.as_ref() != Some(&error) {
             self.set_notice(format!("config: {error}"));
             self.save_error = Some(error);
@@ -287,6 +338,30 @@ impl App {
                 if let Err(error) = result {
                     changed |= self.set_notice(error.to_string());
                 }
+            }
+            IoOutcome::Updated(result) => {
+                let Some(saving) = self.saving.take_if(|saving| saving.token == done.tag) else {
+                    return false;
+                };
+                match result {
+                    Ok(updated) => {
+                        // Edits made after the job was queued stay unsaved for the next save
+                        // and stay visible over the saved lists.
+                        self.unsaved
+                            .retain(|change| !saving.changes.contains(change));
+                        let mut loaded = crate::store::parse(&updated.text);
+                        for change in &self.unsaved {
+                            // An edit the saved lists now reject is left for the next save to report.
+                            let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
+                        }
+                        self.saved(loaded);
+                    }
+                    Err(error) => {
+                        self.save_retry = Some(Instant::now() + SAVE_RETRY);
+                        self.save_failed(error.cause.to_string());
+                    }
+                }
+                changed = true;
             }
             IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
                 changed |= self.set_notice(error.to_string());
@@ -704,7 +779,9 @@ impl App {
 
     fn commit(&mut self, change: Change) -> Result<(), String> {
         change.apply(&mut self.palettes, &mut self.templates)?;
-        self.pending.push(change);
+        self.unsaved.retain(|older| older.key() != change.key());
+        self.unsaved.push(change);
+        self.dirty = true;
         Ok(())
     }
 
@@ -753,13 +830,15 @@ mod tests {
             IoOutcome::Opened(_) => app.open_request.as_ref().map_or(0, |r| r.token),
             IoOutcome::Listed(_) => app.dialog().unwrap_or(0),
             IoOutcome::Exported(_) => 0,
+            IoOutcome::Updated(_) => app.saving.as_ref().map_or(0, |saving| saving.token),
         };
-        Done {
-            id: 1,
-            tag,
-            elapsed: std::time::Duration::ZERO,
-            outcome,
-        }
+        Done::new(tag, std::time::Duration::ZERO, outcome)
+    }
+
+    // Drains unsaved edits as a save that succeeded would.
+    fn take_changes(app: &mut App) -> Vec<Change> {
+        app.dirty = false;
+        std::mem::take(&mut app.unsaved)
     }
 
     fn jobs(app: &mut App) -> Vec<Job> {
@@ -881,12 +960,7 @@ mod tests {
     #[test]
     fn results_for_a_closed_dialog_leave_a_reopened_dialog_alone() {
         use rthid_io::dir::Listing;
-        let reply = |tag, outcome| Done {
-            id: 1,
-            tag,
-            elapsed: std::time::Duration::ZERO,
-            outcome,
-        };
+        let reply = |tag, outcome| Done::new(tag, std::time::Duration::ZERO, outcome);
         let listing = |dir: &str| Listing {
             dir: dir.into(),
             entries: vec![Entry {
@@ -1207,7 +1281,7 @@ mod tests {
         ] {
             press(&mut app, code);
         }
-        assert!(app.modal.is_none() && !app.take_changes().is_empty());
+        assert!(app.modal.is_none() && !take_changes(&mut app).is_empty());
         assert_eq!(
             app.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
@@ -1219,7 +1293,7 @@ mod tests {
         }
         assert_eq!(app.settings.options.strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
-        assert!(!app.show_original && app.modal.is_none() && app.take_changes().is_empty());
+        assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
     }
 
     #[test]
@@ -1229,7 +1303,7 @@ mod tests {
             press(&mut app, code);
         }
         assert!(app.notice().unwrap().contains("must not be empty"));
-        assert!(app.modal.is_some() && app.take_changes().is_empty());
+        assert!(app.modal.is_some() && take_changes(&mut app).is_empty());
         press(&mut app, KeyCode::Down);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -1249,7 +1323,106 @@ mod tests {
         }
         assert_eq!(app.settings.palette_name, "Z");
         assert!(app.palettes.find("Z").is_some());
-        assert!(app.modal.is_none() && !app.take_changes().is_empty() && !app.show_original);
+        assert!(app.modal.is_none() && !take_changes(&mut app).is_empty() && !app.show_original);
+    }
+
+    // Takes the queued save job with the tag its result echoes.
+    fn save_job(app: &mut App) -> (u64, PathBuf, Box<dyn rthid_io::io::Edit>) {
+        match app.take_jobs().pop() {
+            Some((Job::Update { path, edit, .. }, tag)) => (tag, path, edit),
+            _ => panic!("save job expected"),
+        }
+    }
+
+    fn save_done(tag: u64, result: Result<rthid_io::io::Updated, rthid_io::io::IoError>) -> Done {
+        Done::new(tag, std::time::Duration::ZERO, IoOutcome::Updated(result))
+    }
+
+    #[test]
+    fn unsaved_edits_keep_the_last_change_per_list_and_name() {
+        let mut app = App::empty();
+        let last = Change::UpsertTemplate(Template::capture("Shared".into(), &Settings::default()));
+        for change in [
+            Change::RemovePreset("Shared".into()),
+            Change::RemoveTemplate("Shared".into()),
+            last.clone(),
+            Change::RemovePreset("Other".into()),
+            Change::RemovePreset("Other".into()),
+        ] {
+            app.commit(change).unwrap();
+        }
+        assert_eq!(
+            app.unsaved(),
+            [
+                Change::RemovePreset("Shared".into()),
+                last,
+                Change::RemovePreset("Other".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn edits_made_during_a_save_are_saved_after_it_succeeds() {
+        use rthid_io::io::Updated;
+        let config = Path::new("config.toml");
+        let mut app = App::empty();
+        app.apply(Effect::SaveTemplate("First".into())).unwrap();
+        app.queue_save(config, Instant::now());
+        let (tag, path, edit) = save_job(&mut app);
+        app.apply(Effect::SaveTemplate("Second".into())).unwrap();
+        let text = edit.apply(None).unwrap();
+        let first = || Updated {
+            path: path.clone(),
+            text: text.clone(),
+        };
+        assert!(!app.complete(save_done(tag + 1, Ok(first()))));
+        assert!(app.complete(save_done(tag, Ok(first()))));
+        assert_eq!(app.unsaved().len(), 1);
+        assert!(app.templates.find("First").is_some());
+        assert!(app.templates.find("Second").is_some());
+        app.queue_save(config, Instant::now());
+        let (tag, path, edit) = save_job(&mut app);
+        let text = edit.apply(Some(text)).unwrap();
+        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
+        assert!(app.unsaved().is_empty());
+        let names: Vec<_> = app.templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        app.queue_save(config, Instant::now());
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn failed_saves_keep_edits_and_retry_after_the_deadline() {
+        use rthid_io::io::{Cause, IoError, Op, Updated};
+        let config = Path::new("config.toml");
+        let mut app = App::empty();
+        app.apply(Effect::SaveTemplate("Zine".into())).unwrap();
+        let started = Instant::now();
+        app.queue_save(config, started);
+        let (tag, path, _) = save_job(&mut app);
+        let busy = IoError {
+            op: Op::Save,
+            path,
+            cause: Cause::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "config is busy",
+            )),
+        };
+        assert!(app.complete(save_done(tag, Err(busy))));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.unsaved().len(), 1);
+        let deadline = app.save_retry().unwrap();
+        assert!(deadline >= started + SAVE_RETRY);
+        app.queue_save(config, deadline - Duration::from_millis(1));
+        assert!(app.take_jobs().is_empty());
+        app.queue_save(config, deadline);
+        assert!(app.save_retry().is_none());
+        let (tag, path, edit) = save_job(&mut app);
+        let text = edit.apply(None).unwrap();
+        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
+        assert!(app.unsaved().is_empty());
+        assert!(app.notice().is_none());
+        assert!(app.templates.find("Zine").is_some());
     }
 
     #[test]
@@ -1257,12 +1430,11 @@ mod tests {
         let mut app = App::empty();
         app.apply(Effect::SaveTemplate("First".into())).unwrap();
         app.apply(Effect::RemoveTemplate("First".into())).unwrap();
-        let changes = app.take_changes();
-        assert!(
-            matches!(&changes[..], [Change::UpsertTemplate(t), Change::RemoveTemplate(name)]
-            if t.name == "First" && name == "First")
+        assert_eq!(
+            take_changes(&mut app),
+            [Change::RemoveTemplate("First".into())]
         );
-        assert!(app.take_changes().is_empty());
+        assert!(take_changes(&mut app).is_empty());
         app.save_failed("busy".into());
         assert_eq!(app.notice(), Some("config: busy"));
         app.set_notice("open: failed".into());
@@ -1390,10 +1562,7 @@ mod tests {
         assert!(app.palettes.find("Selected").is_none());
         assert!(app.templates.find("Other").is_some());
         assert!(app.templates.find("Zine").is_none());
-        assert!(
-            app.take_changes()
-                .contains(&Change::RemovePreset("Selected".into()))
-        );
+        assert!(take_changes(&mut app).contains(&Change::RemovePreset("Selected".into())));
         app.saved(Loaded::default());
         assert!(app.notice().is_none());
     }
@@ -1415,15 +1584,21 @@ mod tests {
             );
             assert_eq!(app.templates, templates);
             assert_eq!(app.notice(), Some("config warning"));
-            assert!(app.take_changes().is_empty());
+            assert!(app.unsaved().is_empty());
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &app.geometry(Rect::new(0, 0, 20, 10)),
             );
             assert!(app.notice().is_none());
             app.apply(Effect::SaveTemplate("Another".into())).unwrap();
-            assert_eq!(app.take_changes().is_empty(), blocked);
-            assert!(app.take_changes().is_empty());
+            assert_eq!(app.unsaved().is_empty(), blocked);
+            app.queue_save(Path::new("config.toml"), Instant::now());
+            assert_eq!(
+                matches!(jobs(&mut app).as_slice(), [Job::Update { .. }]),
+                !blocked
+            );
+            app.queue_save(Path::new("config.toml"), Instant::now());
+            assert!(jobs(&mut app).is_empty());
         }
     }
 
