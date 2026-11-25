@@ -25,17 +25,18 @@ jobs:
       - run: mise run ci:rthid
 
   changes:
-    # Decides whether the widgets and dither jobs have anything new to test.
+    # Decides whether the library jobs have anything new to test.
     runs-on: ubuntu-latest
     outputs:
       widgets: ${{ steps.filter.outputs.widgets }}
       dither: ${{ steps.filter.outputs.dither }}
+      io: ${{ steps.filter.outputs.io }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
-          # Manifests, the toolchain and this workflow can change either crate's build too.
+          # Manifests, the toolchain and this workflow can change each crate's build too.
           # The shared list is declared once and reused through a YAML anchor.
           filters: |
             shared: &shared
@@ -45,6 +46,10 @@ jobs:
               - '.github/workflows/ci.yml'
             dither:
               - *shared
+              - 'crates/rthid-dither/**'
+            io:
+              - *shared
+              - 'crates/rthid-io/**'
               - 'crates/rthid-dither/**'
             widgets:
               - *shared
@@ -81,6 +86,18 @@ jobs:
       # rust-cache keys entries by job, so this cache is separate from the check job's.
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:dither
+
+  io:
+    # Unit tests, doctests and rustdoc warnings for rthid-io.
+    # The crate has no platform sensitive goldens, so one runner is enough.
+    needs: changes
+    if: needs.changes.outputs.io == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci:io
 
   coverage:
     # Report only. Coverage does not depend on the OS, so one runner is enough.

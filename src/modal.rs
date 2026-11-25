@@ -12,6 +12,7 @@ use ratatui::{
     widgets::Block,
 };
 use rthid_dither::dither::Mode;
+use rthid_io::dir::Entry;
 use rthid_widgets::{Confirm, Dialog, ListPicker, Outcome, TextInput};
 
 const OPEN_HINTS: &[(&str, &str)] = &[
@@ -205,15 +206,6 @@ pub struct ModalLayout {
     pub field: Option<Rect>,
     /// List content without a border, when present.
     pub list: Option<Rect>,
-}
-
-/// Visible directory entry supplied by the event loop.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// File name relative to the listed directory.
-    pub name: String,
-    /// Whether selecting this entry lists a directory.
-    pub dir: bool,
 }
 
 /// Path field and directory selection for opening an image.

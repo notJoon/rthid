@@ -908,8 +908,8 @@ mod tests {
     }
     #[test]
     fn open_dialog_keeps_path_above_scrolled_entries() {
-        use crate::modal::Entry;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use rthid_io::dir::Entry;
         let mut app = App::empty();
         app.modal = Some(Modal::open_file("/images".into()));
         app.set_listing(

@@ -5,7 +5,7 @@ use crate::{
     export::Export,
     grid::GridCache,
     memo::Memo,
-    modal::{Ctx, Effect, Entry, Modal, Next, Step},
+    modal::{Ctx, Effect, Modal, Next, Step},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use rthid_io::dir::Entry;
 use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
@@ -201,7 +202,7 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(modal) = &mut self.modal {
             if let Modal::OpenFile(picker) = modal
-                && let Some(path) = crate::paste::dropped_path(text)
+                && let Some(path) = rthid_io::paste::dropped_path(text)
             {
                 picker.input = rthid_widgets::TextInput::new(path.to_string_lossy(), usize::MAX);
                 picker.typed = true;
@@ -220,7 +221,7 @@ impl App {
                     );
                 }
             }
-        } else if let Some(path) = crate::paste::dropped_path(text) {
+        } else if let Some(path) = rthid_io::paste::dropped_path(text) {
             self.request_open(path, None);
         }
     }
@@ -238,9 +239,19 @@ impl App {
 
     /// Rebuilds the grid and dither if settings changed, sends a new dither to the
     /// companion PNG and clamps the viewport to the preview area. Call before each draw.
-    pub fn sync(&mut self, preview: Rect) {
+    /// Returns whether the grid or dither was rebuilt.
+    pub fn sync(&mut self, preview: Rect) -> bool {
+        let before = (
+            self.grid_cache.grid.version(),
+            self.grid_cache.dithered.version(),
+        );
         self.refresh();
         self.clamp_viewport(preview);
+        before
+            != (
+                self.grid_cache.grid.version(),
+                self.grid_cache.dithered.version(),
+            )
     }
 
     /// Coordinates shared by preview input and rendering.
@@ -281,6 +292,11 @@ impl App {
     /// Collects finished PNG writes and reports whether the status line changed.
     pub fn poll_export(&mut self) -> bool {
         self.export.as_mut().is_some_and(Export::poll)
+    }
+
+    /// Takes the last completed PNG write duration once for the debug log.
+    pub fn take_encode_elapsed(&mut self) -> Option<std::time::Duration> {
+        self.export.as_mut().and_then(Export::take_elapsed)
     }
 
     /// Latest companion PNG error for the status line.
@@ -595,6 +611,23 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    #[test]
+    fn sync_reports_only_grid_or_dither_rebuilds() {
+        let mut app = App::builtin(RgbaImage::new(4, 2), None);
+        let preview = test_layout().preview;
+        assert!(!app.sync(preview));
+        app.settings.scale = 200;
+        assert!(app.sync(preview));
+        assert!(!app.sync(preview));
+        app.show_original = false;
+        assert!(app.sync(preview));
+        assert!(!app.sync(preview));
+        app.settings.options.strength = 0.5;
+        assert!(app.sync(preview));
+        assert!(!app.sync(preview));
+        assert!(!App::empty().sync(preview));
+    }
 
     #[test]
     fn open_dialog_requests_listing_and_retains_failed_open() {

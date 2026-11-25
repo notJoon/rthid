@@ -1,10 +1,8 @@
 //! Companion PNG wrapper. Submits each new dithered grid to the background
 //! writer and keeps the latest error for the status line.
 
-use rthid_dither::{
-    dither::PaletteColor,
-    png::{Job, Worker},
-};
+use rthid_dither::dither::PaletteColor;
+use rthid_io::png::{Job, Worker};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -15,6 +13,7 @@ pub struct Export {
     path: PathBuf,
     worker: Option<Worker>,
     error: Option<String>,
+    elapsed: Option<std::time::Duration>,
 }
 
 impl Export {
@@ -26,6 +25,7 @@ impl Export {
         };
         Self {
             worker,
+            elapsed: None,
             error: message(&path, error),
             path,
         }
@@ -57,9 +57,15 @@ impl Export {
         if let Some(worker) = &self.worker
             && let Some(result) = worker.poll()
         {
-            return self.set_error(result.err());
+            self.elapsed = Some(result.elapsed);
+            return self.set_error(result.result.err());
         }
         false
+    }
+
+    /// Takes the last completed write duration once for the debug log.
+    pub fn take_elapsed(&mut self) -> Option<std::time::Duration> {
+        self.elapsed.take()
     }
 
     /// Waits for the last write and returns the final error, if any. Later syncs are ignored.

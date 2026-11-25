@@ -1,13 +1,14 @@
 //! Background PNG writer for the dithered grid. Each dot becomes a solid square
 //! and the file is replaced only after a complete encode.
 
-use crate::dither::{self, PaletteColor};
 use image::ImageEncoder;
+use rthid_dither::dither::{self, PaletteColor};
 use std::{
     io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 /// Integer dot size from 1 to 4 that keeps the long side within 2048 px,
@@ -28,10 +29,18 @@ pub struct Job {
     pub palette: Vec<PaletteColor>,
 }
 
+/// Result and duration of a completed PNG write. Callers decide whether to log the time.
+pub struct Completion {
+    /// Whether the file was written successfully.
+    pub result: io::Result<()>,
+    /// Time spent encoding and writing.
+    pub elapsed: Duration,
+}
+
 /// Background PNG writer. When several grids are queued only the newest is written.
 pub struct Worker {
     jobs: Option<Sender<(u64, Job)>>,
-    results: Receiver<(u64, Option<io::Error>)>,
+    results: Receiver<(u64, Completion)>,
     latest: u64,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
@@ -47,6 +56,7 @@ impl Worker {
                 let mut result = Ok(());
                 while let Ok(first) = queued.recv() {
                     let (id, job) = queued.try_iter().last().unwrap_or(first);
+                    let started = Instant::now();
                     result = write_atomic(
                         &path,
                         &job.indices,
@@ -55,11 +65,21 @@ impl Worker {
                         &job.palette,
                         preview_scale(job.w, job.h),
                     );
+                    let elapsed = started.elapsed();
                     let error = result
                         .as_ref()
                         .err()
                         .map(|error| io::Error::new(error.kind(), error.to_string()));
-                    if finished.send((id, error)).is_err() {
+                    if finished
+                        .send((
+                            id,
+                            Completion {
+                                result: error.map_or(Ok(()), Err),
+                                elapsed,
+                            },
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -84,12 +104,12 @@ impl Worker {
     }
 
     /// Returns the result for the latest submitted grid once written, ignoring replaced grids.
-    pub fn poll(&self) -> Option<io::Result<()>> {
+    pub fn poll(&self) -> Option<Completion> {
         self.results
             .try_iter()
             .filter(|(id, _)| *id == self.latest)
             .last()
-            .map(|(_, error)| error.map_or(Ok(()), Err))
+            .map(|(_, completion)| completion)
     }
 
     /// Waits for the final job and reports its result, even if it was already polled.
@@ -154,8 +174,35 @@ pub fn write_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dither::make_palette;
+    use rthid_dither::dither::make_palette;
     use std::fs;
+
+    #[test]
+    fn poll_carries_latest_write_duration_once() {
+        let (jobs, _) = mpsc::channel();
+        let (finished, results) = mpsc::channel();
+        let worker = Worker {
+            jobs: Some(jobs),
+            results,
+            latest: 2,
+            thread: None,
+        };
+        for id in [1, 2] {
+            finished
+                .send((
+                    id,
+                    Completion {
+                        result: Ok(()),
+                        elapsed: Duration::from_millis(id),
+                    },
+                ))
+                .unwrap();
+        }
+        let completion = worker.poll().unwrap();
+        assert!(completion.result.is_ok());
+        assert_eq!(completion.elapsed, Duration::from_millis(2));
+        assert!(worker.poll().is_none());
+    }
 
     #[test]
     fn preview_scale_bounds_the_long_side_with_exact_integer_dots() {
@@ -201,7 +248,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(result) = worker.poll() {
-                return result;
+                return result.result;
             }
             assert!(std::time::Instant::now() < deadline, "PNG job timed out");
             std::thread::sleep(std::time::Duration::from_millis(5));

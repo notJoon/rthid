@@ -169,7 +169,9 @@ rthid photo.png --preview-png /tmp/preview.png
 ## Environment
 
 `RTHID_DEBUG_LOG`: append frame and input diagnostics to this file for terminal
-rendering issues. Enable only while reproducing an issue: logs can grow quickly
+rendering issues. `[timing]` lines record elapsed milliseconds for `decode` and
+`list` with their paths, `sync` when the grid or dither rebuilt, `save` for config
+writes and `encode` for completed background PNG writes. Enable only while reproducing an issue: logs can grow quickly
 and slow rendering. An inaccessible path prevents startup; a write failure
 exits the application.
 

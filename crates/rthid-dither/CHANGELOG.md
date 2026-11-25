@@ -11,5 +11,3 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and tone adjustments
 - Palettes parsed from hex colors and sorted by luminance
 - `rasterize`: expands palette indices into RGBA pixels with nearest neighbor sampling
-- PNG export with a background writer that writes the latest queued grid
-- Atomic file replacement through a temporary file beside the destination

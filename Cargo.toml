@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/rthid-dither", "crates/rthid-widgets"]
+members = ["crates/rthid-dither", "crates/rthid-io", "crates/rthid-widgets"]
 
 [workspace.dependencies]
 image = "0.25.10"
@@ -19,6 +19,7 @@ clap = { version = "4.6.10", features = ["derive"] }
 image.workspace = true
 ratatui.workspace = true
 rthid-dither = { path = "crates/rthid-dither" }
+rthid-io = { path = "crates/rthid-io" }
 rthid-widgets = { path = "crates/rthid-widgets" }
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Decode, directory listing, grid sync, config save and PNG encode timings in
+  `RTHID_DEBUG_LOG`
+
 - Optional image argument with an empty start screen and image drag and drop
   through terminal bracketed paste
 - `o` to browse directories or type an image path, with home directory expansion

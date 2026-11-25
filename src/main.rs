@@ -34,8 +34,6 @@ mod grid;
 mod memo;
 /// Modal input and preset editing.
 mod modal;
-/// Paths carried by terminal paste events.
-mod paste;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -49,11 +47,12 @@ use std::{
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, ValueEnum};
-use image::{RgbaImage, imageops};
+#[cfg(test)]
+use image::RgbaImage;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{
@@ -62,12 +61,16 @@ use ratatui::crossterm::{
     },
     execute,
 };
+use rthid_io::{
+    dir::list_dir,
+    image::{check_not_source, load_image},
+    path::expand_tilde,
+};
 
 use crate::{
     app::{App, Request},
     cells::Glyphs,
     graphics::Mode as Graphics,
-    modal::Entry,
     ui::Renderer,
 };
 
@@ -88,10 +91,6 @@ impl Drop for BracketedPaste {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
-
-// Sources are shrunk on load to bound dither work per keypress.
-// Offering a full resolution export would require keeping the unshrunk original.
-const MAX_SOURCE_SIDE: u32 = 1024;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -126,84 +125,12 @@ enum CliGraphics {
     Off,
 }
 
-// The companion PNG is replaced on every re-dither, so it must never be the source image.
-// A missing destination cannot be the source, which has to exist to load.
-fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
-    if let Some(preview) = preview
-        && let (Ok(a), Ok(b)) = (source.canonicalize(), preview.canonicalize())
-        && a == b
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--preview-png must not point at the source image",
-        ));
-    }
-    Ok(())
-}
-
-// Shrinks sources on load to bound processing work.
-fn load_image(path: &Path) -> Result<RgbaImage, String> {
-    let source =
-        image::open(path).map_err(|error| format!("Could not load {}: {error}", path.display()))?;
-    Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
-        source.resize(
-            MAX_SOURCE_SIDE,
-            MAX_SOURCE_SIDE,
-            imageops::FilterType::Triangle,
-        )
-    } else {
-        source
-    }
-    .to_rgba8())
-}
-
-fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
-    let dir = dir.canonicalize()?;
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        let is_dir = metadata.is_dir();
-        if is_dir
-            || (metadata.is_file()
-                && image::ImageFormat::from_path(entry.path())
-                    .is_ok_and(|format| format.reading_enabled()))
-        {
-            entries.push(Entry { name, dir: is_dir });
-        }
-    }
-    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
-    if dir.parent().is_some() {
-        entries.insert(
-            0,
-            Entry {
-                name: "..".into(),
-                dir: true,
-            },
-        );
-    }
-    Ok((dir, entries))
-}
-
-fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(home) = home {
-        if text == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = text.strip_prefix("~/") {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(text)
-}
-
-fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
+fn handle_request(
+    app: &mut App,
+    request: Request,
+    preview_png: Option<&Path>,
+    mut debug_log: Option<&mut File>,
+) -> io::Result<()> {
     let request = match request {
         Request::Open(path, dir) => {
             let home_path = path == Path::new("~") || path.starts_with("~/");
@@ -229,17 +156,38 @@ fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
         request => request,
     };
     match request {
-        Request::List(path) => match list_dir(&path) {
-            Ok((dir, entries)) => app.set_listing(dir, entries),
-            Err(error) => {
-                app.set_notice(format!("open: {}: {error}", path.display()));
+        Request::List(path) => {
+            let started = Instant::now();
+            let result = list_dir(&path);
+            if let Some(log) = &mut debug_log {
+                writeln!(
+                    log,
+                    "[timing] list {} {}",
+                    started.elapsed().as_millis(),
+                    path.display()
+                )?;
             }
-        },
+            match result {
+                Ok((dir, entries)) => app.set_listing(dir, entries),
+                Err(error) => {
+                    app.set_notice(format!("open: {}: {error}", path.display()));
+                }
+            }
+        }
         Request::Open(path, _) => {
-            match check_not_source(&path, preview_png)
+            let started = Instant::now();
+            let result = check_not_source(&path, preview_png)
                 .map_err(|error| error.to_string())
-                .and_then(|()| load_image(&path))
-            {
+                .and_then(|()| load_image(&path));
+            if let Some(log) = &mut debug_log {
+                writeln!(
+                    log,
+                    "[timing] decode {} {}",
+                    started.elapsed().as_millis(),
+                    path.display()
+                )?;
+            }
+            match result {
                 Ok(image) => app.open_image(path, image),
                 Err(error) => {
                     app.set_notice(format!("open: {error}"));
@@ -247,6 +195,7 @@ fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
             }
         }
     }
+    Ok(())
 }
 
 // Pointer motion alone changes nothing on screen.
@@ -281,13 +230,25 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = path.map(|path| {
-        let image = load_image(&path).unwrap_or_else(|error| {
+    let source = if let Some(path) = path {
+        let started = Instant::now();
+        let image = load_image(&path);
+        if let Some(log) = &mut debug_log {
+            writeln!(
+                log,
+                "[timing] decode {} {}",
+                started.elapsed().as_millis(),
+                path.display()
+            )?;
+        }
+        let image = image.unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
         });
-        (path, image)
-    });
+        Some((path, image))
+    } else {
+        None
+    };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
     let mut messages = Vec::new();
@@ -348,8 +309,12 @@ fn event_loop(
     let mut redraw = true;
     while !app.quit {
         if redraw {
-            app.poll_export();
-            app.sync(layout.preview);
+            poll_export(app, &mut debug_log)?;
+            let started = Instant::now();
+            let rebuilt = app.sync(layout.preview);
+            if rebuilt && let Some(log) = &mut debug_log {
+                writeln!(log, "[timing] sync {}", started.elapsed().as_millis())?;
+            }
             let frame = terminal.draw(|frame| {
                 ui::draw(frame, app, &layout, renderer);
             })?;
@@ -358,14 +323,14 @@ fn event_loop(
             }
         }
         if let Some(request) = app.take_request() {
-            handle_request(app, request, preview_png);
+            handle_request(app, request, preview_png, debug_log.as_deref_mut())?;
             redraw = true;
             continue;
         }
         redraw = false;
         // With a companion PNG, wake periodically so background write results reach the status line.
         if app.has_export() && !event::poll(Duration::from_millis(50))? {
-            redraw = app.poll_export();
+            redraw = poll_export(app, &mut debug_log)?;
             continue;
         }
         // Drain queued input so held-down repeats cost one re-dither, not one each.
@@ -393,12 +358,28 @@ fn event_loop(
         }
         if app.take_save()
             && let Some(path) = config_path
-            && let Err(error) = store::save(path, &app.palettes, &app.templates)
         {
-            redraw |= app.set_notice(format!("config: {error}"));
+            let started = Instant::now();
+            let result = store::save(path, &app.palettes, &app.templates);
+            if let Some(log) = &mut debug_log {
+                writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
+            }
+            if let Err(error) = result {
+                redraw |= app.set_notice(format!("config: {error}"));
+            }
         }
     }
     Ok(())
+}
+
+fn poll_export(app: &mut App, debug_log: &mut Option<&mut File>) -> io::Result<bool> {
+    let changed = app.poll_export();
+    if let Some(elapsed) = app.take_encode_elapsed()
+        && let Some(log) = debug_log
+    {
+        writeln!(log, "[timing] encode {}", elapsed.as_millis())?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -407,68 +388,32 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn directory_listing_filters_and_sorts() {
-        let temp = tempfile::tempdir().unwrap();
-        for name in [".hidden.png", "z.png", "b.png", "notes.txt"] {
-            std::fs::write(temp.path().join(name), b"").unwrap();
-        }
-        for name in ["c", "a"] {
-            std::fs::create_dir(temp.path().join(name)).unwrap();
-        }
-        let (dir, entries) = list_dir(temp.path()).unwrap();
-        assert_eq!(dir, temp.path().canonicalize().unwrap());
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.name.as_str(), entry.dir))
-                .collect::<Vec<_>>(),
-            [
-                ("..", true),
-                ("a", true),
-                ("c", true),
-                ("b.png", false),
-                ("z.png", false)
-            ]
-        );
-        assert!(list_dir(&temp.path().join("missing")).is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(temp.path().join("a"), temp.path().join("linked")).unwrap();
-            symlink(temp.path().join("b.png"), temp.path().join("linked.png")).unwrap();
-            symlink(temp.path().join("missing"), temp.path().join("broken.png")).unwrap();
-            let (_, entries) = list_dir(temp.path()).unwrap();
-            assert_eq!(entries.len(), 7);
-            assert!(entries.contains(&Entry {
-                name: "linked".into(),
-                dir: true
-            }));
-            assert!(entries.contains(&Entry {
-                name: "linked.png".into(),
-                dir: false
-            }));
-        }
-    }
-
-    #[test]
-    fn tilde_expansion_only_uses_a_home_prefix() {
-        for (text, home, expected) in [
-            ("~", Some(Path::new("/home/me")), "/home/me"),
-            (
-                "~/photo.png",
-                Some(Path::new("/home/me")),
-                "/home/me/photo.png",
-            ),
-            (
-                "~other/photo.png",
-                Some(Path::new("/home/me")),
-                "~other/photo.png",
-            ),
-            ("photo~.png", Some(Path::new("/home/me")), "photo~.png"),
-            ("~/photo.png", None, "~/photo.png"),
-            ("~", None, "~"),
+    fn request_timings_include_operation_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("photo.png");
+        RgbaImage::new(2, 2).save(&image).unwrap();
+        let log_path = dir.path().join("debug.log");
+        let mut log = File::create(&log_path).unwrap();
+        let mut app = App::empty();
+        for request in [
+            Request::List(dir.path().into()),
+            Request::Open(image.clone(), None),
         ] {
-            assert_eq!(expand_tilde(text, home), PathBuf::from(expected));
+            handle_request(&mut app, request, None, Some(&mut log)).unwrap();
+        }
+        let text = std::fs::read_to_string(log_path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for (line, operation, path) in [
+            (lines[0], "list", dir.path()),
+            (lines[1], "decode", image.as_path()),
+        ] {
+            let rest = line
+                .strip_prefix(&format!("[timing] {operation} "))
+                .unwrap();
+            let (milliseconds, logged_path) = rest.split_once(' ').unwrap();
+            milliseconds.parse::<u128>().unwrap();
+            assert_eq!(logged_path, path.display().to_string());
         }
     }
 
@@ -480,7 +425,7 @@ mod tests {
         assert!(app.modal.is_none());
         assert!(app.notice().unwrap().starts_with("Loading "));
         let request = app.take_request().unwrap();
-        handle_request(&mut app, request, None);
+        handle_request(&mut app, request, None, None).unwrap();
         assert!(app.notice().is_none());
         let Some(modal::Modal::OpenFile(picker)) = &app.modal else {
             panic!("open dialog expected")
@@ -493,7 +438,9 @@ mod tests {
                 Some(temp.path().to_path_buf()),
             ),
             None,
-        );
+            None,
+        )
+        .unwrap();
         assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
         assert!(app.notice().unwrap().contains("Could not load"));
         assert!(
@@ -508,7 +455,9 @@ mod tests {
                 &mut app,
                 Request::Open(path, Some(temp.path().to_path_buf())),
                 None,
-            );
+                None,
+            )
+            .unwrap();
             assert_eq!(app.source_path(), Some(photo.as_path()));
         }
         assert!(app.modal.is_none());
@@ -595,16 +544,5 @@ mod tests {
         ] {
             assert!(needs_redraw(&event));
         }
-    }
-
-    #[test]
-    fn preview_png_may_not_overwrite_the_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("photo.png");
-        std::fs::write(&source, b"image").unwrap();
-        let aliased = dir.path().join(".").join("photo.png");
-        assert!(check_not_source(&source, Some(&aliased)).is_err());
-        assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
-        assert!(check_not_source(&source, None).is_ok());
     }
 }
