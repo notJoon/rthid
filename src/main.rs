@@ -191,7 +191,7 @@ fn main() -> std::io::Result<()> {
         loaded.save_blocked,
     );
     let term_program = std::env::var("TERM_PROGRAM").ok();
-    app.viewport.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
     let terminal_result = ratatui::run(|terminal| {
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));

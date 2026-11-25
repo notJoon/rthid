@@ -124,37 +124,33 @@ impl Glyphs {
     }
 }
 
-impl Viewport {
-    // Clears the minimap frame and paints the fitted overview inside its border.
-    // The border and dimming are drawn by draw_minimap.
-    fn render_minimap(
-        &self,
-        pixels: Pixels<'_>,
-        geometry: &PreviewGeometry,
-        buffer: &mut Buffer,
-        cache: &mut OverviewCache,
-    ) {
-        let Some(Minimap { frame, .. }) = geometry.minimap else {
-            return;
-        };
-        // Letterboxing hides the main preview beneath the inset.
-        Clear.render(frame, buffer);
-        let fitted = crate::viewport::geometry(
-            &Viewport {
-                zoom: Zoom::Fit,
-                ..*self
-            },
-            geometry.grid,
-            Block::bordered().inner(frame),
-        );
-        render_overview(pixels, self.glyphs, &fitted, buffer, cache);
-    }
+// Clears the minimap frame and paints the fitted overview inside its border.
+// The border and dimming are drawn by draw_minimap.
+fn render_minimap(
+    pixels: Pixels<'_>,
+    glyphs: Glyphs,
+    geometry: &PreviewGeometry,
+    buffer: &mut Buffer,
+    cache: &mut OverviewCache,
+) {
+    let Some(Minimap { frame, .. }) = geometry.minimap else {
+        return;
+    };
+    // Letterboxing hides the main preview beneath the inset.
+    Clear.render(frame, buffer);
+    let fitted = crate::viewport::geometry(
+        &Viewport::default(),
+        geometry.grid,
+        Block::bordered().inner(frame),
+    );
+    render_overview(pixels, glyphs, &fitted, buffer, cache);
 }
 
-/// Paints the visible dot region and minimap, reporting sampled Dithered approximation.
+/// Paints the visible dot region and minimap with the chosen glyphs, reporting
+/// sampled Dithered approximation.
 pub fn render(
     pixels: Pixels<'_>,
-    viewport: &Viewport,
+    glyphs: Glyphs,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     caches: &mut OverviewCaches,
@@ -166,9 +162,9 @@ pub fn render(
         render_exact(pixels, geometry, k, buffer);
         false
     } else {
-        render_overview(pixels, viewport.glyphs, geometry, buffer, &mut caches.full)
+        render_overview(pixels, glyphs, geometry, buffer, &mut caches.full)
     };
-    draw_minimap(pixels, viewport, geometry, buffer, &mut caches.inset);
+    draw_minimap(pixels, glyphs, geometry, buffer, &mut caches.inset);
     approximate
 }
 
@@ -201,7 +197,7 @@ fn render_exact(pixels: Pixels<'_>, geometry: &PreviewGeometry, k: u8, buffer: &
 // viewport to half brightness.
 fn draw_minimap(
     pixels: Pixels<'_>,
-    viewport: &Viewport,
+    glyphs: Glyphs,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
@@ -214,7 +210,7 @@ fn draw_minimap(
     else {
         return;
     };
-    viewport.render_minimap(pixels, geometry, buffer, cache);
+    render_minimap(pixels, glyphs, geometry, buffer, cache);
     Block::bordered()
         .border_style(Color::Gray)
         .render(frame, buffer);
@@ -478,13 +474,12 @@ mod tests {
     #[test]
     fn quadrant_overview_and_minimap_use_only_block_elements() {
         let (w, h, palette, indices, mut viewport) = minimap_fixture();
-        viewport.glyphs = Glyphs::Quadrant;
         let area = Rect::new(2, 3, 60, 30);
         let mut buffer = Buffer::empty(area);
         viewport.zoom = Zoom::Fit;
         render(
             indexed(&indices, &palette),
-            &viewport,
+            Glyphs::Quadrant,
             &crate::viewport::geometry(&viewport, (w, h), area),
             &mut buffer,
             &mut OverviewCaches::default(),
@@ -499,8 +494,9 @@ mod tests {
         viewport.zoom = Zoom::In(1);
         let geometry = geometry(&viewport, (w, h), area);
         let Minimap { map, .. } = geometry.minimap.unwrap();
-        viewport.render_minimap(
+        render_minimap(
             indexed(&indices, &palette),
+            Glyphs::Quadrant,
             &geometry,
             &mut buffer,
             &mut Memo::default(),
@@ -529,8 +525,9 @@ mod tests {
         let mut baseline = Buffer::empty(area);
         let geometry = geometry(&viewport, (w, h), area);
         let Minimap { frame, map, .. } = geometry.minimap.unwrap();
-        viewport.render_minimap(
+        render_minimap(
             indexed(&indices, &palette),
+            Glyphs::default(),
             &geometry,
             &mut baseline,
             &mut Memo::default(),
@@ -545,7 +542,7 @@ mod tests {
             let viewport_rect = viewport.viewport_rect(w, h, viewport.visible(w, h, area), map);
             render(
                 indexed(&indices, &palette),
-                &viewport,
+                Glyphs::default(),
                 &crate::viewport::geometry(&viewport, (w, h), area),
                 &mut current,
                 &mut OverviewCaches::default(),
@@ -625,15 +622,12 @@ mod tests {
                 255,
             ),
         ] {
-            let viewport = Viewport {
-                glyphs,
-                ..Viewport::default()
-            };
+            let viewport = Viewport::default();
             let mut buffer = Buffer::empty(area);
             assert_eq!(
                 render(
                     indexed(&indices, &palette),
-                    &viewport,
+                    glyphs,
                     &geometry(&viewport, size, area),
                     &mut buffer,
                     &mut OverviewCaches::default(),
@@ -657,7 +651,7 @@ mod tests {
         for (version, expected) in [(1, 1), (1, 1), (2, 2)] {
             render(
                 Pixels::Rgb(&pixels, version),
-                &Viewport::default(),
+                Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
                 &mut buffer,
                 &mut cache,
@@ -667,7 +661,7 @@ mod tests {
         let area = Rect::new(0, 0, 2, 2);
         render(
             Pixels::Rgb(&pixels, 2),
-            &Viewport::default(),
+            Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
             &mut cache,
@@ -677,7 +671,7 @@ mod tests {
         let updated = rgb(1, 2, &[[0; 3], [255; 3]]);
         render(
             Pixels::Rgb(&updated, 3),
-            &Viewport::default(),
+            Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
             &mut cache,
@@ -721,7 +715,7 @@ mod tests {
             for source in [indexed(&indices, &palette), Pixels::Rgb(&pixels, 1)] {
                 render(
                     source,
-                    &viewport,
+                    Glyphs::default(),
                     &before,
                     &mut buffer,
                     &mut OverviewCaches::default(),
@@ -729,7 +723,7 @@ mod tests {
                 assert_eq!(buffer[partial].bg, Color::Rgb(255, 0, 0));
                 render(
                     source,
-                    &viewport,
+                    Glyphs::default(),
                     &after,
                     &mut buffer,
                     &mut OverviewCaches::default(),
@@ -747,10 +741,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&pixels, 1),
-            &Viewport {
-                zoom: Zoom::In(1),
-                ..Viewport::default()
-            },
+            Glyphs::default(),
             &crate::viewport::geometry(
                 &Viewport {
                     zoom: Zoom::In(1),
@@ -777,7 +768,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             assert!(!render(
                 Pixels::Rgb(&rgb(4, 4, &pixels), 1),
-                &Viewport::default(),
+                Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
                 &mut buffer,
                 &mut OverviewCaches::default()
@@ -806,7 +797,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&rgb(1, 4, &pixels), 1),
-            &Viewport::default(),
+            Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
             &mut buffer,
             &mut OverviewCaches::default()
@@ -823,7 +814,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             Pixels::Rgb(&rgb(1, 2, &pixels), 1),
-            &Viewport::default(),
+            Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut buffer,
             &mut OverviewCaches::default()
@@ -849,10 +840,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             indexed(&[0, 1, 2], &palette),
-            &Viewport {
-                zoom: Zoom::In(1),
-                ..Viewport::default()
-            },
+            Glyphs::default(),
             &crate::viewport::geometry(
                 &Viewport {
                     zoom: Zoom::In(1),
@@ -881,7 +869,7 @@ mod tests {
         };
         render(
             indexed(&vec![0; 120 * 120], &palette),
-            &viewport,
+            Glyphs::default(),
             &crate::viewport::geometry(&viewport, (120, 120), area),
             &mut buffer,
             &mut OverviewCaches::default(),
@@ -907,7 +895,7 @@ mod tests {
                 };
                 render(
                     Pixels::Rgb(&pixels, version),
-                    &viewport,
+                    Glyphs::default(),
                     &geometry(&viewport, pixels.dimensions(), area),
                     &mut Buffer::empty(area),
                     &mut caches,
@@ -934,7 +922,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             assert!(!render(
                 pixels,
-                &viewport,
+                Glyphs::default(),
                 &geometry(&viewport, (2, 2), area),
                 &mut buffer,
                 &mut OverviewCaches::default()
@@ -975,7 +963,13 @@ mod tests {
             assert_eq!(g.visible, (4, 9));
             for pixels in [Pixels::Rgb(&pixels, 1), indexed(&indices, &palette)] {
                 let mut buffer = Buffer::empty(area);
-                assert!(!render(pixels, &viewport, &g, &mut buffer, &mut caches));
+                assert!(!render(
+                    pixels,
+                    Glyphs::default(),
+                    &g,
+                    &mut buffer,
+                    &mut caches
+                ));
                 for pos in area.positions() {
                     assert_eq!(buffer[pos].fg, Color::Rgb(expected, expected, expected));
                     assert_eq!(buffer[pos].bg, Color::Rgb(expected, expected, expected));
@@ -991,7 +985,6 @@ mod tests {
         let indices: Vec<_> = (0..20 * 20).map(|i| u8::from(i / 20 >= 12)).collect();
         let viewport = Viewport {
             zoom: Zoom::Out(2),
-            glyphs: Glyphs::Quadrant,
             ..Viewport::default()
         };
         let g = geometry(&viewport, (20, 20), area);
@@ -999,7 +992,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         assert!(!render(
             indexed(&indices, &palette),
-            &viewport,
+            Glyphs::Quadrant,
             &g,
             &mut buffer,
             &mut OverviewCaches::default()

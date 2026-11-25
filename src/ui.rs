@@ -140,7 +140,7 @@ pub fn log_minimap(
         };
         cells::render(
             pixels,
-            &fitted,
+            app.glyphs,
             &viewport::geometry(&fitted, geometry.grid, area),
             &mut overview,
             &mut cells::OverviewCaches::default(),
@@ -415,7 +415,7 @@ fn draw_preview(
     } else {
         cells::render(
             app.displayed(),
-            &app.viewport,
+            app.glyphs,
             geometry,
             frame.buffer_mut(),
             &mut renderer.overviews,
@@ -451,7 +451,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     let mode = if geometry.zoom == viewport::Zoom::Fit {
         format!(
             "Fit ({}){}",
-            app.viewport.glyphs.name(),
+            app.glyphs.name(),
             if report.approximate {
                 " approximate"
             } else {
@@ -891,7 +891,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Fit (sextant)"));
-        app.viewport.glyphs = cells::Glyphs::Quadrant;
+        app.glyphs = cells::Glyphs::Quadrant;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Fit (quadrant)"));
         app.viewport.zoom = viewport::Zoom::In(1);

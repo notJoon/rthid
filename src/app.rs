@@ -1,7 +1,7 @@
 //! Interactive state and the key and mouse handling that changes it.
 
 use crate::{
-    cells::Pixels,
+    cells::{Glyphs, Pixels},
     export::Export,
     grid::GridCache,
     memo::Memo,
@@ -29,7 +29,9 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Saved settings with independent palette colors.
     pub templates: Templates,
-    /// Preview zoom, glyphs, minimap and dot origin.
+    /// Glyph set for sampled Dithered cells and the minimap.
+    pub glyphs: Glyphs,
+    /// Preview zoom, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
@@ -62,6 +64,7 @@ impl App {
     ) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
+            glyphs: Glyphs::default(),
             viewport: Viewport::default(),
             preview_focus: false,
             last_drag: None,
@@ -1046,7 +1049,6 @@ mod tests {
                 x: 100,
                 y: 100,
                 hide_minimap: true,
-                ..Viewport::default()
             };
             for (kind, column, row) in [
                 (MouseEventKind::Down(MouseButton::Left), 10, 10),
