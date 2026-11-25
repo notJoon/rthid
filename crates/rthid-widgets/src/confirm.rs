@@ -2,7 +2,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::Outcome;
+use crate::{Outcome, outcome::is_release};
 
 /// Yes or no question that treats every key except a lowercase y as a no.
 ///
@@ -58,8 +58,10 @@ impl Confirm {
     /// Returns `Submit(())` for a lowercase y and `Cancel` for any other key,
     /// including an uppercase Y, Enter and Esc.
     ///
-    /// Modifiers are not checked. The result is never `Ignored` or
-    /// `Consumed`, so the caller should close the question after any key.
+    /// Modifiers are not checked. A key release returns `Ignored` so the
+    /// question survives the release of the key that opened it. Otherwise the
+    /// result is never `Ignored` or `Consumed`, so the caller should close the
+    /// question after any key.
     ///
     /// # Examples
     ///
@@ -74,7 +76,9 @@ impl Confirm {
     /// assert_eq!(confirm.handle_key(key(KeyCode::Enter)), Outcome::Cancel);
     /// ```
     pub fn handle_key(&self, key: KeyEvent) -> Outcome<()> {
-        if key.code == KeyCode::Char('y') {
+        if is_release(&key) {
+            Outcome::Ignored
+        } else if key.code == KeyCode::Char('y') {
             Outcome::Submit(())
         } else {
             Outcome::Cancel

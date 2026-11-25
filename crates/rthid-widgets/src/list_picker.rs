@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, List, ListState, StatefulWidget},
 };
 
-use crate::Outcome;
+use crate::{Outcome, outcome::is_release};
 
 /// Selection over a list of items the caller owns and passes in on each call.
 ///
@@ -91,6 +91,9 @@ impl ListPicker {
     /// - Esc returns `Cancel`.
     /// - Any other key returns `Ignored`.
     ///
+    /// A key release returns `Ignored` before anything else, so each press
+    /// moves once.
+    ///
     /// Modifiers are not checked and there is no wrapping, paging, Home or End.
     ///
     /// # Examples
@@ -108,6 +111,9 @@ impl ListPicker {
     /// assert_eq!(picker.handle_key(key(KeyCode::Esc), 3), Outcome::Cancel);
     /// ```
     pub fn handle_key(&mut self, key: KeyEvent, len: usize) -> Outcome<usize> {
+        if is_release(&key) {
+            return Outcome::Ignored;
+        }
         let last = len.saturating_sub(1);
         self.selected = self.selected.min(last);
         match key.code {

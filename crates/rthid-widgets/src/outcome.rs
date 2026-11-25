@@ -1,5 +1,7 @@
 //! Shared key handling results for parent components.
 
+use ratatui::crossterm::event::{KeyEvent, KeyEventKind};
+
 /// Result of handing a key to a component.
 ///
 /// Components never act on `Submit` or `Cancel` themselves. The caller
@@ -31,4 +33,45 @@ pub enum Outcome<T> {
     Submit(T),
     /// The user asked to dismiss the component without a value.
     Cancel,
+}
+
+// Some terminals, such as the Windows console, also report key releases.
+// Acting on them would apply every key twice, so components ignore them.
+pub(crate) fn is_release(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Release
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Confirm, ListPicker, TextInput};
+    use ratatui::crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
+
+    #[test]
+    fn components_ignore_key_releases() {
+        let release = |code| {
+            KeyEvent::new_with_kind_and_state(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+                KeyEventState::NONE,
+            )
+        };
+        assert_eq!(
+            Confirm::new("?").handle_key(release(KeyCode::Char('d'))),
+            Outcome::Ignored
+        );
+        let mut input = TextInput::new("", 8);
+        assert_eq!(
+            input.handle_key(release(KeyCode::Char('a'))),
+            Outcome::Ignored
+        );
+        assert_eq!(input.text(), "");
+        let mut picker = ListPicker::new(0);
+        assert_eq!(
+            picker.handle_key(release(KeyCode::Down), 3),
+            Outcome::Ignored
+        );
+        assert_eq!(picker.selected(), 0);
+    }
 }

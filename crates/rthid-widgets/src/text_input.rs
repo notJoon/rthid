@@ -9,7 +9,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::Outcome;
+use crate::{Outcome, outcome::is_release};
 
 /// Single line text field with a cursor and a length limit.
 ///
@@ -93,6 +93,7 @@ impl TextInput {
     /// - Enter returns `Submit(())` and Esc returns `Cancel`.
     /// - Any other key, including Tab, Up, Down, control characters and
     ///   characters with Ctrl or Alt, returns `Ignored`.
+    /// - A key release returns `Ignored`, so each press edits once.
     ///
     /// # Examples
     ///
@@ -110,6 +111,9 @@ impl TextInput {
     /// assert_eq!(input.handle_key(ctrl_a), Outcome::Ignored);
     /// ```
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome<()> {
+        if is_release(&key) {
+            return Outcome::Ignored;
+        }
         match key.code {
             KeyCode::Char(c)
                 if !c.is_control()
