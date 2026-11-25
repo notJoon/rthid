@@ -176,7 +176,8 @@ fn render_exact(pixels: Pixels<'_>, geometry: &PreviewGeometry, k: u8, buffer: &
     let (w, _) = geometry.grid;
     let area = geometry.target;
     let (ox, oy) = geometry.origin;
-    let (vw, vh) = geometry.visible;
+    // Paint the partially visible edge dot that `visible` leaves out for navigation.
+    let (vw, vh) = geometry.drawn;
     let k = u32::from(k);
     let color = |x, half_y| {
         let (x, y) = (x / k, half_y / k);
@@ -686,6 +687,57 @@ mod tests {
             cache.full.get().unwrap(),
             &[Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]
         );
+    }
+
+    #[test]
+    fn exact_painting_preserves_partial_edge_dots() {
+        let palette = make_palette(&["#000", "#f00"]).unwrap();
+        let indices: Vec<_> = (0..256)
+            .map(|i| u8::from(i % 16 == 15 || i / 16 == 15))
+            .collect();
+        let pixels = rgb(
+            16,
+            16,
+            &indices
+                .iter()
+                .map(|&i| palette[usize::from(i)].rgb)
+                .collect::<Vec<_>>(),
+        );
+        for (zoom, area, partial, full) in [
+            // Each area clips the sixteenth dot, so `partial` lies in the clipped dot and `full` in the last dot after panning.
+            (Zoom::In(3), Rect::new(0, 0, 47, 30), (46, 0), (44, 0)),
+            (Zoom::In(3), Rect::new(0, 0, 48, 23), (0, 22), (0, 21)),
+            (Zoom::In(4), Rect::new(0, 0, 64, 31), (0, 30), (0, 28)),
+        ] {
+            let mut viewport = Viewport {
+                zoom,
+                hide_minimap: true,
+                ..Viewport::default()
+            };
+            let mut buffer = Buffer::empty(area);
+            let before = geometry(&viewport, (16, 16), area);
+            viewport.pan(i64::MAX, i64::MAX, &before);
+            let after = geometry(&viewport, (16, 16), area);
+            for source in [indexed(&indices, &palette), Pixels::Rgb(&pixels, 1)] {
+                render(
+                    source,
+                    &viewport,
+                    &before,
+                    &mut buffer,
+                    &mut OverviewCaches::default(),
+                );
+                assert_eq!(buffer[partial].bg, Color::Rgb(255, 0, 0));
+                render(
+                    source,
+                    &viewport,
+                    &after,
+                    &mut buffer,
+                    &mut OverviewCaches::default(),
+                );
+                assert_eq!(buffer[full].fg, Color::Rgb(255, 0, 0));
+                assert_eq!(buffer[full].bg, Color::Rgb(255, 0, 0));
+            }
+        }
     }
 
     #[test]

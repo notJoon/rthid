@@ -277,6 +277,36 @@ mod tests {
     }
 
     #[test]
+    fn status_excludes_partial_edge_dots_until_panned() {
+        let mut app = App::new(RgbaImage::new(16, 16), None);
+        for (zoom, area, initial, panned) in [
+            // 47 columns at 3x clip the sixteenth column and 31 rows at 4x clip the sixteenth row.
+            (
+                viewport::Zoom::In(3),
+                Rect::new(0, 0, 47, 30),
+                "300% x 1-15 y 1-16",
+                "300% x 2-16 y 1-16",
+            ),
+            (
+                viewport::Zoom::In(4),
+                Rect::new(0, 0, 64, 31),
+                "400% x 1-16 y 1-15",
+                "400% x 1-16 y 2-16",
+            ),
+        ] {
+            app.viewport = viewport::Viewport {
+                zoom,
+                ..viewport::Viewport::default()
+            };
+            let before = viewport::geometry(&app.viewport, (16, 16), area);
+            assert!(status(&app, &before, PreviewReport::default()).contains(initial));
+            app.viewport.pan(i64::MAX, i64::MAX, &before);
+            let after = viewport::geometry(&app.viewport, (16, 16), area);
+            assert!(status(&app, &after, PreviewReport::default()).contains(panned));
+        }
+    }
+
+    #[test]
     fn status_uses_preview_report_and_prioritizes_export_errors() {
         let mut app = App::new(RgbaImage::new(4, 6), None);
         let geometry = app.geometry(Rect::new(1, 1, 20, 10));

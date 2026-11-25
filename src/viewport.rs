@@ -120,8 +120,10 @@ pub struct PreviewGeometry {
     pub area: Rect,
     /// Current preview scale.
     pub zoom: Zoom,
-    /// Visible dot dimensions, including partially visible dots at enlarged scales.
+    /// Fully visible dot dimensions used for navigation, status and overflow.
     pub visible: (u32, u32),
+    /// Dot dimensions to paint, which at In(k) also include the partially visible edge dot.
+    pub drawn: (u32, u32),
     /// Clamped dot origin of the visible region.
     pub origin: (u32, u32),
     /// Cells occupied by the visible region.
@@ -133,12 +135,7 @@ pub struct PreviewGeometry {
 impl PreviewGeometry {
     /// Whether any image dots lie outside the visible region.
     pub fn overflows(&self) -> bool {
-        if self.zoom == Zoom::Fit {
-            return false;
-        }
-        let (dx, dy) = self.zoom.dots_per_cell(self.grid, self.area);
-        f64::from(self.grid.0) > f64::from(self.area.width) * dx
-            || f64::from(self.grid.1) > f64::from(self.area.height) * dy
+        self.grid.0 > self.visible.0 || self.grid.1 > self.visible.1
     }
 
     /// Whole dot distance for a keyboard cell step on each axis.
@@ -168,6 +165,17 @@ pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeo
     let mut viewport = *viewport;
     viewport.clamp(w, h, area);
     let visible = viewport.visible(w, h, area);
+    // In(k) paints the partial edge dot as well, capped by the grid remaining from the origin
+    // so painting never reads past the image. Other zooms paint exactly the visible region.
+    let drawn = if let Zoom::In(k) = viewport.zoom {
+        let k = u32::from(k);
+        (
+            (w - viewport.x).min(u32::from(area.width).div_ceil(k)),
+            (h - viewport.y).min((u32::from(area.height) * 2).div_ceil(k)),
+        )
+    } else {
+        visible
+    };
     let (cw, ch) = if area.is_empty() || w == 0 || h == 0 {
         (0, 0)
     } else if viewport.zoom == Zoom::Fit {
@@ -175,8 +183,8 @@ pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeo
     } else {
         let (dx, dy) = viewport.zoom.dots_per_cell(grid, area);
         (
-            ((f64::from(visible.0) / dx).ceil() as u16).min(area.width),
-            ((f64::from(visible.1) / dy).ceil() as u16).min(area.height),
+            ((f64::from(drawn.0) / dx).ceil() as u16).min(area.width),
+            ((f64::from(drawn.1) / dy).ceil() as u16).min(area.height),
         )
     };
     let target = if viewport.zoom == Zoom::Fit {
@@ -194,6 +202,7 @@ pub fn geometry(viewport: &Viewport, grid: (u32, u32), area: Rect) -> PreviewGeo
         area,
         zoom: viewport.zoom,
         visible,
+        drawn,
         origin: (viewport.x, viewport.y),
         target,
         minimap,
@@ -206,12 +215,11 @@ impl Viewport {
         let fw = (area.width / 3).min(18);
         let frame = Rect::new(area.right() - fw, area.y, fw, (area.height / 3).min(10));
         let inner = Block::bordered().inner(frame);
-        let (dx, dy) = self.zoom.dots_per_cell((w, h), area);
+        let (vw, vh) = self.visible(w, h, area);
         if w == 0
             || h == 0
             || self.zoom == Zoom::Fit
-            || (f64::from(w) <= f64::from(area.width) * dx
-                && f64::from(h) <= f64::from(area.height) * dy)
+            || (w <= vw && h <= vh)
             || self.hide_minimap
             || inner.width < 3
             || inner.height < 3
@@ -225,7 +233,8 @@ impl Viewport {
         ))
     }
 
-    /// Dot dimensions covered by the available cells at this zoom.
+    /// Whole dots that fit. A clipped edge dot is excluded so it stays reachable by panning
+    /// and the status line does not report it as shown.
     pub(crate) fn visible(&self, w: u32, h: u32, area: Rect) -> (u32, u32) {
         if self.zoom == Zoom::Fit {
             return (w, h);
@@ -234,14 +243,7 @@ impl Viewport {
             return (0, 0);
         }
         let (dx, dy) = self.zoom.dots_per_cell((w, h), area);
-        let count = |cells: u16, dots: f64| {
-            let size = f64::from(cells) * dots;
-            if matches!(self.zoom, Zoom::In(_)) {
-                size.ceil() as u32
-            } else {
-                size.floor() as u32
-            }
-        };
+        let count = |cells: u16, dots: f64| (f64::from(cells) * dots).floor() as u32;
         (w.min(count(area.width, dx)), h.min(count(area.height, dy)))
     }
 
@@ -323,6 +325,39 @@ mod tests {
         Zoom::In(3),
         Zoom::In(4),
     ];
+
+    #[test]
+    fn partial_edge_dots_remain_reachable() {
+        for (zoom, area, visible, origin) in [
+            // 47 columns at 3x clip the sixteenth column, while 23 rows at 3x and 31 rows at 4x clip the sixteenth row.
+            (Zoom::In(3), Rect::new(0, 0, 47, 24), (15, 16), (1, 0)),
+            (Zoom::In(3), Rect::new(0, 0, 48, 23), (16, 15), (0, 1)),
+            (Zoom::In(4), Rect::new(0, 0, 64, 31), (16, 15), (0, 1)),
+        ] {
+            let mut viewport = Viewport {
+                zoom,
+                ..Viewport::default()
+            };
+            let before = geometry(&viewport, (16, 16), area);
+            assert_eq!(before.visible, visible);
+            assert_eq!(before.drawn, (16, 16));
+            assert_eq!(before.target, area);
+            assert!(before.overflows());
+            let map = before.minimap.unwrap();
+            assert_eq!(
+                map.viewport,
+                viewport.viewport_rect(16, 16, visible, map.map)
+            );
+            viewport.pan(i64::MAX, i64::MAX, &before);
+            let after = geometry(&viewport, (16, 16), area);
+            assert_eq!(after.origin, origin);
+            assert_eq!(after.drawn, visible);
+            assert_eq!(
+                (after.origin.0 + visible.0, after.origin.1 + visible.1),
+                (16, 16)
+            );
+        }
+    }
 
     #[test]
     fn zoom_step_table_and_limits() {
