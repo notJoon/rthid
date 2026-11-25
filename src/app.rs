@@ -760,6 +760,15 @@ mod tests {
         assert!(matches!(app.take_jobs().as_slice(), [Job::Export { .. }]));
         assert_eq!(app.export_status(), Some(error.as_str()));
         assert!(!app.complete(done(IoOutcome::Exported(Err(failure(Op::Encode))))));
+        let mut timeout = failure(Op::Encode);
+        timeout.cause = rthid_io::io::Cause::TimedOut;
+        assert!(app.complete(done(IoOutcome::Exported(Err(timeout)))));
+        assert!(
+            app.export_result()
+                .unwrap_err()
+                .to_string()
+                .contains("did not finish before quitting")
+        );
         assert!(app.complete(done(IoOutcome::Exported(Ok(path.clone())))));
         assert!(app.export_status().is_none());
         assert!(app.notice().is_none());

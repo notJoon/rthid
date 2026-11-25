@@ -47,6 +47,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -197,11 +198,21 @@ fn main() -> std::io::Result<()> {
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
+    let worker_panic = Arc::new(Mutex::new(None::<String>));
+    let mut pending = Vec::new();
     let mut terminal_result = ratatui::run(|terminal| {
-        let previous = std::panic::take_hook();
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
+        let worker_panic = Arc::clone(&worker_panic);
+        let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if std::thread::current().name() == Some(rthid_io::io::WORKER_NAME) {
+                let message = info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| info.payload().downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                *worker_panic.lock().unwrap() = Some(message.lines().next().unwrap_or("").into());
                 if let Some(mut log) = panic_log.as_ref() {
                     let _ = writeln!(log, "IO worker panic: {info}");
                 }
@@ -218,10 +229,16 @@ fn main() -> std::io::Result<()> {
             debug_log.as_mut(),
             config_path.as_deref(),
             &mut io,
+            &mut pending,
         )
     });
     drop(bracketed_paste);
     drop(mouse_capture);
+    terminal_result = terminal_result.and(save_on_quit(
+        config_path.as_deref(),
+        &pending,
+        &mut debug_log.as_mut(),
+    ));
     app.finish();
     for job in app.take_jobs() {
         io.submit(job);
@@ -230,7 +247,30 @@ fn main() -> std::io::Result<()> {
         terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
         app.complete(done);
     }
+    if debug_log.is_none()
+        && let Some(message) = worker_panic.lock().unwrap().as_ref()
+    {
+        eprintln!("IO worker panicked: {message}");
+    }
     terminal_result.and(app.export_result())
+}
+
+fn save_on_quit(
+    path: Option<&Path>,
+    pending: &[store::Change],
+    debug_log: &mut Option<&mut File>,
+) -> io::Result<()> {
+    if !pending.is_empty()
+        && let Some(path) = path
+    {
+        let started = Instant::now();
+        let result = store::save(path, pending);
+        if let Some(log) = debug_log {
+            writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
+        }
+        result?;
+    }
+    Ok(())
 }
 
 // Keep only the last edit for each list and name while a save is pending.
@@ -250,10 +290,10 @@ fn event_loop(
     mut debug_log: Option<&mut File>,
     config_path: Option<&Path>,
     io: &mut IO,
+    pending: &mut Vec<store::Change>,
 ) -> io::Result<()> {
     let mut layout = ui::layout(terminal.size()?);
     let mut redraw = true;
-    let mut pending = Vec::<store::Change>::new();
     let mut retry_at: Option<Instant> = None;
     while !app.quit {
         while let Some(done) = io.poll() {
@@ -314,13 +354,13 @@ fn event_loop(
         }
         let changes = app.take_changes();
         let new_changes = !changes.is_empty();
-        queue_changes(&mut pending, changes);
+        queue_changes(pending, changes);
         if !pending.is_empty()
             && (new_changes || retry_at.is_some_and(|deadline| Instant::now() >= deadline))
             && let Some(path) = config_path
         {
             let started = Instant::now();
-            let result = store::save(path, &pending);
+            let result = store::save(path, pending);
             if let Some(log) = &mut debug_log {
                 writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
             }
@@ -345,6 +385,22 @@ fn event_loop(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn quit_retries_pending_changes_and_returns_save_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let changes = vec![store::Change::UpsertTemplate(settings::Template::capture(
+            "Pending".into(),
+            &settings::Settings::default(),
+        ))];
+        std::fs::write(&path, "version = [").unwrap();
+        assert!(store::save(&path, &changes).is_err());
+        assert!(save_on_quit(Some(&path), &changes, &mut None).is_err());
+        std::fs::write(&path, "version = 1").unwrap();
+        save_on_quit(Some(&path), &changes, &mut None).unwrap();
+        assert!(store::load(&path).templates.find("Pending").is_some());
+    }
 
     #[test]
     fn pending_saves_keep_the_last_change_per_list_and_name() {

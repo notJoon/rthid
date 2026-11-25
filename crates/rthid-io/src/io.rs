@@ -206,6 +206,8 @@ pub enum Cause {
     Panicked(String),
     /// The worker stopped before executing the job.
     Stopped,
+    /// The operation was still pending at the shutdown deadline.
+    TimedOut,
 }
 
 impl fmt::Display for Cause {
@@ -216,6 +218,7 @@ impl fmt::Display for Cause {
             Self::IsSource => f.write_str("--preview-png must not point at the source image"),
             Self::Panicked(message) => write!(f, "IO job panicked: {message}"),
             Self::Stopped => f.write_str("IO worker stopped"),
+            Self::TimedOut => f.write_str("operation did not finish before quitting"),
         }
     }
 }
@@ -379,7 +382,20 @@ impl IO {
 
     fn finish_timeout(mut self, timeout: Duration) -> Vec<Done> {
         self.stop_timeout(timeout);
-        std::iter::from_fn(|| self.poll()).collect()
+        let mut done: Vec<_> = std::iter::from_fn(|| self.poll()).collect();
+        for kind in KINDS {
+            if let Some(pending) = self.pending[kind as usize].take() {
+                done.push(failure(
+                    pending.id,
+                    kind,
+                    pending.submitted.elapsed(),
+                    pending.op,
+                    pending.path,
+                    Cause::TimedOut,
+                ));
+            }
+        }
+        done
     }
 
     fn stop(&mut self) {
@@ -773,11 +789,31 @@ mod tests {
 
     #[test]
     fn finish_detaches_a_blocked_worker_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
+        let opened = worker.submit(open(dir.path().to_path_buf()));
         let resume = pause(&mut worker);
-        worker.submit(export("unused.png".into(), false));
+        let exported = worker.submit(export("unused.png".into(), false));
         let started = Instant::now();
-        assert!(worker.finish_timeout(Duration::from_millis(50)).is_empty());
+        let done = worker.finish_timeout(Duration::from_millis(50));
+        assert_eq!(done.len(), 3);
+        assert_eq!(done[0].id, opened);
+        assert!(matches!(done[0].outcome, Outcome::Opened(Ok(_))));
+        assert_eq!(done[2].id, exported);
+        assert!(matches!(
+            done[2].outcome,
+            Outcome::Exported(Err(IoError {
+                cause: Cause::TimedOut,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            done[1].outcome,
+            Outcome::Listed(Err(IoError {
+                cause: Cause::TimedOut,
+                ..
+            }))
+        ));
         assert!(started.elapsed() < Duration::from_secs(1));
         // Dropping the receiver makes the worker stop before the queued export.
         resume.send(()).unwrap();

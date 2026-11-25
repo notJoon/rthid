@@ -28,6 +28,23 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".rthid-")
+                && name.ends_with(".tmp")
+                && let Ok(metadata) = entry.metadata()
+                && metadata.is_file()
+                && let Ok(modified) = metadata.modified()
+                && modified
+                    .elapsed()
+                    .is_ok_and(|age| age > Duration::from_secs(3600))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     let (temp, mut file) = loop {
         let temp = parent.join(format!(
             ".rthid-{}-{}.tmp",
@@ -41,10 +58,8 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
         }
     };
     let mut temp = Temp(Some(temp));
-    match fs::metadata(path) {
-        Ok(metadata) => file.set_permissions(metadata.permissions())?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Ok(metadata) = fs::metadata(path) {
+        let _ = file.set_permissions(metadata.permissions());
     }
     write(&mut file)?;
     drop(file);
@@ -61,6 +76,19 @@ pub fn update<T>(
     path: &Path,
     transform: impl FnOnce(Option<String>) -> io::Result<(String, T)>,
 ) -> io::Result<T> {
+    let mut path = path.to_path_buf();
+    let mut hops = 0;
+    while let Ok(target) = fs::read_link(&path) {
+        if hops == 40 {
+            return Err(io::Error::other("config symlink loop or too many links"));
+        }
+        hops += 1;
+        path = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new(".")).join(target)
+        };
+    }
     let path = match path.canonicalize() {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -111,7 +139,10 @@ pub fn update<T>(
         file.sync_all()
     })?;
     #[cfg(unix)]
-    File::open(path.parent().unwrap())?.sync_all()?;
+    {
+        // Rename committed the edit, reporting failure could retry it over another instance's edits.
+        let _ = File::open(path.parent().unwrap()).and_then(|dir| dir.sync_all());
+    }
     Ok(result)
 }
 
@@ -169,6 +200,54 @@ mod tests {
         );
         assert!(path.with_extension("lock").exists());
         assert!(!alias.with_extension("lock").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_links_share_the_target_lock_and_reject_excessive_hops() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config");
+        let alias = dir.path().join("alias");
+        symlink("nested/config", &alias).unwrap();
+        update(&alias, |_| Ok(("created".into(), ()))).unwrap();
+        assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "created");
+        assert!(path.with_extension("lock").exists());
+        assert!(!alias.with_extension("lock").exists());
+        for hop in (0..40).rev() {
+            let target = if hop == 39 {
+                alias.clone()
+            } else {
+                dir.path().join(format!("link{}", hop + 1))
+            };
+            symlink(target, dir.path().join(format!("link{hop}"))).unwrap();
+        }
+        update(&dir.path().join("link1"), |text| Ok((text.unwrap(), ()))).unwrap();
+        assert!(update(&dir.path().join("link0"), |_| Ok((String::new(), ()))).is_err());
+        let cycle = dir.path().join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(update(&cycle, |_| Ok((String::new(), ()))).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "created");
+    }
+
+    #[test]
+    fn replacement_sweeps_only_old_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join(".rthid-old.tmp");
+        let recent = dir.path().join(".rthid-new.tmp");
+        let unrelated = dir.path().join("unrelated.tmp");
+        for path in [&old, &recent, &unrelated] {
+            File::create(path).unwrap();
+        }
+        let earlier = std::time::SystemTime::now() - Duration::from_secs(3601);
+        for path in [&old, &unrelated] {
+            File::open(path).unwrap().set_modified(earlier).unwrap();
+        }
+        replace(&dir.path().join("config"), |file| file.write_all(b"saved")).unwrap();
+        assert!(!old.exists());
+        assert!(recent.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

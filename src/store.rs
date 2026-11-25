@@ -221,6 +221,9 @@ pub fn load(path: &Path) -> Loaded {
 
 /// Parses valid entries and retains warnings and reasons to block saving.
 pub fn parse(text: &str) -> Loaded {
+    if text.trim().is_empty() {
+        return Loaded::default();
+    }
     let mut table: toml::Table = match toml::from_str(text) {
         Ok(table) => table,
         Err(error) => {
@@ -236,6 +239,7 @@ pub fn parse(text: &str) -> Loaded {
     let templates = table
         .remove("template")
         .unwrap_or(toml::Value::Array(Vec::new()));
+    table.entry("version").or_insert(toml::Value::Integer(1));
     let file: FileStore = match toml::Value::Table(table).try_into() {
         Ok(file) => file,
         Err(error) => {
@@ -306,6 +310,7 @@ pub fn parse(text: &str) -> Loaded {
 /// TOML comments and formatting are lost on save.
 pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
     atomic::update(path, |text| {
+        let text = text.filter(|text| !text.trim().is_empty());
         let mut loaded = text.as_deref().map(parse).unwrap_or_default();
         if let Some(reason) = &loaded.save_blocked {
             return Err(io::Error::other(reason.clone()));
@@ -376,6 +381,7 @@ pub fn save(path: &Path, changes: &[Change]) -> io::Result<Loaded> {
             let position = entries
                 .iter()
                 .position(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name));
+            // The UI shows one entry per name, so edits replace or remove even invalid duplicates.
             entries.retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some(name));
             if let Some(value) = replacement {
                 entries.insert(position.unwrap_or(entries.len()).min(entries.len()), value);
@@ -461,6 +467,24 @@ mod tests {
             vec![expected]
         );
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn empty_and_versionless_files_accept_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let change =
+            Change::UpsertTemplate(Template::capture("Saved".into(), &Settings::default()));
+        for text in ["", " \n\t", "[[template]]\nname = 'Existing'\n"] {
+            fs::write(&path, text).unwrap();
+            assert!(load(&path).save_blocked.is_none());
+            let loaded = save(&path, std::slice::from_ref(&change)).unwrap();
+            assert!(loaded.templates.find("Saved").is_some());
+            assert!(loaded.save_blocked.is_none());
+            if !text.trim().is_empty() {
+                assert!(loaded.templates.find("Existing").is_some());
+            }
+        }
     }
 
     #[test]
