@@ -1,4 +1,7 @@
-use crate::view::{Pixels, RgbOverviewCache, View};
+use crate::{
+    ui::Layout,
+    view::{Pixels, PreviewGeometry, RgbOverviewCache, View},
+};
 use image::{RgbaImage, imageops};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -99,7 +102,6 @@ pub struct App {
     png_worker: Option<Worker>,
     pub view: View,
     pub preview_focus: bool,
-    pub preview_area: Rect,
     last_drag: Option<(u16, u16)>,
     pub source: RgbaImage,
     pub params: Params,
@@ -129,7 +131,6 @@ impl App {
             png_worker,
             view: View::default(),
             preview_focus: false,
-            preview_area: Rect::default(),
             last_drag: None,
             source,
             params: Params::default(),
@@ -167,8 +168,16 @@ impl App {
         }
     }
 
+    /// Refreshes image consumers and clamps the view to the current layout.
+    pub fn sync(&mut self, layout: &Layout) -> bool {
+        let status_changed = self.refresh();
+        let (w, h) = self.grid_size();
+        self.view.clamp(w, h, layout.preview);
+        status_changed
+    }
+
     // Rebuilds the grid when needed and dithers only when a consumer needs it.
-    pub fn refresh(&mut self) -> bool {
+    fn refresh(&mut self) -> bool {
         let mut status_changed = self.poll_png();
         if self.dirty {
             self.dirty = false;
@@ -263,20 +272,21 @@ impl App {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    /// Applies mouse input using the current preview coordinates.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry) {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
-        if !self.view.exact || !self.preview_area.contains(point.into()) {
+        if !self.view.exact || !geometry.area.contains(point.into()) {
             return;
         }
-        let (w, h) = self.grid_size();
+        let (w, h) = geometry.grid;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some((_, map)) = self.view.minimap(w, h, self.preview_area)
-                    && map.contains(point.into())
+                if let Some(minimap) = geometry.minimap
+                    && minimap.map.contains(point.into())
                 {
                     self.view
-                        .center_on_minimap(point, w, h, self.preview_area, map);
+                        .center_on_minimap(point, w, h, geometry.area, minimap.map);
                 } else {
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
                         && let Some((x, y)) = prev
@@ -286,22 +296,23 @@ impl App {
                             (i64::from(y) - i64::from(mouse.row)) * 2,
                             w,
                             h,
-                            self.preview_area,
+                            geometry.area,
                         );
                     }
                     self.last_drag = Some(point);
                 }
             }
-            MouseEventKind::ScrollUp => self.view.pan(0, -6, w, h, self.preview_area),
-            MouseEventKind::ScrollDown => self.view.pan(0, 6, w, h, self.preview_area),
+            MouseEventKind::ScrollUp => self.view.pan(0, -6, w, h, geometry.area),
+            MouseEventKind::ScrollDown => self.view.pan(0, 6, w, h, geometry.area),
             // Trackpads send horizontal swipes as sideways scrolls.
-            MouseEventKind::ScrollLeft => self.view.pan(-6, 0, w, h, self.preview_area),
-            MouseEventKind::ScrollRight => self.view.pan(6, 0, w, h, self.preview_area),
+            MouseEventKind::ScrollLeft => self.view.pan(-6, 0, w, h, geometry.area),
+            MouseEventKind::ScrollRight => self.view.pan(6, 0, w, h, geometry.area),
             _ => {}
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    /// Applies a key using the current preview coordinates for panning.
+    pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -324,8 +335,8 @@ impl App {
             return;
         }
         if self.preview_focus {
-            let (w, h) = self.grid_size();
-            let (vw, vh) = self.view.visible(w, h, self.preview_area);
+            let (w, h) = geometry.grid;
+            let (vw, vh) = geometry.visible;
             let page_x = i64::from(vw.saturating_sub(2).max(1));
             let page_y = i64::from(vh.saturating_sub(2).max(1));
             let pan = match key.code {
@@ -350,7 +361,7 @@ impl App {
             };
             if let Some((dx, dy)) = pan {
                 if self.view.exact {
-                    self.view.pan(dx, dy, w, h, self.preview_area);
+                    self.view.pan(dx, dy, w, h, geometry.area);
                 }
                 return;
             }
@@ -445,18 +456,29 @@ impl App {
 mod tests {
     use super::*;
 
+    fn test_layout() -> Layout {
+        crate::ui::layout(Rect::new(0, 0, 41, 9))
+    }
+
+    fn preview_geometry(app: &App, area: Rect) -> PreviewGeometry {
+        crate::view::geometry(&app.view, app.grid_size(), area)
+    }
+
     // Returns whether the key asked for a re-dither, then performs it.
     fn press(app: &mut App, code: KeyCode) -> bool {
-        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle_key(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            &preview_geometry(app, test_layout().preview),
+        );
         let dirty = app.dirty;
-        app.refresh();
+        app.sync(&test_layout());
         dirty
     }
 
     fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            app.refresh();
+            app.sync(&test_layout());
             if ready(app) {
                 return;
             }
@@ -473,6 +495,26 @@ mod tests {
         app.parameter_list
             .select(PARAMS.iter().position(|&p| p == param));
         app
+    }
+
+    #[test]
+    fn sync_clamps_after_layout_and_grid_changes() {
+        let mut app = App::new(RgbaImage::new(120, 80), None);
+        for (screen, scale, rotation, expected) in [
+            (Rect::new(0, 0, 41, 9), 100, 0, (110, 70)),
+            (Rect::new(0, 0, 100, 40), 100, 0, (51, 8)),
+            (Rect::new(0, 0, 100, 40), 50, 0, (0, 0)),
+            (Rect::new(0, 0, 100, 40), 100, 1, (11, 48)),
+        ] {
+            app.params.scale = scale;
+            app.params.rotation = rotation;
+            app.dirty = true;
+            app.view.x = 999;
+            app.view.y = 999;
+            app.sync(&crate::ui::layout(screen));
+            assert_eq!((app.view.x, app.view.y), expected);
+            assert_eq!(app.original.dimensions(), app.grid_size());
+        }
     }
 
     #[test]
@@ -510,9 +552,12 @@ mod tests {
         assert!(app.show_original);
         assert!(app.indices.is_empty());
         assert!(app.dither_stale);
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &preview_geometry(&app, test_layout().preview),
+        );
         assert!(!app.dirty);
-        app.refresh();
+        app.sync(&test_layout());
         let (w, h) = app.grid_size();
         assert_eq!(app.indices.len(), (w * h) as usize);
         assert!(!app.dither_stale);
@@ -629,8 +674,14 @@ mod tests {
         app.params.options.tone.gamma = 2.0;
         assert!(press(&mut app, KeyCode::Char('D')));
         assert_eq!(app.params.options.tone.gamma, 1.0);
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &preview_geometry(&app, test_layout().preview),
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &preview_geometry(&app, test_layout().preview),
+        );
         assert!(app.dirty);
     }
 
@@ -647,12 +698,12 @@ mod tests {
         let mut app = app_at(Param::Scale);
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
-        app.handle_key(release);
+        app.handle_key(release, &preview_geometry(&app, test_layout().preview));
         assert!(!app.quit);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        app.handle_key(ctrl('r'));
+        app.handle_key(ctrl('r'), &preview_geometry(&app, test_layout().preview));
         assert!(!app.dirty);
-        app.handle_key(ctrl('c'));
+        app.handle_key(ctrl('c'), &preview_geometry(&app, test_layout().preview));
         assert!(app.quit);
     }
 
@@ -683,7 +734,6 @@ mod tests {
     #[test]
     fn tab_and_preview_keys_change_view_without_redithering() {
         let mut app = App::new(RgbaImage::new(40, 40), None);
-        app.preview_area = ratatui::layout::Rect::new(0, 0, 10, 5);
         assert!(!press(&mut app, KeyCode::Char('z')));
         assert!(!app.view.exact);
         assert!(!press(&mut app, KeyCode::Tab));
@@ -725,21 +775,18 @@ mod tests {
             (Glyphs::Quadrant, Rect::new(38, 4, 9, 4), (36, 27)),
         ] {
             let mut app = App::new(RgbaImage::new(120, 120), None);
-            app.preview_area = Rect::new(2, 3, 48, 18);
+            let area = Rect::new(2, 3, 48, 18);
             app.view.exact = true;
             app.view.glyphs = glyphs;
-            let mut buffer = Buffer::empty(app.preview_area);
-            let (_, map, _) = app
-                .view
-                .render_minimap(
-                    app.displayed(),
-                    120,
-                    120,
-                    app.preview_area,
-                    &mut buffer,
-                    &mut RgbOverviewCache::default(),
-                )
-                .unwrap();
+            let mut buffer = Buffer::empty(area);
+            let geometry = preview_geometry(&app, area);
+            let map = geometry.minimap.unwrap().map;
+            app.view.render_minimap(
+                app.displayed(),
+                &geometry,
+                &mut buffer,
+                &mut RgbOverviewCache::default(),
+            );
             assert_eq!(map, expected);
             assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);
             for (kind, column, row, expected) in [
@@ -762,12 +809,15 @@ mod tests {
                     (0, 0),
                 ),
             ] {
-                app.handle_mouse(MouseEvent {
-                    kind,
-                    column,
-                    row,
-                    modifiers: KeyModifiers::NONE,
-                });
+                app.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &preview_geometry(&app, area),
+                );
                 assert_eq!((app.view.x, app.view.y), expected, "{glyphs:?}");
                 assert!(!app.dirty);
             }
@@ -777,16 +827,19 @@ mod tests {
     #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
-        app.preview_area = Rect::new(2, 3, 48, 18);
+        let area = Rect::new(2, 3, 48, 18);
         app.view.exact = true;
-        let (_, map) = app.view.minimap(120, 120, app.preview_area).unwrap();
+        let map = preview_geometry(&app, area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
-            app.handle_mouse(MouseEvent {
-                kind,
-                column,
-                row,
-                modifiers: KeyModifiers::NONE,
-            });
+            app.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &preview_geometry(app, area),
+            );
             assert!(!app.dirty);
             assert!(!app.preview_focus);
         };
@@ -839,7 +892,6 @@ mod tests {
     #[test]
     fn preview_page_keys_use_overlap_and_clamp_without_redithering() {
         let mut app = App::new(RgbaImage::new(40, 40), None);
-        app.preview_area = Rect::new(2, 3, 10, 5);
         app.preview_focus = true;
         app.view.exact = true;
         assert!(!press(&mut app, KeyCode::Char('L')));
@@ -860,7 +912,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rthid-quit-test-{}.png", std::process::id()));
         let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
         for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
-            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            app.handle_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &preview_geometry(&app, test_layout().preview),
+            );
         }
         assert!(app.quit);
         assert!(app.dirty);
@@ -876,7 +931,7 @@ mod tests {
         let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
         let wait_for_change = |app: &mut App| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !app.refresh() {
+            while !app.sync(&test_layout()) {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "PNG status change timed out"
@@ -891,13 +946,13 @@ mod tests {
                 .unwrap()
                 .starts_with(&format!("PNG {}: ", path.display()))
         );
-        assert!(!app.refresh());
+        assert!(!app.sync(&test_layout()));
         std::fs::remove_dir(&path).unwrap();
         app.dirty = true;
-        assert!(!app.refresh());
+        assert!(!app.sync(&test_layout()));
         wait_for_change(&mut app);
         assert!(app.png_error.is_none());
-        assert!(!app.refresh());
+        assert!(!app.sync(&test_layout()));
         drop(app);
         std::fs::remove_file(path).unwrap();
     }
@@ -913,7 +968,7 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         app.png_error = Some("previous write failed".into());
         app.dirty = true;
-        app.refresh();
+        app.sync(&test_layout());
         assert_eq!(app.png_error.as_deref(), Some("previous write failed"));
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
@@ -933,17 +988,17 @@ mod tests {
             image::open(&path).is_ok_and(|image| image.width() == 8)
         });
         std::fs::remove_file(&path).unwrap();
-        app.refresh();
+        app.sync(&test_layout());
         assert!(!path.exists());
         std::fs::create_dir(&path).unwrap();
         app.dirty = true;
-        app.refresh();
+        app.sync(&test_layout());
         wait_for(&mut app, |app| app.png_error.is_some());
-        app.refresh();
+        app.sync(&test_layout());
         assert!(app.png_error.is_some());
         std::fs::remove_dir(&path).unwrap();
         app.dirty = true;
-        app.refresh();
+        app.sync(&test_layout());
         wait_for(&mut app, |app| app.png_error.is_none());
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();

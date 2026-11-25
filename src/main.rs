@@ -190,19 +190,21 @@ fn main() -> std::io::Result<()> {
             });
         }
         execute!(io::stdout(), EnableMouseCapture)?;
+        let size = terminal.size()?;
+        let mut layout = ui::layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
         let mut redraw = true;
         while !app.quit {
             if redraw {
-                app.refresh();
-                let frame = terminal.draw(|frame| app.draw(frame))?;
+                app.sync(&layout);
+                let frame = terminal.draw(|frame| app.draw(frame, &layout))?;
                 if let Some(log) = &mut debug_log {
-                    app.log_minimap(log, &frame)?;
+                    app.log_minimap(log, &frame, &layout)?;
                 }
             }
             redraw = false;
             // With a companion PNG, wake periodically so background write results reach the status line.
             if app.preview_png.is_some() && !event::poll(Duration::from_millis(50))? {
-                redraw = app.refresh();
+                redraw = app.sync(&layout);
                 continue;
             }
             // Drain queued input so held-down repeats cost one re-dither, not one each.
@@ -212,9 +214,13 @@ fn main() -> std::io::Result<()> {
                     writeln!(log, "event {event:?}")?;
                 }
                 redraw |= needs_redraw(&event);
+                let geometry = view::geometry(&app.view, app.grid_size(), layout.preview);
                 match event {
-                    Event::Key(key) => app.handle_key(key),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Key(key) => app.handle_key(key, &geometry),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse, &geometry),
+                    Event::Resize(width, height) => {
+                        layout = ui::layout(ratatui::layout::Rect::new(0, 0, width, height));
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {

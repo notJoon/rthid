@@ -185,6 +185,56 @@ pub struct View {
     pub y: u32,
 }
 
+/// Preview coordinates shared by input handling and rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewGeometry {
+    /// Image dimensions after scaling and rotation.
+    pub grid: (u32, u32),
+    /// Terminal cells available for the preview.
+    pub area: Rect,
+    /// Image dimensions visible in exact mode.
+    pub visible: (u32, u32),
+    /// Clamped image origin in exact mode.
+    pub origin: (u32, u32),
+    /// Overview inset when exact mode has room for it.
+    pub minimap: Option<Minimap>,
+}
+
+/// Minimap border, fitted image, and visible image region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Minimap {
+    /// Border surrounding the overview.
+    pub frame: Rect,
+    /// Image cells inside the border.
+    pub map: Rect,
+    /// Visible portion of the image projected onto the map.
+    pub viewport: Rect,
+}
+
+/// Computes preview coordinates with a clamped origin without changing the view.
+pub fn geometry(view: &View, grid: (u32, u32), area: Rect) -> PreviewGeometry {
+    let (w, h) = grid;
+    let mut view = *view;
+    view.clamp(w, h, area);
+    let visible = view.visible(w, h, area);
+    let minimap = if w == 0 || h == 0 {
+        None
+    } else {
+        view.minimap(w, h, area).map(|(frame, map)| Minimap {
+            frame,
+            map,
+            viewport: view.viewport_rect(w, h, visible, map),
+        })
+    };
+    PreviewGeometry {
+        grid,
+        area,
+        visible,
+        origin: (view.x, view.y),
+        minimap,
+    }
+}
+
 impl View {
     pub fn minimap(&self, w: u32, h: u32, area: Rect) -> Option<(Rect, Rect)> {
         // A bordered frame in the top-right corner; the overview fits inside the border.
@@ -224,32 +274,28 @@ impl View {
         self.clamp(w, h, area);
     }
 
+    /// Paints the undimmed overview into the supplied minimap frame.
     pub fn render_minimap(
         &self,
         pixels: Pixels<'_>,
-        w: u32,
-        h: u32,
-        area: Rect,
+        geometry: &PreviewGeometry,
         buffer: &mut Buffer,
         cache: &mut RgbOverviewCache,
-    ) -> Option<(Rect, Rect, Rect)> {
-        let (frame, map) = self.minimap(w, h, area)?;
+    ) {
+        let Some(Minimap { frame, .. }) = geometry.minimap else {
+            return;
+        };
         // Clear letterboxing so the 1:1 dots cannot show through the inset.
         Clear.render(frame, buffer);
         render_overview(
             pixels,
-            w,
-            h,
+            geometry.grid.0,
+            geometry.grid.1,
             self.glyphs,
             Block::bordered().inner(frame),
             buffer,
             cache,
         );
-        Some((
-            frame,
-            map,
-            self.viewport_rect(w, h, self.visible(w, h, area), map),
-        ))
     }
 
     pub fn center_on_minimap(&mut self, point: (u16, u16), w: u32, h: u32, area: Rect, map: Rect) {
@@ -332,6 +378,7 @@ fn render_exact(
     draw_minimap(pixels, w, h, view, area, buffer, cache);
 }
 
+/// Paints the minimap and dims cells outside the visible image region.
 pub fn draw_minimap(
     pixels: Pixels<'_>,
     w: u32,
@@ -341,7 +388,14 @@ pub fn draw_minimap(
     buffer: &mut Buffer,
     cache: &mut RgbOverviewCache,
 ) {
-    if let Some((frame, map, viewport)) = view.render_minimap(pixels, w, h, area, buffer, cache) {
+    let geometry = geometry(view, (w, h), area);
+    if let Some(Minimap {
+        frame,
+        map,
+        viewport,
+    }) = geometry.minimap
+    {
+        view.render_minimap(pixels, &geometry, buffer, cache);
         Block::bordered()
             .border_style(Color::Gray)
             .render(frame, buffer);
@@ -481,6 +535,79 @@ mod tests {
     use image::Rgba;
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid::dither::make_palette;
+
+    #[test]
+    fn geometry_preserves_visible_size_and_minimap_coordinates() {
+        let area = Rect::new(2, 3, 48, 18);
+        for (exact, hidden, grid, area, origin, visible, expected_minimap) in [
+            (false, false, (120, 120), area, (72, 84), (48, 36), None),
+            (true, true, (120, 120), area, (72, 84), (48, 36), None),
+            (
+                true,
+                false,
+                (120, 120),
+                area,
+                (72, 84),
+                (48, 36),
+                Some(Minimap {
+                    frame: Rect::new(34, 3, 16, 6),
+                    map: Rect::new(38, 4, 9, 4),
+                    viewport: Rect::new(43, 6, 4, 2),
+                }),
+            ),
+            (
+                true,
+                false,
+                (120, 120),
+                Rect::new(2, 3, 10, 5),
+                (110, 110),
+                (10, 10),
+                None,
+            ),
+            (
+                true,
+                false,
+                (120, 120),
+                Rect::default(),
+                (120, 120),
+                (0, 0),
+                None,
+            ),
+            (true, false, (0, 0), area, (0, 0), (0, 0), None),
+            (
+                true,
+                false,
+                (2, 3),
+                area,
+                (0, 0),
+                (2, 3),
+                Some(Minimap {
+                    frame: Rect::new(34, 3, 16, 6),
+                    map: Rect::new(39, 4, 6, 4),
+                    viewport: Rect::new(39, 4, 6, 4),
+                }),
+            ),
+        ] {
+            let view = View {
+                exact,
+                hide_minimap: hidden,
+                x: 999,
+                y: 999,
+                ..View::default()
+            };
+            assert_eq!(
+                geometry(&view, grid, area),
+                PreviewGeometry {
+                    grid,
+                    area,
+                    visible,
+                    origin,
+                    minimap: expected_minimap,
+                },
+            );
+            assert_eq!((view.x, view.y), (999, 999));
+        }
+    }
 
     fn indexed<'a>(indices: &'a [u8], palette: &'a [PaletteColor]) -> Pixels<'a> {
         Pixels::Indexed { indices, palette }
@@ -643,16 +770,14 @@ mod tests {
         assert!(buffer.content.iter().all(is_block));
         assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
         view.exact = true;
-        let (_, map, _) = view
-            .render_minimap(
-                indexed(&indices, &palette),
-                w,
-                h,
-                area,
-                &mut buffer,
-                &mut RgbOverviewCache::default(),
-            )
-            .unwrap();
+        let geometry = geometry(&view, (w, h), area);
+        let Minimap { map, .. } = geometry.minimap.unwrap();
+        view.render_minimap(
+            indexed(&indices, &palette),
+            &geometry,
+            &mut buffer,
+            &mut RgbOverviewCache::default(),
+        );
         assert!(map.positions().all(|pos| is_block(&buffer[pos])));
         assert!(map.positions().any(|pos| buffer[pos].symbol() != " "));
     }
@@ -675,16 +800,14 @@ mod tests {
         let area = Rect::new(2, 3, 60, 30);
         let (w, h, palette, indices, mut view) = minimap_fixture();
         let mut baseline = Buffer::empty(area);
-        let (frame, map, _) = view
-            .render_minimap(
-                indexed(&indices, &palette),
-                w,
-                h,
-                area,
-                &mut baseline,
-                &mut RgbOverviewCache::default(),
-            )
-            .unwrap();
+        let geometry = geometry(&view, (w, h), area);
+        let Minimap { frame, map, .. } = geometry.minimap.unwrap();
+        view.render_minimap(
+            indexed(&indices, &palette),
+            &geometry,
+            &mut baseline,
+            &mut RgbOverviewCache::default(),
+        );
         Block::bordered()
             .border_style(Color::Gray)
             .render(frame, &mut baseline);
@@ -736,16 +859,14 @@ mod tests {
         let area = Rect::new(0, 0, 60, 30);
         let (w, h, palette, indices, mut view) = minimap_fixture();
         let mut baseline = Buffer::empty(area);
-        let (frame, map, _) = view
-            .render_minimap(
-                indexed(&indices, &palette),
-                w,
-                h,
-                area,
-                &mut baseline,
-                &mut RgbOverviewCache::default(),
-            )
-            .unwrap();
+        let geometry = geometry(&view, (w, h), area);
+        let Minimap { frame, map, .. } = geometry.minimap.unwrap();
+        view.render_minimap(
+            indexed(&indices, &palette),
+            &geometry,
+            &mut baseline,
+            &mut RgbOverviewCache::default(),
+        );
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut previous: Option<(Buffer, Rect)> = None;
         let mut bytes = Vec::<u8>::new();
