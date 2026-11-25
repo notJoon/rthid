@@ -120,6 +120,14 @@ impl Graphics {
         }
     }
 
+    /// Builds a protocol renderer without querying the terminal.
+    #[cfg(test)]
+    pub(crate) fn for_protocol(protocol: ProtocolType) -> Self {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(protocol);
+        Self::new(picker)
+    }
+
     /// Returns the protocol label used in the status line.
     pub fn name(&self) -> &'static str {
         self.name
@@ -298,21 +306,12 @@ mod tests {
     #[test]
     fn graphics_ignores_source_alpha() {
         let grid = RgbaImage::from_raw(1, 2, vec![25, 26, 128, 0, 231, 47, 93, 128]).unwrap();
-        for exact in [false, true] {
-            let (_, image) = original_image(
-                &grid,
-                &crate::view::geometry(
-                    &View {
-                        exact,
-                        ..View::default()
-                    },
-                    grid.dimensions(),
-                    Rect::new(0, 0, 1, 1),
-                ),
-                (1, 2),
-            );
-            assert_eq!(image.as_raw(), &[25, 26, 128, 255, 231, 47, 93, 255]);
-        }
+        let (_, image) = original_image(
+            &grid,
+            &crate::view::geometry(&View::default(), grid.dimensions(), Rect::new(0, 0, 1, 1)),
+            (1, 2),
+        );
+        assert_eq!(image.as_raw(), &[25, 26, 128, 255, 231, 47, 93, 255]);
     }
 
     #[test]
@@ -350,7 +349,6 @@ mod tests {
         }
     }
 
-    use crate::{app::App, ui::layout};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -361,49 +359,24 @@ mod tests {
 
     #[test]
     fn graphics_cache_tracks_overview_grid_and_area() {
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        let mut picker = ratatui_image::picker::Picker::halfblocks();
-        picker.set_protocol_type(ProtocolType::Kitty);
-        let mut graphics = Graphics::new(picker);
+        let pixels = RgbaImage::new(120, 120);
+        let mut graphics = Graphics::for_protocol(ProtocolType::Iterm2);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        let mut draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
-            app.sync(layout(terminal.size().unwrap()).preview);
+        for (grid_version, area, expected) in [
+            (1, Rect::new(1, 1, 69, 36), 1),
+            (1, Rect::new(1, 1, 69, 36), 1),
+            (2, Rect::new(1, 1, 69, 36), 2),
+            (2, Rect::new(1, 1, 59, 31), 3),
+            (2, Rect::new(1, 1, 59, 31), 3),
+        ] {
+            let geometry = crate::view::geometry(&View::default(), pixels.dimensions(), area);
             terminal
                 .draw(|frame| {
-                    let geometry = app.geometry(layout(frame.area()).preview);
-                    graphics.present(
-                        frame,
-                        (app.show_original && !app.view.exact && !geometry.area.is_empty())
-                            .then(|| (app.pipeline.grid(), app.pipeline.grid_version(), &geometry)),
-                    );
+                    graphics.present(frame, Some((&pixels, grid_version, &geometry)));
                 })
                 .unwrap();
-            graphics.cache.version()
-        };
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.params.options.strength = 0.5;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.x = 1;
-        app.view.y = 1;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.exact = true;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.x = 2;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.hide_minimap = true;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.exact = false;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.exact = true;
-        app.params.rotation = crate::app::Rotation::R180;
-        assert_eq!(draw(&mut app, &mut terminal), 1);
-        app.view.exact = false;
-        assert_eq!(draw(&mut app, &mut terminal), 2);
-        assert_eq!(draw(&mut app, &mut terminal), 2);
-        app.params.scale = 50;
-        assert_eq!(draw(&mut app, &mut terminal), 3);
-        terminal.backend_mut().resize(90, 35);
-        assert_eq!(draw(&mut app, &mut terminal), 4);
+            assert_eq!(graphics.cache.version(), expected);
+        }
     }
 
     #[test]

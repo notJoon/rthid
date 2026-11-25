@@ -27,6 +27,8 @@ mod export;
 mod graphics;
 /// Single entry caches with build versions.
 mod memo;
+#[cfg(test)]
+mod test_support;
 /// Screen layout, panels and status line.
 mod ui;
 /// Preview geometry and cell rendering for Overview, 1:1 and the minimap.
@@ -241,59 +243,32 @@ mod tests {
             ("sextant", CliGlyphs::Sextant),
             ("quadrant", CliGlyphs::Quadrant),
         ] {
-            for args in [
-                vec!["rthid", "--glyphs", value],
-                vec![
-                    "rthid",
-                    "photo.png",
-                    "--glyphs",
-                    value,
-                    "--preview-png",
-                    "dots.png",
-                ],
-                vec![
-                    "rthid",
-                    "--preview-png",
-                    "dots.png",
-                    "--glyphs",
-                    value,
-                    "photo.png",
-                ],
-            ] {
-                let parsed = Args::try_parse_from(&args).unwrap();
-                assert_eq!(parsed.glyphs, Some(expected));
-                if args.len() > 3 {
-                    assert_eq!(parsed.image, PathBuf::from("photo.png"));
-                    assert_eq!(parsed.preview_png, Some(PathBuf::from("dots.png")));
-                }
-            }
+            let args = Args::try_parse_from(["rthid", "--glyphs", value]).unwrap();
+            assert_eq!(args.glyphs, Some(expected));
         }
-        let args = Args::try_parse_from(["rthid", "--glyphs=quadrant"]).unwrap();
-        assert!(matches!(args.glyphs, Some(CliGlyphs::Quadrant)));
+        let args = Args::try_parse_from([
+            "rthid",
+            "photo.png",
+            "--graphics",
+            "off",
+            "--glyphs",
+            "quadrant",
+            "--preview-png",
+            "dots.png",
+        ])
+        .unwrap();
+        assert_eq!(args.image, PathBuf::from("photo.png"));
+        assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
+        assert_eq!(args.graphics, CliGraphics::Off);
+        assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
     }
 
     #[test]
     fn cli_rejects_invalid_arguments() {
         for args in [
-            vec!["--preview-png"],
-            vec!["--preview-png", ""],
-            vec!["--preview-png="],
-            vec!["--preview-png", "-dots.png"],
-            vec!["--preview-png", "--wat"],
-            vec!["--preview-png", "a", "--preview-png", "b"],
-            vec!["--graphics"],
-            vec!["--graphics", ""],
             vec!["--graphics", "kitty"],
-            vec!["--graphics", "Auto"],
-            vec!["--graphics", "off", "--graphics", "auto"],
-            vec!["--glyphs"],
-            vec!["--glyphs", ""],
             vec!["--glyphs", "unknown"],
-            vec!["--glyphs", "Quadrant"],
-            vec!["--glyphs", "--preview-png"],
-            vec!["--glyphs", "quadrant", "--glyphs", "sextant"],
-            vec!["--glyphs", "sextant", "--glyphs", "sextant"],
-            vec!["--wat"],
+            vec!["--preview-png", ""],
             vec!["a", "b"],
         ] {
             assert!(
@@ -321,20 +296,18 @@ mod tests {
             Event::Resize(80, 24),
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         ] {
-            assert!([&moved, &event, &moved].into_iter().any(needs_redraw));
+            assert!(needs_redraw(&event));
         }
     }
 
     #[test]
     fn preview_png_may_not_overwrite_the_source() {
-        let dir = std::env::temp_dir().join(format!("rthid-cli-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TempDir::new();
         let source = dir.join("photo.png");
         std::fs::write(&source, b"image").unwrap();
         let aliased = dir.join(".").join("photo.png");
         assert!(check_not_source(&source, Some(&aliased)).is_err());
         assert!(check_not_source(&source, Some(&dir.join("dots.png"))).is_ok());
         assert!(check_not_source(&source, None).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

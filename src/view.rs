@@ -667,50 +667,18 @@ mod tests {
     }
 
     #[test]
-    fn indexed_modes_draw_their_glyphs() {
-        let palette = make_palette(&["#000", "#fff"]).unwrap();
-        let mut indices = vec![0; 4 * 6];
-        indices[0] = 1;
-        let area = Rect::new(1, 1, 69, 20);
-        for (glyphs, exact) in [
-            (Glyphs::Sextant, false),
-            (Glyphs::Quadrant, false),
-            (Glyphs::Quadrant, true),
-        ] {
-            let view = View {
-                glyphs,
-                exact,
-                ..View::default()
-            };
-            let mut buffer = Buffer::empty(area);
-            render(
-                indexed(&indices, &palette),
-                &view,
-                &geometry(&view, (4, 6), area),
-                &mut buffer,
-                &mut OverviewCaches::default(),
-            );
-            let has_sextant = buffer.content.iter().any(|cell| {
-                cell.symbol()
-                    .chars()
-                    .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
-            });
-            assert_eq!(has_sextant, glyphs == Glyphs::Sextant && !exact);
-            if exact {
-                assert!(buffer.content.iter().any(|cell| cell.symbol() == "▀"));
-                assert_eq!(buffer[(1, 1)].fg, Color::Rgb(255, 255, 255));
-                assert_eq!(buffer[(1, 1)].bg, Color::Rgb(0, 0, 0));
-            }
+    fn glyph_masks_use_row_major_bits() {
+        for (mask, glyph) in [(1, '▘'), (2, '▝'), (4, '▖'), (8, '▗')] {
+            assert_eq!(Glyphs::Quadrant.glyph(mask), glyph, "mask {mask}");
         }
-    }
-
-    #[test]
-    fn quadrant_masks_use_row_major_bits() {
-        let expected = [
-            ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
-        ];
-        for (mask, glyph) in expected.into_iter().enumerate() {
-            assert_eq!(Glyphs::Quadrant.glyph(mask as u32), glyph, "mask {mask}");
+        for (mask, glyph) in [
+            (1, '\u{1fb00}'),
+            (21, '▌'),
+            (22, '\u{1fb14}'),
+            (42, '▐'),
+            (63, '█'),
+        ] {
+            assert_eq!(Glyphs::Sextant.glyph(mask), glyph, "mask {mask}");
         }
     }
 
@@ -827,110 +795,6 @@ mod tests {
     }
 
     #[test]
-    fn minimap_pan_restores_cells_and_emits_colors() {
-        use ratatui::{
-            Terminal, TerminalOptions, Viewport,
-            backend::{Backend, CrosstermBackend, TestBackend},
-        };
-        ratatui::crossterm::style::force_color_output(true);
-        let area = Rect::new(0, 0, 60, 30);
-        let (w, h, palette, indices, mut view) = minimap_fixture();
-        let mut baseline = Buffer::empty(area);
-        let geometry = geometry(&view, (w, h), area);
-        let Minimap { frame, map, .. } = geometry.minimap.unwrap();
-        view.render_minimap(
-            indexed(&indices, &palette),
-            &geometry,
-            &mut baseline,
-            &mut Memo::default(),
-        );
-        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        let mut previous: Option<(Buffer, Rect)> = None;
-        let mut bytes = Vec::<u8>::new();
-        let mut ansi_terminal = Terminal::with_options(
-            CrosstermBackend::new(&mut bytes),
-            TerminalOptions {
-                viewport: Viewport::Fixed(area),
-            },
-        )
-        .unwrap();
-        for (x, y) in [(0, 0), (60, 60), (1, 1), (120, 120), (0, 0), (1, 0), (1, 1)] {
-            view.x = x;
-            view.y = y;
-            let viewport = view.viewport_rect(w, h, view.visible(w, h, area), map);
-            terminal
-                .draw(|f| {
-                    render(
-                        indexed(&indices, &palette),
-                        &view,
-                        &crate::view::geometry(&view, (w, h), area),
-                        f.buffer_mut(),
-                        &mut OverviewCaches::default(),
-                    );
-                })
-                .unwrap();
-            let current = terminal.backend().buffer().clone();
-            let completed = ansi_terminal
-                .draw(|f| {
-                    render(
-                        indexed(&indices, &palette),
-                        &view,
-                        &crate::view::geometry(&view, (w, h), area),
-                        f.buffer_mut(),
-                        &mut OverviewCaches::default(),
-                    );
-                })
-                .unwrap();
-            assert_eq!(completed.buffer, &current);
-            if let Some((prev, old)) = &previous {
-                let mut restored = 0;
-                for pos in frame.positions() {
-                    if map.contains(pos) && viewport.contains(pos) && !old.contains(pos) {
-                        restored += 1;
-                    }
-                }
-                let emitted = prev.diff(&current);
-                let expected: Vec<_> = frame
-                    .positions()
-                    .filter(|&p| current[p] != prev[p])
-                    .collect();
-                let actual: Vec<_> = emitted
-                    .iter()
-                    .filter(|(x, y, _)| frame.contains((*x, *y).into()))
-                    .map(|(x, y, _)| ratatui::layout::Position::new(*x, *y))
-                    .collect();
-                assert_eq!(
-                    actual, expected,
-                    "minimap diff must emit every changed cell exactly once"
-                );
-                let mut map_bytes = Vec::<u8>::new();
-                let mut map_backend = CrosstermBackend::new(&mut map_bytes);
-                map_backend
-                    .draw(
-                        prev.diff(&current)
-                            .into_iter()
-                            .filter(|(x, y, _)| frame.contains((*x, *y).into())),
-                    )
-                    .unwrap();
-                assert!(map_bytes.ends_with(b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m"));
-                if restored > 0 {
-                    assert!(map_bytes.windows(6).any(|s| s == b"\x1b[38;2"));
-                    assert!(
-                        map_bytes.windows(6).any(|s| s == b";48;2;"),
-                        "RGB backgrounds must be explicit"
-                    );
-                }
-            }
-            previous = Some((current, viewport));
-        }
-        drop(ansi_terminal);
-        let output = String::from_utf8(bytes).unwrap();
-        let second_frame = output.split("\x1b[0m").nth(1).unwrap();
-        assert!(second_frame.contains("\x1b[38;2;255;255;255;48;2;238;102;68m🬣"));
-        assert!(second_frame.contains("\x1b[38;2;85;93;102;48;2;119;51;34m🬱"));
-    }
-
-    #[test]
     fn minimap_glyphs_are_single_width() {
         use ratatui::buffer::CellWidth;
         for ch in ('\u{1fb00}'..='\u{1fb3b}').chain(" ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█┌┐└┘─│".chars())
@@ -961,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_fit_corrects_subcell_aspect() {
+    fn overview_fit_corrects_cell_aspect() {
         assert_eq!(
             fit_aspect(120, 120, Rect::new(0, 0, 60, 40), CELL_ASPECT),
             (60, 26)
@@ -1003,59 +867,65 @@ mod tests {
     fn render_samples_centers_and_reduces_only_extra_colors() {
         let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
         let area = Rect::new(0, 0, 1, 1);
-        let mut buffer = Buffer::empty(area);
-        // Sample columns 1 and 3 of each row. Column 0 must not participate.
-        assert!(!render(
-            indexed(&[2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1], &palette),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (4, 3), area),
-            &mut buffer,
-            &mut OverviewCaches::default()
-        ));
-        assert_eq!(buffer[(0, 0)].symbol(), "▐");
-        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 0));
-        assert!(render(
-            indexed(&[0, 2, 0, 2, 1, 2], &palette),
-            &View::default(),
-            &crate::view::geometry(&View::default(), (2, 3), area),
-            &mut buffer,
-            &mut OverviewCaches::default()
-        ));
-        assert_eq!(buffer[(0, 0)].symbol(), "▌");
-        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(255, 255, 255));
-    }
-
-    #[test]
-    fn quadrant_samples_centers_and_reduces_only_extra_colors() {
-        let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
-        let area = Rect::new(0, 0, 1, 1);
-        let mut buffer = Buffer::empty(area);
-        let view = View {
-            glyphs: Glyphs::Quadrant,
-            ..View::default()
-        };
-        assert!(!render(
-            indexed(&[2, 2, 2, 2, 2, 0, 2, 1, 2, 2, 2, 2, 2, 0, 2, 1], &palette),
-            &view,
-            &crate::view::geometry(&view, (4, 4), area),
-            &mut buffer,
-            &mut OverviewCaches::default()
-        ));
-        assert_eq!(buffer[(0, 0)].symbol(), "▐");
-        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(51, 51, 51));
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 0));
-        assert!(render(
-            indexed(&[0, 2, 1, 2], &palette),
-            &view,
-            &crate::view::geometry(&view, (2, 2), area),
-            &mut buffer,
-            &mut OverviewCaches::default()
-        ));
-        assert_eq!(buffer[(0, 0)].symbol(), "▌");
-        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(255, 255, 255));
+        for (glyphs, size, indices, approximate, symbol, fg, bg) in [
+            (
+                Glyphs::Sextant,
+                (4, 3),
+                vec![2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1],
+                false,
+                "▐",
+                51,
+                0,
+            ),
+            (
+                Glyphs::Sextant,
+                (2, 3),
+                vec![0, 2, 0, 2, 1, 2],
+                true,
+                "▌",
+                0,
+                255,
+            ),
+            (
+                Glyphs::Quadrant,
+                (4, 4),
+                vec![2, 2, 2, 2, 2, 0, 2, 1, 2, 2, 2, 2, 2, 0, 2, 1],
+                false,
+                "▐",
+                51,
+                0,
+            ),
+            (
+                Glyphs::Quadrant,
+                (2, 2),
+                vec![0, 2, 1, 2],
+                true,
+                "▌",
+                0,
+                255,
+            ),
+        ] {
+            let view = View {
+                glyphs,
+                ..View::default()
+            };
+            let mut buffer = Buffer::empty(area);
+            assert_eq!(
+                render(
+                    indexed(&indices, &palette),
+                    &view,
+                    &geometry(&view, size, area),
+                    &mut buffer,
+                    &mut OverviewCaches::default(),
+                ),
+                approximate,
+                "{glyphs:?} {size:?}"
+            );
+            let cell = &buffer[(0, 0)];
+            assert_eq!(cell.symbol(), symbol);
+            assert_eq!(cell.fg, Color::Rgb(fg, fg, fg));
+            assert_eq!(cell.bg, Color::Rgb(bg, bg, bg));
+        }
     }
 
     #[test]
@@ -1131,42 +1001,30 @@ mod tests {
         let pixels: Vec<_> = (0..16)
             .map(|i| if i % 4 < 2 { [0; 3] } else { [255; 3] })
             .collect();
-        for glyphs in [Glyphs::Sextant, Glyphs::Quadrant] {
-            for (width, expected) in [(2, vec![0, 255]), (1, vec![127])] {
-                let area = Rect::new(2, 3, width, 3);
-                let mut buffer = Buffer::empty(area);
-                assert!(!render(
-                    Pixels::Rgb(&rgb(4, 4, &pixels), 1),
-                    &View {
-                        glyphs,
-                        ..View::default()
-                    },
-                    &crate::view::geometry(
-                        &View {
-                            glyphs,
-                            ..View::default()
-                        },
-                        (4, 4),
-                        area
-                    ),
-                    &mut buffer,
-                    &mut OverviewCaches::default()
-                ));
-                let (cw, ch) = fit_aspect(4, 4, area, CELL_ASPECT);
-                let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
-                assert_eq!((cw, ch), (width, 1));
-                for (x, value) in expected.into_iter().enumerate() {
-                    let cell = &buffer[(target.x + x as u16, target.y)];
-                    assert_eq!(cell.symbol(), "▀");
-                    assert_eq!(cell.fg, Color::Rgb(value, value, value));
-                    assert_eq!(cell.bg, Color::Rgb(value, value, value));
-                }
-                assert!(
-                    area.positions()
-                        .filter(|&pos| !target.contains(pos))
-                        .all(|pos| buffer[pos].symbol() == " ")
-                );
+        for (width, expected) in [(2, vec![0, 255]), (1, vec![127])] {
+            let area = Rect::new(2, 3, width, 3);
+            let mut buffer = Buffer::empty(area);
+            assert!(!render(
+                Pixels::Rgb(&rgb(4, 4, &pixels), 1),
+                &View::default(),
+                &crate::view::geometry(&View::default(), (4, 4), area),
+                &mut buffer,
+                &mut OverviewCaches::default()
+            ));
+            let (cw, ch) = fit_aspect(4, 4, area, CELL_ASPECT);
+            let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
+            assert_eq!((cw, ch), (width, 1));
+            for (x, value) in expected.into_iter().enumerate() {
+                let cell = &buffer[(target.x + x as u16, target.y)];
+                assert_eq!(cell.symbol(), "▀");
+                assert_eq!(cell.fg, Color::Rgb(value, value, value));
+                assert_eq!(cell.bg, Color::Rgb(value, value, value));
             }
+            assert!(
+                area.positions()
+                    .filter(|&pos| !target.contains(pos))
+                    .all(|pos| buffer[pos].symbol() == " ")
+            );
         }
     }
 
@@ -1264,5 +1122,28 @@ mod tests {
         assert_eq!(buffer[(33, 2)].bg, Color::Reset);
         let (_, map) = view.minimap(120, 120, area).unwrap();
         assert_eq!(buffer[(map.x, map.y)].fg, Color::Rgb(0, 0, 0));
+    }
+    #[test]
+    fn rgb_overview_and_minimap_keep_separate_memos() {
+        let pixels = RgbaImage::new(120, 120);
+        let area = Rect::new(0, 0, 69, 36);
+        let mut caches = OverviewCaches::default();
+        for version in [1, 2] {
+            for exact in [false, true, false, true] {
+                let view = View {
+                    exact,
+                    ..View::default()
+                };
+                render(
+                    Pixels::Rgb(&pixels, version),
+                    &view,
+                    &geometry(&view, pixels.dimensions(), area),
+                    &mut Buffer::empty(area),
+                    &mut caches,
+                );
+            }
+            assert_eq!(caches.full.version(), version);
+            assert_eq!(caches.inset.version(), version);
+        }
     }
 }

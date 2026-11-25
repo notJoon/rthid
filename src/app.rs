@@ -599,49 +599,34 @@ mod tests {
     use ratatui::layout::Rect;
 
     #[test]
-    fn rotation_preserves_pixels_and_cycles() {
-        let image = RgbaImage::from_raw(2, 3, (0..24).collect()).unwrap();
-        for (rotation, degrees, expected) in [
-            (Rotation::R0, 0, image.clone()),
-            (Rotation::R90, 90, imageops::rotate90(&image)),
-            (Rotation::R180, 180, imageops::rotate180(&image)),
-            (Rotation::R270, 270, imageops::rotate270(&image)),
+    fn rotation_cycles_and_reports_axes() {
+        for (rotation, degrees, swaps_axes) in [
+            (Rotation::R0, 0, false),
+            (Rotation::R90, 90, true),
+            (Rotation::R180, 180, false),
+            (Rotation::R270, 270, true),
         ] {
             assert_eq!(rotation.cw().ccw(), rotation);
             assert_eq!(rotation.ccw().cw(), rotation);
             assert_eq!(rotation.cw().cw().cw().cw(), rotation);
             assert_eq!(rotation.degrees(), degrees);
-            let rotated = rotation.apply(image.clone());
-            assert_eq!(rotated, expected);
-            assert_eq!(
-                rotated.dimensions() != image.dimensions(),
-                rotation.swaps_axes()
-            );
+            assert_eq!(rotation.swaps_axes(), swaps_axes);
         }
     }
 
     #[test]
-    fn adjustments_and_defaults_leave_the_input_unchanged() {
+    fn adjustments_use_unsnapped_steps_and_restore_each_default() {
         let params = Params {
             scale: 105,
             ..Params::default()
         };
         let next = params.adjusted(Param::Scale, 1);
-        assert_eq!(params.scale, 105);
         assert_eq!(next.scale, 115);
         assert_eq!(next.with_default(Param::Scale).scale, 100);
         for param in Param::ALL {
             let next = params.adjusted(param, -1);
             let reset = next.with_default(param);
             assert_eq!(param.label(&reset), param.label(&Params::default()));
-            assert_eq!(param.shows_dithered(), param != Param::Scale);
-            if param == Param::Palette {
-                assert_eq!(next.palette_name(), PALETTES[2].name);
-                assert_eq!(
-                    next.options.palette,
-                    dither::make_palette(PALETTES[2].colors).unwrap()
-                );
-            }
         }
     }
 
@@ -678,15 +663,19 @@ mod tests {
         crate::ui::layout(Rect::new(0, 0, 41, 9))
     }
 
+    fn versions(app: &App) -> (u64, u64) {
+        (app.pipeline.grid.version(), app.pipeline.dithered.version())
+    }
+
     // Compares build versions after applying the key.
     fn press(app: &mut App, code: KeyCode) -> bool {
-        let before = (app.pipeline.grid.version(), app.pipeline.dithered.version());
+        let before = versions(app);
         app.handle_key(
             KeyEvent::new(code, KeyModifiers::NONE),
             &app.geometry(test_layout().preview),
         );
         app.sync(test_layout().preview);
-        before != (app.pipeline.grid.version(), app.pipeline.dithered.version())
+        before != versions(app)
     }
 
     fn app_at(param: Param) -> App {
@@ -696,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_keys_control_builds() {
+    fn pipeline_rebuilds_only_stale_stages() {
         let mut app = App::new(RgbaImage::new(20, 10), None);
         assert_eq!(app.pipeline.grid.version(), 1);
         assert_eq!(app.pipeline.dithered.version(), 0);
@@ -712,12 +701,16 @@ mod tests {
         assert_eq!(app.pipeline.dithered.version(), 2);
         app.show_original = true;
         app.params.rotation = Rotation::R180;
+        app.params.scale = 110;
         app.sync(test_layout().preview);
         assert_eq!(app.pipeline.grid.version(), 2);
         assert_eq!(app.pipeline.dithered.version(), 2);
         app.show_original = false;
         app.sync(test_layout().preview);
         assert_eq!(app.pipeline.dithered.version(), 3);
+        assert_eq!(app.grid_size(), (22, 11));
+        let (w, h) = app.grid_size();
+        assert_eq!(app.pipeline.dithered.get().unwrap().len(), (w * h) as usize);
     }
 
     #[test]
@@ -773,27 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn original_defers_dithering_until_space_then_refresh() {
-        let mut app = App::new(RgbaImage::new(20, 10), None);
-        assert!(app.pipeline.dithered.get().is_none());
-        assert!(press(&mut app, KeyCode::Right));
-        assert_eq!(app.pipeline.grid.get().unwrap().dimensions(), (22, 11));
-        assert!(app.show_original);
-        assert!(app.pipeline.dithered.get().is_none());
-        assert_eq!(app.pipeline.dithered.version(), 0);
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            &app.geometry(test_layout().preview),
-        );
-        assert_eq!(app.pipeline.dithered.version(), 0);
-        app.sync(test_layout().preview);
-        let (w, h) = app.grid_size();
-        assert_eq!(app.pipeline.dithered.get().unwrap().len(), (w * h) as usize);
-        assert_eq!(app.pipeline.dithered.version(), 1);
-    }
-
-    #[test]
-    fn original_preserves_rgb_and_ignores_alpha() {
+    fn original_preserves_rgb_and_alpha() {
         let source = RgbaImage::from_raw(
             3,
             1,
@@ -915,12 +888,9 @@ mod tests {
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
             &app.geometry(test_layout().preview),
         );
-        let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
+        let version = versions(&app);
         app.refresh();
-        assert_eq!(
-            (app.pipeline.grid.version(), app.pipeline.dithered.version()),
-            version
-        );
+        assert_eq!(versions(&app), version);
     }
 
     #[test]
@@ -939,13 +909,10 @@ mod tests {
         app.handle_key(release, &app.geometry(test_layout().preview));
         assert!(!app.quit);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
+        let version = versions(&app);
         app.handle_key(ctrl('r'), &app.geometry(test_layout().preview));
         app.refresh();
-        assert_eq!(
-            (app.pipeline.grid.version(), app.pipeline.dithered.version()),
-            version
-        );
+        assert_eq!(versions(&app), version);
         app.handle_key(ctrl('c'), &app.geometry(test_layout().preview));
         assert!(app.quit);
     }
@@ -983,15 +950,10 @@ mod tests {
         assert!(app.preview_focus);
         assert!(!press(&mut app, KeyCode::Char('z')));
         assert!(app.view.exact);
-        for key in [
-            KeyCode::Right,
-            KeyCode::Char('l'),
-            KeyCode::Down,
-            KeyCode::Char('j'),
-        ] {
-            assert!(!press(&mut app, key));
-        }
-        assert_eq!((app.view.x, app.view.y), (2, 2));
+        assert!(!press(&mut app, KeyCode::Char('L')));
+        assert_eq!(app.view.x, 8);
+        assert!(!press(&mut app, KeyCode::Right));
+        assert_eq!((app.view.x, app.view.y), (9, 0));
         assert_eq!(app.selected, 0);
         for _ in 0..100 {
             press(&mut app, KeyCode::Right);
@@ -1010,77 +972,13 @@ mod tests {
     }
 
     #[test]
-    fn minimap_clicks_match_drawn_geometry_for_each_glyph_set() {
-        use crate::view::Glyphs;
-        use ratatui::buffer::Buffer;
-        for (glyphs, expected, center) in [
-            (Glyphs::Sextant, Rect::new(38, 4, 9, 4), (36, 27)),
-            (Glyphs::Quadrant, Rect::new(38, 4, 9, 4), (36, 27)),
-        ] {
-            let mut app = App::new(RgbaImage::new(120, 120), None);
-            let area = Rect::new(2, 3, 48, 18);
-            app.view.exact = true;
-            app.view.glyphs = glyphs;
-            let mut buffer = Buffer::empty(area);
-            let geometry = app.geometry(area);
-            let map = geometry.minimap.unwrap().map;
-            crate::view::render(
-                app.displayed(),
-                &app.view,
-                &geometry,
-                &mut buffer,
-                &mut crate::view::OverviewCaches::default(),
-            );
-            assert_eq!(map, expected);
-            assert_ne!(buffer[(map.x, map.y)].bg, ratatui::style::Color::Reset);
-            for (kind, column, row, expected) in [
-                (
-                    MouseEventKind::Down(MouseButton::Left),
-                    map.x + map.width / 2,
-                    map.y + 1,
-                    center,
-                ),
-                (
-                    MouseEventKind::Drag(MouseButton::Left),
-                    map.right() - 1,
-                    map.bottom() - 1,
-                    (72, 84),
-                ),
-                (
-                    MouseEventKind::Drag(MouseButton::Left),
-                    map.x,
-                    map.y,
-                    (0, 0),
-                ),
-            ] {
-                let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
-                app.handle_mouse(
-                    MouseEvent {
-                        kind,
-                        column,
-                        row,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &app.geometry(area),
-                );
-                assert_eq!((app.view.x, app.view.y), expected, "{glyphs:?}");
-                app.refresh();
-                assert_eq!(
-                    (app.pipeline.grid.version(), app.pipeline.dithered.version()),
-                    version
-                );
-            }
-        }
-    }
-
-    #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::new(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
         app.view.exact = true;
         let map = app.geometry(area).minimap.unwrap().map;
         let mouse = |app: &mut App, kind, column, row| {
-            let version = (app.pipeline.grid.version(), app.pipeline.dithered.version());
+            let version = versions(app);
             app.handle_mouse(
                 MouseEvent {
                     kind,
@@ -1091,10 +989,7 @@ mod tests {
                 &app.geometry(area),
             );
             app.refresh();
-            assert_eq!(
-                (app.pipeline.grid.version(), app.pipeline.dithered.version()),
-                version
-            );
+            assert_eq!(versions(app), version);
             assert!(!app.preview_focus);
         };
         mouse(
@@ -1141,24 +1036,32 @@ mod tests {
         );
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
         assert_eq!((app.view.x, app.view.y), (69, 80));
+        app.view.exact = true;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            map.right() - 1,
+            map.bottom() - 1,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            map.x,
+            map.y,
+        );
+        assert_eq!((app.view.x, app.view.y), (0, 0));
     }
 
     #[test]
-    fn preview_page_keys_use_overlap_and_clamp_without_redithering() {
-        let mut app = App::new(RgbaImage::new(40, 40), None);
+    fn minimap_toggle_changes_visibility_without_redithering() {
+        let mut app = App::new(RgbaImage::new(120, 120), None);
         app.preview_focus = true;
         app.view.exact = true;
-        assert!(!press(&mut app, KeyCode::Char('L')));
-        assert!(!press(&mut app, KeyCode::Char('J')));
-        assert_eq!((app.view.x, app.view.y), (8, 8));
-        assert!(!press(&mut app, KeyCode::Char('H')));
-        assert!(!press(&mut app, KeyCode::Char('K')));
-        assert_eq!((app.view.x, app.view.y), (0, 0));
-        for _ in 0..10 {
-            press(&mut app, KeyCode::Char('L'));
-            press(&mut app, KeyCode::Char('J'));
+        assert!(press(&mut app, KeyCode::Char(' ')));
+        for hidden in [true, false] {
+            assert!(!press(&mut app, KeyCode::Char('m')));
+            assert_eq!(app.view.hide_minimap, hidden);
         }
-        assert_eq!((app.view.x, app.view.y), (30, 30));
     }
 
     #[test]

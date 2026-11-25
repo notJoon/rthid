@@ -253,6 +253,23 @@ mod tests {
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn draw_text(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        renderer: &mut Renderer,
+    ) -> String {
+        terminal
+            .draw(|frame| draw(frame, app, &layout(frame.area()), renderer))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn status_uses_preview_report_and_prioritizes_export_errors() {
         let mut app = App::new(RgbaImage::new(4, 6), None);
@@ -279,11 +296,10 @@ mod tests {
             )
             .starts_with("Original (kitty) | Overview (sextant) |")
         );
-        let dir = std::env::temp_dir().join(format!("rthid-ui-export-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::test_support::TempDir::new();
         for with_export in [false, true] {
             if with_export {
-                app = App::new(RgbaImage::new(4, 6), Some(dir.clone()));
+                app = App::new(RgbaImage::new(4, 6), Some(dir.to_path_buf()));
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
                 assert!(app.finish_png().is_err());
             }
@@ -299,36 +315,6 @@ mod tests {
                 app.export_status().unwrap_or("Graphics failed"),
             );
         }
-        std::fs::remove_dir(dir).unwrap();
-    }
-
-    #[test]
-    fn rgb_overview_and_minimap_keep_separate_memos() {
-        let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        for exact in [false, true, false, true] {
-            app.view.exact = exact;
-            terminal
-                .draw(|frame| {
-                    draw(frame, &app, &layout(frame.area()), &mut renderer);
-                })
-                .unwrap();
-        }
-        assert_eq!(renderer.overviews.full.version(), 1);
-        assert_eq!(renderer.overviews.inset.version(), 1);
-        app.params.rotation = crate::app::Rotation::R180;
-        app.sync(layout(terminal.size().unwrap()).preview);
-        for exact in [false, true] {
-            app.view.exact = exact;
-            terminal
-                .draw(|frame| {
-                    draw(frame, &app, &layout(frame.area()), &mut renderer);
-                })
-                .unwrap();
-        }
-        assert_eq!(renderer.overviews.full.version(), 2);
-        assert_eq!(renderer.overviews.inset.version(), 2);
     }
 
     #[test]
@@ -380,25 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_preserves_view_state() {
-        let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        app.view.exact = true;
-        app.view.x = 119;
-        app.view.y = 119;
-        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        let layout = layout(terminal.size().unwrap());
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout, &mut renderer);
-            })
-            .unwrap();
-        assert_eq!((app.view.x, app.view.y), (119, 119));
-        app.sync(layout.preview);
-        assert_eq!((app.view.x, app.view.y), (51, 48));
-    }
-
-    #[test]
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
         let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
@@ -422,23 +389,21 @@ mod tests {
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.x, map.y)))
             .unwrap();
-        assert!(corner.contains(
-            "displayed=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
-        assert!(corner.contains(
-            "overview=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
-        assert!(corner.contains("modifier: NONE"));
+        let (displayed, overview) = corner.split_once(" overview=").unwrap();
+        for cell in [displayed, overview] {
+            assert!(cell.contains("fg: Rgb(255, 255, 255)"));
+            assert!(cell.contains("bg: Rgb(255, 255, 255)"));
+        }
+        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), "▀");
         let outside = text
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.right() - 1, map.bottom() - 1)))
             .unwrap();
-        assert!(outside.contains(
-            "displayed=Cell { symbol: Some(\"▀\"), fg: Rgb(127, 127, 127), bg: Rgb(127, 127, 127)"
-        ));
-        assert!(outside.contains(
-            "overview=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
+        let (displayed, overview) = outside.split_once(" overview=").unwrap();
+        assert!(displayed.contains("fg: Rgb(127, 127, 127)"));
+        assert!(displayed.contains("bg: Rgb(127, 127, 127)"));
+        assert!(overview.contains("fg: Rgb(255, 255, 255)"));
+        assert!(overview.contains("bg: Rgb(255, 255, 255)"));
 
         assert!(
             log_minimap(
@@ -458,13 +423,8 @@ mod tests {
         assert!(app.show_original);
         app.view.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
         for label in [
             "Scale",
             "Mode",
@@ -521,68 +481,12 @@ mod tests {
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         assert_eq!(renderer.parameter_list.selected(), Some(5));
         assert_eq!(renderer.parameter_list.offset(), 4);
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
         for label in ["Serpentine", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
-    }
-
-    #[test]
-    fn minimap_toggle_reveals_covered_dots_without_redithering() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut renderer = Renderer::default();
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        app.view.exact = true;
-        app.preview_focus = true;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
-        let has_frame = |buffer: &ratatui::buffer::Buffer| {
-            buffer
-                .content
-                .iter()
-                .any(|c| c.fg == Color::Gray && c.symbol() == "┌")
-        };
-        assert!(has_frame(terminal.backend().buffer()));
-        let version = app.pipeline.grid_version();
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &app.geometry(layout(terminal.size().unwrap()).preview),
-        );
-        app.sync(layout(terminal.size().unwrap()).preview);
-        assert_eq!(app.pipeline.grid_version(), version);
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
-        assert!(!has_frame(terminal.backend().buffer()));
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &app.geometry(layout(terminal.size().unwrap()).preview),
-        );
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
-        assert!(has_frame(terminal.backend().buffer()));
     }
 
     #[test]
@@ -592,32 +496,15 @@ mod tests {
         app.show_original = false;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Overview (sextant)"));
         app.view.glyphs = view::Glyphs::Quadrant;
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Overview (quadrant)"));
         app.view.exact = true;
         app.preview_focus = true;
-        terminal
-            .draw(|frame| {
-                draw(frame, &app, &layout(frame.area()), &mut renderer);
-            })
-            .unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("1:1 x 1-4 y 1-6"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
     }

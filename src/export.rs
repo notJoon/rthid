@@ -104,11 +104,11 @@ mod tests {
         )
     }
 
-    fn wait_for(export: &mut Export, ready: impl Fn(&Export) -> bool) {
+    fn poll_until(export: &mut Export, ready: impl Fn(&Export, bool) -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            export.poll();
-            if ready(export) {
+            let changed = export.poll();
+            if ready(export, changed) {
                 return;
             }
             assert!(
@@ -120,35 +120,21 @@ mod tests {
     }
 
     #[test]
-    fn sync_submits_latest_pixels() {
-        let path =
-            std::env::temp_dir().join(format!("rthid-version-test-{}.png", std::process::id()));
-        let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2);
-        sync(&mut export, 2, 4);
-        export.finish().unwrap();
-        assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
-        assert!(export.status().is_none());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn poll_requests_redraw_only_when_png_status_changes() {
-        let path = std::env::temp_dir().join(format!("rthid-status-test-{}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
+        let dir = crate::test_support::TempDir::new();
+        let path = dir.join("preview.png");
         let mut export = Export::new(path.clone());
+        for (w, h, width) in [(4, 2, 16), (2, 4, 8)] {
+            sync(&mut export, w, h);
+            poll_until(&mut export, |_, changed| {
+                assert!(!changed);
+                image::open(&path).is_ok_and(|image| image.width() == width)
+            });
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         sync(&mut export, 4, 2);
-        let wait_for_change = |export: &mut Export| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !export.poll() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "PNG status change timed out"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        };
-        wait_for_change(&mut export);
+        poll_until(&mut export, |_, changed| changed);
         assert!(
             export
                 .status()
@@ -158,55 +144,25 @@ mod tests {
         assert!(!export.poll());
         std::fs::remove_dir(&path).unwrap();
         sync(&mut export, 4, 2);
-        wait_for_change(&mut export);
+        poll_until(&mut export, |_, changed| changed);
         assert!(export.status().is_none());
         assert!(!export.poll());
         export.finish().unwrap();
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn sync_keeps_write_error_until_background_success() {
-        let dir = std::env::temp_dir().join(format!("rthid-error-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::test_support::TempDir::new();
         let path = dir.join("preview.png");
         std::fs::create_dir(&path).unwrap();
         let mut export = Export::new(path.clone());
         sync(&mut export, 4, 2);
-        wait_for(&mut export, |export| export.status().is_some());
+        poll_until(&mut export, |export, _| export.status().is_some());
         std::fs::remove_dir(&path).unwrap();
         let error = export.status().unwrap().to_owned();
         sync(&mut export, 4, 2);
         assert_eq!(export.status(), Some(error.as_str()));
         export.finish().unwrap();
         assert!(export.status().is_none());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn sync_updates_companion_and_reports_write_errors() {
-        let dir = std::env::temp_dir().join(format!("rthid-refresh-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("preview.png");
-        let mut export = Export::new(path.clone());
-        sync(&mut export, 4, 2);
-        wait_for(&mut export, |_| {
-            image::open(&path).is_ok_and(|image| image.width() == 16)
-        });
-        sync(&mut export, 2, 4);
-        wait_for(&mut export, |_| {
-            image::open(&path).is_ok_and(|image| image.width() == 8)
-        });
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        sync(&mut export, 2, 4);
-        wait_for(&mut export, |export| export.status().is_some());
-        export.poll();
-        assert!(export.status().is_some());
-        std::fs::remove_dir(&path).unwrap();
-        sync(&mut export, 2, 4);
-        wait_for(&mut export, |export| export.status().is_none());
-        export.finish().unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }
