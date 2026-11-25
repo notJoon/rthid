@@ -24,9 +24,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:rthid
 
+  changes:
+    # Decides whether the widgets job has anything new to test.
+    runs-on: ubuntu-latest
+    outputs:
+      widgets: ${{ steps.filter.outputs.widgets }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          # Manifests, the toolchain and this workflow can change the crate's build too.
+          filters: |
+            widgets:
+              - 'crates/rthid-widgets/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'mise.toml'
+              - '.github/workflows/ci.yml'
+
   widgets:
     # Unit tests, doctests and rustdoc warnings for rthid-widgets, in parallel with check.
     # The crate is platform independent, so one runner is enough.
+    # A skipped job counts as passing for required checks.
+    needs: changes
+    if: needs.changes.outputs.widgets == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
