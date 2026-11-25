@@ -1,5 +1,5 @@
-//! Terminal independent image processing (palette dithering and PNG export)
-//! used by the rthid binary and its golden tests.
+//! Terminal independent palette dithering, PNG export and atomic file replacement,
+//! used by the rthid binary.
 
 /// Palette parsing and Atkinson error diffusion into palette indices.
 pub mod dither;

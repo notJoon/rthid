@@ -1,7 +1,7 @@
 //! Editable settings and palette presets.
 
 use image::{RgbaImage, imageops};
-use rthid::dither::{self, Mode, Options, PaletteColor, Tone};
+use rthid_dither::dither::{self, Mode, Options, PaletteColor, Tone};
 
 /// Maximum number of characters in a preset or template name.
 pub const MAX_NAME_CHARS: usize = 32;
@@ -198,7 +198,7 @@ impl Template {
             rotation: settings.rotation,
             palette_name: self.palette_name.clone(),
             palette_hex: self.palette_hex.clone(),
-            options: rthid::dither::Options {
+            options: rthid_dither::dither::Options {
                 palette,
                 mode: self.mode,
                 strength: self.strength,

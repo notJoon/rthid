@@ -77,7 +77,7 @@ const MAX_SOURCE_SIDE: u32 = 1024;
 #[command(version, about)]
 struct Args {
     /// Source image to preview.
-    #[arg(default_value = "tests/fixtures/hsl.jpg")]
+    #[arg(default_value = "crates/rthid-dither/tests/fixtures/hsl.jpg")]
     image: PathBuf,
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
@@ -276,7 +276,10 @@ mod tests {
     fn cli_defaults_and_definition() {
         Args::command().debug_assert();
         let args = Args::try_parse_from(["rthid"]).unwrap();
-        assert_eq!(args.image, PathBuf::from("tests/fixtures/hsl.jpg"));
+        assert_eq!(
+            args.image,
+            PathBuf::from("crates/rthid-dither/tests/fixtures/hsl.jpg")
+        );
         assert_eq!(args.preview_png, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());

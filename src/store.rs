@@ -1,7 +1,7 @@
 //! User palettes and independent settings templates in a versioned TOML file.
 
 use crate::settings::{Palettes, Preset, Settings, Template, Templates};
-use rthid::{
+use rthid_dither::{
     atomic,
     dither::{Mode, Tone},
 };

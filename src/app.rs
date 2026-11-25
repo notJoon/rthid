@@ -440,7 +440,7 @@ mod tests {
         ui::Layout,
     };
     use ratatui::layout::Rect;
-    use rthid::dither::Mode;
+    use rthid_dither::dither::Mode;
 
     #[test]
     fn template_manager_saves_and_applies_settings() {

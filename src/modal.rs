@@ -4,7 +4,7 @@ use crate::settings::{
     MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use rthid::dither::Mode;
+use rthid_dither::dither::Mode;
 use rthid_widgets::{Confirm, ListPicker, Outcome, TextInput};
 
 const PRESET_HINTS: &[(&str, &str)] = &[

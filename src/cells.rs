@@ -13,7 +13,7 @@ use ratatui::{
     style::Color,
     widgets::{Block, Clear, Widget},
 };
-use rthid::dither::PaletteColor;
+use rthid_dither::dither::PaletteColor;
 
 /// Grid version, visible region, zoom and target size for averaged RGB cells.
 #[derive(PartialEq)]
@@ -418,7 +418,7 @@ mod tests {
     use image::Rgba;
     use ratatui::layout::Constraint;
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
-    use rthid::dither::make_palette;
+    use rthid_dither::dither::make_palette;
 
     #[test]
     fn cell_reduction_preserves_ties_masks_and_color_approximation() {

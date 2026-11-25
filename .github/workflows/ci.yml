@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   check:
-    # Linux x86_64 and macOS arm64 keep the golden tests honest across platforms.
+    # Covers the rthid binary on Linux and macOS.
     strategy:
       fail-fast: false
       matrix:
@@ -25,17 +25,24 @@ jobs:
       - run: mise run ci:rthid
 
   changes:
-    # Decides whether the widgets job has anything new to test.
+    # Decides whether the widgets and dither jobs have anything new to test.
     runs-on: ubuntu-latest
     outputs:
       widgets: ${{ steps.filter.outputs.widgets }}
+      dither: ${{ steps.filter.outputs.dither }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
-          # Manifests, the toolchain and this workflow can change the crate's build too.
+          # Manifests, the toolchain and this workflow can change either crate's build too.
           filters: |
+            dither:
+              - 'crates/rthid-dither/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'mise.toml'
+              - '.github/workflows/ci.yml'
             widgets:
               - 'crates/rthid-widgets/**'
               - 'Cargo.toml'
@@ -56,6 +63,24 @@ jobs:
       # rust-cache keys entries by job, so this cache is separate from the check job's.
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:widgets
+
+  dither:
+    # Unit tests, golden tests and rustdoc warnings for rthid-dither.
+    # Linux x86_64 and macOS arm64 keep the golden tests honest across platforms.
+    # A skipped job counts as passing for required checks.
+    needs: changes
+    if: needs.changes.outputs.dither == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      # rust-cache keys entries by job, so this cache is separate from the check job's.
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci:dither
 
   coverage:
     # Report only. Coverage does not depend on the OS, so one runner is enough.

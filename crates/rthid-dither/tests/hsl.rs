@@ -1,9 +1,9 @@
-// Checks that dithering hsl.jpg matches the golden output pixel for pixel.
-// Goldens (.idx) hold one palette index per pixel.
+//! Checks that dithering hsl.jpg matches the golden output pixel for pixel.
+//! Goldens (.idx) hold one palette index per pixel.
 use std::sync::LazyLock;
 
 use image::RgbaImage;
-use rthid::dither::{Mode, Options, Tone, dither, make_palette};
+use rthid_dither::dither::{Mode, Options, Tone, dither, make_palette};
 
 const PALETTE: [&str; 4] = ["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"];
 
