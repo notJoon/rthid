@@ -15,6 +15,9 @@ use rthid_dither::dither::Mode;
 use rthid_io::dir::Entry;
 use rthid_widgets::{Confirm, Dialog, ListPicker, Outcome, TextInput};
 
+/// Character limit of the open dialog's path field.
+pub const PATH_MAX_CHARS: usize = 4096;
+
 const OPEN_HINTS: &[(&str, &str)] = &[
     ("Up/Down", "select"),
     ("click", "select"),
@@ -225,7 +228,7 @@ pub struct FilePicker {
 impl FilePicker {
     /// Replaces the directory and resets the field, selection and scroll.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
-        self.input = TextInput::new(dir.join("").to_string_lossy(), 4096);
+        self.input = TextInput::new(dir.join("").to_string_lossy(), PATH_MAX_CHARS);
         self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
         self.dir = dir;
         self.entries = entries;
@@ -630,7 +633,7 @@ impl Modal {
     /// Opens a path field while the event loop loads the starting directory.
     pub fn open_file(start: PathBuf) -> Self {
         Self::OpenFile(Box::new(FilePicker {
-            input: TextInput::new(start.join("").to_string_lossy(), 4096),
+            input: TextInput::new(start.join("").to_string_lossy(), PATH_MAX_CHARS),
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
@@ -1023,7 +1026,7 @@ mod tests {
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
         };
-        picker.input = TextInput::new("~/raw path.png", 4096);
+        picker.input = TextInput::new("~/raw path.png", PATH_MAX_CHARS);
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(

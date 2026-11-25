@@ -17,8 +17,17 @@ pub struct Entry {
     pub dir: bool,
 }
 
+/// Canonical directory and its visible entries.
+#[derive(Debug)]
+pub struct Listing {
+    /// Canonical directory path.
+    pub dir: PathBuf,
+    /// Sorted visible entries.
+    pub entries: Vec<Entry>,
+}
+
 /// Lists visible directories first, then readable image formats, sorted by name.
-pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
+pub fn list_dir(dir: &Path) -> io::Result<Listing> {
     let dir = dir.canonicalize()?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
@@ -28,12 +37,19 @@ pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
         if name.starts_with('.') {
             continue;
         }
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+        let Ok(mut file_type) = entry.file_type() else {
             continue;
         };
-        let is_dir = metadata.is_dir();
+        // Only symlinks need a stat to learn what they point at.
+        if file_type.is_symlink() {
+            let Ok(metadata) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            file_type = metadata.file_type();
+        }
+        let is_dir = file_type.is_dir();
         if is_dir
-            || (metadata.is_file()
+            || (file_type.is_file()
                 && image::ImageFormat::from_path(entry.path())
                     .is_ok_and(|format| format.reading_enabled()))
         {
@@ -55,7 +71,7 @@ pub fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
             },
         );
     }
-    Ok((dir, entries))
+    Ok(Listing { dir, entries })
 }
 
 #[cfg(test)]
@@ -71,7 +87,7 @@ mod tests {
         for name in ["c", "a"] {
             std::fs::create_dir(temp.path().join(name)).unwrap();
         }
-        let (dir, entries) = list_dir(temp.path()).unwrap();
+        let Listing { dir, entries } = list_dir(temp.path()).unwrap();
         assert_eq!(dir, temp.path().canonicalize().unwrap());
         assert_eq!(
             entries
@@ -93,7 +109,7 @@ mod tests {
             symlink(temp.path().join("a"), temp.path().join("linked")).unwrap();
             symlink(temp.path().join("b.png"), temp.path().join("linked.png")).unwrap();
             symlink(temp.path().join("missing"), temp.path().join("broken.png")).unwrap();
-            let (_, entries) = list_dir(temp.path()).unwrap();
+            let entries = list_dir(temp.path()).unwrap().entries;
             assert_eq!(entries.len(), 7);
             assert!(entries.contains(&Entry {
                 file_name: "linked".into(),

@@ -1,6 +1,6 @@
 //! Shared background filesystem work with independent latest results for each kind.
 
-use crate::{dir::Entry, png};
+use crate::{dir::Listing, png};
 use image::RgbaImage;
 use std::{
     collections::VecDeque,
@@ -18,7 +18,7 @@ use std::{
 
 /// Work kinds. Jobs of the same kind coalesce, different kinds never replace each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     /// Open an image or directory.
     Open,
     /// List a directory.
@@ -57,7 +57,7 @@ pub enum Job {
 
 impl Job {
     /// Returns the kind used for coalescing.
-    pub fn kind(&self) -> Kind {
+    pub(crate) fn kind(&self) -> Kind {
         match self {
             Self::Open { .. } => Kind::Open,
             Self::List(_) => Kind::List,
@@ -69,6 +69,9 @@ impl Job {
         }
     }
 
+    // TODO: Kind, op and path are derived again in `Done`, `Pending` and `failure`. Store them as
+    //       explicit `Done` fields with `execute` returning the resolved path, and move the test
+    //       only Panic and Pause jobs behind an injected executor.
     fn context(&self) -> (Op, PathBuf) {
         match self {
             Self::Open { path, .. } => (Op::Decode, path.clone()),
@@ -105,15 +108,6 @@ pub enum Opened {
     },
     /// A directory selected instead of an image.
     Dir(Listing),
-}
-
-/// Canonical directory and its visible entries.
-#[derive(Debug)]
-pub struct Listing {
-    /// Canonical directory path.
-    pub dir: PathBuf,
-    /// Sorted visible entries.
-    pub entries: Vec<Entry>,
 }
 
 /// A completed job and its measured duration.
@@ -259,20 +253,32 @@ struct Pending {
 }
 
 impl Pending {
-    fn stopped(&self, kind: Kind) -> Done {
+    fn fail(&self, kind: Kind, cause: Cause) -> Done {
         failure(
             self.id,
             kind,
             self.submitted.elapsed(),
             self.op,
             self.path.clone(),
-            Cause::Stopped,
+            cause,
         )
     }
 }
 
 /// Stable worker name used to isolate caught panics from terminal panic hooks.
 pub const WORKER_NAME: &str = "rthid-io";
+
+/// Longest wait for the worker when the queue shuts down.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Text of a panic payload, for reporting worker panics.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
+}
 
 struct Queue {
     slots: Mutex<[Option<(u64, Job)>; 3]>,
@@ -331,8 +337,12 @@ impl IO {
             submitted: Instant::now(),
         });
         if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
-            self.local
-                .push_back(self.pending[kind as usize].as_ref().unwrap().stopped(kind));
+            self.local.push_back(
+                self.pending[kind as usize]
+                    .as_ref()
+                    .unwrap()
+                    .fail(kind, Cause::Stopped),
+            );
         } else {
             self.jobs.slots.lock().unwrap()[kind as usize] = Some((id, job));
             self.jobs.ready.notify_one();
@@ -353,7 +363,7 @@ impl IO {
                         return KINDS.into_iter().find_map(|kind| {
                             self.pending[kind as usize]
                                 .take()
-                                .map(|pending| pending.stopped(kind))
+                                .map(|pending| pending.fail(kind, Cause::Stopped))
                         });
                     }
                 }
@@ -377,7 +387,7 @@ impl IO {
     /// Skips queued reads and waits up to five seconds for the newest export.
     /// Returns available results and detaches a worker still running at the deadline.
     pub fn finish(self) -> Vec<Done> {
-        self.finish_timeout(Duration::from_secs(5))
+        self.finish_timeout(SHUTDOWN_WAIT)
     }
 
     fn finish_timeout(mut self, timeout: Duration) -> Vec<Done> {
@@ -385,21 +395,10 @@ impl IO {
         let mut done: Vec<_> = std::iter::from_fn(|| self.poll()).collect();
         for kind in KINDS {
             if let Some(pending) = self.pending[kind as usize].take() {
-                done.push(failure(
-                    pending.id,
-                    kind,
-                    pending.submitted.elapsed(),
-                    pending.op,
-                    pending.path,
-                    Cause::TimedOut,
-                ));
+                done.push(pending.fail(kind, Cause::TimedOut));
             }
         }
         done
-    }
-
-    fn stop(&mut self) {
-        self.stop_timeout(Duration::from_secs(5));
     }
 
     fn stop_timeout(&mut self, timeout: Duration) {
@@ -410,6 +409,7 @@ impl IO {
         drop(slots);
         if let Some(thread) = self.thread.take() {
             let deadline = Instant::now() + timeout;
+            // TODO: Wait on a final message from the worker with a timeout instead of polling.
             while !thread.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -422,7 +422,7 @@ impl IO {
 
 impl Drop for IO {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_timeout(SHUTDOWN_WAIT);
     }
 }
 
@@ -439,6 +439,8 @@ fn failure(id: u64, kind: Kind, elapsed: Duration, op: Op, path: PathBuf, cause:
     }
 }
 
+// TODO: One thread runs every kind, so a listing or open waits behind a running export.
+//       Give each kind its own thread on the same slots, or at least split Export off.
 fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: Arc<AtomicBool>) {
     loop {
         let (id, job) = {
@@ -468,15 +470,8 @@ fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: 
             }
             execute(job, home.as_deref(), &mut op, &mut path)
         }));
-        let result = result.unwrap_or_else(|payload| {
-            Err(Cause::Panicked(
-                payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                    .unwrap_or_else(|| "unknown panic".into()),
-            ))
-        });
+        let result = result
+            .unwrap_or_else(|payload| Err(Cause::Panicked(panic_message(&*payload).to_owned())));
         let outcome = match result {
             Ok(outcome) => Done {
                 id,
@@ -492,9 +487,7 @@ fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: 
 }
 
 fn listing(path: &Path) -> Result<Listing, Cause> {
-    crate::dir::list_dir(path)
-        .map(|(dir, entries)| Listing { dir, entries })
-        .map_err(Cause::Io)
+    crate::dir::list_dir(path).map_err(Cause::Io)
 }
 
 fn execute(
@@ -743,7 +736,7 @@ mod tests {
         resume.send(()).unwrap();
         assert_eq!(wait(&mut worker).kind(), Kind::List);
         assert_eq!(wait(&mut worker).id, latest);
-        worker.stop();
+        worker.stop_timeout(SHUTDOWN_WAIT);
         for _ in 0..2 {
             let id = worker.submit(open(dir.path().to_path_buf()));
             assert!(worker.busy());
@@ -763,7 +756,7 @@ mod tests {
     #[test]
     fn failed_join_returns_stopped_for_outstanding_ids() {
         let mut worker = IO::new(None).unwrap();
-        worker.stop();
+        worker.stop_timeout(SHUTDOWN_WAIT);
         let (finished, results) = mpsc::channel();
         let (release, paused) = mpsc::channel();
         worker.results = results;

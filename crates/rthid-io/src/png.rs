@@ -23,6 +23,7 @@ pub struct Grid {
     pub palette: Vec<PaletteColor>,
 }
 
+// TODO: Take `&Grid` instead of its fields, since the only caller destructures a Grid.
 /// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
 /// file beside `path` and renames it over the destination only after encoding succeeds.
 pub fn write_atomic(
@@ -124,7 +125,8 @@ mod tests {
             let raw = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
             let raw_path = dir.path().join(&raw);
             fs::copy(&target, &raw_path).unwrap();
-            let (base, entries) = crate::dir::list_dir(dir.path()).unwrap();
+            let crate::dir::Listing { dir: base, entries } =
+                crate::dir::list_dir(dir.path()).unwrap();
             let entry = entries.iter().find(|entry| entry.file_name == raw).unwrap();
             assert_eq!(
                 crate::image::load_image(&base.join(&entry.file_name))

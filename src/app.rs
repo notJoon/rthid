@@ -5,7 +5,7 @@ use crate::{
     export::Export,
     grid::GridCache,
     memo::Memo,
-    modal::{Ctx, Effect, Modal, Next, Step},
+    modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
     store::{Change, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
@@ -22,9 +22,10 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::path::PathBuf;
 
-enum OpenRequest {
-    Queued { from_dialog: bool },
-    Submitted { id: u64, from_dialog: bool },
+struct OpenRequest {
+    /// Worker id, known once the job is submitted.
+    id: Option<u64>,
+    from_dialog: bool,
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -33,6 +34,9 @@ pub struct App {
     export: Option<Export>,
     source_path: Option<PathBuf>,
     notice: Option<String>,
+    // TODO: Derive the Loading text from `open_request` and render it ahead of `notice` in the
+    //       status line. Notices would then never need deferring, and this field and every
+    //       `loading()` guard could go.
     deferred_notice: Option<String>,
     save_blocked: Option<String>,
     outbox: Vec<Job>,
@@ -197,6 +201,9 @@ impl App {
             } else {
                 &mut self.notice
             };
+            // TODO: Notice ownership is decided by comparing text here and in the Exported arm of
+            //       `complete`. Give config, export and open errors their own slots, or tag the notice
+            //       with its source, so each source clears only its own message and `save_error` goes.
             if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
                 *notice = None;
             }
@@ -207,10 +214,8 @@ impl App {
         self.save_blocked = loaded.save_blocked;
     }
 
-    /// Restores failed edits before newer ones and reports the save error.
-    pub fn save_failed(&mut self, mut changes: Vec<Change>, error: String) {
-        changes.append(&mut self.pending);
-        self.pending = changes;
+    /// Reports the save error once per distinct message.
+    pub fn save_failed(&mut self, error: String) {
         if self.save_error.as_ref() != Some(&error) {
             self.set_notice(format!("config: {error}"));
             self.save_error = Some(error);
@@ -228,46 +233,31 @@ impl App {
         let mut from_dialog = false;
         let opened = matches!(done.outcome, IoOutcome::Opened(_));
         if opened {
-            let Some(OpenRequest::Submitted {
-                id,
-                from_dialog: origin,
-            }) = self.open_request
-            else {
-                return false;
-            };
-            if id != done.id {
-                return false;
+            match &self.open_request {
+                Some(request) if request.id == Some(done.id) => from_dialog = request.from_dialog,
+                _ => return false,
             }
-            from_dialog = origin;
             self.open_request = None;
             self.notice = None;
             changed = true;
         }
-        let changed = match done.outcome {
+        match done.outcome {
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
                 if from_dialog && matches!(self.modal, Some(Modal::OpenFile(_))) {
                     // TODO: A dialog generation counter would keep an earlier load from closing a reopened dialog.
                     self.modal = None;
                 }
                 self.open_image(path, image);
-                true
+                changed = true;
             }
-            IoOutcome::Opened(Ok(Opened::Dir(listing))) => {
-                if self.modal.is_none() && !from_dialog {
+            IoOutcome::Opened(Ok(Opened::Dir(listing))) | IoOutcome::Listed(Ok(listing)) => {
+                if opened && self.modal.is_none() && !from_dialog {
                     self.modal = Some(Modal::open_file(listing.dir.clone()));
                 }
                 if matches!(self.modal, Some(Modal::OpenFile(_))) {
                     self.set_listing(listing.dir, listing.entries);
                     changed = true;
                 }
-                changed
-            }
-            IoOutcome::Listed(Ok(listing)) => {
-                if matches!(self.modal, Some(Modal::OpenFile(_))) {
-                    self.set_listing(listing.dir, listing.entries);
-                    changed = true;
-                }
-                changed
             }
             IoOutcome::Exported(result) => {
                 if let Some(export) = &mut self.export {
@@ -285,12 +275,11 @@ impl App {
                 if let Err(error) = result {
                     changed |= self.set_notice(error.to_string());
                 }
-                changed
             }
             IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
-                self.set_notice(error.to_string()) | changed
+                changed |= self.set_notice(error.to_string());
             }
-        };
+        }
         if opened {
             let deferred = self.deferred_notice.take();
             if self.notice.is_none() {
@@ -304,19 +293,20 @@ impl App {
         self.open_request.is_some()
     }
 
+    // TODO: Let jobs carry a requester token that `Done` echoes back, stored on
+    //       `Modal::OpenFile` as a dialog generation. Opened and Listed results would then route
+    //       by token, removing this handshake and the Open branch in the main event loop.
     /// Associates the worker id with the origin captured when Open was requested.
     pub fn open_submitted(&mut self, id: u64) {
-        if let Some(
-            OpenRequest::Queued { from_dialog } | OpenRequest::Submitted { from_dialog, .. },
-        ) = self.open_request
-        {
-            self.open_request = Some(OpenRequest::Submitted { id, from_dialog });
+        if let Some(request) = &mut self.open_request {
+            request.id = Some(id);
         }
     }
 
     /// Queues an image load and shows its file name while loading.
     pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
-        self.open_request = Some(OpenRequest::Queued {
+        self.open_request = Some(OpenRequest {
+            id: None,
             from_dialog: matches!(self.modal, Some(Modal::OpenFile(_))),
         });
         self.notice = Some(format!(
@@ -345,7 +335,8 @@ impl App {
             if let Modal::OpenFile(picker) = modal
                 && let Some(path) = rthid_io::paste::dropped_path(text)
             {
-                picker.input = rthid_widgets::TextInput::new(path.to_string_lossy(), 4096);
+                picker.input =
+                    rthid_widgets::TextInput::new(path.to_string_lossy(), PATH_MAX_CHARS);
                 picker.typed = true;
                 return;
             }
@@ -375,17 +366,11 @@ impl App {
     /// companion PNG and clamps the viewport to the preview area. Call before each draw.
     /// Returns whether the grid or dither was rebuilt.
     pub fn sync(&mut self, preview: Rect) -> bool {
-        let before = (
-            self.grid_cache.grid.version(),
-            self.grid_cache.dithered.version(),
-        );
+        let versions = |cache: &GridCache| (cache.grid.version(), cache.dithered.version());
+        let before = versions(&self.grid_cache);
         self.refresh();
         self.clamp_viewport(preview);
-        before
-            != (
-                self.grid_cache.grid.version(),
-                self.grid_cache.dithered.version(),
-            )
+        before != versions(&self.grid_cache)
     }
 
     /// Coordinates shared by preview input and rendering.
@@ -677,30 +662,25 @@ impl App {
                 self.show_original = show_original;
             }
             Effect::SavePreset { preset, base } => {
-                let index = self.palettes.upsert(preset.clone())?;
-                self.apply(Effect::Preview(
-                    base.with_preset(self.palettes.get(index).unwrap()),
-                ))?;
-                self.pending.push(Change::UpsertPreset(preset));
+                let name = preset.name.clone();
+                self.commit(Change::UpsertPreset(preset))?;
+                let preset = self.palettes.find(&name).and_then(|i| self.palettes.get(i));
+                let settings = base.with_preset(preset.unwrap());
+                self.apply(Effect::Preview(settings))?;
             }
-            Effect::RemovePreset(name) => {
-                if let Some(index) = self.palettes.find(&name) {
-                    self.palettes.remove(index)?;
-                }
-                self.pending.push(Change::RemovePreset(name));
-            }
+            Effect::RemovePreset(name) => self.commit(Change::RemovePreset(name))?,
             Effect::SaveTemplate(name) => {
                 let template = Template::capture(name, &self.settings);
-                self.templates.upsert(template.clone())?;
-                self.pending.push(Change::UpsertTemplate(template));
+                self.commit(Change::UpsertTemplate(template))?;
             }
-            Effect::RemoveTemplate(name) => {
-                if let Some(index) = self.templates.find(&name) {
-                    self.templates.remove(index);
-                }
-                self.pending.push(Change::RemoveTemplate(name));
-            }
+            Effect::RemoveTemplate(name) => self.commit(Change::RemoveTemplate(name))?,
         }
+        Ok(())
+    }
+
+    fn commit(&mut self, change: Change) -> Result<(), String> {
+        change.apply(&mut self.palettes, &mut self.templates)?;
+        self.pending.push(change);
         Ok(())
     }
 
@@ -761,7 +741,7 @@ mod tests {
 
     #[test]
     fn completions_route_images_directories_listings_and_errors() {
-        use rthid_io::io::{Listing, Op};
+        use rthid_io::{dir::Listing, io::Op};
         let listing = || Listing {
             dir: "/images".into(),
             entries: vec![],
@@ -811,7 +791,7 @@ mod tests {
 
     #[test]
     fn late_opens_preserve_dialogs_and_editor_restore_state() {
-        use rthid_io::io::Listing;
+        use rthid_io::dir::Listing;
         let listing = || {
             IoOutcome::Opened(Ok(Opened::Dir(Listing {
                 dir: "/images".into(),
@@ -875,7 +855,7 @@ mod tests {
             panic!("open dialog expected")
         };
         assert!(picker.typed);
-        assert_eq!(picker.input.text().chars().count(), 4096);
+        assert_eq!(picker.input.text().chars().count(), PATH_MAX_CHARS);
         app.handle_paste(&format!("/{}.png", "a".repeat(5000)));
         assert_eq!(
             app.modal
@@ -886,7 +866,7 @@ mod tests {
                 .text()
                 .chars()
                 .count(),
-            4096
+            PATH_MAX_CHARS
         );
     }
 
@@ -1191,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_save_requeues_edits_before_newer_changes() {
+    fn failed_save_reports_each_error_once() {
         let mut app = App::empty();
         app.apply(Effect::SaveTemplate("First".into())).unwrap();
         app.apply(Effect::RemoveTemplate("First".into())).unwrap();
@@ -1200,19 +1180,15 @@ mod tests {
             matches!(&changes[..], [Change::UpsertTemplate(t), Change::RemoveTemplate(name)]
             if t.name == "First" && name == "First")
         );
-        app.apply(Effect::SaveTemplate("Later".into())).unwrap();
-        let mut expected = changes.clone();
-        expected.extend(app.pending.clone());
-        app.save_failed(changes, "busy".into());
-        assert_eq!(app.notice(), Some("config: busy"));
-        assert_eq!(app.take_changes(), expected);
         assert!(app.take_changes().is_empty());
+        app.save_failed("busy".into());
+        assert_eq!(app.notice(), Some("config: busy"));
         app.set_notice("open: failed".into());
-        app.save_failed(vec![], "busy".into());
+        app.save_failed("busy".into());
         assert_eq!(app.notice(), Some("open: failed"));
         app.saved(Loaded::default());
         assert_eq!(app.notice(), Some("open: failed"));
-        app.save_failed(vec![], "denied".into());
+        app.save_failed("denied".into());
         assert_eq!(app.notice(), Some("config: denied"));
         app.saved(Loaded::default());
         assert!(app.notice().is_none());
@@ -1220,7 +1196,7 @@ mod tests {
 
     #[test]
     fn loading_defers_notices_until_open_finishes() {
-        use rthid_io::io::{Listing, Op};
+        use rthid_io::{dir::Listing, io::Op};
         for notice_kind in 0..3 {
             for result_kind in 0..3 {
                 let mut app = App::empty();
@@ -1232,8 +1208,8 @@ mod tests {
                 app.set_notice("earlier notice".into());
                 let expected = match notice_kind {
                     0 => {
-                        app.save_failed(vec![], "config is busy".into());
-                        app.save_failed(vec![], "config is busy".into());
+                        app.save_failed("config is busy".into());
+                        app.save_failed("config is busy".into());
                         assert_eq!(app.save_error.as_deref(), Some("config is busy"));
                         "config: config is busy".to_string()
                     }

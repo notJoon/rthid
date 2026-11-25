@@ -118,6 +118,8 @@ enum CliGraphics {
     Off,
 }
 
+// TODO: The startup decode and both config saves write timing lines by hand. Share one
+//       timing helper with this function.
 fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
     if let Some(log) = debug_log {
         writeln!(
@@ -205,14 +207,11 @@ fn main() -> std::io::Result<()> {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
         let previous = std::panic::take_hook();
+        // TODO: Worker panics already arrive as `Cause::Panicked` in `Done`. Keep this hook only to
+        //       silence stderr for the worker thread and report the panic from that result.
         std::panic::set_hook(Box::new(move |info| {
             if std::thread::current().name() == Some(rthid_io::io::WORKER_NAME) {
-                let message = info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| info.payload().downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
+                let message = rthid_io::io::panic_message(info.payload());
                 *worker_panic.lock().unwrap() = Some(message.lines().next().unwrap_or("").into());
                 if let Some(mut log) = panic_log.as_ref() {
                     let _ = writeln!(log, "IO worker panic: {info}");
@@ -324,17 +323,16 @@ fn event_loop(
             }
         }
         redraw = false;
-        let timeout = retry_at.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let timeout = if io.busy() {
-            Some(
-                timeout
-                    .unwrap_or(Duration::from_millis(30))
-                    .min(Duration::from_millis(30)),
-            )
-        } else {
-            timeout
-        };
-        if timeout.is_none() || event::poll(timeout.unwrap())? {
+        // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
+        //       when a job finishes instead.
+        let timeout = [
+            retry_at.map(|deadline| deadline.saturating_duration_since(Instant::now())),
+            io.busy().then_some(Duration::from_millis(30)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if timeout.map_or(Ok(true), event::poll)? {
             // Drain queued input so held-down repeats cost one re-dither, not one each.
             loop {
                 let event = event::read()?;
@@ -367,6 +365,9 @@ fn event_loop(
             && let Some(path) = config_path
         {
             let started = Instant::now();
+            // TODO: This save blocks the event loop for up to the lock wait plus fsync. Run it as an IO
+            //       job that carries the full pending set and apply the result in `App::complete`. Keep
+            //       one queue of unsaved edits, either here or in App, not both.
             let result = store::save(path, Duration::from_millis(50), pending);
             if let Some(log) = &mut debug_log {
                 writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
@@ -379,7 +380,7 @@ fn event_loop(
                 }
                 Err(error) => {
                     retry_at = Some(Instant::now() + Duration::from_secs(2));
-                    app.save_failed(Vec::new(), error.to_string());
+                    app.save_failed(error.to_string());
                 }
             }
             redraw = true;
@@ -437,7 +438,10 @@ mod tests {
 
     #[test]
     fn completion_timings_include_operation_duration_and_path() {
-        use rthid_io::io::{Listing, Opened, Outcome};
+        use rthid_io::{
+            dir::Listing,
+            io::{Opened, Outcome},
+        };
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("debug.log");
         let mut log = File::create(&log_path).unwrap();

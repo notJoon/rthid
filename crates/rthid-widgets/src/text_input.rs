@@ -76,22 +76,21 @@ impl TextInput {
     }
 
     /// Inserts printable characters at the cursor up to the character limit.
-    /// Returns `Consumed`, including when no characters fit.
     ///
     /// # Examples
     ///
     /// ```
     /// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    /// use rthid_widgets::{Outcome, TextInput};
+    /// use rthid_widgets::TextInput;
     ///
     /// let mut input = TextInput::new("éz", 4);
     /// input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-    /// assert_eq!(input.insert_str("猫\n界extra"), Outcome::Consumed);
+    /// input.insert_str("猫\n界extra");
     /// assert_eq!(input.text(), "é猫界z");
     /// input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
     /// assert_eq!(input.text(), "é猫z");
     /// ```
-    pub fn insert_str(&mut self, text: &str) -> Outcome<()> {
+    pub fn insert_str(&mut self, text: &str) {
         let remaining = self.max.saturating_sub(self.text.chars().count());
         let inserted: String = text
             .chars()
@@ -101,7 +100,6 @@ impl TextInput {
         let byte = self.byte_cursor();
         self.cursor += inserted.chars().count();
         self.text.insert_str(byte, &inserted);
-        Outcome::Consumed
     }
 
     fn byte_cursor(&self) -> usize {

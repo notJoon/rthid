@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+// TODO: `tempfile::Builder` with `NamedTempFile::persist` covers this guard and the unique
+//       name loop once tempfile is a normal dependency.
 struct Temp(Option<PathBuf>);
 
 impl Drop for Temp {
@@ -145,6 +147,7 @@ pub fn update<T>(
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
+    // TODO: `store::load` repeats this regular file check. Expose one reader from here for both.
     let text = match fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => Some(fs::read_to_string(&path)?),
         Ok(_) => {
