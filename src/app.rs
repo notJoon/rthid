@@ -723,7 +723,8 @@ mod tests {
 
     #[test]
     fn finish_png_exports_changes_queued_with_quit() {
-        let path = std::env::temp_dir().join(format!("rthid-quit-test-{}.png", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.png");
         let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
         for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
             app.handle_key(
@@ -735,6 +736,5 @@ mod tests {
         assert_eq!(app.grid_cache.grid.version(), 1);
         app.finish_png().unwrap();
         assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
-        std::fs::remove_file(path).unwrap();
     }
 }

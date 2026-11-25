@@ -198,8 +198,8 @@ mod tests {
 
     #[test]
     fn worker_eventually_writes_latest_job_and_reports_its_result() {
-        let dir = std::env::temp_dir().join(format!("rthid-worker-test-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("latest.png");
         let mut worker = Worker::new(path.clone()).unwrap();
         let palette = make_palette(&["#000", "#fff"]).unwrap();
@@ -219,7 +219,6 @@ mod tests {
         assert!(image.pixels().all(|p| p.0 == [255; 4]));
         drop(worker);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     fn wait_for_result(worker: &Worker) -> io::Result<()> {
@@ -235,8 +234,8 @@ mod tests {
 
     #[test]
     fn worker_finish_reports_unpolled_and_polled_write_failures() {
-        let dir = std::env::temp_dir().join(format!("rthid-finish-error-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         for polled in [false, true] {
             let mut worker = Worker::new(dir.clone()).unwrap();
             worker
@@ -252,14 +251,12 @@ mod tests {
             }
             assert!(worker.finish().is_err());
         }
-        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
     fn worker_finish_uses_latest_success_after_write_failure() {
-        let dir =
-            std::env::temp_dir().join(format!("rthid-finish-recovery-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("preview.png");
         let mut worker = Worker::new(path.clone()).unwrap();
         for index in [1, 0] {
@@ -277,12 +274,12 @@ mod tests {
         }
         worker.finish().unwrap();
         assert!(image::open(path).is_ok());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn worker_finish_handles_no_jobs_and_panics() {
-        Worker::new(std::env::temp_dir().join("rthid-unused.png"))
+        let dir = tempfile::tempdir().unwrap();
+        Worker::new(dir.path().join("rthid-unused.png"))
             .unwrap()
             .finish()
             .unwrap();
@@ -299,8 +296,8 @@ mod tests {
 
     #[test]
     fn atomic_png_replaces_and_preserves_destination_on_failure() {
-        let dir = std::env::temp_dir().join(format!("rthid-png-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("preview.png");
         let palette = make_palette(&["#000", "#fff"]).unwrap();
         std::fs::write(&path, b"old").unwrap();
@@ -323,6 +320,5 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         write_atomic(&path, &[1], 1, 1, &palette, 1).unwrap();
         assert_eq!(image::open(&path).unwrap().width(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

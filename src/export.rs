@@ -121,8 +121,8 @@ mod tests {
 
     #[test]
     fn poll_requests_redraw_only_when_png_status_changes() {
-        let dir = crate::temp_dir::TempDir::new();
-        let path = dir.join("preview.png");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.png");
         let mut export = Export::new(path.clone());
         for (w, h, width) in [(4, 2, 16), (2, 4, 8)] {
             sync(&mut export, w, h);
@@ -152,8 +152,8 @@ mod tests {
 
     #[test]
     fn sync_keeps_write_error_until_background_success() {
-        let dir = crate::temp_dir::TempDir::new();
-        let path = dir.join("preview.png");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.png");
         std::fs::create_dir(&path).unwrap();
         let mut export = Export::new(path.clone());
         sync(&mut export, 4, 2);

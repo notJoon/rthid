@@ -302,10 +302,10 @@ mod tests {
             )
             .starts_with("Original (kitty) | Overview (sextant) |")
         );
-        let dir = crate::temp_dir::TempDir::new();
+        let dir = tempfile::tempdir().unwrap();
         for with_export in [false, true] {
             if with_export {
-                app = App::new(RgbaImage::new(4, 6), Some(dir.to_path_buf()));
+                app = App::new(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
                 app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
                 assert!(app.finish_png().is_err());
             }

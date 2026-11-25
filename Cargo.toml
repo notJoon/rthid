@@ -16,3 +16,6 @@ opt-level = 1
 # Optimize dependencies in dev builds so image decoding stays fast
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+tempfile = "3.27.0"

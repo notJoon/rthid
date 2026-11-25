@@ -33,9 +33,6 @@ mod grid;
 mod memo;
 /// Editable settings and palette presets.
 mod settings;
-/// Temporary directories for tests.
-#[cfg(test)]
-mod temp_dir;
 /// Screen layout, panels and status line.
 mod ui;
 /// Preview coordinates for Overview, 1:1 and the minimap.
@@ -309,12 +306,12 @@ mod tests {
 
     #[test]
     fn preview_png_may_not_overwrite_the_source() {
-        let dir = crate::temp_dir::TempDir::new();
-        let source = dir.join("photo.png");
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.png");
         std::fs::write(&source, b"image").unwrap();
-        let aliased = dir.join(".").join("photo.png");
+        let aliased = dir.path().join(".").join("photo.png");
         assert!(check_not_source(&source, Some(&aliased)).is_err());
-        assert!(check_not_source(&source, Some(&dir.join("dots.png"))).is_ok());
+        assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
         assert!(check_not_source(&source, None).is_ok());
     }
 }
