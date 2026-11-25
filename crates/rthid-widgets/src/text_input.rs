@@ -11,7 +11,25 @@ use ratatui::{
 
 use crate::Outcome;
 
-/// Edits text with a cursor and length limit measured in characters.
+/// Single line text field with a cursor and a length limit.
+///
+/// The limit and the cursor count Unicode scalar values (`char`), not bytes,
+/// so multibyte text edits one character at a time. Drawing measures display
+/// width instead, so wide characters take two columns on screen.
+///
+/// # Examples
+///
+/// ```
+/// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+/// use rthid_widgets::{Outcome, TextInput};
+///
+/// let mut input = TextInput::new("café", 16);
+/// let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+/// input.handle_key(key(KeyCode::Backspace));
+/// input.handle_key(key(KeyCode::Char('e')));
+/// assert_eq!(input.handle_key(key(KeyCode::Enter)), Outcome::Submit(()));
+/// assert_eq!(input.text(), "cafe");
+/// ```
 pub struct TextInput {
     text: String,
     cursor: usize,
@@ -19,7 +37,16 @@ pub struct TextInput {
 }
 
 impl TextInput {
-    /// Truncates to the character limit and places the cursor at the end.
+    /// Creates a field holding at most `max` characters of `text`, with the
+    /// cursor after the last character.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rthid_widgets::TextInput;
+    ///
+    /// assert_eq!(TextInput::new("é界ab", 3).text(), "é界a");
+    /// ```
     pub fn new(text: impl Into<String>, max: usize) -> Self {
         let text: String = text.into().chars().take(max).collect();
         Self {
@@ -29,7 +56,21 @@ impl TextInput {
         }
     }
 
-    /// Borrows the current value, including after submission.
+    /// Returns the current value.
+    ///
+    /// Submitting does not clear the field, so the caller reads the value
+    /// here after `Submit` and can keep the field open if it is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    /// use rthid_widgets::TextInput;
+    ///
+    /// let mut input = TextInput::new("warm", 16);
+    /// input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    /// assert_eq!(input.text(), "warm");
+    /// ```
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -41,7 +82,33 @@ impl TextInput {
             .map_or(self.text.len(), |(byte, _)| byte)
     }
 
-    /// Handles editing keys and leaves submitted text available for validation.
+    /// Applies an editing key and reports whether the field used it.
+    ///
+    /// - A printable character without Ctrl or Alt is inserted at the cursor.
+    ///   Shift is allowed. At the limit the character is dropped but the key
+    ///   still returns `Consumed`.
+    /// - Backspace deletes before the cursor and Delete deletes at it.
+    /// - Left, Right, Home and End move the cursor within the text.
+    /// - All of the above return `Consumed`, even when nothing changes.
+    /// - Enter returns `Submit(())` and Esc returns `Cancel`.
+    /// - Any other key, including Tab, Up, Down, control characters and
+    ///   characters with Ctrl or Alt, returns `Ignored`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    /// use rthid_widgets::{Outcome, TextInput};
+    ///
+    /// let mut input = TextInput::new("ab", 3);
+    /// let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    /// input.handle_key(key(KeyCode::Home));
+    /// assert_eq!(input.handle_key(key(KeyCode::Char('x'))), Outcome::Consumed);
+    /// assert_eq!(input.handle_key(key(KeyCode::Char('y'))), Outcome::Consumed);
+    /// assert_eq!(input.text(), "xab");
+    /// let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+    /// assert_eq!(input.handle_key(ctrl_a), Outcome::Ignored);
+    /// ```
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome<()> {
         match key.code {
             KeyCode::Char(c)
@@ -78,7 +145,30 @@ impl TextInput {
         Outcome::Consumed
     }
 
-    /// Draws the prefix and styled text, scrolling to leave a visible cursor cell.
+    /// Draws `prefix` unstyled followed by the text in `style` on the first
+    /// row of `area`, and returns where the terminal cursor belongs.
+    ///
+    /// When the line is wider than `area`, it scrolls left just enough to keep
+    /// the cursor cell inside the last column. Characters cut by either edge
+    /// are skipped rather than split, and cells without text are not cleared.
+    /// The returned position is in buffer coordinates, ready for
+    /// `Frame::set_cursor_position`. An empty `area` draws nothing and
+    /// returns `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{buffer::Buffer, layout::{Position, Rect}, style::Style};
+    /// use rthid_widgets::TextInput;
+    ///
+    /// let area = Rect::new(0, 0, 6, 1);
+    /// let mut buf = Buffer::empty(area);
+    /// let input = TextInput::new("hello", 16);
+    /// let cursor = input.render("> ", Style::default(), area, &mut buf);
+    /// // "> hello" plus the cursor needs 8 columns, so two scroll away.
+    /// assert_eq!(cursor, Some(Position::new(5, 0)));
+    /// assert_eq!(buf, Buffer::with_lines(["hello "]));
+    /// ```
     pub fn render(
         &self,
         prefix: &str,

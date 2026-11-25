@@ -1,6 +1,22 @@
 //! Formatting for groups of key descriptions.
 
-/// Preserves group and pair order with a separator between hints.
+/// Joins key and action pairs into one help line.
+///
+/// Each pair becomes `key: action` and pairs are joined with ` | ` in the
+/// given order. Groups let callers combine hints from several components,
+/// such as [`Confirm::HINTS`](crate::Confirm::HINTS), with their own. Empty
+/// groups add nothing and no groups give an empty string.
+///
+/// # Examples
+///
+/// ```
+/// use rthid_widgets::key_hints;
+///
+/// let picker: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "open")];
+/// let app: &[(&str, &str)] = &[("q", "quit")];
+/// assert_eq!(key_hints(&[picker, &[], app]), "j/k: move | Enter: open | q: quit");
+/// assert_eq!(key_hints(&[]), "");
+/// ```
 pub fn key_hints(groups: &[&[(&str, &str)]]) -> String {
     groups
         .iter()

@@ -13,14 +13,45 @@ use ratatui::{
 
 use crate::Outcome;
 
-/// Keeps selection and the last rendered scroll offset.
+/// Selection over a list of items the caller owns and passes in on each call.
+///
+/// The picker stores only the selected index and the scroll offset of the
+/// last draw. The offset lives in a [`Cell`] so that drawing through `&self`
+/// still keeps the view from jumping between frames. Because the item count
+/// can change between calls, the index is clamped whenever it is used.
+///
+/// # Examples
+///
+/// ```
+/// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+/// use rthid_widgets::{ListPicker, Outcome};
+///
+/// let items = ["bayer", "floyd", "atkinson"];
+/// let mut picker = ListPicker::new(0);
+/// let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+/// assert_eq!(picker.handle_key(key(KeyCode::Char('j')), items.len()), Outcome::Consumed);
+/// assert_eq!(picker.handle_key(key(KeyCode::Enter), items.len()), Outcome::Submit(1));
+/// ```
 pub struct ListPicker {
     selected: usize,
     offset: Cell<usize>,
 }
 
 impl ListPicker {
-    /// Starts at the supplied index, clamped when items are handled or drawn.
+    /// Creates a picker with `selected` as the initial index and no scroll.
+    ///
+    /// An index past the end is allowed and is clamped to the last item on
+    /// the next key or draw.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rthid_widgets::ListPicker;
+    ///
+    /// let picker = ListPicker::new(2);
+    /// assert_eq!(picker.selected(), 2);
+    /// assert_eq!(picker.offset(), 0);
+    /// ```
     pub fn new(selected: usize) -> Self {
         Self {
             selected,
@@ -28,12 +59,54 @@ impl ListPicker {
         }
     }
 
-    /// Returns the index last updated by input handling.
+    /// Returns the selected index as stored.
+    ///
+    /// Only [`ListPicker::handle_key`] clamps the stored index. Drawing clamps
+    /// a copy, so this may exceed the item count until the next key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    /// use rthid_widgets::ListPicker;
+    ///
+    /// let mut picker = ListPicker::new(5);
+    /// assert_eq!(picker.selected(), 5);
+    /// picker.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 3);
+    /// assert_eq!(picker.selected(), 1);
+    /// ```
     pub fn selected(&self) -> usize {
         self.selected
     }
 
-    /// Clamps selection to the current items before handling navigation.
+    /// Handles a key for a list of `len` items.
+    ///
+    /// The stored index is first clamped to the last item, for every key.
+    /// Then:
+    ///
+    /// - Up or k moves up and Down or j moves down, stopping at either end,
+    ///   and return `Consumed`.
+    /// - Enter returns `Submit` with the selected index, or `Consumed` when
+    ///   the list is empty.
+    /// - Esc returns `Cancel`.
+    /// - Any other key returns `Ignored`.
+    ///
+    /// Modifiers are not checked and there is no wrapping, paging, Home or End.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    /// use rthid_widgets::{ListPicker, Outcome};
+    ///
+    /// let mut picker = ListPicker::new(0);
+    /// let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    /// assert_eq!(picker.handle_key(key(KeyCode::Char('k')), 3), Outcome::Consumed);
+    /// assert_eq!(picker.selected(), 0);
+    /// assert_eq!(picker.handle_key(key(KeyCode::Char('x')), 3), Outcome::Ignored);
+    /// assert_eq!(picker.handle_key(key(KeyCode::Enter), 0), Outcome::Consumed);
+    /// assert_eq!(picker.handle_key(key(KeyCode::Esc), 3), Outcome::Cancel);
+    /// ```
     pub fn handle_key(&mut self, key: KeyEvent, len: usize) -> Outcome<usize> {
         let last = len.saturating_sub(1);
         self.selected = self.selected.min(last);
@@ -50,17 +123,70 @@ impl ListPicker {
         Outcome::Consumed
     }
 
-    /// Starts the next draw from the top before keeping selection visible.
+    /// Forgets the retained scroll so the next draw starts from the first item.
+    ///
+    /// The draw still scrolls as far as needed to show the selection. Useful
+    /// when the picker is reopened or its items are replaced.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line};
+    /// use rthid_widgets::ListPicker;
+    ///
+    /// let area = Rect::new(0, 0, 5, 2);
+    /// let mut buf = Buffer::empty(area);
+    /// let picker = ListPicker::new(3);
+    /// picker.render(["a", "b", "c", "d"].map(Line::raw), None, Style::default(), area, &mut buf);
+    /// assert_eq!(picker.offset(), 2);
+    /// picker.reset_scroll();
+    /// assert_eq!(picker.offset(), 0);
+    /// ```
     pub fn reset_scroll(&self) {
         self.offset.set(0);
     }
 
-    /// Returns the offset retained by the last draw.
+    /// Returns the index of the first visible item after the last draw, or
+    /// zero before any draw or after [`ListPicker::reset_scroll`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line};
+    /// use rthid_widgets::ListPicker;
+    ///
+    /// let area = Rect::new(0, 0, 5, 2);
+    /// let mut buf = Buffer::empty(area);
+    /// let picker = ListPicker::new(4);
+    /// assert_eq!(picker.offset(), 0);
+    /// picker.render(["a", "b", "c", "d", "e"].map(Line::raw), None, Style::default(), area, &mut buf);
+    /// assert_eq!(picker.offset(), 3);
+    /// ```
     pub fn offset(&self) -> usize {
         self.offset.get()
     }
 
-    /// Draws with a selection marker and retains ratatui's adjusted offset.
+    /// Draws `items` into `area`, inside `block` when given.
+    ///
+    /// The selected row is prefixed with `> ` and styled with `highlight`,
+    /// and other rows are indented to match. The list scrolls only as far as
+    /// needed to keep the selection visible, starting from the retained
+    /// offset, and the new offset is stored for the next draw. An index past
+    /// the end is drawn on the last item without changing the stored index,
+    /// and an empty list draws no selection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line};
+    /// use rthid_widgets::ListPicker;
+    ///
+    /// let area = Rect::new(0, 0, 5, 2);
+    /// let mut buf = Buffer::empty(area);
+    /// let picker = ListPicker::new(2);
+    /// picker.render(["a", "b", "c"].map(Line::raw), None, Style::default(), area, &mut buf);
+    /// assert_eq!(buf, Buffer::with_lines(["  b  ", "> c  "]));
+    /// ```
     pub fn render<'a>(
         &self,
         items: impl IntoIterator<Item = Line<'a>>,
