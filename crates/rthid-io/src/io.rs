@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -295,6 +295,8 @@ pub struct IO {
     next_id: u64,
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    // Disconnects when the worker exits, including by panic.
+    exited: Receiver<()>,
 }
 
 const KINDS: [Kind; 3] = [Kind::Open, Kind::List, Kind::Export];
@@ -310,9 +312,13 @@ impl IO {
         let (finished, results) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
+        let (alive, exited) = mpsc::channel();
         let thread = thread::Builder::new()
             .name(WORKER_NAME.into())
-            .spawn(move || run(queued, finished, home, stop))?;
+            .spawn(move || {
+                let _alive: Sender<()> = alive;
+                run(queued, finished, home, stop)
+            })?;
         Ok(Self {
             jobs,
             results,
@@ -321,6 +327,7 @@ impl IO {
             next_id: 0,
             stopping,
             thread: Some(thread),
+            exited,
         })
     }
 
@@ -407,15 +414,14 @@ impl IO {
         let slots = self.jobs.slots.lock().unwrap();
         self.jobs.ready.notify_one();
         drop(slots);
-        if let Some(thread) = self.thread.take() {
-            let deadline = Instant::now() + timeout;
-            // TODO: Wait on a final message from the worker with a timeout instead of polling.
-            while !thread.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(2));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
+        // A worker still running at the deadline is detached.
+        if let Some(thread) = self.thread.take()
+            && matches!(
+                self.exited.recv_timeout(timeout),
+                Err(RecvTimeoutError::Disconnected)
+            )
+        {
+            let _ = thread.join();
         }
     }
 }
@@ -752,8 +758,11 @@ mod tests {
         worker.stop_timeout(SHUTDOWN_WAIT);
         let (finished, results) = mpsc::channel();
         let (release, paused) = mpsc::channel();
+        let (alive, exited) = mpsc::channel::<()>();
         worker.results = results;
+        worker.exited = exited;
         worker.thread = Some(thread::spawn(move || {
+            let _alive = alive;
             paused.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(finished);
             panic!("worker failed outside a job");

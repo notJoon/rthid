@@ -215,7 +215,10 @@ mod tests {
         // A new destination is readable by others under the common umask, not private.
         let fresh = dir.path().join("fresh.png");
         replace(&fresh, |_| Ok(())).unwrap();
-        assert_ne!(fs::metadata(&fresh).unwrap().permissions().mode() & 0o044, 0);
+        assert_ne!(
+            fs::metadata(&fresh).unwrap().permissions().mode() & 0o044,
+            0
+        );
     }
 
     #[test]

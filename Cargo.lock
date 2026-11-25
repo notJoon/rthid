@@ -2105,6 +2105,7 @@ name = "rthid-io"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "rthid-dither",
  "tempfile",
 ]

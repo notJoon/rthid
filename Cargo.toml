@@ -9,6 +9,7 @@ members = ["crates/rthid-dither", "crates/rthid-io", "crates/rthid-widgets"]
 [workspace.dependencies]
 image = "0.25.10"
 tempfile = "3.27.0"
+libc = "0.2.191"
 ratatui = "0.30.2"
 
 [workspace.lints.rust]

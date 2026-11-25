@@ -44,6 +44,7 @@ mod ui;
 mod viewport;
 
 use std::{
+    fmt::Display,
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -118,19 +119,25 @@ enum CliGraphics {
     Off,
 }
 
-// TODO: The startup decode and both config saves write timing lines by hand. Share one
-//       timing helper with this function.
-fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
+// Writes one timing line in milliseconds, followed by the path when there is one.
+fn log_timing(
+    debug_log: &mut Option<&mut File>,
+    op: impl Display,
+    elapsed: Duration,
+    path: Option<&Path>,
+) -> io::Result<()> {
     if let Some(log) = debug_log {
-        writeln!(
-            log,
-            "[timing] {} {} {}",
-            done.op(),
-            done.elapsed.as_millis(),
-            done.path().display()
-        )?;
+        let ms = elapsed.as_millis();
+        match path {
+            Some(path) => writeln!(log, "[timing] {op} {ms} {}", path.display())?,
+            None => writeln!(log, "[timing] {op} {ms}")?,
+        }
     }
     Ok(())
+}
+
+fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
+    log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
 }
 
 // Pointer motion alone changes nothing on screen.
@@ -169,14 +176,12 @@ fn main() -> std::io::Result<()> {
     let source = if let Some(path) = path {
         let started = Instant::now();
         let image = load_image(&path);
-        if let Some(log) = &mut debug_log {
-            writeln!(
-                log,
-                "[timing] decode {} {}",
-                started.elapsed().as_millis(),
-                path.display()
-            )?;
-        }
+        log_timing(
+            &mut debug_log.as_mut(),
+            "decode",
+            started.elapsed(),
+            Some(&path),
+        )?;
         let image = image.unwrap_or_else(|error| {
             eprintln!("Could not load {}: {error}", path.display());
             std::process::exit(1);
@@ -267,9 +272,7 @@ fn save_on_quit(
     {
         let started = Instant::now();
         let result = store::save(path, Duration::from_secs(1), pending);
-        if let Some(log) = debug_log {
-            writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
-        }
+        log_timing(debug_log, "save", started.elapsed(), None)?;
         result?;
     }
     Ok(())
@@ -305,8 +308,8 @@ fn event_loop(
         if redraw {
             let started = Instant::now();
             let rebuilt = app.sync(layout.preview);
-            if rebuilt && let Some(log) = &mut debug_log {
-                writeln!(log, "[timing] sync {}", started.elapsed().as_millis())?;
+            if rebuilt {
+                log_timing(&mut debug_log, "sync", started.elapsed(), None)?;
             }
             let frame = terminal.draw(|frame| {
                 ui::draw(frame, app, &layout, renderer);
@@ -369,9 +372,7 @@ fn event_loop(
             //       job that carries the full pending set and apply the result in `App::complete`. Keep
             //       one queue of unsaved edits, either here or in App, not both.
             let result = store::save(path, Duration::from_millis(50), pending);
-            if let Some(log) = &mut debug_log {
-                writeln!(log, "[timing] save {}", started.elapsed().as_millis())?;
-            }
+            log_timing(&mut debug_log, "save", started.elapsed(), None)?;
             match result {
                 Ok(loaded) => {
                     pending.clear();
