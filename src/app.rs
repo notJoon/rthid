@@ -1,4 +1,5 @@
 use crate::{
+    export::Export,
     memo::Memo,
     ui::Layout,
     view::{Pixels, PreviewGeometry, View},
@@ -10,7 +11,6 @@ use ratatui::crossterm::event::{
 #[cfg(test)]
 use ratatui::layout::Rect;
 use rthid::dither::{self, Mode, Options};
-use rthid::png::{Job, Worker};
 use std::path::PathBuf;
 
 /// Palette presets available in the parameter panel.
@@ -88,11 +88,8 @@ pub struct Pipeline {
 
 /// Interactive parameters, preview state and image consumers.
 pub struct App {
-    /// Optional companion PNG destination.
-    pub preview_png: Option<PathBuf>,
-    /// Most recent PNG worker error.
-    pub png_error: Option<String>,
-    png_worker: Option<Worker>,
+    /// Optional companion PNG export.
+    pub export: Option<Export>,
     /// Preview position and display mode.
     pub view: View,
     /// Whether keys control the preview.
@@ -115,16 +112,8 @@ pub struct App {
 impl App {
     /// Initializes image consumers and builds the initial preview grid.
     pub fn new(source: RgbaImage, preview_png: Option<PathBuf>) -> Self {
-        let (png_worker, png_error) =
-            match preview_png.as_ref().map(|path| Worker::new(path.clone())) {
-                Some(Ok(worker)) => (Some(worker), None),
-                Some(Err(error)) => (None, Some(error)),
-                None => (None, None),
-            };
         let mut app = Self {
-            preview_png,
-            png_error: None,
-            png_worker,
+            export: preview_png.map(Export::new),
             view: View::default(),
             preview_focus: false,
             last_drag: None,
@@ -139,7 +128,6 @@ impl App {
             dirty: true,
             quit: false,
         };
-        app.set_png_error(png_error);
         app.refresh();
         app
     }
@@ -177,7 +165,7 @@ impl App {
 
     // Rebuilds the grid when needed and dithers only when a consumer needs it.
     fn refresh(&mut self) -> bool {
-        let mut status_changed = self.poll_png();
+        let mut status_changed = self.export.as_mut().is_some_and(Export::poll);
         self.dirty = false;
         let (w, h) = self.scaled_size();
         let pipeline = &mut self.pipeline;
@@ -190,12 +178,12 @@ impl App {
                 _ => scaled,
             }
         });
-        if self.show_original && self.png_worker.is_none() {
+        if self.show_original && !self.export.as_ref().is_some_and(Export::needs_dither) {
             return status_changed;
         }
         let grid = pipeline.grid.get().expect("processed grid");
         let (gw, gh) = grid.dimensions();
-        let rebuilt = pipeline.dithered.update(
+        pipeline.dithered.update(
             (pipeline.grid.version(), self.params.options.clone()),
             || {
                 dither::dither(
@@ -206,19 +194,14 @@ impl App {
                 )
             },
         );
-        if !rebuilt {
-            return status_changed;
-        }
-        if let Some(worker) = &mut self.png_worker {
-            let submitted = worker.submit(Job {
-                indices: self.pipeline.dithered.get().expect("dithered grid").clone(),
-                w: gw,
-                h: gh,
-                palette: self.params.options.palette.clone(),
-            });
-            if let Err(error) = submitted {
-                status_changed |= self.set_png_error(Some(error));
-            }
+        if let Some(export) = &mut self.export {
+            status_changed |= export.sync(
+                pipeline.dithered.get().expect("dithered grid"),
+                gw,
+                gh,
+                &self.params.options.palette,
+                pipeline.dithered.version(),
+            );
         }
         status_changed
     }
@@ -238,39 +221,12 @@ impl App {
         }
     }
 
-    fn set_png_error(&mut self, error: Option<std::io::Error>) -> bool {
-        let error = error.map(|error| {
-            format!(
-                "PNG {}: {error}",
-                self.preview_png
-                    .as_ref()
-                    .expect("PNG destination")
-                    .display()
-            )
-        });
-        let changed = self.png_error != error;
-        self.png_error = error;
-        changed
-    }
-
-    fn poll_png(&mut self) -> bool {
-        if let Some(worker) = &self.png_worker
-            && let Some(error) = worker.poll()
-        {
-            return self.set_png_error(error);
-        }
-        false
-    }
-
     /// Flushes pending image changes and waits for the PNG worker.
     pub fn finish_png(&mut self) -> std::io::Result<()> {
         // A change and quit can arrive in the same input batch.
         self.refresh();
-        if let Some(worker) = self.png_worker.take() {
-            self.set_png_error(worker.finish().err());
-        }
-        match &self.png_error {
-            Some(error) => Err(std::io::Error::other(error.clone())),
+        match &mut self.export {
+            Some(export) => export.finish(),
             None => Ok(()),
         }
     }
@@ -474,21 +430,6 @@ mod tests {
         let dirty = app.dirty;
         app.sync(&test_layout());
         dirty
-    }
-
-    fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            app.sync(&test_layout());
-            if ready(app) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "PNG completion timed out"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
     }
 
     fn app_at(param: Param) -> App {
@@ -951,85 +892,5 @@ mod tests {
         app.finish_png().unwrap();
         assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (8, 16));
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn idle_refresh_requests_redraw_only_when_png_status_changes() {
-        let path = std::env::temp_dir().join(format!("rthid-status-test-{}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
-        let wait_for_change = |app: &mut App| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !app.sync(&test_layout()) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "PNG status change timed out"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        };
-        wait_for_change(&mut app);
-        assert!(
-            app.png_error
-                .as_ref()
-                .unwrap()
-                .starts_with(&format!("PNG {}: ", path.display()))
-        );
-        assert!(!app.sync(&test_layout()));
-        std::fs::remove_dir(&path).unwrap();
-        app.pipeline.dithered.clear();
-        assert!(!app.sync(&test_layout()));
-        wait_for_change(&mut app);
-        assert!(app.png_error.is_none());
-        assert!(!app.sync(&test_layout()));
-        drop(app);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn refresh_keeps_write_error_until_background_success() {
-        let dir = std::env::temp_dir().join(format!("rthid-error-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("preview.png");
-        std::fs::create_dir(&path).unwrap();
-        let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
-        wait_for(&mut app, |app| app.png_error.is_some());
-        std::fs::remove_dir(&path).unwrap();
-        app.png_error = Some("previous write failed".into());
-        app.pipeline.dithered.clear();
-        app.sync(&test_layout());
-        assert_eq!(app.png_error.as_deref(), Some("previous write failed"));
-        drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn refresh_updates_companion_and_reports_write_errors() {
-        let dir = std::env::temp_dir().join(format!("rthid-refresh-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("preview.png");
-        let mut app = App::new(RgbaImage::new(4, 2), Some(path.clone()));
-        wait_for(&mut app, |_| {
-            image::open(&path).is_ok_and(|image| image.width() == 16)
-        });
-        press(&mut app, KeyCode::Char('r'));
-        wait_for(&mut app, |_| {
-            image::open(&path).is_ok_and(|image| image.width() == 8)
-        });
-        std::fs::remove_file(&path).unwrap();
-        app.sync(&test_layout());
-        assert!(!path.exists());
-        std::fs::create_dir(&path).unwrap();
-        app.pipeline.dithered.clear();
-        app.sync(&test_layout());
-        wait_for(&mut app, |app| app.png_error.is_some());
-        app.sync(&test_layout());
-        assert!(app.png_error.is_some());
-        std::fs::remove_dir(&path).unwrap();
-        app.pipeline.dithered.clear();
-        app.sync(&test_layout());
-        wait_for(&mut app, |app| app.png_error.is_none());
-        drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

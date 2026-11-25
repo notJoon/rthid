@@ -1,0 +1,220 @@
+use rthid::{
+    dither::PaletteColor,
+    png::{Job, Worker},
+};
+use std::{io, path::PathBuf};
+
+/// Companion PNG destination, background writer and latest status.
+pub struct Export {
+    path: PathBuf,
+    worker: Option<Worker>,
+    error: Option<String>,
+    submitted: Option<u64>,
+}
+
+impl Export {
+    /// Starts the writer and retains startup errors for display.
+    pub fn new(path: PathBuf) -> Self {
+        let (worker, error) = match Worker::new(path.clone()) {
+            Ok(worker) => (Some(worker), None),
+            Err(error) => (None, Some(error)),
+        };
+        let mut export = Self {
+            path,
+            worker,
+            error: None,
+            submitted: None,
+        };
+        export.set_error(error);
+        export
+    }
+
+    /// Whether a writer needs dithered pixels even when the preview shows RGB.
+    pub fn needs_dither(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Submits changed dithered pixels and reports a status change.
+    pub fn sync(
+        &mut self,
+        indices: &[u8],
+        w: u32,
+        h: u32,
+        palette: &[PaletteColor],
+        version: u64,
+    ) -> bool {
+        if self.submitted == Some(version) {
+            return false;
+        }
+        if let Some(worker) = &mut self.worker {
+            self.submitted = Some(version);
+            if let Err(error) = worker.submit(Job {
+                indices: indices.to_vec(),
+                w,
+                h,
+                palette: palette.to_vec(),
+            }) {
+                return self.set_error(Some(error));
+            }
+        }
+        false
+    }
+
+    /// Collects the latest write result and reports a status change.
+    pub fn poll(&mut self) -> bool {
+        if let Some(worker) = &self.worker
+            && let Some(error) = worker.poll()
+        {
+            return self.set_error(error);
+        }
+        false
+    }
+
+    /// Waits for pending writes and reports the final status.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if let Some(worker) = self.worker.take() {
+            self.set_error(worker.finish().err());
+        }
+        match &self.error {
+            Some(error) => Err(io::Error::other(error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns the latest PNG error formatted for display.
+    pub fn status(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn set_error(&mut self, error: Option<io::Error>) -> bool {
+        let error = error.map(|error| format!("PNG {}: {error}", self.path.display()));
+        let changed = self.error != error;
+        self.error = error;
+        changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rthid::dither::make_palette;
+
+    fn sync(export: &mut Export, w: u32, h: u32, version: u64) -> bool {
+        export.sync(
+            &vec![0; (w * h) as usize],
+            w,
+            h,
+            &make_palette(&["#000", "#fff"]).unwrap(),
+            version,
+        )
+    }
+
+    fn wait_for(export: &mut Export, ready: impl Fn(&Export) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            export.poll();
+            if ready(export) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PNG completion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn sync_submits_each_version_once() {
+        let path =
+            std::env::temp_dir().join(format!("rthid-version-test-{}.png", std::process::id()));
+        let mut export = Export::new(path.clone());
+        assert!(!sync(&mut export, 4, 2, 1));
+        assert!(!sync(&mut export, 2, 4, 1));
+        export.finish().unwrap();
+        assert_eq!(image::open(&path).unwrap().to_rgba8().dimensions(), (16, 8));
+        assert!(export.status().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn poll_requests_redraw_only_when_png_status_changes() {
+        let path = std::env::temp_dir().join(format!("rthid-status-test-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let mut export = Export::new(path.clone());
+        sync(&mut export, 4, 2, 1);
+        let wait_for_change = |export: &mut Export| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !export.poll() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PNG status change timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait_for_change(&mut export);
+        assert!(
+            export
+                .status()
+                .unwrap()
+                .starts_with(&format!("PNG {}: ", path.display()))
+        );
+        assert!(!export.poll());
+        std::fs::remove_dir(&path).unwrap();
+        assert!(!sync(&mut export, 4, 2, 2));
+        wait_for_change(&mut export);
+        assert!(export.status().is_none());
+        assert!(!export.poll());
+        export.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sync_keeps_write_error_until_background_success() {
+        let dir = std::env::temp_dir().join(format!("rthid-error-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("preview.png");
+        std::fs::create_dir(&path).unwrap();
+        let mut export = Export::new(path.clone());
+        sync(&mut export, 4, 2, 1);
+        wait_for(&mut export, |export| export.status().is_some());
+        std::fs::remove_dir(&path).unwrap();
+        let error = export.status().unwrap().to_owned();
+        assert!(!sync(&mut export, 4, 2, 2));
+        assert_eq!(export.status(), Some(error.as_str()));
+        export.finish().unwrap();
+        assert!(export.status().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sync_updates_companion_and_reports_write_errors() {
+        let dir = std::env::temp_dir().join(format!("rthid-refresh-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("preview.png");
+        let mut export = Export::new(path.clone());
+        sync(&mut export, 4, 2, 1);
+        wait_for(&mut export, |_| {
+            image::open(&path).is_ok_and(|image| image.width() == 16)
+        });
+        sync(&mut export, 2, 4, 2);
+        wait_for(&mut export, |_| {
+            image::open(&path).is_ok_and(|image| image.width() == 8)
+        });
+        std::fs::remove_file(&path).unwrap();
+        assert!(!sync(&mut export, 2, 4, 2));
+        assert!(!path.exists());
+        assert_eq!(export.submitted, Some(2));
+        std::fs::create_dir(&path).unwrap();
+        sync(&mut export, 2, 4, 3);
+        wait_for(&mut export, |export| export.status().is_some());
+        export.poll();
+        assert!(export.status().is_some());
+        std::fs::remove_dir(&path).unwrap();
+        sync(&mut export, 2, 4, 4);
+        wait_for(&mut export, |export| export.status().is_none());
+        export.finish().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

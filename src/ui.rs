@@ -210,8 +210,10 @@ fn status(app: &App, geometry: &view::PreviewGeometry, report: PreviewReport) ->
     } else {
         "Dithered".into()
     };
-    app.png_error
-        .clone()
+    app.export
+        .as_ref()
+        .and_then(crate::export::Export::status)
+        .map(str::to_owned)
         .or(report.graphics_error)
         .unwrap_or_else(|| {
             format!(
@@ -275,8 +277,14 @@ mod tests {
             )
             .starts_with("Original (kitty) | Overview (sextant) |")
         );
-        for png_error in [None, Some("PNG failed".to_owned())] {
-            app.png_error = png_error;
+        let dir = std::env::temp_dir().join(format!("rthid-ui-export-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for with_export in [false, true] {
+            if with_export {
+                app.export = Some(crate::export::Export::new(dir.clone()));
+                app.sync(&layout(Rect::new(0, 0, 80, 24)));
+                assert!(app.export.as_mut().unwrap().finish().is_err());
+            }
             assert_eq!(
                 status(
                     &app,
@@ -286,9 +294,13 @@ mod tests {
                         ..PreviewReport::default()
                     },
                 ),
-                app.png_error.as_deref().unwrap_or("Graphics failed"),
+                app.export
+                    .as_ref()
+                    .and_then(crate::export::Export::status)
+                    .unwrap_or("Graphics failed"),
             );
         }
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

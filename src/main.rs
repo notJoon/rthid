@@ -1,4 +1,6 @@
 mod app;
+/// Companion PNG export and status.
+mod export;
 /// Terminal graphics detection, rendering and cleanup.
 mod graphics;
 /// Single entry caches with build versions.
@@ -165,8 +167,8 @@ fn main() -> std::io::Result<()> {
             }
             redraw = false;
             // With a companion PNG, wake periodically so background write results reach the status line.
-            if app.preview_png.is_some() && !event::poll(Duration::from_millis(50))? {
-                redraw = app.sync(&layout);
+            if app.export.is_some() && !event::poll(Duration::from_millis(50))? {
+                redraw = app.export.as_mut().is_some_and(export::Export::poll);
                 continue;
             }
             // Drain queued input so held-down repeats cost one re-dither, not one each.
