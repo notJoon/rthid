@@ -15,7 +15,7 @@ use rthid_widgets::{Dialog, ListPicker, TextInput, key_hints};
 use crate::{app::App, settings::Setting};
 
 // Keys that open a modal, shown first on the main screen.
-const MODAL_HINTS: &[(&str, &str)] = &[("P", "presets"), ("T", "templates")];
+const MODAL_HINTS: &[(&str, &str)] = &[("o", "open"), ("P", "presets"), ("T", "templates")];
 
 const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("Tab", "focus"),
@@ -230,6 +230,50 @@ fn draw_modal(frame: &mut Frame, app: &App, preview: Rect) {
         rows,
         picker,
     } = match modal {
+        Modal::OpenFile(picker) => {
+            let rows: Vec<_> = picker
+                .entries
+                .iter()
+                .map(|entry| {
+                    Line::raw(format!(
+                        "{}{}",
+                        entry.name,
+                        if entry.dir { "/" } else { "" }
+                    ))
+                })
+                .collect();
+            let dialog = Dialog {
+                title: "Open image",
+                min_width: DIALOG_MIN_WIDTH,
+            };
+            let width = rows
+                .iter()
+                .map(Line::width)
+                .chain([Line::raw(picker.input.text()).width()])
+                .max()
+                .unwrap_or(0)
+                .min(u16::MAX as usize) as u16;
+            let height = rows.len().saturating_add(1).min(u16::MAX as usize) as u16;
+            let area = dialog.area(preview, frame.area(), (width, height));
+            let inner = dialog.render(area, frame.buffer_mut());
+            let [field, entries] =
+                Split::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+            if let Some(cursor) =
+                picker
+                    .input
+                    .render("", Style::default(), field, frame.buffer_mut())
+            {
+                frame.set_cursor_position(cursor);
+            }
+            picker.list.render(
+                rows,
+                None,
+                Style::default().bg(Color::DarkGray),
+                entries,
+                frame.buffer_mut(),
+            );
+            return;
+        }
         Modal::Templates {
             list,
             prompt,
@@ -879,14 +923,59 @@ mod tests {
         }
     }
     #[test]
+    fn open_dialog_keeps_path_above_scrolled_entries() {
+        use crate::modal::Entry;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::empty();
+        app.modal = Some(Modal::open_file("/images".into()));
+        app.set_listing(
+            "/images".into(),
+            (0..30)
+                .map(|i| Entry {
+                    name: format!("folder{i:02}"),
+                    dir: true,
+                })
+                .collect(),
+        );
+        let mut renderer = Renderer::default();
+        for (width, height) in [(60, 12), (1, 1), (20, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let layout = layout(terminal.size().unwrap());
+            for _ in 0..20 {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    &app.geometry(layout.preview),
+                );
+            }
+            terminal
+                .draw(|frame| draw(frame, &app, &layout, &mut renderer))
+                .unwrap();
+            if width == 60 {
+                let Some(Modal::OpenFile(picker)) = &app.modal else {
+                    unreachable!()
+                };
+                assert!(picker.list.offset() > 0);
+                let cursor = terminal.get_cursor_position().unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("Open image"));
+                assert!(text.contains("/images"));
+                assert!(text.contains("folder20/"));
+                assert!(cursor.y < buffer.area.height);
+                assert_eq!(buffer[(cursor.x - 1, cursor.y)].symbol(), "s");
+            }
+        }
+    }
+
+    #[test]
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
         );
     }
 

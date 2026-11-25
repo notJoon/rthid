@@ -67,6 +67,7 @@ use crate::{
     app::{App, Request},
     cells::Glyphs,
     graphics::Mode as Graphics,
+    modal::Entry,
     ui::Renderer,
 };
 
@@ -154,6 +155,87 @@ fn load_image(path: &Path) -> Result<RgbaImage, String> {
         source
     }
     .to_rgba8())
+}
+
+fn list_dir(dir: &Path) -> io::Result<(PathBuf, Vec<Entry>)> {
+    let dir = dir.canonicalize()?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let is_dir = metadata.is_dir();
+        if is_dir
+            || (metadata.is_file()
+                && image::ImageFormat::from_path(entry.path())
+                    .is_ok_and(|format| format.reading_enabled()))
+        {
+            entries.push(Entry { name, dir: is_dir });
+        }
+    }
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+    if dir.parent().is_some() {
+        entries.insert(
+            0,
+            Entry {
+                name: "..".into(),
+                dir: true,
+            },
+        );
+    }
+    Ok((dir, entries))
+}
+
+fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        if text == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = text.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
+
+fn handle_request(app: &mut App, request: Request, preview_png: Option<&Path>) {
+    let request = match request {
+        Request::Open(path) => {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let path = path
+                .to_str()
+                .map(|text| expand_tilde(text, home.as_deref()))
+                .unwrap_or(path);
+            if path.is_dir() {
+                Request::List(path)
+            } else {
+                Request::Open(path)
+            }
+        }
+        request => request,
+    };
+    match request {
+        Request::List(path) => match list_dir(&path) {
+            Ok((dir, entries)) => app.set_listing(dir, entries),
+            Err(error) => {
+                app.set_notice(format!("open: {}: {error}", path.display()));
+            }
+        },
+        Request::Open(path) => {
+            match check_not_source(&path, preview_png)
+                .map_err(|error| error.to_string())
+                .and_then(|()| load_image(&path))
+            {
+                Ok(image) => app.open_image(path, image),
+                Err(error) => {
+                    app.set_notice(format!("open: {error}"));
+                }
+            }
+        }
+    }
 }
 
 // Pointer motion alone changes nothing on screen.
@@ -264,16 +346,8 @@ fn event_loop(
                 ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
             }
         }
-        if let Some(Request::Open(path)) = app.take_request() {
-            match check_not_source(&path, preview_png)
-                .map_err(|error| error.to_string())
-                .and_then(|()| load_image(&path))
-            {
-                Ok(image) => app.open_image(path, image),
-                Err(error) => {
-                    app.set_notice(format!("open: {error}"));
-                }
-            }
+        if let Some(request) = app.take_request() {
+            handle_request(app, request, preview_png);
             redraw = true;
             continue;
         }
@@ -318,6 +392,80 @@ fn event_loop(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn directory_listing_filters_and_sorts() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [".hidden.png", "z.png", "b.png", "notes.txt"] {
+            std::fs::write(temp.path().join(name), b"").unwrap();
+        }
+        for name in ["c", "a"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let (dir, entries) = list_dir(temp.path()).unwrap();
+        assert_eq!(dir, temp.path().canonicalize().unwrap());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.dir))
+                .collect::<Vec<_>>(),
+            [
+                ("..", true),
+                ("a", true),
+                ("c", true),
+                ("b.png", false),
+                ("z.png", false)
+            ]
+        );
+        assert!(list_dir(&temp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn tilde_expansion_only_uses_a_home_prefix() {
+        for (text, home, expected) in [
+            ("~", Some(Path::new("/home/me")), "/home/me"),
+            (
+                "~/photo.png",
+                Some(Path::new("/home/me")),
+                "/home/me/photo.png",
+            ),
+            (
+                "~other/photo.png",
+                Some(Path::new("/home/me")),
+                "~other/photo.png",
+            ),
+            ("photo~.png", Some(Path::new("/home/me")), "photo~.png"),
+            ("~/photo.png", None, "~/photo.png"),
+            ("~", None, "~"),
+        ] {
+            assert_eq!(expand_tilde(text, home), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn open_requests_list_directories_and_keep_failures_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::empty();
+        app.modal = Some(modal::Modal::open_file(temp.path().to_path_buf()));
+        app.request_open(temp.path().to_path_buf());
+        let request = app.take_request().unwrap();
+        handle_request(&mut app, request, None);
+        assert!(app.notice().is_none());
+        let Some(modal::Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert_eq!(picker.dir, temp.path().canonicalize().unwrap());
+        handle_request(
+            &mut app,
+            Request::Open(temp.path().join("missing.png")),
+            None,
+        );
+        assert!(matches!(app.modal, Some(modal::Modal::OpenFile(_))));
+        assert!(app.notice().unwrap().contains("Could not load"));
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 2));
+        assert!(app.modal.is_none());
+        assert!(app.notice().is_none());
+    }
 
     #[test]
     fn cli_defaults_and_definition() {

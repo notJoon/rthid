@@ -5,7 +5,7 @@ use crate::{
     export::Export,
     grid::GridCache,
     memo::Memo,
-    modal::{Ctx, Effect, Modal, Next},
+    modal::{Ctx, Effect, Entry, Modal, Next},
     settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
@@ -22,6 +22,8 @@ use std::path::PathBuf;
 pub enum Request {
     /// Load a replacement source image.
     Open(PathBuf),
+    /// Read a directory for the open dialog.
+    List(PathBuf),
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -136,6 +138,9 @@ impl App {
     /// Replaces the source and resets preview navigation while retaining settings.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.notice = None;
+        if matches!(self.modal, Some(Modal::OpenFile(_))) {
+            self.modal = None;
+        }
         self.source_path = Some(path);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
@@ -143,6 +148,14 @@ impl App {
         self.settings.rotation = Rotation::R0;
         self.show_original = true;
         self.refresh();
+    }
+
+    /// Supplies directory entries to the open dialog if it is still open.
+    pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        if let Some(Modal::OpenFile(picker)) = &mut self.modal {
+            picker.set_listing(dir, entries);
+            self.notice = None;
+        }
     }
 
     /// Current configuration diagnostic for the status line.
@@ -181,9 +194,17 @@ impl App {
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(modal) = &mut self.modal {
-            if let Some(input) = modal.text_input_mut() {
+            if modal.text_input_mut().is_some() {
                 for c in text.chars().filter(|c| !c.is_control()) {
-                    input.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                    modal.handle_key(
+                        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                        Ctx {
+                            palettes: &self.palettes,
+                            templates: &self.templates,
+                            settings: &self.settings,
+                            show_original: self.show_original,
+                        },
+                    );
                 }
             }
         } else if let Some(path) = crate::paste::dropped_path(text) {
@@ -373,6 +394,18 @@ impl App {
             }
             return;
         }
+        if key.code == KeyCode::Char('o') {
+            let start = self
+                .source_path()
+                .and_then(|path| path.parent())
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            self.last_drag = None;
+            self.modal = Some(Modal::open_file(start.clone()));
+            self.request = Some(Request::List(start));
+            return;
+        }
         if key.code == KeyCode::Char('P') {
             self.last_drag = None;
             self.modal = Some(Modal::presets(&self.settings, &self.palettes));
@@ -452,6 +485,8 @@ impl App {
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
+            Effect::Open(path) => self.request_open(path),
+            Effect::ListDir(path) => self.request = Some(Request::List(path)),
             Effect::Notice(message) => {
                 self.set_notice(message);
             }
@@ -528,6 +563,38 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    #[test]
+    fn open_dialog_requests_listing_and_retains_failed_open() {
+        for source in [None, Some(PathBuf::from("/images/photo.png"))] {
+            let mut app = App::empty();
+            app.source_path = source.clone();
+            press(&mut app, KeyCode::Char('o'));
+            let dir = if source.is_some() { "/images" } else { "." };
+            assert_eq!(app.take_request(), Some(Request::List(PathBuf::from(dir))));
+            app.set_listing(
+                PathBuf::from(dir),
+                vec![Entry {
+                    name: "bad.png".into(),
+                    dir: false,
+                }],
+            );
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.take_request(),
+                Some(Request::Open(PathBuf::from(dir).join("bad.png")))
+            );
+            app.set_notice("open: invalid image".into());
+            assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+            assert_eq!(app.notice(), Some("open: invalid image"));
+            app.handle_paste("/typed.png");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.take_request(),
+                Some(Request::Open(PathBuf::from(format!("{dir}/typed.png"))))
+            );
+        }
+    }
 
     #[test]
     fn paste_edits_active_fields_or_requests_an_image() {

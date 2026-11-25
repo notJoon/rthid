@@ -1,11 +1,15 @@
 //! Component based dialogs and palette drafts with cancel snapshots.
 
+use std::path::PathBuf;
+
 use crate::settings::{
     MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use rthid_dither::dither::Mode;
 use rthid_widgets::{Confirm, ListPicker, Outcome, TextInput};
+
+const OPEN_HINTS: &[(&str, &str)] = &[("Up/Down", "select"), ("Enter", "open"), ("Esc", "close")];
 
 const PRESET_HINTS: &[(&str, &str)] = &[
     ("Up/Down j/k", "select"),
@@ -98,6 +102,10 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
+    /// Request a source image without closing the dialog.
+    Open(PathBuf),
+    /// Request the entries of a directory.
+    ListDir(PathBuf),
     /// Report a validation error without leaving the dialog.
     Notice(String),
     /// Show settings in the dithered preview.
@@ -150,6 +158,8 @@ impl OnYes {
 
 /// Dialogs that capture all input except quitting with Ctrl+C.
 pub enum Modal {
+    /// Directory listing and editable image path.
+    OpenFile(Box<FilePicker>),
     /// Palette selection and optional removal confirmation.
     Presets {
         /// Selection and retained scroll position.
@@ -168,6 +178,70 @@ pub enum Modal {
     },
     /// Palette draft with an independent cancel snapshot.
     Editor(Box<Editor>),
+}
+
+/// Visible directory entry supplied by the event loop.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// File name relative to the listed directory.
+    pub name: String,
+    /// Whether selecting this entry lists a directory.
+    pub dir: bool,
+}
+
+/// Path field and directory selection for opening an image.
+pub struct FilePicker {
+    /// Editable path submitted after a text edit.
+    pub input: TextInput,
+    /// Selected entry and retained scroll position.
+    pub list: ListPicker,
+    /// Directory containing the listed entries.
+    pub dir: PathBuf,
+    /// Visible directories and supported image files.
+    pub entries: Vec<Entry>,
+    /// Whether Enter submits the field instead of the selected entry.
+    pub typed: bool,
+}
+
+impl FilePicker {
+    /// Replaces the directory and resets the field, selection and scroll.
+    pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        self.input = TextInput::new(dir.to_string_lossy(), usize::MAX);
+        self.list = ListPicker::new(0);
+        self.dir = dir;
+        self.entries = entries;
+        self.typed = false;
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Step {
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.list.handle_key(key, self.entries.len());
+            self.typed = false;
+            return Step::stay();
+        }
+        match self.input.handle_key(key) {
+            Outcome::Consumed => self.typed = true,
+            Outcome::Cancel => return Step::close(),
+            Outcome::Submit(()) if self.typed => {
+                return Step::effect(Next::Stay, Effect::Open(PathBuf::from(self.input.text())));
+            }
+            Outcome::Submit(()) => {
+                if let Some(entry) = self.entries.get(self.list.selected()) {
+                    let path = self.dir.join(&entry.name);
+                    return Step::effect(
+                        Next::Stay,
+                        if entry.dir {
+                            Effect::ListDir(path)
+                        } else {
+                            Effect::Open(path)
+                        },
+                    );
+                }
+            }
+            Outcome::Ignored => {}
+        }
+        Step::stay()
+    }
 }
 
 /// Editable palette and the settings it temporarily replaces.
@@ -315,9 +389,21 @@ impl Editor {
 }
 
 impl Modal {
+    /// Opens a path field while the event loop loads the starting directory.
+    pub fn open_file(start: PathBuf) -> Self {
+        Self::OpenFile(Box::new(FilePicker {
+            input: TextInput::new(start.to_string_lossy(), usize::MAX),
+            list: ListPicker::new(0),
+            dir: start,
+            entries: Vec::new(),
+            typed: false,
+        }))
+    }
+
     /// Active text field, excluding prompts behind a confirmation.
     pub fn text_input_mut(&mut self) -> Option<&mut TextInput> {
         match self {
+            Self::OpenFile(picker) => Some(&mut picker.input),
             Self::Templates {
                 prompt,
                 confirm: None,
@@ -352,6 +438,7 @@ impl Modal {
     /// Key descriptions for the component currently receiving input.
     pub fn hints(&self) -> &'static [(&'static str, &'static str)] {
         match self {
+            Self::OpenFile(_) => OPEN_HINTS,
             Self::Presets {
                 confirm: Some((_, on_yes)),
                 ..
@@ -378,6 +465,7 @@ impl Modal {
             return Step::stay();
         }
         let confirm = match self {
+            Self::OpenFile(picker) => return picker.handle_key(key),
             Self::Presets { confirm, .. } | Self::Templates { confirm, .. } => confirm,
             Self::Editor(editor) => return editor.handle_key(key, &ctx),
         };
@@ -503,7 +591,7 @@ impl Modal {
                     }
                 }
             }
-            Self::Editor(_) => unreachable!(),
+            Self::Editor(_) | Self::OpenFile(_) => unreachable!(),
         }
         Step::stay()
     }
@@ -517,6 +605,76 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn open_file_routes_selection_and_text() {
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let settings = Settings::default();
+        let mut modal = Modal::open_file(PathBuf::from("/images"));
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(
+            PathBuf::from("/images"),
+            vec![
+                Entry {
+                    name: "album".into(),
+                    dir: true,
+                },
+                Entry {
+                    name: "photo.png".into(),
+                    dir: false,
+                },
+            ],
+        );
+        let context = || ctx(&palettes, &templates, &settings);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(
+            matches!(step.effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
+        );
+        modal.handle_key(key(KeyCode::Down), context());
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("/images/photo.png"))
+        );
+        modal.handle_key(key(KeyCode::Up), context());
+        modal.handle_key(key(KeyCode::Char('j')), context());
+        let Modal::OpenFile(picker) = &modal else {
+            unreachable!()
+        };
+        assert_eq!(picker.list.selected(), 0);
+        assert_eq!(picker.input.text(), "/imagesj");
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.input = TextInput::new("~/raw path.png", usize::MAX);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("~/raw path.png"))
+        );
+        modal.handle_key(key(KeyCode::Down), context());
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path)) if path == std::path::Path::new("/images/photo.png"))
+        );
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(PathBuf::from("/empty"), vec![]);
+        assert_eq!(picker.list.selected(), 0);
+        assert_eq!(picker.list.offset(), 0);
+        assert!(!picker.typed);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(matches!(step.next, Next::Stay));
+        assert!(step.effect.is_none());
+        assert!(matches!(
+            modal.handle_key(key(KeyCode::Esc), context()).next,
+            Next::Close
+        ));
     }
 
     fn ctx<'a>(

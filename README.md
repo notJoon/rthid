@@ -6,7 +6,11 @@ rthid previews dithering of an image in the terminal.
 cargo run -- [image]
 ```
 
-Omit the image path to start with an empty preview.
+Omit the image path to start with an empty preview. Press `o` to browse directories
+or type an image path, including `~/` paths. Use `Up` / `Down` to select,
+`Enter` to open, and `Esc` to close. You can also drop an image into a terminal
+that supports bracketed paste. Open errors appear in the status line and keep
+the current image and dialog available.
 
 See [docs/preview.md](docs/preview.md) for keys and options.
 
