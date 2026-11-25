@@ -1,269 +1,256 @@
-use crate::view;
+//! Screen layout and per frame drawing of the preview, parameter panel, help line
+//! and status line.
+//!
+//! Drawing never mutates App. State that must change while drawing, such as caches
+//! and scroll offsets, lives in Renderer.
+
+use crate::{cells, graphics, viewport};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, List, Paragraph};
+use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::app::{App, KITTY_IMAGE_ID, PALETTES, PARAMS, Param};
-use ratatui::buffer::CellDiffOption;
-use ratatui_image::{
-    Resize, StatefulImage,
-    picker::{Capability, ProtocolType},
-    protocol::{StatefulProtocol, StatefulProtocolType, kitty::StatefulKitty},
-};
+use crate::{app::App, settings::Setting};
 
-fn repaint_previous(
-    graphics: &mut crate::app::Graphics,
-    placement: Option<(ratatui::layout::Rect, bool)>,
-    buffer: &mut ratatui::buffer::Buffer,
-) {
-    if graphics.picker.protocol_type() != ProtocolType::Kitty
-        && graphics.placement != placement
-        && let Some((rect, _)) = graphics.placement
-    {
-        for pos in rect.intersection(buffer.area).positions() {
-            buffer[pos].set_diff_option(CellDiffOption::AlwaysUpdate);
-        }
-    }
-    graphics.placement = placement;
+/// Terminal regions shared by input handling and rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// Preview border and title.
+    pub preview_block: Rect,
+    /// Preview content inside the border, the area passed to App::sync and
+    /// App::geometry.
+    pub preview: Rect,
+    /// Parameter list including its border.
+    pub panel: Rect,
+    /// Key bindings below the body.
+    pub help: Rect,
+    /// Preview and export status.
+    pub status: Rect,
 }
 
-impl App {
-    pub fn log_minimap(
-        &mut self,
-        log: &mut impl std::io::Write,
-        frame: &ratatui::CompletedFrame<'_>,
-    ) -> std::io::Result<()> {
-        let (w, h) = self.grid_size();
-        writeln!(
-            log,
-            "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
-            frame.count, self.view, self.preview_area
-        )?;
-        let mut overview = ratatui::buffer::Buffer::empty(self.preview_area);
-        let mut cache = std::mem::take(&mut self.rgb_overviews);
-        let pixels = self.displayed();
-        if let Some((inset, map, viewport)) =
-            self.view
-                .render_minimap(pixels, w, h, self.preview_area, &mut overview, &mut cache)
-        {
-            writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
-            for pos in inset.positions() {
-                writeln!(
-                    log,
-                    "{},{} displayed={:?} overview={:?}",
-                    pos.x, pos.y, frame.buffer[pos], overview[pos]
-                )?;
-            }
-        }
-        self.rgb_overviews = cache;
-        log.flush()
+/// Splits the screen into the preview and a fixed width parameter panel above
+/// one help row and one status row.
+pub fn layout(screen: impl Into<Rect>) -> Layout {
+    let [body, help, status] = Split::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(screen.into());
+    let [preview_block, panel] =
+        Split::horizontal([Constraint::Min(0), Constraint::Length(29)]).areas(body);
+    Layout {
+        preview_block,
+        preview: Block::bordered().inner(preview_block),
+        panel,
+        help,
+        status,
     }
+}
 
-    pub fn draw(&mut self, frame: &mut Frame) {
-        let [body, help, status] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-        let [preview, panel] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(29)]).areas(body);
-        let focus_style =
-            |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
-        let block = Block::bordered()
-            .title("rthid")
-            .border_style(focus_style(self.preview_focus));
-        self.preview_area = block.inner(preview);
-        let (gw, gh) = self.grid_size();
-        self.view.clamp(gw, gh, self.preview_area);
-        let approximate = self.draw_preview(frame);
-        let picker = self
-            .graphics
-            .as_ref()
-            .map(|graphics| &graphics.picker)
-            .filter(|_| self.show_original && !self.preview_area.is_empty());
-        frame.render_widget(block, preview);
-        let list = List::new(PARAMS.map(|param| self.label(param)))
-            .block(
-                Block::bordered()
-                    .title("Parameters")
-                    .border_style(focus_style(!self.preview_focus)),
-            )
-            .highlight_symbol("> ")
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-        frame.render_stateful_widget(list, panel, &mut self.parameter_list);
-        frame.render_widget(
-            Paragraph::new(if self.preview_focus {
+/// Drawing state that lives across frames, so draw can update caches while App
+/// stays borrowed immutably. Holds terminal graphics, RGB overview caches and the
+/// parameter panel scroll state.
+#[derive(Default)]
+pub struct Renderer {
+    graphics: Option<graphics::Graphics>,
+    overviews: cells::OverviewCaches,
+    setting_list: ListState,
+}
+
+impl Renderer {
+    /// Pass None to draw every view with cell glyphs.
+    pub fn new(graphics: Option<graphics::Graphics>) -> Self {
+        Self {
+            graphics,
+            ..Self::default()
+        }
+    }
+}
+
+// TODO: Use Glyphs { approximate } and Image { protocol, error } variants alongside
+// the PreviewGeometry enum when the slider lands.
+/// What the preview draw learned for the status line.
+#[derive(Default)]
+struct PreviewReport {
+    approximate: bool,
+    graphics_name: Option<&'static str>,
+    graphics_error: Option<String>,
+}
+
+/// Writes a minimap record for RTHID_DEBUG_LOG. After a header line, each minimap
+/// cell is logged as drawn next to the same cell of an undimmed overview.
+///
+/// Only the header is written when no minimap is shown, which includes every
+/// frame outside 1:1.
+pub fn log_minimap(
+    app: &App,
+    log: &mut impl std::io::Write,
+    frame: &ratatui::CompletedFrame<'_>,
+    geometry: &viewport::PreviewGeometry,
+) -> std::io::Result<()> {
+    let (w, h) = geometry.grid;
+    writeln!(
+        log,
+        "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
+        frame.count, app.viewport, geometry.area
+    )?;
+    let mut overview = ratatui::buffer::Buffer::empty(geometry.area);
+    let pixels = app.displayed();
+    if let Some(viewport::Minimap {
+        frame: inset,
+        map,
+        viewport,
+    }) = geometry.minimap
+    {
+        let area = Block::bordered().inner(inset);
+        cells::render(
+            pixels,
+            &viewport::Viewport {
+                exact: false,
+                ..app.viewport
+            },
+            &viewport::PreviewGeometry { area, ..*geometry },
+            &mut overview,
+            &mut cells::OverviewCaches::default(),
+        );
+        writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
+        for pos in inset.positions() {
+            writeln!(
+                log,
+                "{},{} displayed={:?} overview={:?}",
+                pos.x, pos.y, frame.buffer[pos], overview[pos]
+            )?;
+        }
+    }
+    log.flush()
+}
+
+/// Draws the preview, parameter panel, help line and status line without changing
+/// App. Expects App::sync to have run for this layout.
+pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
+    let focus_style =
+        |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
+    let block = Block::bordered()
+        .title("rthid")
+        .border_style(focus_style(app.preview_focus));
+    let geometry = app.geometry(layout.preview);
+    let report = draw_preview(frame, app, &geometry, renderer);
+    frame.render_widget(block, layout.preview_block);
+    let list = List::new(Setting::ALL.map(|setting| setting.label(&app.settings)))
+        .block(
+            Block::bordered()
+                .title("Parameters")
+                .border_style(focus_style(!app.preview_focus)),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    renderer.setting_list.select(Some(app.selected));
+    frame.render_stateful_widget(list, layout.panel, &mut renderer.setting_list);
+    frame.render_widget(
+            Paragraph::new(if app.preview_focus {
                 "Tab: focus | Space: original/dithered | z: overview/1:1 | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
             } else {
                 "Tab: focus | Space: original/dithered | mouse: drag/wheel/map (1:1) | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
             }),
-            help,
+            layout.help,
         );
-        let mode = if self.view.exact {
-            let (w, h) = self.view.visible(gw, gh, self.preview_area);
-            if w == 0 || h == 0 {
-                "1:1 empty".into()
-            } else {
-                format!(
-                    "1:1 x {}-{} y {}-{}",
-                    self.view.x + 1,
-                    self.view.x + w,
-                    self.view.y + 1,
-                    self.view.y + h
+    frame.render_widget(
+        Paragraph::new(status(app, &geometry, report)),
+        layout.status,
+    );
+}
+
+// Uses terminal graphics only for Original in Overview and cell glyphs otherwise.
+// Calls present every frame so a hidden image is cleared.
+fn draw_preview(
+    frame: &mut Frame,
+    app: &App,
+    geometry: &viewport::PreviewGeometry,
+    renderer: &mut Renderer,
+) -> PreviewReport {
+    let image_mode = renderer.graphics.is_some()
+        && app.show_original
+        && !app.viewport.exact
+        && !geometry.area.is_empty();
+    let approximate = if image_mode {
+        false
+    } else {
+        cells::render(
+            app.displayed(),
+            &app.viewport,
+            geometry,
+            frame.buffer_mut(),
+            &mut renderer.overviews,
+        )
+    };
+    let mut report = PreviewReport {
+        approximate,
+        ..PreviewReport::default()
+    };
+    if let Some(graphics) = &mut renderer.graphics {
+        graphics.present(
+            frame,
+            image_mode.then(|| {
+                (
+                    app.grid_cache.grid(),
+                    app.grid_cache.grid_version(),
+                    geometry,
                 )
-            }
+            }),
+        );
+        if image_mode {
+            report.graphics_name = Some(graphics.name());
+            report.graphics_error = graphics.error().map(str::to_owned);
+        }
+    }
+    report
+}
+
+// A companion PNG error, then a graphics error, replaces the normal status line.
+fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
+    let (gw, gh) = geometry.grid;
+    let (sw, sh) = app.grid_cache.source_size();
+    let mode = if app.viewport.exact {
+        let (w, h) = geometry.visible;
+        if w == 0 || h == 0 {
+            "1:1 empty".into()
         } else {
             format!(
-                "Overview ({}){}",
-                self.view.glyphs.name(),
-                if approximate { " approximate" } else { "" },
+                "1:1 x {}-{} y {}-{}",
+                geometry.origin.0 + 1,
+                geometry.origin.0 + w,
+                geometry.origin.1 + 1,
+                geometry.origin.1 + h
             )
-        };
-        let displayed = if let Some(picker) = picker {
-            let name = match picker.protocol_type() {
-                ProtocolType::Kitty => "kitty",
-                ProtocolType::Iterm2 => "iTerm2",
-                ProtocolType::Sixel => "sixel",
-                ProtocolType::Halfblocks => "halfblocks",
-            };
-            format!("Original ({name})")
-        } else if self.show_original {
-            "Original".into()
-        } else {
-            "Dithered".into()
-        };
-        frame.render_widget(
-            Paragraph::new(
-                self.png_error
-                    .clone()
-                    .or_else(|| picker.and_then(|_| self.graphics.as_ref()?.error.clone()))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{displayed} | {mode} | Source {}x{} | Grid {gw}x{gh} | Rotation {}°",
-                            self.source.width(),
-                            self.source.height(),
-                            u16::from(self.params.rotation) * 90,
-                        )
-                    }),
-            ),
-            status,
-        );
-    }
-
-    // Draws the preview, as a protocol image when Original is shown on a graphics terminal.
-    fn draw_preview(&mut self, frame: &mut Frame) -> bool {
-        let (gw, gh) = self.grid_size();
-        let image_mode = self.show_original && !self.preview_area.is_empty();
-        let Some(graphics) = self.graphics.as_mut().filter(|_| image_mode) else {
-            let mut cache = std::mem::take(&mut self.rgb_overviews);
-            let approximate = view::render(
-                self.displayed(),
-                gw,
-                gh,
-                &self.view,
-                self.preview_area,
-                frame.buffer_mut(),
-                &mut cache,
-            );
-            self.rgb_overviews = cache;
-            if let Some(graphics) = self.graphics.as_mut() {
-                repaint_previous(graphics, None, frame.buffer_mut());
-            }
-            return approximate;
-        };
-        let overlay = self.view.exact && self.view.minimap(gw, gh, self.preview_area).is_some();
-        let key = (
-            self.view.x,
-            self.view.y,
-            self.view.exact,
-            self.preview_area,
-            overlay,
-        );
-        if graphics
-            .cache
-            .as_ref()
-            .is_none_or(|(old, _, _)| *old != key)
-        {
-            let picker = &graphics.picker;
-            let font = picker.font_size();
-            let (rect, image) = view::original_image(
-                &self.original,
-                &self.view,
-                self.preview_area,
-                (font.width, font.height),
-            );
-            let protocol = if picker.protocol_type() == ProtocolType::Kitty {
-                // Pin the image id so exit cleanup can delete it.
-                StatefulProtocol::new(
-                    image.into(),
-                    font,
-                    None,
-                    StatefulProtocolType::Kitty(StatefulKitty::new(
-                        KITTY_IMAGE_ID,
-                        picker.tmux_detected(),
-                        picker
-                            .capabilities()
-                            .contains(&Capability::KittyCompression),
-                    )),
-                )
+        }
+    } else {
+        format!(
+            "Overview ({}){}",
+            app.viewport.glyphs.name(),
+            if report.approximate {
+                " approximate"
             } else {
-                picker.new_resize_protocol(image.into())
-            };
-            graphics.cache = Some((key, rect, protocol));
-            graphics.error = None;
-        }
-        let rect = graphics.cache.as_ref().unwrap().1;
-        repaint_previous(graphics, Some((rect, overlay)), frame.buffer_mut());
-        let picker = &graphics.picker;
-        let Some((_, rect, protocol)) = graphics.cache.as_mut() else {
-            return false;
-        };
-        frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Fit(None)),
-            *rect,
-            protocol,
-        );
-        if let Some(result) = protocol.last_encoding_result() {
-            graphics.error = result.err().map(|error| format!("Graphics: {error}"));
-        }
-        if !overlay {
-            return false;
-        }
-        view::draw_minimap(
-            view::Pixels::Rgb(&self.original),
-            gw,
-            gh,
-            &self.view,
-            self.preview_area,
-            frame.buffer_mut(),
-            &mut self.rgb_overviews,
-        );
-        if matches!(
-            picker.protocol_type(),
-            ProtocolType::Iterm2 | ProtocolType::Sixel
-        ) && let Some((inset, _)) = self.view.minimap(gw, gh, self.preview_area)
-        {
-            for pos in inset.positions() {
-                frame.buffer_mut()[pos].set_diff_option(CellDiffOption::AlwaysUpdate);
-            }
-        }
-        false
-    }
-
-    fn label(&self, param: Param) -> String {
-        let o = &self.params.options;
-        match param {
-            Param::Scale => format!("Scale: {}%", self.params.scale),
-            Param::Mode => format!("Mode: {:?}", o.mode),
-            Param::Palette => format!("Palette: {}", PALETTES[self.params.palette].0),
-            Param::Strength => format!("Strength: {:.1}", o.strength),
-            Param::Serpentine => format!("Serpentine: {}", if o.serpentine { "on" } else { "off" }),
-            Param::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
-            Param::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
-        }
-    }
+                ""
+            },
+        )
+    };
+    let displayed = if let Some(name) = report.graphics_name {
+        format!("Original ({name})")
+    } else if app.show_original {
+        "Original".into()
+    } else {
+        "Dithered".into()
+    };
+    app.export_status()
+        .map(str::to_owned)
+        .or(report.graphics_error)
+        .unwrap_or_else(|| {
+            format!(
+                "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
+                app.settings.rotation.degrees(),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -272,154 +259,178 @@ mod tests {
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
-    #[test]
-    fn graphics_cache_tracks_grid() {
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        let mut picker = ratatui_image::picker::Picker::halfblocks();
-        picker.set_protocol_type(ProtocolType::Kitty);
-        app.graphics = Some(crate::app::Graphics::new(picker));
-        app.view.exact = true;
-        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-
-        app.params.options.strength = 0.5;
-        app.dirty = true;
-        app.refresh();
-        assert!(app.graphics.as_ref().unwrap().cache.is_some());
-        app.view.x = 1;
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-
-        app.params.rotation = 2;
-        app.dirty = true;
-        app.refresh();
-        assert!(app.graphics.as_ref().unwrap().cache.is_none());
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-
-        app.params.scale = 50;
-        app.dirty = true;
-        app.refresh();
-        assert!(app.graphics.as_ref().unwrap().cache.is_none());
+    fn draw_text(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        renderer: &mut Renderer,
+    ) -> String {
+        terminal
+            .draw(|frame| draw(frame, app, &layout(frame.area()), renderer))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
-    fn image_placement_repaints_only_previous_rect_for_iterm2_and_sixel() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        let area = Rect::new(0, 0, 10, 8);
-        let old = Rect::new(2, 1, 6, 5);
-        for protocol in [
-            ProtocolType::Kitty,
-            ProtocolType::Iterm2,
-            ProtocolType::Sixel,
-        ] {
-            let mut picker = ratatui_image::picker::Picker::halfblocks();
-            picker.set_protocol_type(protocol);
-            let mut graphics = crate::app::Graphics::new(picker);
-            for placement in [
-                Some((Rect::new(3, 2, 2, 2), false)),
-                Some((old, true)),
-                None,
-            ] {
-                graphics.placement = Some((old, false));
-                let mut buffer = Buffer::empty(area);
-                let baseline = buffer.clone();
-                repaint_previous(&mut graphics, placement, &mut buffer);
-                let emitted = baseline.diff(&buffer);
-                let expected = if protocol == ProtocolType::Kitty {
-                    0
-                } else {
-                    old.area()
-                };
-                assert_eq!(emitted.len(), expected as usize);
-                assert!(
-                    emitted
-                        .iter()
-                        .all(|(x, y, _)| old.contains((*x, *y).into()))
-                );
-                let baseline = Buffer::empty(area);
-                let mut unchanged = baseline.clone();
-                repaint_previous(&mut graphics, placement, &mut unchanged);
-                assert!(baseline.diff(&unchanged).is_empty());
+    fn status_uses_preview_report_and_prioritizes_export_errors() {
+        let mut app = App::new(RgbaImage::new(4, 6), None);
+        let geometry = app.geometry(Rect::new(1, 1, 20, 10));
+        assert!(
+            status(
+                &app,
+                &geometry,
+                PreviewReport {
+                    approximate: true,
+                    ..PreviewReport::default()
+                },
+            )
+            .starts_with("Original | Overview (sextant) approximate |")
+        );
+        assert!(
+            status(
+                &app,
+                &geometry,
+                PreviewReport {
+                    graphics_name: Some("kitty"),
+                    ..PreviewReport::default()
+                },
+            )
+            .starts_with("Original (kitty) | Overview (sextant) |")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for with_export in [false, true] {
+            if with_export {
+                app = App::new(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
+                app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
+                assert!(app.finish_png().is_err());
             }
+            assert_eq!(
+                status(
+                    &app,
+                    &geometry,
+                    PreviewReport {
+                        graphics_error: Some("Graphics failed".to_owned()),
+                        ..PreviewReport::default()
+                    },
+                ),
+                app.export_status().unwrap_or("Graphics failed"),
+            );
         }
     }
 
     #[test]
-    fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
-        for protocol in [
-            ProtocolType::Kitty,
-            ProtocolType::Iterm2,
-            ProtocolType::Sixel,
+    fn layout_preserves_regions_and_preview_border() {
+        for (screen, expected) in [
+            (
+                Rect::new(0, 0, 100, 40),
+                Layout {
+                    preview_block: Rect::new(0, 0, 71, 38),
+                    preview: Rect::new(1, 1, 69, 36),
+                    panel: Rect::new(71, 0, 29, 38),
+                    help: Rect::new(0, 38, 100, 1),
+                    status: Rect::new(0, 39, 100, 1),
+                },
+            ),
+            (
+                Rect::new(2, 3, 41, 9),
+                Layout {
+                    preview_block: Rect::new(2, 3, 12, 7),
+                    preview: Rect::new(3, 4, 10, 5),
+                    panel: Rect::new(14, 3, 29, 7),
+                    help: Rect::new(2, 10, 41, 1),
+                    status: Rect::new(2, 11, 41, 1),
+                },
+            ),
+            (
+                Rect::new(0, 0, 20, 5),
+                Layout {
+                    preview_block: Rect::new(0, 0, 0, 3),
+                    preview: Rect::new(0, 1, 0, 1),
+                    panel: Rect::new(0, 0, 20, 3),
+                    help: Rect::new(0, 3, 20, 1),
+                    status: Rect::new(0, 4, 20, 1),
+                },
+            ),
+            (
+                Rect::default(),
+                Layout {
+                    preview_block: Rect::default(),
+                    preview: Rect::default(),
+                    panel: Rect::default(),
+                    help: Rect::default(),
+                    status: Rect::default(),
+                },
+            ),
         ] {
-            let mut app = App::new(RgbaImage::new(12, 12), None);
-            let mut picker = ratatui_image::picker::Picker::halfblocks();
-            picker.set_protocol_type(protocol);
-            app.graphics = Some(crate::app::Graphics::new(picker));
-            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-            terminal.draw(|frame| app.draw(frame)).unwrap();
-            let (old, _) = app.graphics.as_ref().unwrap().placement.unwrap();
-            app.show_original = false;
-            app.refresh();
-            let completed = terminal.draw(|frame| app.draw(frame)).unwrap();
-            for pos in completed.buffer.area.positions() {
-                assert_eq!(
-                    completed.buffer[pos].diff_option == CellDiffOption::AlwaysUpdate,
-                    protocol != ProtocolType::Kitty && old.contains(pos),
-                    "{protocol:?} at {pos:?}",
-                );
-            }
-            assert!(app.graphics.as_ref().unwrap().placement.is_none());
+            assert_eq!(layout(screen), expected, "{screen:?}");
         }
     }
 
     #[test]
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
+        let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
-        app.view.exact = true;
+        app.viewport.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
-        let frame = terminal.draw(|f| app.draw(f)).unwrap();
-        app.log_minimap(&mut log, &frame).unwrap();
+        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        let frame = terminal
+            .draw(|f| {
+                draw(f, &app, &layout(f.area()), &mut renderer);
+            })
+            .unwrap();
+        log_minimap(&app, &mut log, &frame, &geometry).unwrap();
         let text = String::from_utf8(log).unwrap();
         assert!(text.starts_with("[minimap] frame=0 grid=180x180"));
-        let (inset, map) = app.view.minimap(180, 180, app.preview_area).unwrap();
+        let viewport::Minimap {
+            frame: inset, map, ..
+        } = geometry.minimap.unwrap();
         assert_eq!(text.lines().count(), 2 + inset.area() as usize);
         let corner = text
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.x, map.y)))
             .unwrap();
-        assert!(corner.contains(
-            "displayed=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
-        assert!(corner.contains(
-            "overview=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
-        assert!(corner.contains("modifier: NONE"));
+        let (displayed, overview) = corner.split_once(" overview=").unwrap();
+        for cell in [displayed, overview] {
+            assert!(cell.contains("fg: Rgb(255, 255, 255)"));
+            assert!(cell.contains("bg: Rgb(255, 255, 255)"));
+        }
+        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), "▀");
         let outside = text
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.right() - 1, map.bottom() - 1)))
             .unwrap();
-        assert!(outside.contains(
-            "displayed=Cell { symbol: Some(\"▀\"), fg: Rgb(127, 127, 127), bg: Rgb(127, 127, 127)"
-        ));
-        assert!(outside.contains(
-            "overview=Cell { symbol: Some(\"▀\"), fg: Rgb(255, 255, 255), bg: Rgb(255, 255, 255)"
-        ));
+        let (displayed, overview) = outside.split_once(" overview=").unwrap();
+        assert!(displayed.contains("fg: Rgb(127, 127, 127)"));
+        assert!(displayed.contains("bg: Rgb(127, 127, 127)"));
+        assert!(overview.contains("fg: Rgb(255, 255, 255)"));
+        assert!(overview.contains("bg: Rgb(255, 255, 255)"));
 
         assert!(
-            app.log_minimap(&mut std::io::Cursor::new(&mut [0u8; 1][..]), &frame)
-                .is_err()
+            log_minimap(
+                &app,
+                &mut std::io::Cursor::new(&mut [0u8; 1][..]),
+                &frame,
+                &geometry,
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn draws_parameters_and_truecolor_half_blocks() {
+    fn draws_settings_and_truecolor_half_blocks() {
+        let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
-        app.view.exact = true;
+        app.viewport.exact = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
         for label in [
             "Scale",
             "Mode",
@@ -445,94 +456,133 @@ mod tests {
         // Tiny terminals must not panic.
         for (width, height) in [(1, 1), (20, 5), (60, 12)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| app.draw(frame)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
+                .unwrap();
         }
     }
     #[test]
-    fn parameter_list_keeps_scroll_offset_when_moving_within_visible_rows() {
+    fn setting_list_keeps_scroll_offset_when_moving_within_visible_rows() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+        let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::new(4, 4), None);
         let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
         for _ in 0..6 {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-            terminal.draw(|frame| app.draw(frame)).unwrap();
+            app.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &app.geometry(layout(terminal.size().unwrap()).preview),
+            );
+            terminal
+                .draw(|frame| {
+                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                })
+                .unwrap();
         }
-        assert_eq!(app.parameter_list.selected(), Some(6));
-        assert_eq!(app.parameter_list.offset(), 4);
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        assert_eq!(app.parameter_list.selected(), Some(5));
-        assert_eq!(app.parameter_list.offset(), 4);
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        assert_eq!(renderer.setting_list.selected(), Some(6));
+        assert_eq!(renderer.setting_list.offset(), 4);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &app.geometry(layout(terminal.size().unwrap()).preview),
+        );
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert_eq!(renderer.setting_list.selected(), Some(5));
+        assert_eq!(renderer.setting_list.offset(), 4);
         for label in ["Serpentine", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
     }
 
     #[test]
-    fn minimap_toggle_reveals_covered_dots_without_redithering() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut app = App::new(RgbaImage::new(120, 120), None);
-        app.view.exact = true;
-        app.preview_focus = true;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let has_frame = |buffer: &ratatui::buffer::Buffer| {
-            buffer
-                .content
-                .iter()
-                .any(|c| c.fg == Color::Gray && c.symbol() == "┌")
-        };
-        assert!(has_frame(terminal.backend().buffer()));
-        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(!app.dirty);
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        assert!(!has_frame(terminal.backend().buffer()));
-        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        assert!(has_frame(terminal.backend().buffer()));
-    }
-
-    #[test]
-    fn overview_and_exact_modes_draw_their_glyphs_and_status() {
+    fn overview_and_exact_modes_show_their_status() {
+        let mut renderer = Renderer::default();
         let mut app = App::new(RgbaImage::new(4, 6), None);
         app.show_original = false;
-        app.indices = vec![0; 24];
-        app.indices[0] = 1;
+        app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        assert!(buffer.content.iter().any(|cell| {
-            cell.symbol()
-                .chars()
-                .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
-        }));
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Overview (sextant)"));
-        app.view.glyphs = view::Glyphs::Quadrant;
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        app.viewport.glyphs = cells::Glyphs::Quadrant;
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Overview (quadrant)"));
-        assert!(
-            !text
-                .chars()
-                .any(|c| ('\u{1fb00}'..='\u{1fb3b}').contains(&c))
-        );
-        app.view.exact = true;
+        app.viewport.exact = true;
         app.preview_focus = true;
-        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "▀"));
-        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("1:1 x 1-4 y 1-6"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
+    }
+    #[test]
+    fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
+        use ratatui::buffer::CellDiffOption;
+        use ratatui_image::picker::ProtocolType;
+        for exact in [false, true] {
+            for protocol in [
+                ProtocolType::Kitty,
+                ProtocolType::Iterm2,
+                ProtocolType::Sixel,
+            ] {
+                let mut app = App::new(RgbaImage::new(12, 12), None);
+                let mut picker = ratatui_image::picker::Picker::halfblocks();
+                picker.set_protocol_type(protocol);
+                let font = picker.font_size();
+                let geometry = app.geometry(layout(ratatui::layout::Size::new(100, 40)).preview);
+                let (cw, ch) = viewport::fit_aspect(
+                    geometry.grid.0,
+                    geometry.grid.1,
+                    geometry.area,
+                    f64::from(font.height) / f64::from(font.width),
+                );
+                let old = geometry
+                    .area
+                    .centered(Constraint::Length(cw), Constraint::Length(ch));
+                let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
+                let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    })
+                    .unwrap();
+                app.show_original = exact;
+                app.viewport.exact = exact;
+                app.sync(layout(terminal.size().unwrap()).preview);
+                let completed = terminal
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    })
+                    .unwrap();
+                for pos in completed.buffer.area.positions() {
+                    assert_eq!(
+                        completed.buffer[pos].diff_option == CellDiffOption::AlwaysUpdate,
+                        protocol != ProtocolType::Kitty && old.contains(pos),
+                        "{protocol:?} at {pos:?}",
+                    );
+                }
+                let mut glyphs = crate::ui::Renderer::new(None);
+                let mut baseline = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                baseline
+                    .draw(|frame| {
+                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut glyphs);
+                    })
+                    .unwrap();
+                for pos in completed.buffer.area.positions() {
+                    let mut actual = completed.buffer[pos].clone();
+                    actual.set_diff_option(CellDiffOption::None);
+                    assert_eq!(actual, baseline.backend().buffer()[pos]);
+                }
+                let text: String = completed
+                    .buffer
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(!text.contains(&format!(
+                    "Original ({})",
+                    renderer.graphics.as_ref().unwrap().name()
+                )));
+            }
+        }
     }
 }

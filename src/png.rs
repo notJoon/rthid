@@ -1,3 +1,6 @@
+//! Background PNG writer for the dithered grid. Each dot becomes a solid square
+//! and the file is replaced only after a complete encode.
+
 use crate::dither::{self, PaletteColor};
 use image::ImageEncoder;
 use std::{
@@ -11,17 +14,25 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+/// Integer dot size from 1 to 4 that keeps the long side within 2048 px,
+/// unless the grid is already larger.
 pub fn preview_scale(w: u32, h: u32) -> u32 {
     2048u32.checked_div(w.max(h)).unwrap_or(1).clamp(1, 4)
 }
 
+/// Owned grid submitted for background PNG encoding.
 pub struct Job {
+    /// One palette index per dot, row major.
     pub indices: Vec<u8>,
+    /// Grid width in pixels.
     pub w: u32,
+    /// Grid height in pixels.
     pub h: u32,
+    /// Colors referenced by the indices.
     pub palette: Vec<PaletteColor>,
 }
 
+/// Background PNG writer. When several grids are queued only the newest is written.
 pub struct Worker {
     jobs: Option<Sender<(u64, Job)>>,
     results: Receiver<(u64, Option<io::Error>)>,
@@ -30,6 +41,7 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Spawns the writer thread for the destination path.
     pub fn new(path: PathBuf) -> io::Result<Self> {
         let (jobs, queued) = mpsc::channel::<(u64, Job)>();
         let (finished, results) = mpsc::channel();
@@ -37,11 +49,8 @@ impl Worker {
             .name("preview-png".into())
             .spawn(move || {
                 let mut result = Ok(());
-                while let Ok(mut newest) = queued.recv() {
-                    for job in queued.try_iter() {
-                        newest = job;
-                    }
-                    let (id, job) = newest;
+                while let Ok(first) = queued.recv() {
+                    let (id, job) = queued.try_iter().last().unwrap_or(first);
                     result = write_atomic(
                         &path,
                         &job.indices,
@@ -68,6 +77,7 @@ impl Worker {
         })
     }
 
+    /// Queues a grid without blocking and makes it the latest requested result.
     pub fn submit(&mut self, job: Job) -> io::Result<()> {
         self.latest += 1;
         self.jobs
@@ -77,13 +87,13 @@ impl Worker {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PNG worker stopped"))
     }
 
-    // Ignore completions for grids that have already been replaced in the UI.
-    pub fn poll(&self) -> Option<Option<io::Error>> {
+    /// Returns the result for the latest submitted grid once written, ignoring replaced grids.
+    pub fn poll(&self) -> Option<io::Result<()>> {
         self.results
             .try_iter()
             .filter(|(id, _)| *id == self.latest)
             .last()
-            .map(|(_, error)| error)
+            .map(|(_, error)| error.map_or(Ok(()), Err))
     }
 
     /// Waits for the final job and reports its result, even if it was already polled.
@@ -106,7 +116,8 @@ impl Drop for Worker {
     }
 }
 
-/// Writes an integer-scaled dot grid, replacing the destination only after PNG encoding succeeds.
+/// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
+/// file beside `path` and renames it over the destination only after encoding succeeds.
 pub fn write_atomic(
     path: &Path,
     indices: &[u8],
@@ -116,14 +127,9 @@ pub fn write_atomic(
     scale: u32,
 ) -> io::Result<()> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid PNG grid or scale");
-    let ow = w
-        .checked_mul(scale)
-        .filter(|&v| v > 0)
-        .ok_or_else(invalid)?;
-    let oh = h
-        .checked_mul(scale)
-        .filter(|&v| v > 0)
-        .ok_or_else(invalid)?;
+    let scaled = |n: u32| n.checked_mul(scale).filter(|&v| v > 0).ok_or_else(invalid);
+    let ow = scaled(w)?;
+    let oh = scaled(h)?;
     (ow as usize)
         .checked_mul(oh as usize)
         .and_then(|n| n.checked_mul(4))
@@ -192,8 +198,8 @@ mod tests {
 
     #[test]
     fn worker_eventually_writes_latest_job_and_reports_its_result() {
-        let dir = std::env::temp_dir().join(format!("rthid-worker-test-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("latest.png");
         let mut worker = Worker::new(path.clone()).unwrap();
         let palette = make_palette(&["#000", "#fff"]).unwrap();
@@ -207,16 +213,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert!(wait_for_result(&worker).is_none());
+        assert!(wait_for_result(&worker).is_ok());
         let image = image::open(&path).unwrap().to_rgba8();
         assert_eq!(image.dimensions(), (12, 8));
         assert!(image.pixels().all(|p| p.0 == [255; 4]));
         drop(worker);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
     }
 
-    fn wait_for_result(worker: &Worker) -> Option<io::Error> {
+    fn wait_for_result(worker: &Worker) -> io::Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(result) = worker.poll() {
@@ -229,8 +234,8 @@ mod tests {
 
     #[test]
     fn worker_finish_reports_unpolled_and_polled_write_failures() {
-        let dir = std::env::temp_dir().join(format!("rthid-finish-error-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         for polled in [false, true] {
             let mut worker = Worker::new(dir.clone()).unwrap();
             worker
@@ -242,18 +247,16 @@ mod tests {
                 })
                 .unwrap();
             if polled {
-                assert!(wait_for_result(&worker).is_some());
+                assert!(wait_for_result(&worker).is_err());
             }
             assert!(worker.finish().is_err());
         }
-        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
     fn worker_finish_uses_latest_success_after_write_failure() {
-        let dir =
-            std::env::temp_dir().join(format!("rthid-finish-recovery-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("preview.png");
         let mut worker = Worker::new(path.clone()).unwrap();
         for index in [1, 0] {
@@ -266,17 +269,17 @@ mod tests {
                 })
                 .unwrap();
             if index == 1 {
-                assert!(wait_for_result(&worker).is_some());
+                assert!(wait_for_result(&worker).is_err());
             }
         }
         worker.finish().unwrap();
         assert!(image::open(path).is_ok());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn worker_finish_handles_no_jobs_and_panics() {
-        Worker::new(std::env::temp_dir().join("rthid-unused.png"))
+        let dir = tempfile::tempdir().unwrap();
+        Worker::new(dir.path().join("rthid-unused.png"))
             .unwrap()
             .finish()
             .unwrap();
@@ -293,8 +296,8 @@ mod tests {
 
     #[test]
     fn atomic_png_replaces_and_preserves_destination_on_failure() {
-        let dir = std::env::temp_dir().join(format!("rthid-png-test-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let path = dir.join("preview.png");
         let palette = make_palette(&["#000", "#fff"]).unwrap();
         std::fs::write(&path, b"old").unwrap();
@@ -317,6 +320,5 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         write_atomic(&path, &[1], 1, 1, &palette, 1).unwrap();
         assert_eq!(image::open(&path).unwrap().width(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

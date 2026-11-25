@@ -1,5 +1,6 @@
 [tools]
-rust = { version = "1.93.0", components = "clippy,rustfmt" }
+rust = { version = "1.93.0", components = "clippy,rustfmt,llvm-tools-preview" }
+"github:taiki-e/cargo-llvm-cov" = "0.9.2"
 
 [tasks.run]
 run = "cargo run"
@@ -9,3 +10,7 @@ run = "cargo test"
 
 [tasks.lint]
 run = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
+
+# Prints line and region coverage per file. Add --html for a browsable report in target/llvm-cov/html.
+[tasks.coverage]
+run = "cargo llvm-cov --summary-only"

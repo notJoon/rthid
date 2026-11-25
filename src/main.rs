@@ -1,20 +1,61 @@
+//! rthid previews dithering of an image in the terminal.
+//!
+//! The source is loaded and shrunk once. `grid::GridCache` scales and rotates it into
+//! the grid and, when Dithered or a companion PNG needs it, dithers the grid
+//! into palette indices. `app::App` holds `settings::Settings` and the
+//! `viewport::Viewport`. `ui::draw` turns them into a frame through `cells` (cell glyphs) or `graphics`
+//! (terminal images), and `Export` writes the dithered grid to the companion PNG.
+//!
+//! Glossary:
+//! - Grid: the scaled and rotated image. Its pixels are also called dots.
+//! - Cell: one terminal character position.
+//! - Half block: the `▀` glyph whose fg and bg colors show two stacked dots in one cell.
+//! - Sextant and Quadrant: glyph sets for the dithered Overview and minimap that split a
+//!   cell into 2x3 or 2x2 subcells painted in the cell fg or bg color.
+//! - Overview: the whole grid fitted to the preview.
+//! - 1:1 (`exact` in code): one dot per half cell, panned from the viewport origin.
+//! - Minimap: an Overview inset shown in 1:1, dimmed outside the visible region.
+//! - Approximate: some Overview cell sampled more than two palette colors, so
+//!   the extra samples took the nearer kept color.
+//! - Companion PNG: the optional `--preview-png` file, rewritten after each new dither.
+
+/// Interactive state and input handling.
 mod app;
+/// Cell rendering for Overview, 1:1 and the minimap.
+mod cells;
+/// Companion PNG writer and its status.
+mod export;
+/// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for the Original Overview.
+mod graphics;
+/// Source image, scaled grid and dithered indices caches.
+mod grid;
+/// Single entry caches with build versions.
+mod memo;
+/// Editable settings and palette presets.
+mod settings;
+/// Screen layout, panels and status line.
 mod ui;
-mod view;
+/// Preview coordinates for Overview, 1:1 and the minimap.
+mod viewport;
 
 use std::{
-    ffi::OsString,
+    fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use clap::{Parser, ValueEnum};
 use image::imageops;
+use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
     execute,
 };
 
+use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
+
+/// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
 
 impl Drop for MouseCapture {
@@ -23,104 +64,39 @@ impl Drop for MouseCapture {
     }
 }
 
-struct KittyCleanup {
-    tmux: bool,
-}
-
-impl Drop for KittyCleanup {
-    fn drop(&mut self) {
-        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
-        let mut stdout = io::stdout().lock();
-        let _ = write!(
-            stdout,
-            "{start}{escape}_Ga=d,d=I,i={KITTY_IMAGE_ID}{escape}\\{end}"
-        )
-        .and_then(|()| stdout.flush());
-    }
-}
-
-use crate::{
-    app::{App, KITTY_IMAGE_ID},
-    view::Glyphs,
-};
-use ratatui_image::picker::{
-    Picker, ProtocolType,
-    cap_parser::{Parser, QueryStdioOptions},
-};
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum Graphics {
-    #[default]
-    Auto,
-    Off,
-}
-
 // Sources are shrunk on load to bound dither work per keypress.
-// Keep the original around once export needs full resolution.
+// Offering a full resolution export would require keeping the unshrunk original.
 const MAX_SOURCE_SIDE: u32 = 1024;
 
-fn parse_args(
-    args: impl IntoIterator<Item = OsString>,
-) -> io::Result<(PathBuf, Option<PathBuf>, Option<Glyphs>, Graphics)> {
-    let mut args = args.into_iter();
-    let mut source = None;
-    let mut preview = None;
-    let mut glyphs = None;
-    let mut graphics = None;
-    let invalid = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Usage: rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]",
-        )
-    };
-    fn choice<T: Copy>(
-        slot: &mut Option<T>,
-        next: Option<OsString>,
-        choices: &[(&str, T)],
-    ) -> Option<()> {
-        if slot.is_some() {
-            return None;
-        }
-        let next = next?;
-        *slot = Some(choices.iter().find(|(name, _)| next == *name)?.1);
-        Some(())
-    }
-    while let Some(arg) = args.next() {
-        if arg == "--preview-png" {
-            if preview.is_some() {
-                return Err(invalid());
-            }
-            let value = args.next().ok_or_else(invalid)?;
-            if value.is_empty() || value.as_encoded_bytes().starts_with(b"-") {
-                return Err(invalid());
-            }
-            preview = Some(PathBuf::from(value));
-        } else if arg == "--graphics" {
-            choice(
-                &mut graphics,
-                args.next(),
-                &[("auto", Graphics::Auto), ("off", Graphics::Off)],
-            )
-            .ok_or_else(invalid)?;
-        } else if arg == "--glyphs" {
-            choice(
-                &mut glyphs,
-                args.next(),
-                &[("sextant", Glyphs::Sextant), ("quadrant", Glyphs::Quadrant)],
-            )
-            .ok_or_else(invalid)?;
-        } else if arg.as_encoded_bytes().starts_with(b"-") || source.is_some() {
-            return Err(invalid());
-        } else {
-            source = Some(PathBuf::from(arg));
-        }
-    }
-    Ok((
-        source.unwrap_or_else(|| "tests/fixtures/hsl.jpg".into()),
-        preview,
-        glyphs,
-        graphics.unwrap_or_default(),
-    ))
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Source image to preview.
+    #[arg(default_value = "tests/fixtures/hsl.jpg")]
+    image: PathBuf,
+    /// Save the dithered preview to a PNG file.
+    #[arg(long, value_name = "PATH")]
+    preview_png: Option<PathBuf>,
+    /// Glyph set for the dithered overview and minimap.
+    #[arg(long, value_enum)]
+    glyphs: Option<CliGlyphs>,
+    /// Detect terminal graphics or use glyph rendering.
+    #[arg(long, value_enum, default_value = "auto")]
+    graphics: CliGraphics,
+}
+
+// TODO: These enums mirror cells::Glyphs and graphics::Mode to keep clap out of lower modules.
+// Revisit deriving ValueEnum on domain enums if that separation stops mattering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliGlyphs {
+    Sextant,
+    Quadrant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliGraphics {
+    Auto,
+    Off,
 }
 
 // The companion PNG is replaced on every re-dither, so it must never be the source image.
@@ -138,12 +114,26 @@ fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+// Pointer motion alone changes nothing on screen.
 fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
 }
 
 fn main() -> std::io::Result<()> {
-    let (path, preview_png, glyphs, graphics) = parse_args(std::env::args_os().skip(1))?;
+    let Args {
+        image: path,
+        preview_png,
+        glyphs,
+        graphics,
+    } = Args::parse();
+    let glyphs = glyphs.map(|glyphs| match glyphs {
+        CliGlyphs::Sextant => Glyphs::Sextant,
+        CliGlyphs::Quadrant => Glyphs::Quadrant,
+    });
+    let graphics = match graphics {
+        CliGraphics::Auto => Graphics::Auto,
+        CliGraphics::Off => Graphics::Off,
+    };
     check_not_source(&path, preview_png.as_deref())?;
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -153,139 +143,140 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = match image::open(&path) {
-        Ok(image) if image.width().max(image.height()) > MAX_SOURCE_SIDE => image
-            .resize(
-                MAX_SOURCE_SIDE,
-                MAX_SOURCE_SIDE,
-                imageops::FilterType::Triangle,
-            )
-            .to_rgba8(),
-        Ok(image) => image.to_rgba8(),
-        Err(error) => {
-            eprintln!("Could not load {}: {error}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let source = image::open(&path).unwrap_or_else(|error| {
+        eprintln!("Could not load {}: {error}", path.display());
+        std::process::exit(1);
+    });
+    let source = if source.width().max(source.height()) > MAX_SOURCE_SIDE {
+        source.resize(
+            MAX_SOURCE_SIDE,
+            MAX_SOURCE_SIDE,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        source
+    }
+    .to_rgba8();
     let mut app = App::new(source, preview_png);
     let term_program = std::env::var("TERM_PROGRAM").ok();
-    app.view.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    app.viewport.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mouse_capture = MouseCapture;
-    let mut kitty_cleanup = None;
     let terminal_result = ratatui::run(|terminal| {
-        if graphics == Graphics::Auto && term_program.as_deref() != Some("Apple_Terminal") {
-            app.graphics = Picker::from_query_stdio_with_options(QueryStdioOptions {
-                timeout: Duration::from_millis(200),
-                ..QueryStdioOptions::default()
-            })
-            .ok()
-            .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
-            .map(|picker| {
-                if picker.protocol_type() == ProtocolType::Kitty {
-                    kitty_cleanup = Some(KittyCleanup {
-                        tmux: picker.tmux_detected(),
-                    });
-                }
-                app::Graphics::new(picker)
-            });
-        }
+        let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut redraw = true;
-        while !app.quit {
-            if redraw {
-                app.refresh();
-                let frame = terminal.draw(|frame| app.draw(frame))?;
-                if let Some(log) = &mut debug_log {
-                    app.log_minimap(log, &frame)?;
-                }
-            }
-            redraw = false;
-            // With a companion PNG, wake periodically so background write results reach the status line.
-            if app.preview_png.is_some() && !event::poll(Duration::from_millis(50))? {
-                redraw = app.refresh();
-                continue;
-            }
-            // Drain queued input so held-down repeats cost one re-dither, not one each.
-            loop {
-                let event = event::read()?;
-                if let Some(log) = &mut debug_log {
-                    writeln!(log, "event {event:?}")?;
-                }
-                redraw |= needs_redraw(&event);
-                match event {
-                    Event::Key(key) => app.handle_key(key),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    _ => {}
-                }
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
-        Ok(())
+        event_loop(terminal, &mut app, &mut renderer, debug_log.as_mut())
     });
-    drop(kitty_cleanup);
     drop(mouse_capture);
     let png_result = app.finish_png();
     terminal_result.and(png_result)
 }
 
+// Syncs and draws when something changed, then waits for input and applies
+// every queued event before the next draw. Runs until the app requests quit.
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    renderer: &mut Renderer,
+    mut debug_log: Option<&mut File>,
+) -> io::Result<()> {
+    let mut layout = ui::layout(terminal.size()?);
+    let mut redraw = true;
+    while !app.quit {
+        if redraw {
+            app.poll_export();
+            app.sync(layout.preview);
+            let frame = terminal.draw(|frame| {
+                ui::draw(frame, app, &layout, renderer);
+            })?;
+            if let Some(log) = &mut debug_log {
+                ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
+            }
+        }
+        redraw = false;
+        // With a companion PNG, wake periodically so background write results reach the status line.
+        if app.has_export() && !event::poll(Duration::from_millis(50))? {
+            redraw = app.poll_export();
+            continue;
+        }
+        // Drain queued input so held-down repeats cost one re-dither, not one each.
+        loop {
+            let event = event::read()?;
+            if let Some(log) = &mut debug_log {
+                writeln!(log, "event {event:?}")?;
+            }
+            redraw |= needs_redraw(&event);
+            match event {
+                Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                Event::Mouse(mouse) => app.handle_mouse(mouse, &app.geometry(layout.preview)),
+                Event::Resize(width, height) => {
+                    layout = ui::layout(ratatui::layout::Size::new(width, height));
+                    app.clamp_viewport(layout.preview);
+                }
+                _ => {}
+            }
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use clap::CommandFactory;
 
     #[test]
-    fn cli_selects_graphics_and_rejects_invalid_or_duplicate_values() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&[]).unwrap().3, Graphics::Auto);
-        for (value, expected) in [("auto", Graphics::Auto), ("off", Graphics::Off)] {
-            assert_eq!(
-                parse(&["photo.png", "--graphics", value, "--glyphs", "quadrant"])
-                    .unwrap()
-                    .3,
-                expected
-            );
-        }
-        for args in [
-            vec!["--graphics"],
-            vec!["--graphics", ""],
-            vec!["--graphics", "kitty"],
-            vec!["--graphics", "Auto"],
-            vec!["--graphics", "off", "--graphics", "auto"],
-        ] {
-            assert!(parse(&args).is_err(), "{args:?}");
-        }
+    fn cli_defaults_and_definition() {
+        Args::command().debug_assert();
+        let args = Args::try_parse_from(["rthid"]).unwrap();
+        assert_eq!(args.image, PathBuf::from("tests/fixtures/hsl.jpg"));
+        assert_eq!(args.preview_png, None);
+        assert!(args.glyphs.is_none());
+        assert!(matches!(args.graphics, CliGraphics::Auto));
     }
 
     #[test]
-    fn cli_selects_glyphs_and_rejects_invalid_or_duplicate_values() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&[]).unwrap().2, None);
-        for (value, expected) in [
-            ("sextant", view::Glyphs::Sextant),
-            ("quadrant", view::Glyphs::Quadrant),
-        ] {
-            for args in [
-                vec!["--glyphs", value],
-                vec!["photo.png", "--glyphs", value, "--preview-png", "dots.png"],
-                vec!["--preview-png", "dots.png", "--glyphs", value, "photo.png"],
-            ] {
-                assert_eq!(parse(&args).unwrap().2, Some(expected));
-            }
+    fn cli_accepts_enum_values_and_paths() {
+        for (value, expected) in [("auto", CliGraphics::Auto), ("off", CliGraphics::Off)] {
+            let args = Args::try_parse_from(["rthid", "--graphics", value]).unwrap();
+            assert_eq!(args.graphics, expected);
         }
-        for args in [
-            vec!["--glyphs"],
-            vec!["--glyphs", ""],
-            vec!["--glyphs", "unknown"],
-            vec!["--glyphs", "Quadrant"],
-            vec!["--glyphs", "--preview-png"],
-            vec!["--glyphs", "quadrant", "--glyphs", "sextant"],
-            vec!["--glyphs", "sextant", "--glyphs", "sextant"],
+        for (value, expected) in [
+            ("sextant", CliGlyphs::Sextant),
+            ("quadrant", CliGlyphs::Quadrant),
         ] {
-            assert_eq!(
-                parse(&args).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput,
+            let args = Args::try_parse_from(["rthid", "--glyphs", value]).unwrap();
+            assert_eq!(args.glyphs, Some(expected));
+        }
+        let args = Args::try_parse_from([
+            "rthid",
+            "photo.png",
+            "--graphics",
+            "off",
+            "--glyphs",
+            "quadrant",
+            "--preview-png",
+            "dots.png",
+        ])
+        .unwrap();
+        assert_eq!(args.image, PathBuf::from("photo.png"));
+        assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
+        assert_eq!(args.graphics, CliGraphics::Off);
+        assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_arguments() {
+        for args in [
+            vec!["--graphics", "kitty"],
+            vec!["--glyphs", "unknown"],
+            vec!["--preview-png", ""],
+            vec!["a", "b"],
+        ] {
+            assert!(
+                Args::try_parse_from(std::iter::once("rthid").chain(args.iter().copied())).is_err(),
                 "{args:?}"
             );
         }
@@ -309,56 +300,18 @@ mod tests {
             Event::Resize(80, 24),
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         ] {
-            assert!([&moved, &event, &moved].into_iter().any(needs_redraw));
-        }
-    }
-
-    #[test]
-    fn cli_accepts_image_and_companion_and_rejects_invalid_arguments() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(
-            parse(&[]).unwrap(),
-            ("tests/fixtures/hsl.jpg".into(), None, None, Graphics::Auto)
-        );
-        assert_eq!(
-            parse(&["photo.png", "--preview-png", "dots.png"]).unwrap(),
-            (
-                "photo.png".into(),
-                Some("dots.png".into()),
-                None,
-                Graphics::Auto
-            )
-        );
-        assert_eq!(
-            parse(&["--preview-png", "dots.png", "photo.png"]).unwrap(),
-            (
-                "photo.png".into(),
-                Some("dots.png".into()),
-                None,
-                Graphics::Auto
-            )
-        );
-        for args in [
-            vec!["--preview-png"],
-            vec!["--wat"],
-            vec!["a", "b"],
-            vec!["--preview-png", "a", "--preview-png", "b"],
-            vec!["--preview-png", "--wat"],
-        ] {
-            assert!(parse(&args).is_err(), "{args:?}");
+            assert!(needs_redraw(&event));
         }
     }
 
     #[test]
     fn preview_png_may_not_overwrite_the_source() {
-        let dir = std::env::temp_dir().join(format!("rthid-cli-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("photo.png");
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.png");
         std::fs::write(&source, b"image").unwrap();
-        let aliased = dir.join(".").join("photo.png");
+        let aliased = dir.path().join(".").join("photo.png");
         assert!(check_not_source(&source, Some(&aliased)).is_err());
-        assert!(check_not_source(&source, Some(&dir.join("dots.png"))).is_ok());
+        assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
         assert!(check_not_source(&source, None).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

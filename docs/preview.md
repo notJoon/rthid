@@ -6,8 +6,10 @@
 rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off]
 ```
 
+Use `rthid --help` for option details and `rthid --version` for the version.
+
 `image` defaults to `tests/fixtures/hsl.jpg`. Use a terminal with Unicode
-half-block support and support for the selected overview glyphs (sextants or
+half block support and support for the selected overview glyphs (sextants or
 quadrants).
 
 ## Display
@@ -16,10 +18,10 @@ Original / Dithered selects the image layer; Overview / 1:1 selects how it is
 shown. The preview starts with Original in Overview.
 
 - **Original / Dithered**: Original shows the scaled, rotated source as real pixels
-  via Kitty, iTerm2, or Sixel when supported; otherwise it uses truecolor half blocks.
-  The status line names the graphics protocol when active. 1:1 uses nearest-neighbor
-  scaling; graphics overview preserves aspect using the terminal's cell pixel size.
-  Half-block overview averages pixels per half cell. Press `Space` to toggle
+  via Kitty, iTerm2, or Sixel in Overview when supported. Otherwise, including
+  in 1:1, it uses truecolor half blocks. The status line names the graphics protocol
+  only while drawing an image. Graphics overview preserves aspect using the terminal's cell pixel size.
+  Half block overview averages pixels per half cell. Press `Space` to toggle
   between original and dithered. Dithering is deferred while Original is shown
   unless a companion PNG is enabled.
   Changing a dither parameter reveals the dithered result; scale, rotation,
@@ -27,7 +29,7 @@ shown. The preview starts with Original in Overview.
 - **Overview**: fits the whole grid into the preview. For Dithered,
   `approximate` means colors were reduced for terminal display; sampling may
   omit detail even without this label.
-- **1:1**: shows each grid pixel without resampling or color reduction.
+- **1:1**: shows each grid pixel as half a cell without resampling or color reduction.
   The status line shows inclusive, one-based x/y dot ranges.
 - **Minimap**: appears in the top-right corner in 1:1. The visible region keeps
   its colors; the rest is dimmed. Hidden when the terminal is too small.
