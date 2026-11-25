@@ -8,7 +8,7 @@ rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|
 
 Use `rthid --help` for option details and `rthid --version` for the version.
 
-`image` defaults to `crates/rthid-dither/tests/fixtures/hsl.jpg`. Use a terminal
+Omit `image` to start with an empty preview. Use a terminal
 with Unicode half block support and support for the selected overview glyphs
 (sextants or quadrants).
 

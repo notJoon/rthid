@@ -3,8 +3,10 @@
 rthid previews dithering of an image in the terminal.
 
 ```sh
-cargo run -- <image>
+cargo run -- [image]
 ```
+
+Omit the image path to start with an empty preview.
 
 See [docs/preview.md](docs/preview.md) for keys and options.
 

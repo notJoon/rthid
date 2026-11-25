@@ -51,7 +51,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use image::imageops;
+use image::{RgbaImage, imageops};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
@@ -77,8 +77,7 @@ const MAX_SOURCE_SIDE: u32 = 1024;
 #[command(version, about)]
 struct Args {
     /// Source image to preview.
-    #[arg(default_value = "crates/rthid-dither/tests/fixtures/hsl.jpg")]
-    image: PathBuf,
+    image: Option<PathBuf>,
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
@@ -122,6 +121,22 @@ fn check_not_source(source: &Path, preview: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+// Shrinks sources on load to bound processing work.
+fn load_image(path: &Path) -> Result<RgbaImage, String> {
+    let source =
+        image::open(path).map_err(|error| format!("Could not load {}: {error}", path.display()))?;
+    Ok(if source.width().max(source.height()) > MAX_SOURCE_SIDE {
+        source.resize(
+            MAX_SOURCE_SIDE,
+            MAX_SOURCE_SIDE,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        source
+    }
+    .to_rgba8())
+}
+
 // Pointer motion alone changes nothing on screen.
 fn needs_redraw(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
@@ -143,7 +158,9 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Auto => Graphics::Auto,
         CliGraphics::Off => Graphics::Off,
     };
-    check_not_source(&path, preview_png.as_deref())?;
+    if let Some(path) = &path {
+        check_not_source(path, preview_png.as_deref())?;
+    }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
             std::fs::OpenOptions::new()
@@ -152,20 +169,13 @@ fn main() -> std::io::Result<()> {
                 .open(path)
         })
         .transpose()?;
-    let source = image::open(&path).unwrap_or_else(|error| {
-        eprintln!("Could not load {}: {error}", path.display());
-        std::process::exit(1);
+    let source = path.map(|path| {
+        let image = load_image(&path).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        (path, image)
     });
-    let source = if source.width().max(source.height()) > MAX_SOURCE_SIDE {
-        source.resize(
-            MAX_SOURCE_SIDE,
-            MAX_SOURCE_SIDE,
-            imageops::FilterType::Triangle,
-        )
-    } else {
-        source
-    }
-    .to_rgba8();
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
     let mut messages = Vec::new();
@@ -276,10 +286,7 @@ mod tests {
     fn cli_defaults_and_definition() {
         Args::command().debug_assert();
         let args = Args::try_parse_from(["rthid"]).unwrap();
-        assert_eq!(
-            args.image,
-            PathBuf::from("crates/rthid-dither/tests/fixtures/hsl.jpg")
-        );
+        assert_eq!(args.image, None);
         assert_eq!(args.preview_png, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
@@ -312,7 +319,7 @@ mod tests {
             "presets.toml",
         ])
         .unwrap();
-        assert_eq!(args.image, PathBuf::from("photo.png"));
+        assert_eq!(args.image, Some(PathBuf::from("photo.png")));
         assert_eq!(args.config, Some(PathBuf::from("presets.toml")));
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);

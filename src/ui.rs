@@ -125,8 +125,10 @@ pub fn log_minimap(
         "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
         frame.count, app.viewport, geometry.area
     )?;
+    let Some(pixels) = app.displayed() else {
+        return log.flush();
+    };
     let mut overview = ratatui::buffer::Buffer::empty(geometry.area);
-    let pixels = app.displayed();
     if let Some(viewport::Minimap {
         frame: inset,
         map,
@@ -401,6 +403,19 @@ fn draw_preview(
     geometry: &viewport::PreviewGeometry,
     renderer: &mut Renderer,
 ) -> PreviewReport {
+    let Some(pixels) = app.displayed() else {
+        if let Some(graphics) = &mut renderer.graphics {
+            graphics.present(frame, None);
+        }
+        let hint = geometry
+            .area
+            .centered(Constraint::Percentage(100), Constraint::Length(2));
+        frame.render_widget(
+            Paragraph::new("No image\no: open file | drop an image file here").centered(),
+            hint,
+        );
+        return PreviewReport::default();
+    };
     let image_mode = app.modal.is_none()
         && renderer.graphics.is_some()
         && app.show_original
@@ -410,7 +425,7 @@ fn draw_preview(
         false
     } else {
         cells::render(
-            app.displayed(),
+            pixels,
             app.glyphs,
             geometry,
             frame.buffer_mut(),
@@ -426,7 +441,7 @@ fn draw_preview(
             frame,
             image_mode.then(|| {
                 (
-                    app.grid_cache.grid(),
+                    app.grid_cache.grid().expect("processed grid"),
                     app.grid_cache.grid_version(),
                     geometry,
                 )
@@ -442,8 +457,13 @@ fn draw_preview(
 
 // PNG errors, config notices and graphics errors replace the normal status line.
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
+    if let Some(message) = app.export_status().or_else(|| app.notice()) {
+        return message.to_owned();
+    }
+    let Some((sw, sh)) = app.grid_cache.source_size() else {
+        return "No image".into();
+    };
     let (gw, gh) = geometry.grid;
-    let (sw, sh) = app.grid_cache.source_size();
     let mode = if geometry.zoom == viewport::Zoom::Fit {
         format!(
             "Fit ({}){}",
@@ -476,16 +496,12 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     } else {
         "Dithered".into()
     };
-    app.export_status()
-        .map(str::to_owned)
-        .or_else(|| app.notice().map(str::to_owned))
-        .or(report.graphics_error)
-        .unwrap_or_else(|| {
-            format!(
-                "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
-                app.settings.rotation.degrees(),
-            )
-        })
+    report.graphics_error.unwrap_or_else(|| {
+        format!(
+            "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
+            app.settings.rotation.degrees(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -509,6 +525,34 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn empty_preview_draws_hint_and_logs_only_header() {
+        let mut app = App::empty();
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(text.contains("No image"));
+        assert!(text.contains("o: open file | drop an image file here"));
+        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        assert_eq!(
+            status(&app, &geometry, PreviewReport::default()),
+            "No image"
+        );
+        let frame = terminal
+            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .unwrap();
+        let mut log = Vec::new();
+        log_minimap(&app, &mut log, &frame, &geometry).unwrap();
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.starts_with("[minimap]"));
+        assert_eq!(log.lines().count(), 1);
+        app.set_notice("Config notice".into());
+        assert_eq!(
+            status(&app, &geometry, PreviewReport::default()),
+            "Config notice"
+        );
     }
 
     #[test]

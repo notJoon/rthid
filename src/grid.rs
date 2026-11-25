@@ -26,7 +26,7 @@ pub(crate) struct DitherKey {
 /// rebuilds only when its key changes.
 pub struct GridCache {
     /// Loaded image before scaling and rotation.
-    pub(crate) source: RgbaImage,
+    pub(crate) source: Option<RgbaImage>,
     /// Scaled and rotated image cache.
     pub(crate) grid: Memo<GridKey, RgbaImage>,
     /// Palette indices from the last requested dither.
@@ -34,20 +34,38 @@ pub struct GridCache {
 }
 
 impl GridCache {
+    /// Whether an image is loaded.
+    pub fn has_source(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// Replaces the image and invalidates both caches without resetting versions.
+    pub fn set_source(&mut self, image: RgbaImage) {
+        self.source = Some(image);
+        self.grid.clear();
+        self.dithered.clear();
+    }
+
     /// Grid dimensions before rotation for the current scale.
     pub(crate) fn scaled_size(&self, settings: &Settings) -> (u32, u32) {
+        let Some(source) = &self.source else {
+            return (0, 0);
+        };
         let scaled = |n| {
             (f64::from(n) * f64::from(settings.scale) / 100.0)
                 .round()
                 .max(1.0) as u32
         };
-        (scaled(self.source.width()), scaled(self.source.height()))
+        (scaled(source.width()), scaled(source.height()))
     }
 
     /// Rebuilds the grid when the scaled size or rotation changed and, if
     /// `need_dither` is set, the indices when the grid or dither options changed.
     /// Returns true when new indices were built.
     pub fn refresh(&mut self, settings: &Settings, need_dither: bool) -> bool {
+        let Some(source) = &self.source else {
+            return false;
+        };
         let (width, height) = self.scaled_size(settings);
         self.grid.update(
             GridKey {
@@ -57,7 +75,7 @@ impl GridCache {
             },
             || {
                 let scaled =
-                    imageops::resize(&self.source, width, height, imageops::FilterType::Triangle);
+                    imageops::resize(source, width, height, imageops::FilterType::Triangle);
                 settings.rotation.apply(scaled)
             },
         );
@@ -78,8 +96,8 @@ impl GridCache {
     }
 
     /// The scaled and rotated image that is shown as Original and dithered.
-    pub fn grid(&self) -> &RgbaImage {
-        self.grid.get().expect("processed grid")
+    pub fn grid(&self) -> Option<&RgbaImage> {
+        self.grid.get()
     }
 
     /// Number of grid builds, so preview caches can tell when the grid changed.
@@ -94,7 +112,7 @@ impl GridCache {
     }
 
     /// Loaded dimensions before scaling and rotation.
-    pub fn source_size(&self) -> (u32, u32) {
-        self.source.dimensions()
+    pub fn source_size(&self) -> Option<(u32, u32)> {
+        self.source.as_ref().map(RgbaImage::dimensions)
     }
 }
