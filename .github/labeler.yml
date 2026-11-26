@@ -1,0 +1,20 @@
+# Path rules for actions/labeler. Labels are only added, never removed.
+A-tui:
+  - changed-files:
+      - any-glob-to-any-file: 'src/**'
+A-dither:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/rthid-dither/**'
+A-io:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/rthid-io/**'
+A-widgets:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/rthid-widgets/**'
+A-term:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/rthid-term/**'
+# Only when every changed file is documentation.
+C-docs:
+  - changed-files:
+      - all-globs-to-all-files: ['**/*.md', 'docs/**', 'specs/**']

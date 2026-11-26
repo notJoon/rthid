@@ -1,0 +1,44 @@
+name: Labeler
+
+on:
+  # pull_request_target can label PRs from forks. Nothing here checks out PR code.
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # A- labels and C-docs from changed paths, see .github/labeler.yml.
+      - uses: actions/labeler@v7
+        id: paths
+      # Other C- labels from the PR title. Labels are only added, so manual fixes stick.
+      - uses: actions/github-script@v9
+        env:
+          PATH_LABELS: ${{ steps.paths.outputs.all-labels }}
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const have = new Set(process.env.PATH_LABELS.split(',').filter(Boolean));
+            for (const l of context.payload.pull_request.labels) have.add(l.name);
+            const rules = [
+              ['C-bug', /\bfix(es|ed)?\b|\bbug/i],
+              ['C-perf', /\b(speed|faster|perf|performance|profil\w*|optimi[sz]e)\b/i],
+              ['C-refactor', /^(move|split|extract|rename|refactor)\b/i],
+            ];
+            const add = rules.filter(([, re]) => re.test(title)).map(([l]) => l);
+            // Feature verbs count only when nothing more specific matched.
+            const hasCategory = add.length > 0 || [...have].some((l) => l.startsWith('C-'));
+            if (!hasCategory && /^(add|support|show|start|allow)\b/i.test(title)) add.push('C-enhancement');
+            const missing = add.filter((l) => !have.has(l));
+            if (missing.length) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: missing,
+              });
+            }
