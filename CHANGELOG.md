@@ -18,6 +18,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Cells next to a one-column inline image, such as a very tall image at Fit,
+  are redrawn instead of keeping the previous image
 - Resizing the window in iTerm2 no longer leaves copies of the rthid screen in
   the shell's scrollback after quitting
 - Original at Fit is visible again in iTerm2, which answered the Kitty graphics
