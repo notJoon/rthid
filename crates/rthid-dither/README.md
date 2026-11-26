@@ -32,8 +32,12 @@ fn main() {
 ```
 
 Defaults use a black-and-white palette, Tone mode, serpentine Atkinson error
-diffusion at full strength, and no tone adjustment. `rasterize` expands the
-indices to opaque RGBA pixels using nearest-neighbor sampling; its output width
+diffusion at full strength, and no tone adjustment. `Algorithm::Diffusion` selects
+Atkinson, Floyd Steinberg, Jarvis Judice Ninke, Stucki or Sierra Lite through its
+`kernel` field, with `serpentine` and `strength` controlling traversal and error.
+Atkinson spreads only 3/4 of the error. The other kernels spread the full error.
+
+`rasterize` expands the indices to opaque RGBA pixels using nearest-neighbor sampling; its output width
 and height may differ from the input grid's dimensions.
 
 ## Custom palettes and adjustments
@@ -43,12 +47,17 @@ indices refer to this sorted palette. Tone mode quantizes evenly spaced luminanc
 levels; use Color mode to choose the nearest actual RGB color:
 
 ```rust
-use rthid_dither::dither::{Mode, Options, Tone, dither, make_palette};
+use rthid_dither::dither::{Algorithm, Kernel, Mode, Options, Tone, dither, make_palette};
 
 fn main() -> Result<(), String> {
     let options = Options {
         palette: make_palette(&["#172438", "#c45238", "#f3e8c8"])?,
         mode: Mode::Color,
+        algorithm: Algorithm::Diffusion {
+            kernel: Kernel::FloydSteinberg,
+            serpentine: true,
+            strength: 1.0,
+        },
         tone: Tone { gamma: 1.2, ..Tone::default() },
         ..Options::default()
     };

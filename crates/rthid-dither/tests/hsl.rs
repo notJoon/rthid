@@ -3,7 +3,7 @@
 use std::sync::LazyLock;
 
 use image::RgbaImage;
-use rthid_dither::dither::{Mode, Options, Tone, dither, make_palette};
+use rthid_dither::dither::{Algorithm, Kernel, Mode, Options, Tone, dither, make_palette};
 
 const PALETTE: [&str; 4] = ["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"];
 
@@ -18,19 +18,28 @@ fn check(options: Options, golden: &[u8]) {
     assert_eq!(diff, 0, "{diff} pixels differ from the golden");
 }
 
-#[test]
-fn hsl_tone_matches_golden() {
-    let options = Options {
+fn tone_options(kernel: Kernel) -> Options {
+    Options {
         palette: make_palette(&PALETTE).unwrap(),
+        algorithm: Algorithm::Diffusion {
+            kernel,
+            serpentine: true,
+            strength: 1.0,
+        },
         ..Options::default()
-    };
-    check(options, include_bytes!("fixtures/hsl_tone.idx"));
+    }
 }
 
 #[test]
-fn hsl_color_matches_golden() {
-    let options = Options {
-        palette: make_palette(&PALETTE).unwrap(),
+fn hsl_tone_matches_golden() {
+    check(
+        tone_options(Kernel::Atkinson),
+        include_bytes!("fixtures/hsl_tone.idx"),
+    );
+}
+
+fn color_options(kernel: Kernel) -> Options {
+    Options {
         mode: Mode::Color,
         tone: Tone {
             contrast: 0.15,
@@ -39,7 +48,78 @@ fn hsl_color_matches_golden() {
             sharpen: 0.6,
             ..Tone::default()
         },
-        ..Options::default()
-    };
-    check(options, include_bytes!("fixtures/hsl_color.idx"));
+        ..tone_options(kernel)
+    }
+}
+
+#[test]
+fn hsl_color_matches_golden() {
+    check(
+        color_options(Kernel::Atkinson),
+        include_bytes!("fixtures/hsl_color.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_floyd_steinberg_matches_golden() {
+    check(
+        tone_options(Kernel::FloydSteinberg),
+        include_bytes!("fixtures/hsl_tone_floyd_steinberg.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_floyd_steinberg_matches_golden() {
+    check(
+        color_options(Kernel::FloydSteinberg),
+        include_bytes!("fixtures/hsl_color_floyd_steinberg.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_jarvis_matches_golden() {
+    check(
+        tone_options(Kernel::JarvisJudiceNinke),
+        include_bytes!("fixtures/hsl_tone_jarvis.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_jarvis_matches_golden() {
+    check(
+        color_options(Kernel::JarvisJudiceNinke),
+        include_bytes!("fixtures/hsl_color_jarvis.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_stucki_matches_golden() {
+    check(
+        tone_options(Kernel::Stucki),
+        include_bytes!("fixtures/hsl_tone_stucki.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_stucki_matches_golden() {
+    check(
+        color_options(Kernel::Stucki),
+        include_bytes!("fixtures/hsl_color_stucki.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_sierra_lite_matches_golden() {
+    check(
+        tone_options(Kernel::SierraLite),
+        include_bytes!("fixtures/hsl_tone_sierra_lite.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_sierra_lite_matches_golden() {
+    check(
+        color_options(Kernel::SierraLite),
+        include_bytes!("fixtures/hsl_color_sierra_lite.idx"),
+    );
 }

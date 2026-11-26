@@ -5,8 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.2.0] - Unreleased
 
+### Added
+
+- Floyd Steinberg, Jarvis Judice Ninke, Stucki and Sierra Lite kernels selected
+  through `Algorithm`
+
 ### Changed
 
+- Move `serpentine` and `strength` from `Options` into `Algorithm::Diffusion`
 - Keep palette RGB bytes as the single source of color data; derive normalized
   channels privately when dithering in Color mode
 - Include the color's position and input text in palette parsing errors

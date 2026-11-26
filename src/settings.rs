@@ -1,7 +1,16 @@
 //! Editable settings and palette presets.
 
 use image::{RgbaImage, imageops};
-use rthid_dither::dither::{self, Mode, Options, PaletteColor, Tone};
+use rthid_dither::dither::{self, Algorithm, Mode, Options, PaletteColor, Tone};
+
+fn diffusion(options: &mut Options) -> (&mut f64, &mut bool) {
+    let Algorithm::Diffusion {
+        strength,
+        serpentine,
+        ..
+    } = &mut options.algorithm;
+    (strength, serpentine)
+}
 
 /// Maximum number of characters in a preset or template name.
 pub const MAX_NAME_CHARS: usize = 32;
@@ -179,21 +188,27 @@ pub struct Template {
 impl Template {
     /// Copies settings so later preset edits cannot alter this template.
     pub fn capture(name: String, settings: &Settings) -> Self {
+        let Algorithm::Diffusion {
+            strength,
+            serpentine,
+            ..
+        } = settings.options.algorithm;
         Self {
             name,
             palette_name: settings.palette_name.clone(),
             palette_hex: settings.palette_hex.clone(),
             mode: settings.options.mode,
-            strength: settings.options.strength,
-            serpentine: settings.options.serpentine,
+            strength,
+            serpentine,
             scale: settings.scale,
             tone: settings.options.tone,
         }
     }
 
-    /// Restores saved settings while retaining the current image rotation.
+    /// Restores saved settings while retaining the current rotation and kernel.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
+        let Algorithm::Diffusion { kernel, .. } = settings.options.algorithm;
         Ok(Settings {
             scale: self.scale,
             rotation: settings.rotation,
@@ -202,8 +217,11 @@ impl Template {
             options: rthid_dither::dither::Options {
                 palette,
                 mode: self.mode,
-                strength: self.strength,
-                serpentine: self.serpentine,
+                algorithm: Algorithm::Diffusion {
+                    kernel,
+                    strength: self.strength,
+                    serpentine: self.serpentine,
+                },
                 tone: self.tone,
             },
         })
@@ -386,6 +404,11 @@ impl Setting {
     /// Label including the current value.
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
         let o = &settings.options;
+        let Algorithm::Diffusion {
+            strength,
+            serpentine,
+            ..
+        } = o.algorithm;
         match self {
             Setting::Scale => format!("Scale: {}%", settings.scale),
             Setting::Mode => format!("Mode: {:?}", o.mode),
@@ -397,9 +420,9 @@ impl Setting {
                     if matches { "" } else { "*" }
                 )
             }
-            Setting::Strength => format!("Strength: {:.1}", o.strength),
+            Setting::Strength => format!("Strength: {:.1}", strength),
             Setting::Serpentine => {
-                format!("Serpentine: {}", if o.serpentine { "on" } else { "off" })
+                format!("Serpentine: {}", if serpentine { "on" } else { "off" })
             }
             Setting::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
             Setting::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
@@ -499,12 +522,17 @@ impl Settings {
     pub fn with_default(&self, setting: Setting, palettes: &Palettes) -> Self {
         let mut next = self.clone();
         let defaults = Self::default();
+        let Algorithm::Diffusion {
+            strength,
+            serpentine,
+            ..
+        } = defaults.options.algorithm;
         match setting {
             Setting::Scale => next.scale = defaults.scale,
             Setting::Mode => next.options.mode = defaults.options.mode,
             Setting::Palette => next = next.with_preset(&palettes.presets[0]),
-            Setting::Strength => next.options.strength = defaults.options.strength,
-            Setting::Serpentine => next.options.serpentine = defaults.options.serpentine,
+            Setting::Strength => *diffusion(&mut next.options).0 = strength,
+            Setting::Serpentine => *diffusion(&mut next.options).1 = serpentine,
             Setting::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
             Setting::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
             Setting::Gamma => next.options.tone.gamma = defaults.options.tone.gamma,
@@ -540,8 +568,14 @@ impl Settings {
                     (current as i64 + i64::from(dir)).rem_euclid(palettes.len() as i64) as usize;
                 next = next.with_preset(&palettes.presets[i]);
             }
-            Setting::Strength => next.options.strength = step(self.options.strength),
-            Setting::Serpentine => next.options.serpentine = !self.options.serpentine,
+            Setting::Strength => {
+                let (strength, _) = diffusion(&mut next.options);
+                *strength = step(*strength);
+            }
+            Setting::Serpentine => {
+                let (_, serpentine) = diffusion(&mut next.options);
+                *serpentine = !*serpentine;
+            }
             Setting::Brightness => {
                 next.options.tone.brightness = step(self.options.tone.brightness)
             }
@@ -783,7 +817,7 @@ mod tests {
         }
     }
     #[test]
-    fn templates_restore_snapshots_while_retaining_rotation() {
+    fn templates_restore_snapshots_while_retaining_rotation_and_kernel() {
         let mut settings = Settings {
             scale: 60,
             rotation: Rotation::R90,
@@ -794,8 +828,8 @@ mod tests {
                 builtin: false,
             })
         };
-        settings.options.strength = 0.85;
-        settings.options.serpentine = false;
+        *diffusion(&mut settings.options).0 = 0.85;
+        *diffusion(&mut settings.options).1 = false;
         settings.options.tone = Tone {
             brightness: 0.1,
             contrast: 0.15,
@@ -805,11 +839,15 @@ mod tests {
             sharpen: 0.6,
         };
         let mut template = Template::capture("Zine".into(), &settings);
-        let current = Settings {
+        let mut current = Settings {
             rotation: Rotation::R270,
             ..Settings::default()
         };
+        let Algorithm::Diffusion { kernel, .. } = &mut current.options.algorithm;
+        *kernel = dither::Kernel::Stucki;
         let restored = template.apply(&current).unwrap();
+        let Algorithm::Diffusion { kernel, .. } = &mut settings.options.algorithm;
+        *kernel = dither::Kernel::Stucki;
         assert!(
             restored
                 == Settings {

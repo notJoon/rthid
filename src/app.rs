@@ -787,7 +787,7 @@ mod tests {
         ui::Layout,
     };
     use ratatui::layout::Rect;
-    use rthid_dither::dither::Mode;
+    use rthid_dither::dither::{Algorithm, Mode};
 
     fn opened_photo() -> IoOutcome {
         IoOutcome::Opened(Ok(Opened::Image {
@@ -1046,7 +1046,10 @@ mod tests {
         app.show_original = false;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
-        app.settings.options.strength = 0.5;
+        {
+            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
+            *strength = 0.5;
+        }
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         assert!(!App::empty().sync(preview));
@@ -1242,7 +1245,10 @@ mod tests {
     #[test]
     fn template_manager_saves_and_applies_settings() {
         let mut app = app_at(Setting::Strength);
-        app.settings.options.strength = 0.5;
+        {
+            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
+            *strength = 0.5;
+        }
         let saved = app.settings.clone();
         for code in [
             KeyCode::Char('T'),
@@ -1257,12 +1263,16 @@ mod tests {
             app.library.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
         );
-        app.settings.options.strength = 0.9;
+        {
+            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
+            *strength = 0.9;
+        }
         app.settings.rotation = Rotation::R90;
         for code in [KeyCode::Char('T'), KeyCode::Enter] {
             press(&mut app, code);
         }
-        assert_eq!(app.settings.options.strength, 0.5);
+        let Algorithm::Diffusion { strength, .. } = app.settings.options.algorithm;
+        assert_eq!(strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
     }
@@ -1780,7 +1790,10 @@ mod tests {
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 1);
-        app.settings.options.strength = 0.5;
+        {
+            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
+            *strength = 0.5;
+        }
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 2);
@@ -1912,7 +1925,10 @@ mod tests {
         type Getter = fn(&Settings) -> f64;
         let cases: [(Setting, Getter); 8] = [
             (Setting::Scale, |p| f64::from(p.scale)),
-            (Setting::Strength, |p| p.options.strength),
+            (Setting::Strength, |p| {
+                let Algorithm::Diffusion { strength, .. } = p.options.algorithm;
+                strength
+            }),
             (Setting::Brightness, |p| p.options.tone.brightness),
             (Setting::Contrast, |p| p.options.tone.contrast),
             (Setting::Gamma, |p| p.options.tone.gamma),
@@ -1943,7 +1959,8 @@ mod tests {
         assert!(matches!(app.settings.options.mode, Mode::Color));
         let mut app = app_at(Setting::Serpentine);
         press(&mut app, KeyCode::Right);
-        assert!(!app.settings.options.serpentine);
+        let Algorithm::Diffusion { serpentine, .. } = app.settings.options.algorithm;
+        assert!(!serpentine);
         let mut app = app_at(Setting::Palette);
         // Wrapping back lands on the last built-in, which also switches to its Color mode.
         press(&mut app, KeyCode::Left);
