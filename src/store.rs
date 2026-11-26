@@ -41,6 +41,7 @@ pub struct Library {
     save_retry: Option<Instant>,
     save_blocked: Option<String>,
     save_error: Option<String>,
+    load_notice: Option<String>,
     last_token: u64,
 }
 
@@ -51,14 +52,14 @@ pub enum SaveNotice {
     Show(String),
     /// Clears a diagnostic owned by configuration persistence.
     ClearConfig,
-    /// Preserves the current diagnostic for a repeated error.
-    Unchanged,
 }
 
 impl Library {
     /// Starts with loaded lists and no pending edits.
     pub fn new(loaded: Loaded) -> Self {
+        let load_notice = loaded.notice();
         Self {
+            load_notice,
             palettes: loaded.palettes,
             templates: loaded.templates,
             unsaved: Vec::new(),
@@ -70,6 +71,11 @@ impl Library {
             save_error: None,
             last_token: 0,
         }
+    }
+
+    /// Unresolved save failure before load warnings and blocked saving for the status line.
+    pub fn notice(&self) -> Option<&str> {
+        self.save_error.as_deref().or(self.load_notice.as_deref())
     }
 
     /// Applies a validated edit and retains it until a save confirms it.
@@ -151,8 +157,10 @@ impl Library {
     }
 
     fn saved(&mut self, loaded: Loaded) -> SaveNotice {
-        let notice = loaded
-            .notice()
+        self.load_notice = loaded.notice();
+        let notice = self
+            .load_notice
+            .clone()
             .map_or(SaveNotice::ClearConfig, SaveNotice::Show);
         self.save_error = None;
         self.palettes = loaded.palettes;
@@ -162,13 +170,9 @@ impl Library {
     }
 
     fn save_failed(&mut self, error: String) -> SaveNotice {
-        if self.save_error.as_ref() == Some(&error) {
-            SaveNotice::Unchanged
-        } else {
-            let notice = SaveNotice::Show(format!("config: {error}"));
-            self.save_error = Some(error);
-            notice
-        }
+        let text = format!("config: {error}");
+        self.save_error = Some(text.clone());
+        SaveNotice::Show(text)
     }
 }
 
@@ -704,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_save_reports_each_error_once() {
+    fn failed_save_reports_repeated_errors() {
         let mut library = Library::new(Loaded::default());
         library
             .commit(Change::UpsertTemplate(Template::capture(
@@ -720,7 +724,10 @@ mod tests {
             library.save_failed("busy".into()),
             SaveNotice::Show("config: busy".into())
         );
-        assert_eq!(library.save_failed("busy".into()), SaveNotice::Unchanged);
+        assert_eq!(
+            library.save_failed("busy".into()),
+            SaveNotice::Show("config: busy".into())
+        );
         assert_eq!(library.saved(Loaded::default()), SaveNotice::ClearConfig);
         assert_eq!(
             library.save_failed("denied".into()),

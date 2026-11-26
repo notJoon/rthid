@@ -467,7 +467,7 @@ fn draw_preview(
 
 // PNG errors, config notices and graphics errors replace the normal status line.
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
-    if let Some(message) = app.notice().or_else(|| app.export_status()) {
+    if let Some(message) = app.notice() {
         return message.to_owned();
     }
     let Some((sw, sh)) = app.grid_cache.source_size() else {

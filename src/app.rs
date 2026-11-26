@@ -30,6 +30,8 @@ struct OpenRequest {
     token: u64,
     /// Generation of the dialog that asked, if any.
     dialog: Option<u64>,
+    /// Status label shown until this request finishes.
+    label: String,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +43,7 @@ struct Drag {
 
 enum Source {
     Config,
+    Export,
     Other,
 }
 
@@ -62,10 +65,6 @@ pub struct App {
     export: Option<Export>,
     source_path: Option<PathBuf>,
     notice: Option<Notice>,
-    // TODO: Derive the Loading text from `open_request` and render it ahead of `notice` in the
-    //       status line. Notices would then never need deferring, and this field and every
-    //       `loading()` guard could go.
-    deferred_notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
     open_request: Option<OpenRequest>,
     // Last value handed out as a dialog generation or Open token.
@@ -120,7 +119,6 @@ impl App {
             },
             library: Library::new(loaded),
             notice: None,
-            deferred_notice: None,
             outbox: Vec::new(),
             open_request: None,
             last_token: 0,
@@ -174,17 +172,21 @@ impl App {
         if let Some(Modal::OpenFile(picker)) = &mut self.modal {
             picker.set_listing(dir, entries);
         }
-        if !self.loading() {
-            self.notice = None;
-        }
+        self.notice = None;
     }
 
-    /// Current configuration diagnostic for the status line.
+    /// Status text with loading and the current notice before persistent diagnostics.
+    /// Fallbacks are save errors, load warnings and blocked saving, then export status.
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_ref().map(|notice| notice.text.as_str())
+        self.open_request
+            .as_ref()
+            .map(|request| request.label.as_str())
+            .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
+            .or_else(|| self.library.notice())
+            .or_else(|| self.export_status())
     }
 
-    /// Reports a notice or defers it during loading, returning whether the display changed.
+    /// Reports a notice and returns whether the display changed.
     pub fn set_notice(&mut self, notice: String) -> bool {
         self.report_notice(Notice {
             source: Source::Other,
@@ -193,11 +195,7 @@ impl App {
     }
 
     fn report_notice(&mut self, notice: Notice) -> bool {
-        if self.loading() {
-            self.deferred_notice = Some(notice);
-            return false;
-        }
-        let changed = self.notice() != Some(notice.text.as_str());
+        let changed = self.open_request.is_none() && self.notice() != Some(notice.text.as_str());
         self.notice = Some(notice);
         changed
     }
@@ -228,19 +226,14 @@ impl App {
                 });
             }
             SaveNotice::ClearConfig => {
-                let notice = if self.loading() {
-                    &mut self.deferred_notice
-                } else {
-                    &mut self.notice
-                };
-                if notice
+                if self
+                    .notice
                     .as_ref()
                     .is_some_and(|notice| matches!(notice.source, Source::Config))
                 {
-                    *notice = None;
+                    self.notice = None;
                 }
             }
-            SaveNotice::Unchanged => {}
         }
     }
 
@@ -255,6 +248,9 @@ impl App {
         // Dialog that asked for the result. Listings always come from one.
         let mut requester = Some(done.tag);
         let opened = matches!(done.outcome, IoOutcome::Opened(_));
+        if matches!(done.outcome, IoOutcome::Listed(_)) && self.dialog() != Some(done.tag) {
+            return false;
+        }
         if opened {
             let Some(request) = self
                 .open_request
@@ -263,7 +259,6 @@ impl App {
                 return false;
             };
             requester = request.dialog;
-            self.notice = None;
             changed = true;
         }
         match done.outcome {
@@ -284,7 +279,13 @@ impl App {
                     None => self.dialog().is_some(),
                 };
                 if routed {
-                    self.set_listing(listing.dir, listing.entries);
+                    if opened {
+                        if let Some(Modal::OpenFile(picker)) = &mut self.modal {
+                            picker.set_listing(listing.dir, listing.entries);
+                        }
+                    } else {
+                        self.set_listing(listing.dir, listing.entries);
+                    }
                     changed = true;
                 }
             }
@@ -294,7 +295,7 @@ impl App {
                         && self
                             .notice
                             .as_ref()
-                            .is_some_and(|notice| Some(notice.text.as_str()) == export.status())
+                            .is_some_and(|notice| matches!(notice.source, Source::Export))
                     {
                         self.notice = None;
                         changed = true;
@@ -302,7 +303,10 @@ impl App {
                     changed |= export.complete(result.as_ref().map(|_| ()));
                 }
                 if let Err(error) = result {
-                    changed |= self.set_notice(error.to_string());
+                    changed |= self.report_notice(Notice {
+                        source: Source::Export,
+                        text: error.to_string(),
+                    });
                 }
             }
             IoOutcome::Updated(result) => {
@@ -316,15 +320,10 @@ impl App {
                 changed |= self.set_notice(error.to_string());
             }
         }
-        if opened {
-            let deferred = self.deferred_notice.take();
-            if self.notice.is_none() {
-                self.notice = deferred;
-            }
-        }
         changed
     }
 
+    #[cfg(test)]
     fn loading(&self) -> bool {
         self.open_request.is_some()
     }
@@ -358,16 +357,14 @@ impl App {
         self.open_request = Some(OpenRequest {
             token,
             dialog: self.dialog(),
-        });
-        self.notice = Some(Notice {
-            source: Source::Other,
-            text: format!(
+            label: format!(
                 "Loading {}",
                 path.file_name()
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy()
             ),
         });
+        self.notice = None;
         let job = Job::Open {
             path,
             dir,
@@ -572,14 +569,12 @@ impl App {
     }
 
     fn apply_step(&mut self, step: Step) {
-        if step.effect.is_some() && !self.loading() {
+        if let Some(effect) = step.effect {
             self.notice = None;
-        }
-        if let Some(effect) = step.effect
-            && let Err(error) = self.apply(effect)
-        {
-            self.set_notice(error);
-            return;
+            if let Err(error) = self.apply(effect) {
+                self.set_notice(error);
+                return;
+            }
         }
         match step.next {
             Next::Stay => {}
@@ -593,9 +588,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if !self.loading() {
-            self.notice = None;
-        }
+        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -1330,6 +1323,186 @@ mod tests {
     }
 
     #[test]
+    fn notice_regression_validation_resolved_during_loading() {
+        let mut app = App::empty();
+        app.handle_paste("/photo.png");
+        for code in [KeyCode::Char('P'), KeyCode::Char('n'), KeyCode::Char('s')] {
+            press(&mut app, code);
+        }
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('Z'),
+            KeyCode::Enter,
+            KeyCode::Char('s'),
+        ] {
+            press(&mut app, code);
+        }
+        assert!(app.library.palettes.find("Z").is_some());
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "photo.png".into(),
+                image: RgbaImage::new(2, 3),
+            })),
+        ));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_export_resolved_during_loading() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), Some("preview.png".into()));
+        app.request_open("photo.png".into(), None);
+        app.complete(done(
+            &app,
+            IoOutcome::Exported(Err(failure(rthid_io::io::Op::Encode))),
+        ));
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "photo.png".into(),
+                image: RgbaImage::new(2, 3),
+            })),
+        ));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_listing_resolved_during_loading() {
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('o'));
+        app.request_open("photo.png".into(), None);
+        app.complete(done(
+            &app,
+            IoOutcome::Listed(Err(failure(rthid_io::io::Op::List))),
+        ));
+        app.complete(done(
+            &app,
+            IoOutcome::Listed(Ok(rthid_io::dir::Listing {
+                dir: "/images".into(),
+                entries: vec![],
+            })),
+        ));
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "photo.png".into(),
+                image: RgbaImage::new(2, 3),
+            })),
+        ));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_save_failure_survives_replacement_and_input() {
+        let mut app = App::empty();
+        app.request_open("photo.png".into(), None);
+        save_failed(&mut app);
+        app.set_notice("validation".into());
+        press(&mut app, KeyCode::Char('x'));
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "photo.png".into(),
+                image: RgbaImage::new(2, 3),
+            })),
+        ));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        app.set_notice("validation".into());
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, "");
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_stale_listing_error_is_dropped() {
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('o'));
+        let tag = app.dialog().unwrap();
+        press(&mut app, KeyCode::Esc);
+        for reopen in [false, true] {
+            if reopen {
+                press(&mut app, KeyCode::Char('o'));
+            }
+            app.set_notice("retained".into());
+            assert!(!app.complete(Done::new(
+                tag,
+                std::time::Duration::ZERO,
+                IoOutcome::Listed(Err(failure(rthid_io::io::Op::List)))
+            )));
+            assert_eq!(app.notice(), Some("retained"));
+        }
+    }
+
+    #[test]
+    fn modal_pointer_motion_preserves_notice_until_an_effect() {
+        let mut app = App::empty();
+        app.open_dialog(".".into());
+        app.set_notice("open: failed".into());
+        let layout = test_layout();
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: layout.screen.width / 2,
+                row: layout.screen.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &app.geometry(layout.preview),
+            layout.screen,
+        );
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert_eq!(app.notice(), Some("open: failed"));
+        app.apply_step(Step {
+            next: Next::Stay,
+            effect: Some(Effect::Preview(app.settings.clone())),
+        });
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn persistent_notices_follow_fallback_order_until_their_own_success() {
+        let text = "version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']";
+        let loaded = crate::store::parse(text);
+        let warning = loaded.notice().unwrap();
+        let mut app = App::new(None, Some("preview.png".into()), loaded);
+        // A save warning can be replaced before the next draw.
+        saved(&mut app, text);
+        save_failed(&mut app);
+        let error = failure(rthid_io::io::Op::Encode);
+        let export_error = error.to_string();
+        app.complete(done(&app, IoOutcome::Exported(Err(error))));
+        assert_eq!(app.notice(), Some(export_error.as_str()));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, text);
+        assert_eq!(app.notice(), Some(warning.as_str()));
+        saved(&mut app, "");
+        assert_eq!(app.notice(), Some(export_error.as_str()));
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn export_success_preserves_other_sources_with_equal_text() {
+        let mut app = App::new(None, Some("preview.png".into()), Loaded::default());
+        let error = failure(rthid_io::io::Op::Encode);
+        let text = error.to_string();
+        app.complete(done(&app, IoOutcome::Exported(Err(error))));
+        for config in [false, true] {
+            if config {
+                app.save_notice(SaveNotice::Show(text.clone()));
+            } else {
+                app.set_notice(text.clone());
+            }
+            app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+            assert_eq!(app.notice(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
     fn save_notices_preserve_unrelated_errors() {
         let loaded =
             crate::store::parse("version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n");
@@ -1341,7 +1514,8 @@ mod tests {
         assert_eq!(app.notice(), Some("config: config is busy"));
         app.set_notice("open: failed".into());
         save_failed(&mut app);
-        assert_eq!(app.notice(), Some("open: failed"));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        app.set_notice("open: failed".into());
         saved(&mut app, "");
         assert_eq!(app.notice(), Some("open: failed"));
         save_failed(&mut app);
@@ -1351,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_save_clears_only_deferred_config_notices() {
+    fn successful_save_clears_only_config_notices_during_loading() {
         for config in [false, true] {
             let mut app = App::empty();
             app.request_open("photo.png".into(), None);
@@ -1372,12 +1546,11 @@ mod tests {
                 app.notice(),
                 if config { None } else { Some("open: failed") }
             );
-            assert!(app.deferred_notice.is_none());
         }
     }
 
     #[test]
-    fn loading_defers_notices_until_open_finishes() {
+    fn loading_masks_notices_until_open_finishes() {
         use rthid_io::{dir::Listing, io::Op};
         for notice_kind in 0..3 {
             for result_kind in 0..3 {
@@ -1394,6 +1567,7 @@ mod tests {
                         "config: config is busy".to_string()
                     }
                     1 => {
+                        app.open_dialog("/images".into());
                         let error = failure(Op::List);
                         let expected = error.to_string();
                         app.complete(done(&app, IoOutcome::Listed(Err(error))));
@@ -1426,7 +1600,6 @@ mod tests {
                 assert!(app.complete(done(&app, outcome)));
                 assert!(!app.loading());
                 assert_eq!(app.notice(), Some(expected.as_str()));
-                assert!(app.deferred_notice.is_none());
             }
         }
     }
@@ -1516,7 +1689,10 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &app.geometry(Rect::new(0, 0, 20, 10)),
             );
-            assert!(app.notice().is_none());
+            assert_eq!(
+                app.notice(),
+                blocked.then_some("config: saving disabled: broken file")
+            );
             app.apply(Effect::SaveTemplate("Another".into())).unwrap();
             assert_eq!(app.unsaved().is_empty(), blocked);
             app.queue_save(Path::new("config.toml"), Instant::now());
