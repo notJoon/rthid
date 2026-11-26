@@ -16,12 +16,16 @@ const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const MAX_DECODE_SIDE: u32 = 16384;
 
 /// Rejects a companion PNG destination that resolves to the source image.
+///
+/// # Errors
+/// Returns [`crate::io::Cause::IsSource`] with the source path when both paths resolve
+/// to the same file. Paths that cannot be resolved are left to the file operation.
 pub fn check_not_source(source: &Path, preview: Option<&Path>) -> Result<(), crate::io::Cause> {
     if let Some(preview) = preview
         && let (Ok(a), Ok(b)) = (source.canonicalize(), preview.canonicalize())
         && a == b
     {
-        return Err(crate::io::Cause::IsSource);
+        return Err(crate::io::Cause::IsSource(source.to_path_buf()));
     }
     Ok(())
 }
@@ -32,6 +36,9 @@ pub fn check_not_source(source: &Path, preview: Option<&Path>) -> Result<(), cra
 /// the original dimensions or full-resolution pixels; use an image decoder directly for those.
 /// Decoding rejects dimensions above 16384 pixels per side and requests a 256 MiB allocation
 /// limit from the decoder. Only regular files are accepted; Unix FIFOs are opened without blocking.
+///
+/// # Errors
+/// Returns filesystem errors, unsupported format or decode errors, and image limit errors.
 pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
     let file = open_regular(path)?;
     let mut reader = image::ImageReader::new(BufReader::new(file));
@@ -131,7 +138,7 @@ mod tests {
         let aliased = dir.path().join(".").join("photo.png");
         assert!(matches!(
             check_not_source(&source, Some(&aliased)),
-            Err(crate::io::Cause::IsSource)
+            Err(crate::io::Cause::IsSource(path)) if path == source
         ));
         assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
         assert!(check_not_source(&source, None).is_ok());

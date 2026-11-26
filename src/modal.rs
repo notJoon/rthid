@@ -573,15 +573,11 @@ impl Modal {
             ),
             Self::Editor(editor) => {
                 let field = editor.input.as_ref().and_then(|_| {
-                    let selected = editor.rows.selected(editor.draft.colors.len() + 2)?;
-                    let offset = editor.rows.offset().min(selected).max(
-                        selected
-                            .saturating_add(1)
-                            .saturating_sub(usize::from(inner.height)),
-                    );
-                    let row = selected.checked_sub(offset)?;
-                    (row < usize::from(inner.height) && inner.width > 2)
-                        .then(|| Rect::new(inner.x + 2, inner.y + row as u16, inner.width - 2, 1))
+                    let row =
+                        editor
+                            .rows
+                            .selected_row(inner, None, editor.draft.colors.len() + 2)?;
+                    (row.width > 2).then(|| Rect::new(row.x + 2, row.y, row.width - 2, 1))
                 });
                 (field, Some(inner))
             }
@@ -601,7 +597,9 @@ impl Modal {
         };
         let outcome = match self {
             Self::OpenFile(picker) => {
-                let outcome = picker.list.handle_mouse(mouse, area, picker.entries.len());
+                let outcome = picker
+                    .list
+                    .handle_mouse(mouse, None, area, picker.entries.len());
                 if matches!(outcome, Outcome::Consumed | Outcome::Submit(_)) {
                     picker.typed = false;
                 }
@@ -610,16 +608,16 @@ impl Modal {
             Self::Presets {
                 list,
                 confirm: None,
-            } => list.handle_mouse(mouse, area, ctx.palettes.len()),
+            } => list.handle_mouse(mouse, None, area, ctx.palettes.len()),
             Self::Templates {
                 list,
                 prompt: None,
                 confirm: None,
-            } => list.handle_mouse(mouse, area, ctx.templates.len()),
+            } => list.handle_mouse(mouse, None, area, ctx.templates.len()),
             Self::Editor(editor) if editor.input.is_none() => {
                 editor
                     .rows
-                    .handle_mouse(mouse, area, editor.draft.colors.len() + 2)
+                    .handle_mouse(mouse, None, area, editor.draft.colors.len() + 2)
             }
             _ => return Step::stay(),
         };
@@ -712,6 +710,7 @@ impl Modal {
     // The editor and the template prompt each implement that capture today.
     /// Handles component outcomes without mutating application state.
     pub fn handle_key(&mut self, key: KeyEvent, ctx: Ctx<'_>) -> Step {
+        // Releases must not change whether the file picker submits its field or list.
         if key.kind == KeyEventKind::Release {
             return Step::stay();
         }
@@ -1036,6 +1035,10 @@ mod tests {
         assert_eq!(picker.list.selected(picker.entries.len()), Some(1));
         assert_eq!(picker.input.text(), "/images/");
         let context = || ctx(&palettes, &templates, &settings);
+        let mut release = key(KeyCode::Char('a'));
+        release.kind = KeyEventKind::Release;
+        modal.handle_key(release, context());
+        assert!(matches!(&modal, Modal::OpenFile(picker) if !picker.typed));
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(
@@ -1057,6 +1060,9 @@ mod tests {
             unreachable!()
         };
         picker.input = TextInput::new("~/raw path.png", PATH_MAX_CHARS);
+        release.code = KeyCode::Down;
+        modal.handle_key(release, context());
+        assert!(matches!(&modal, Modal::OpenFile(picker) if picker.typed));
         let step = modal.handle_key(key(KeyCode::Enter), context());
         assert!(matches!(step.next, Next::Stay));
         assert!(

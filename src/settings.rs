@@ -19,6 +19,7 @@ pub fn build_palette(hexes: &[impl AsRef<str>]) -> Result<Vec<PaletteColor>, Str
         return Err("hex colors must have at most 7 characters".into());
     }
     dither::make_palette(&hexes.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+        .map_err(|error| error.to_string())
 }
 
 /// Compact color model label for saved settings and palette editing.
@@ -833,6 +834,18 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn palette_error_text_is_preserved() {
+        assert_eq!(
+            build_palette(&["#000", "badhex"]).unwrap_err(),
+            "color 2 (\"badhex\"): expected a 3- or 6-digit hex color"
+        );
+        assert_eq!(
+            build_palette(&[] as &[&str]).unwrap_err(),
+            "palette must have 1 to 256 colors"
+        );
     }
 
     #[test]

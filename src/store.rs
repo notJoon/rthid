@@ -140,7 +140,14 @@ impl Library {
             }
             Err(error) => {
                 self.save_retry = Some(now + SAVE_RETRY);
-                self.save_failed(error.cause.to_string())
+                self.save_failed(match &error.cause {
+                    rthid_io::io::Cause::Io(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        "file is busy".into()
+                    }
+                    cause => cause.to_string(),
+                })
             }
         }
         Some(())
@@ -697,11 +704,11 @@ mod tests {
             path,
             cause: Cause::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "config is busy",
+                "config.toml: file is busy",
             )),
         };
         assert_eq!(library.complete(tag, Err(busy), started), Some(()));
-        assert_eq!(library.notice(), Some("config: config is busy"));
+        assert_eq!(library.notice(), Some("config: file is busy"));
         assert_eq!(library.unsaved().len(), 1);
         let deadline = library.retry_at().unwrap();
         assert_eq!(deadline, started + SAVE_RETRY);

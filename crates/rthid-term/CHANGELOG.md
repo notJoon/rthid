@@ -12,19 +12,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   restore
 - Frame output through a 1 MB buffer, so a full frame reaches the terminal in a
   few writes
-- `synchronized_draw` for synchronized frame updates on terminals that support it
+- `synchronized_draw` for synchronized frame updates on terminals that support it,
+  returning the closure's successful value when it does not borrow the terminal
 - `ElidingBackend`, which sends only the foreground or background color that
   changed and skips the foreground of plain spaces
+- `ElidingBackend::writer` and `writer_mut` for access to the output writer, and
+  `Debug` when the writer supports it
 - `SessionOptions` and `run_terminal_with_options` for session-owned mouse capture
-  and bracketed paste, both disabled by default
+  and bracketed paste, with current and future fields defaulting to off
 - Copyable quick-start and input-mode examples, compiled as documentation tests
-
-### Changed
-
-- Breaking, unreleased: replace the `MouseCapture` and `BracketedPaste` unit
-  guards and manual enable commands with `SessionOptions`
 - Run functions return initialization, final flush and cleanup errors, preserving
   an application error when multiple operations fail
+- Setup errors identify the failed step and preserve the original `io::ErrorKind`
 - Run functions accept successful closure return values beyond `()`
 - Reject nested or concurrent sessions with `io::ErrorKind::AlreadyExists`
 - Install one panic hook that only restores the active session on its owning

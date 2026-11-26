@@ -59,9 +59,8 @@ impl Confirm {
     /// including an uppercase Y, Enter and Esc.
     ///
     /// Modified keys, including Ctrl+y and Alt+y, cancel. A key release returns
-    /// `Ignored` so the question survives the release of the key that opened it. Otherwise the
-    /// result is never `Ignored` or `Consumed`, so the caller should close the
-    /// question after any key.
+    /// `Consumed` so the question survives the release of the key that opened it.
+    /// Other events return `Submit` or `Cancel`, so the caller can close the question.
     ///
     /// # Examples
     ///
@@ -77,7 +76,7 @@ impl Confirm {
     /// ```
     pub fn handle_key(&self, key: KeyEvent) -> Outcome<()> {
         if is_release(&key) {
-            Outcome::Ignored
+            Outcome::Consumed
         } else if key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::NONE {
             Outcome::Submit(())
         } else {

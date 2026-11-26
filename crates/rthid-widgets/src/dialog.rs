@@ -41,8 +41,8 @@ impl Dialog<'_> {
     /// `content` columns and rows.
     ///
     /// The width is the largest of the content width, the title display width
-    /// and `min_width`, plus four columns for the border and one column of
-    /// padding on each side. The height is the content height plus two rows of
+    /// and `min_width`, plus four columns: a border and one padding column on
+    /// each side. The height is the content height plus two rows of
     /// border. Both are capped at the screen size. The dialog is centered on
     /// `anchor`, then shifted so it lies fully inside `screen`.
     ///

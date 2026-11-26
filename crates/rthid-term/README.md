@@ -25,8 +25,7 @@ fn main() -> std::io::Result<()> {
         synchronized_draw(terminal, |terminal| {
             terminal.draw(|frame| {
                 frame.render_widget("Hello! Press any key to quit.", frame.area());
-            })?;
-            Ok(())
+            }).map(|_| ())
         })?;
         if event::read()?.is_key_press() {
             return Ok(());
@@ -57,7 +56,7 @@ makes this worse: a frame contains no newlines, so it leaves in many small write
   reducing the bytes the terminal must process while preserving visible output.
 - **Synchronized updates.** `synchronized_draw` wraps one frame in a synchronized
   update (mode 2026) and flushes it, so supporting terminals paint whole frames.
-  Other terminals ignore the sequences.
+  Other terminals ignore the sequences. It returns the closure's successful value.
 - **Session setup and restore.** `run_terminal` enters raw mode and the alternate
   screen and restores them afterwards. Initialization failures return an error.
 - **Optional input modes.** `SessionOptions` opts into mouse capture and bracketed
@@ -65,7 +64,7 @@ makes this worse: a frame contains no newlines, so it leaves in many small write
 
 ## Mouse capture and bracketed paste
 
-Both modes are off by default. Use `run_terminal_with_options` when your app
+Both modes and any future fields default to off. Use `run_terminal_with_options` when your app
 handles mouse or paste events:
 
 ```rust,no_run
@@ -76,13 +75,13 @@ fn main() -> std::io::Result<()> {
     let options = SessionOptions {
         mouse_capture: true,
         bracketed_paste: true,
+        ..SessionOptions::default()
     };
     run_terminal_with_options(options, |terminal| loop {
         synchronized_draw(terminal, |terminal| {
             terminal.draw(|frame| {
                 frame.render_widget("Mouse and paste enabled. Press any key to quit.", frame.area());
-            })?;
-            Ok(())
+            }).map(|_| ())
         })?;
         match event::read()? {
             event::Event::Key(key) if key.is_press() => return Ok(()),
@@ -97,6 +96,12 @@ fn main() -> std::io::Result<()> {
 Do not enable these modes separately or manage their cleanup guards yourself.
 For custom writers or viewports, construct `Terminal<ElidingBackend<W>>` directly
 and keep using `synchronized_draw`; terminal session setup is then your responsibility.
+Use `writer()` or `writer_mut()` on the backend to inspect or access the output writer.
+The backend implements `Debug` when its writer does.
+
+The value returned by `synchronized_draw` cannot borrow the terminal because ending
+the update requires mutable access to the backend. `Terminal::draw` returns a borrowed
+`CompletedFrame`, so the examples discard it with `.map(|_| ())` inside the closure.
 
 ## Results and session ownership
 
@@ -105,6 +110,7 @@ Initialization, final flush and cleanup failures also return `io::Error`. If mor
 than one operation fails, the application error takes precedence, then the flush
 error, then the cleanup error. Cleanup is attempted even after an earlier error.
 Closures use `io::Error`; convert application-specific errors at this seam if needed.
+Setup errors name the failed step and preserve the original `io::ErrorKind`.
 
 Only one session can run at a time in a process. Nested or concurrent calls return
 `io::ErrorKind::AlreadyExists`; they do not take over another session's terminal.

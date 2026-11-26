@@ -133,8 +133,12 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Off => Graphics::Off,
     };
     if let Some(path) = &path {
-        check_not_source(path, preview_png.as_deref())
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause.to_string()))?;
+        check_not_source(path, preview_png.as_deref()).map_err(|cause| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--preview-png: {cause}"),
+            )
+        })?;
     }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -168,9 +172,11 @@ fn main() -> std::io::Result<()> {
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
+    #[allow(clippy::needless_update, reason = "Keep future input modes disabled.")]
     let options = SessionOptions {
         mouse_capture: true,
         bracketed_paste: true,
+        ..SessionOptions::default()
     };
     let mut terminal_result = run_terminal_with_options(options, |terminal| {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;

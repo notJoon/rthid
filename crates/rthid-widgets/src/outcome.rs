@@ -24,7 +24,8 @@ use ratatui::crossterm::event::{KeyEvent, KeyEventKind};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome<T> {
-    /// The component does not use this key, so the parent may handle it.
+    /// The component does not use this event, so the parent may handle it.
+    /// Key releases return `Consumed` to prevent parent fallback bindings.
     Ignored,
     /// The component used the key and stays open.
     Consumed,
@@ -35,8 +36,7 @@ pub enum Outcome<T> {
     Cancel,
 }
 
-// Some terminals, such as the Windows console, also report key releases.
-// Acting on them would apply every key twice, so components ignore them.
+/// Identifies releases so components consume them without repeating an action.
 pub(crate) fn is_release(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Release
 }
@@ -48,7 +48,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
 
     #[test]
-    fn components_ignore_key_releases() {
+    fn components_consume_key_releases() {
         let release = |code| {
             KeyEvent::new_with_kind_and_state(
                 code,
@@ -59,18 +59,18 @@ mod tests {
         };
         assert_eq!(
             Confirm::new("?").handle_key(release(KeyCode::Char('d'))),
-            Outcome::Ignored
+            Outcome::Consumed
         );
         let mut input = TextInput::new("", 8);
         assert_eq!(
             input.handle_key(release(KeyCode::Char('a'))),
-            Outcome::Ignored
+            Outcome::Consumed
         );
         assert_eq!(input.text(), "");
         let mut picker = ListPicker::new(0);
         assert_eq!(
             picker.handle_key(release(KeyCode::Down), 3),
-            Outcome::Ignored
+            Outcome::Consumed
         );
         assert_eq!(picker.selected(3), Some(0));
     }

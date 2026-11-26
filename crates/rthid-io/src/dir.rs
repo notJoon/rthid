@@ -27,6 +27,10 @@ pub struct Listing {
 }
 
 /// Lists visible directories first, then readable image formats, sorted by name.
+///
+/// # Errors
+/// Returns an error if the directory cannot be resolved or opened.
+/// Entries that cannot be read or inspected are skipped.
 pub fn list_dir(dir: &Path) -> io::Result<Listing> {
     let dir = dir.canonicalize()?;
     let mut entries = Vec::new();

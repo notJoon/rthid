@@ -49,7 +49,9 @@ fn main() -> io::Result<()> {
 
 The terminal session belongs to the app. Widgets render into a ratatui buffer;
 `TextInput` returns the cursor position for the app to apply. Text limits count
-Unicode scalar values, and rendering measures terminal display width.
+Unicode scalar values, and rendering measures terminal display width. Cursor
+movement and deletion also operate on Rust `char` values, not grapheme clusters.
+Combining marks and ZWJ sequences can therefore be split while editing.
 
 ## Composition
 
@@ -58,8 +60,8 @@ itself. Components know nothing about the app, so the app decides what a submit 
 cancel means and composes them into dialogs as needed.
 
 Keep a component open on `Ignored` and `Consumed`. In particular, key releases
-return `Ignored`; they must not dismiss a confirmation. Validate values on
-`Submit` before closing the component. An invalid value can stay open for editing.
+return `Consumed` so parent fallback bindings do not run and confirmations stay
+open. Validate values on `Submit` before closing the component. An invalid value can stay open for editing.
 
 | Component | Purpose |
 | --- | --- |
@@ -83,6 +85,18 @@ let items = ["warm", "cool"];
 assert_eq!(picker.selected(items.len()), Some(1));
 assert_eq!(picker.selected(0), None);
 ```
+
+Pass the same block and outer area used by `render` to `index_at` and
+`handle_mouse`, with the block before the area. The picker computes the content
+area so borders do not select items. `selected_row(area, block, len)` returns the
+selected screen row using the last draw's offset, or `None` for an empty list or
+a selection outside the visible content area.
+
+`ListPicker` returns `Ignored` for keys with Ctrl or Alt so the parent can handle
+shortcuts such as Ctrl+k. Shift is allowed. Releases are always consumed.
+
+`Dialog::area` reserves the content width plus four columns: a border and one
+padding column on each side.
 
 `TextInput` filters control characters from initial and pasted text. `Confirm`
 approves only an unmodified lowercase `y`; other pressed keys cancel.

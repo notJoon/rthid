@@ -5,20 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.2.0] - Unreleased
 
+### Breaking
+
+- `picker.selected()` -> `picker.selected(items.len())`, returning `Option<usize>` with `None` for an empty list
+- Key releases returning `Ignored` -> `Consumed`, preventing parent fallback bindings
+- `picker.index_at(area, position, len)` -> `picker.index_at(position, block, area, len)` with the drawing block and outer area
+- `picker.handle_mouse(mouse, area, len)` -> `picker.handle_mouse(mouse, block, area, len)` with the drawing block and outer area
+- Ctrl or Alt list navigation -> `Ignored` so parent bindings can handle these keys, with Shift still allowed
+
 ### Changed
 
-- `ListPicker::selected(len)` returns the clamped highlighted index, or `None`
-  for an empty list, and drawing uses the same selection
 - `TextInput::new` removes control characters before applying the length limit,
   matching pasted text
 - `Confirm` accepts only an unmodified lowercase y; modified keys cancel
 
 ### Fixed
 
-- The confirmation composition example keeps its question on ignored key releases
+- The composition example relies on consumed key releases to protect fallback bindings
+- `Dialog::area` documentation clarifies its four extra columns
+- `TextInput` documentation explains that combining marks and ZWJ sequences can be split while editing
 
 ### Added
 
+- `ListPicker::selected_row(area, block, len)` returns the visible selected screen row using the last draw
 - Path dependency setup and a complete input example, compiled as a documentation test
 
 ## [0.1.0] - 2026-11-26

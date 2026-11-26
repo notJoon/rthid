@@ -40,6 +40,7 @@ thread_local! {
 pub type BufferedTerminal = Terminal<ElidingBackend<BufWriter<Stdout>>>;
 
 /// Optional input modes owned by a terminal session. Both are disabled by default.
+/// New fields will also default to off.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SessionOptions {
     /// Capture mouse events for the duration of the session.
@@ -57,8 +58,9 @@ pub fn run_terminal<T>(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<T>) -
 
 /// Runs `f` with buffered frame output and restores terminal modes on exit.
 ///
-/// Initialization failures return an I/O error. The closure's error takes precedence over a
-/// final flush error, which takes precedence over a cleanup error. Otherwise its value is returned.
+/// Setup errors include the failed step and preserve the original [`io::ErrorKind`].
+/// The closure's error takes precedence over a final flush error, which takes precedence over a
+/// cleanup error. Otherwise its value is returned.
 /// Nested or concurrent sessions return [`io::ErrorKind::AlreadyExists`].
 ///
 /// The first session installs a process-wide panic hook, which restores only an active session
@@ -71,12 +73,15 @@ pub fn run_terminal_with_options<T>(
     f: impl FnOnce(&mut BufferedTerminal) -> io::Result<T>,
 ) -> io::Result<T> {
     let session = Session::acquire(options)?;
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(|e| setup_error("enable raw mode (is stdin a terminal?)", e))?;
     let mut writer = BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, io::stdout());
-    execute!(writer, EnterAlternateScreen)?;
-    enable_modes(&mut writer, options)?;
+    execute!(writer, EnterAlternateScreen).map_err(|e| setup_error("enter alternate screen", e))?;
+    enable_modes(&mut writer, options).map_err(|e| setup_error("enable input modes", e))?;
     // Panic restoration happens before unwinding: never drop pending buffered output afterwards.
-    let mut terminal = ManuallyDrop::new(Terminal::new(ElidingBackend::new(writer))?);
+    let mut terminal = ManuallyDrop::new(
+        Terminal::new(ElidingBackend::new(writer))
+            .map_err(|e| setup_error("initialize terminal", e))?,
+    );
     let result = f(&mut terminal);
     if SESSION_OPTIONS.get().is_none() {
         return result.and(Err(io::Error::other(
@@ -86,6 +91,13 @@ pub fn run_terminal_with_options<T>(
     let result = finish_terminal(terminal, result);
     let cleanup = session.restore();
     result.and_then(|value| cleanup.map(|()| value))
+}
+
+fn setup_error(step: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("rthid-term: failed to {step}: {error}"),
+    )
 }
 
 fn finish_terminal<T, B: Backend<Error = io::Error> + Write>(
@@ -176,20 +188,55 @@ fn restore_modes(writer: &mut impl Write, options: SessionOptions) -> io::Result
 /// The begin sequence is queued before `draw` runs. The end sequence is always sent and flushed,
 /// even when `draw` fails, so no update is left open and no frame bytes stay in the buffer. The
 /// error from `draw` takes precedence over an error from ending the update.
-pub fn synchronized_draw<B: Backend + Write>(
+/// Returns the closure's value after the update ends successfully. The value cannot borrow
+/// the terminal because ending the update needs mutable access to its backend.
+pub fn synchronized_draw<B: Backend + Write, R>(
     terminal: &mut Terminal<B>,
-    draw: impl FnOnce(&mut Terminal<B>) -> io::Result<()>,
-) -> io::Result<()> {
+    draw: impl FnOnce(&mut Terminal<B>) -> io::Result<R>,
+) -> io::Result<R> {
     queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
     let result = draw(terminal);
     // End the update even when drawing fails, before any direct stdout cleanup.
     let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-    result.and(end)
+    result.and_then(|value| end.map(|()| value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_errors_preserve_kind_and_include_context() {
+        let error = setup_error(
+            "enable raw mode (is stdin a terminal?)",
+            io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "rthid-term: failed to enable raw mode (is stdin a terminal?): access denied"
+        );
+    }
+
+    #[test]
+    fn synchronized_draw_returns_the_closure_value() {
+        use ratatui::{TerminalOptions, Viewport, layout::Rect};
+
+        let mut terminal = Terminal::with_options(
+            ElidingBackend::new(Vec::new()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 10, 1)),
+            },
+        )
+        .unwrap();
+        let value = synchronized_draw(&mut terminal, |terminal| {
+            terminal.draw(|frame| frame.render_widget("frame", frame.area()))?;
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert!(terminal.backend().writer().ends_with(b"\x1b[?2026l"));
+    }
 
     #[test]
     fn modes_are_opt_in_and_cleanup_continues_after_failure() {

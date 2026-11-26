@@ -438,7 +438,12 @@ impl App {
                 h,
                 &self.settings.palette,
             );
-            self.outbox.push((job, 0));
+            match job {
+                Ok(job) => self.outbox.push((job, 0)),
+                Err(error) => {
+                    export.complete(Err(&error));
+                }
+            }
         }
     }
 
@@ -1348,7 +1353,10 @@ mod tests {
         let error = rthid_io::io::IoError {
             op: rthid_io::io::Op::Save,
             path,
-            cause: rthid_io::io::Cause::Io(std::io::Error::other("config is busy")),
+            cause: rthid_io::io::Cause::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "config.toml: file is busy",
+            )),
         };
         app.complete(save_done(tag, Err(error)));
     }
@@ -1414,12 +1422,12 @@ mod tests {
         app.set_notice("validation".into());
         press(&mut app, KeyCode::Char('x'));
         app.complete(done(&app, opened_photo()));
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         app.set_notice("validation".into());
         save_failed(&mut app);
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         press(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         saved(&mut app, "");
         assert!(app.notice().is_none());
     }
@@ -1482,7 +1490,7 @@ mod tests {
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
         assert_eq!(app.notice(), Some(export_error.as_str()));
         press(&mut app, KeyCode::Esc);
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         saved(&mut app, text);
         assert_eq!(app.notice(), Some(warning.as_str()));
         saved(&mut app, "");
@@ -1511,15 +1519,15 @@ mod tests {
         saved(&mut app, "");
         assert!(app.notice().is_none());
         save_failed(&mut app);
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         app.set_notice("open: failed".into());
         save_failed(&mut app);
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         app.set_notice("open: failed".into());
         saved(&mut app, "");
         assert_eq!(app.notice(), Some("open: failed"));
         save_failed(&mut app);
-        assert_eq!(app.notice(), Some("config: config is busy"));
+        assert_eq!(app.notice(), Some("config: file is busy"));
         saved(&mut app, "");
         assert!(app.notice().is_none());
     }
@@ -1558,7 +1566,7 @@ mod tests {
                     0 => {
                         save_failed(&mut app);
                         save_failed(&mut app);
-                        "config: config is busy".to_string()
+                        "config: file is busy".to_string()
                     }
                     1 => {
                         app.open_dialog("/images".into());

@@ -28,6 +28,9 @@ use std::{
 /// A failed write leaves the destination unchanged. Atomic replacement does not imply crash
 /// durability: this function does not sync the file or parent directory. The caller can sync the
 /// file inside `write`; [`update`] also attempts to sync the parent after replacement on Unix.
+///
+/// # Errors
+/// Returns path resolution, temporary file, write callback or replacement errors.
 pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let path = resolve(path, false)?;
     let parent = path
@@ -69,12 +72,16 @@ pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> 
 
 /// Reads a config file, returning `None` when it is missing.
 /// Refuses anything other than a regular file so FIFOs and directories are never read.
+///
+/// # Errors
+/// Returns `InvalidInput` with the path for a target other than a regular file.
+/// Other metadata and text read errors are returned unchanged, except `NotFound`.
 pub fn read_regular(path: &Path) -> io::Result<Option<String>> {
     let read = || {
         if !fs::metadata(path)?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "config is not a regular file",
+                format!("{}: not a regular file", path.display()),
             ));
         }
         fs::read_to_string(path)
@@ -124,6 +131,11 @@ fn resolve(path: &Path, create_parent: bool) -> io::Result<PathBuf> {
 /// Resolves the destination once so symlink aliases share the lock and keep the symlink.
 /// Lock errors, including unsupported filesystem locking, never permit unlocked writes.
 /// The persistent lock file survives config replacement.
+///
+/// # Errors
+/// Returns `WouldBlock` with the path when the lock wait expires and `InvalidInput`
+/// when the target is not a regular file. Also returns path resolution, lock, read,
+/// transform, write and file sync errors.
 pub fn update<T>(
     path: &Path,
     wait: Duration,
@@ -146,7 +158,10 @@ pub fn update<T>(
             Err(fs::TryLockError::WouldBlock) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "config is busy"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("{}: file is busy", path.display()),
+                    ));
                 }
                 thread::sleep(delay.min(remaining));
                 delay = (delay * 2).min(Duration::from_millis(50));
@@ -171,6 +186,27 @@ pub fn update<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_file_checks_include_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = read_regular(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!("{}: not a regular file", dir.path().display())
+        );
+        let error = update(dir.path(), Duration::ZERO, |_| Ok((String::new(), ()))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{}: not a regular file",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
+        assert_eq!(read_regular(&dir.path().join("missing")).unwrap(), None);
+    }
 
     #[test]
     fn concurrent_updates_keep_every_line() {
@@ -312,12 +348,19 @@ mod tests {
         let error =
             update::<()>(&path, wait, |_| panic!("must not update while locked")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(error.to_string(), "config is busy");
+        assert_eq!(
+            error.to_string(),
+            format!("{}: file is busy", path.canonicalize().unwrap().display())
+        );
         assert!(started.elapsed() >= wait);
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         drop(lock);
-        update(&path, Duration::ZERO, |text| Ok((text.unwrap(), ()))).unwrap();
+        // A child forked by a parallel test briefly holds the lock until it execs.
+        update(&path, Duration::from_secs(1), |text| {
+            Ok((text.unwrap(), ()))
+        })
+        .unwrap();
     }
 
     #[test]
