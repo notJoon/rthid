@@ -536,6 +536,11 @@ impl App {
         self.export.as_ref().map_or(Ok(()), Export::result)
     }
 
+    /// Whether a left mouse drag is active on the preview.
+    pub fn dragging(&self) -> bool {
+        self.last_drag.is_some()
+    }
+
     /// Routes modal mouse input or pans and recenters the preview.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry, screen: Rect) {
         if let Some(modal) = &mut self.modal {
@@ -2060,8 +2065,11 @@ mod tests {
         assert_eq!((app.viewport.x, app.viewport.y), (72, 84));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 10, 10);
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 10);
+        assert!(app.dragging());
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 13, 12);
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 13, 12);
+        assert!(!app.dragging());
         mouse(&mut app, MouseEventKind::ScrollUp, 13, 12);
         assert_eq!(app.viewport.y, 68);
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);

@@ -478,6 +478,7 @@ mod tests {
         assert!(!needs_redraw(&moved));
         for event in [
             mouse(MouseEventKind::ScrollDown),
+            mouse(MouseEventKind::Up(event::MouseButton::Left)),
             Event::Resize(80, 24),
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         ] {

@@ -150,6 +150,7 @@ pub fn log_minimap(
             &viewport::geometry(&viewport::Viewport::default(), geometry.grid, area),
             &mut overview,
             &mut cells::OverviewCaches::default(),
+            false,
         );
         writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
         for pos in inset.positions() {
@@ -437,6 +438,7 @@ fn draw_preview(
             geometry,
             frame.buffer_mut(),
             &mut renderer.overviews,
+            app.dragging(),
         )
     };
     let mut report = PreviewReport {
@@ -532,6 +534,44 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn original_release_frame_restores_full_color() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = viewport::Zoom::In(1);
+        app.viewport.hide_minimap = true;
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let layout = layout(terminal.size().unwrap());
+        let g = app.geometry(layout.preview);
+        assert!(g.overflows());
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: g.target.x,
+                    row: g.target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &g,
+                layout.screen,
+            );
+            draw_text(&mut terminal, &app, &mut renderer);
+            for pos in g.target.positions() {
+                let cell = &terminal.backend().buffer()[pos];
+                for color in [cell.fg, cell.bg] {
+                    assert!(match kind {
+                        MouseEventKind::Down(_) => matches!(color, Color::Indexed(_)),
+                        _ => matches!(color, Color::Rgb(..)),
+                    });
+                }
+            }
+        }
     }
 
     #[test]
