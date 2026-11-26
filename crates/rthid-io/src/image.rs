@@ -26,7 +26,12 @@ pub fn check_not_source(source: &Path, preview: Option<&Path>) -> Result<(), cra
     Ok(())
 }
 
-/// Loads an image as RGBA and shrinks it to bound processing work.
+/// Loads preview RGBA pixels, shrinking images whose longest side exceeds 1024 pixels.
+///
+/// Resizing preserves the aspect ratio and uses the Triangle filter. The result does not retain
+/// the original dimensions or full-resolution pixels; use an image decoder directly for those.
+/// Decoding rejects dimensions above 16384 pixels per side and requests a 256 MiB allocation
+/// limit from the decoder. Only regular files are accepted; Unix FIFOs are opened without blocking.
 pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
     let file = open_regular(path)?;
     let mut reader = image::ImageReader::new(BufReader::new(file));

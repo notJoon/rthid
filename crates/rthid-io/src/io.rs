@@ -1,4 +1,7 @@
-//! Shared background filesystem work with independent latest results for each kind.
+//! Background filesystem work with one latest job and result per kind, across destination paths.
+//!
+//! This is not a queue that guarantees every submission will run. See [`IO`] for replacement
+//! and shutdown policies.
 
 use crate::{dir::Listing, png};
 use image::RgbaImage;
@@ -37,6 +40,8 @@ pub trait Edit: Send {
 }
 
 /// Owned filesystem work for the shared thread.
+///
+/// [`IO::submit`] replaces queued work of the same variant, even for different paths.
 pub enum Job {
     /// Decode an image, or list it when the path is a directory.
     Open {
@@ -50,6 +55,8 @@ pub enum Job {
     /// List the given directory.
     List(PathBuf),
     /// Encode a grid at the destination.
+    ///
+    /// A newer Export replaces a queued Export regardless of its destination path.
     Export {
         /// PNG destination.
         path: PathBuf,
@@ -57,12 +64,16 @@ pub enum Job {
         grid: png::Grid,
     },
     /// Rewrite a text file from its current contents under an advisory lock.
+    ///
+    /// A newer Update replaces a queued Update even for a different file. Each edit must include
+    /// every unsaved change for the destination; do not submit incremental edits assuming earlier
+    /// submissions will run. Use [`crate::atomic::update`] when every edit must be applied.
     Update {
         /// File to replace.
         path: PathBuf,
         /// Longest wait for the lock.
         wait: Duration,
-        /// Computes the replacement text.
+        /// Computes the replacement text, carrying all changes not yet confirmed saved.
         edit: Box<dyn Edit>,
     },
     /// Trigger a panic to verify worker recovery.
@@ -338,6 +349,17 @@ struct Queue {
 }
 
 /// One filesystem thread with an independent newest result for each work kind.
+///
+/// Open, List, Export and Update each have one queued slot. A submission replaces queued work
+/// of the same kind **across paths**, and [`Self::poll`] discards superseded results. Work already
+/// running may still complete its filesystem changes. This supports one current source, export
+/// destination and configuration file, rather than independent saves to many files.
+///
+/// Dropping this value can block for up to five seconds. Like [`Self::finish`], it skips queued
+/// reads and updates, attempts the latest queued export, and detaches a worker still running at
+/// the deadline. Drop discards all results; call `finish` when the caller needs to inspect them.
+/// Keep unsaved configuration changes until a matching successful result, then synchronously
+/// save any that remain with [`crate::atomic::update`] after `finish`.
 #[allow(clippy::upper_case_acronyms)]
 pub struct IO {
     jobs: Arc<Queue>,
@@ -388,6 +410,10 @@ impl IO {
     }
 
     /// Queues work without waiting. The result echoes `tag` so callers can tell who asked for it.
+    ///
+    /// Replaces a queued job of the same kind, even if its path differs. Superseded jobs have no
+    /// result; already running work is not cancelled, but its result is discarded if superseded.
+    /// Update jobs must carry all unsaved changes. This method does not guarantee every write runs.
     pub fn submit(&mut self, job: Job, tag: u64) {
         self.enqueue(job, tag);
     }
@@ -455,6 +481,11 @@ impl IO {
 
     /// Skips queued reads and updates and waits up to five seconds for the newest export.
     /// Returns available results and detaches a worker still running at the deadline.
+    ///
+    /// A running operation may finish during the wait. Skipped jobs return [`Cause::Stopped`];
+    /// jobs still pending at the deadline return [`Cause::TimedOut`]. A timeout does not cancel
+    /// an operation already running. Inspect matching Update results, then synchronously save
+    /// remaining unsaved changes with [`crate::atomic::update`]; `finish` does not flush every save.
     pub fn finish(self) -> Vec<Done> {
         self.finish_timeout(SHUTDOWN_WAIT)
     }
@@ -764,6 +795,49 @@ mod tests {
                 );
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), "currentnew");
             }
+        }
+    }
+
+    #[test]
+    fn update_snapshots_replace_queued_updates_even_across_paths() {
+        for different_paths in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("first");
+            let latest = if different_paths {
+                dir.path().join("latest")
+            } else {
+                first.clone()
+            };
+            std::fs::write(&first, "base:").unwrap();
+            std::fs::write(&latest, "base:").unwrap();
+            let mut worker = IO::new(None).unwrap();
+            let resume = pause(&mut worker);
+            for (path, snapshot, tag) in [
+                (first.clone(), "first", 1),
+                (latest.clone(), "first+second", 2),
+            ] {
+                worker.submit(
+                    Job::Update {
+                        path,
+                        wait: Duration::ZERO,
+                        edit: Box::new(Append(snapshot)),
+                    },
+                    tag,
+                );
+            }
+            resume.send(()).unwrap();
+            assert_eq!(wait(&mut worker).kind(), Kind::List);
+            let done = wait(&mut worker);
+            assert_eq!((done.tag, done.path()), (2, latest.as_path()));
+            assert_eq!(
+                std::fs::read_to_string(&latest).unwrap(),
+                "base:first+second"
+            );
+            if different_paths {
+                assert_eq!(std::fs::read_to_string(&first).unwrap(), "base:");
+            }
+            assert!(!worker.busy());
+            assert!(worker.finish().is_empty());
         }
     }
 

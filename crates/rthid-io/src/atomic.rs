@@ -14,7 +14,20 @@ use std::{
 };
 
 /// Replaces the resolved destination after a successful write, keeping symlinks intact.
-/// The caller syncs the file inside the write closure when durability is needed.
+///
+/// The parent directory must already exist. Existing file permissions are preserved when possible;
+/// saving splits hard links and can replace read-only files when their parent allows replacement.
+/// Symlinks to the destination are followed, including dangling links, rather than replaced.
+/// A single-file bind mount cannot be replaced.
+///
+/// The `.rthid-*.tmp` file namespace in the destination directory is reserved for this crate.
+/// On the first use of each resolved parent directory per process, it attempts to delete regular
+/// files in that namespace whose modification time is more than one hour old. Do not store other
+/// files under those names. Cleanup errors are ignored; later calls do not repeat the sweep.
+///
+/// A failed write leaves the destination unchanged. Atomic replacement does not imply crash
+/// durability: this function does not sync the file or parent directory. The caller can sync the
+/// file inside `write`; [`update`] also attempts to sync the parent after replacement on Unix.
 pub fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let path = resolve(path, false)?;
     let parent = path
