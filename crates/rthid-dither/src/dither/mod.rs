@@ -1,11 +1,47 @@
-//! Atkinson error diffusion into palette indices.
+//! Palette indices from error diffusion or thresholds.
 //!
-//! Each pixel snaps to a palette color and 1/8 of its error goes to each of six
-//! neighbors (two to the right, three below and one two rows down), so only 3/4
-//! of the error spreads and highlights and shadows stay clean. Tone mode diffuses
-//! luminance only. Color mode diffuses RGB and picks the nearest palette color.
+//! Atkinson is the default and spreads only 3/4 of the error to keep highlights
+//! and shadows clean. Tone mode quantizes luminance. Color mode picks the
+//! nearest palette color after diffusion or a threshold offset.
+//!
+//! # Two independent choices
+//!
+//! [`Algorithm`] decides how the pattern is made, from quantization error or
+//! from thresholds. [`Mode`] decides what a pixel is compared against to pick a
+//! palette index. Every algorithm supports both modes, so for example Floyd
+//! Steinberg can run with Color and Bayer 4 with Tone.
+//!
+//! # Two execution paths
+//!
+//! The diffusion kernels share one path where each pixel passes its error to
+//! pixels not yet visited, so the result depends on visiting order. Bayer and
+//! Noise share another path that only reads a threshold per position and never
+//! changes neighbors. Both paths share preprocessing and the palette selection
+//! rule.
+//!
+//! # Data flow
+//!
+//! A [`dither`] call validates the input and numeric options, returns all zeros
+//! for a single color palette, normalizes palette colors when Color mode needs
+//! them, converts RGB to `f32` channel buffers with [`Tone`] applied, collapses
+//! them to luma for Tone mode, then runs the selected path. The result is one
+//! palette index per pixel in row major order.
+//!
+//! Inputs are borrowed and never mutated. Diffusion only changes buffers owned by
+//! the call, so comparing algorithms on the same input leaves no error behind.
+//! Alpha is ignored and transparent pixels keep their RGB, so composite onto a
+//! background before calling if that matters.
+
+mod diffusion;
+mod threshold;
+
+pub use diffusion::{Diffusion, Kernel};
+pub use threshold::bayer::BayerSize;
 
 /// A palette color in byte channels.
+///
+/// The bytes are the only stored form. Color mode derives normalized values once
+/// per call, so there is no second copy for callers to keep in sync.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
     /// Bytes used to paint the preview and the PNG.
@@ -15,18 +51,22 @@ pub struct PaletteColor {
 /// Per channel adjustments applied before dithering, in the order sharpen,
 /// contrast, brightness, gamma, then black and white points. The defaults leave
 /// pixels unchanged. All values must be finite and gamma must be positive.
+///
+/// These are preprocessing settings, unrelated to [`Mode::Tone`], which is a
+/// quantization mode. Black and white closer than 0.02, or reversed, are not an
+/// error. The span is floored at 0.02 instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
     /// Offset added after contrast, with the result clipped to 0..=1.
     pub brightness: f64,
     /// Scales the distance from middle gray by `1 + contrast`, so 0 keeps it.
     pub contrast: f64,
-    /// Positive gamma; channels are raised to `1 / gamma`, so values above 1 brighten midtones.
+    /// Positive gamma. Channels are raised to `1 / gamma`, so values above 1 brighten midtones.
     pub gamma: f64,
     /// Level mapped to 0 after gamma. Darker values clip to black.
     pub black: f64,
-    /// Level mapped to 1 after gamma. Lighter values clip to white. The black-to-white
-    /// span is floored at 0.02.
+    /// Level mapped to 1 after gamma. Lighter values clip to white. The span from
+    /// black to white is floored at 0.02.
     pub white: f64,
     /// Unsharp mask strength against a 3x3 box blur. 0 disables it.
     pub sharpen: f64,
@@ -45,33 +85,68 @@ impl Default for Tone {
     }
 }
 
-/// Color space used to diffuse quantization error.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Color model used to quantize, chosen independently of [`Algorithm`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
-    /// Quantizes luminance to evenly spaced levels, one per palette index, and
-    /// diffuses luminance error. The palette colors themselves do not affect the
-    /// choice, so this suits palettes evenly spaced in brightness.
+    /// Quantizes luminance to evenly spaced levels with diffusion or thresholds.
+    /// Palette colors do not affect the choice, so use evenly spaced brightness.
+    ///
+    /// With N colors, luma maps to N - 1 equal steps and index 0 is the darkest
+    /// step. This assigns ink levels by brightness rather than finding
+    /// the closest color, so it suits palettes sorted darkest first with even gaps.
     #[default]
     Tone,
-    /// Diffuses RGB error and picks the nearest palette color by squared
-    /// distance weighted 2, 4 and 3 for red, green and blue.
+    /// Picks the nearest palette color after RGB diffusion or a threshold offset.
+    /// Squared distance weights red, green and blue by 2, 4 and 3.
+    ///
+    /// Ties keep the earlier palette index. The distance is a fixed weighted RGB
+    /// metric, with no Lab distance or color management.
     Color,
 }
 
-/// Palette and processing settings for dithering.
+/// How pixels become palette indices. Defaults to `Diffusion::default()`.
+///
+/// Each variant carries only the settings it uses. Strength and serpentine live in
+/// [`Diffusion`], so a Bayer strength or a Noise serpentine cannot be expressed
+/// and no setting is silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Algorithm {
+    /// Passes quantization error to neighboring pixels.
+    Diffusion(Diffusion),
+    /// Ordered dithering with a recursive Bayer matrix. Has no serpentine or
+    /// strength and scans rows left to right.
+    Bayer(BayerSize),
+    /// Random thresholds from a seeded generator, reproducible for the same seed.
+    /// Has no serpentine or strength and scans rows left to right.
+    ///
+    /// Each threshold depends only on the seed and the row major pixel index, so
+    /// the same input, size, options and seed always give the same output.
+    Noise {
+        /// Selects the threshold sequence. Any `u64` is valid.
+        seed: u64,
+    },
+}
+
+impl Default for Algorithm {
+    fn default() -> Self {
+        Self::Diffusion(Diffusion::default())
+    }
+}
+
+/// Palette and processing settings for dithering. Defaults to a black and white
+/// palette, Tone mode, `Algorithm::default()` and default tone.
+///
+/// The default algorithm is serpentine Atkinson at strength 1, even though
+/// [`BayerSize`] on its own defaults to Four.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     /// Colors sorted darkest first, as built by `make_palette`. Output indices
     /// point into it, and Tone mode relies on the order.
     pub palette: Vec<PaletteColor>,
-    /// Error diffusion color model.
+    /// Color model used to quantize.
     pub mode: Mode,
-    /// Whether odd rows run right to left, which hides the diagonal streaks of
-    /// diffusing in one direction.
-    pub serpentine: bool,
-    /// Scales the diffused error. 1 is full Atkinson and 0 is plain nearest
-    /// color quantization. Must be finite.
-    pub strength: f64,
+    /// Method used to quantize pixels.
+    pub algorithm: Algorithm,
     /// Adjustments applied before quantization.
     pub tone: Tone,
 }
@@ -81,8 +156,7 @@ impl Default for Options {
         Self {
             palette: make_palette(&["#000", "#fff"]).unwrap(),
             mode: Mode::Tone,
-            serpentine: true,
-            strength: 1.0,
+            algorithm: Algorithm::default(),
             tone: Tone::default(),
         }
     }
@@ -107,7 +181,10 @@ fn hex_to_rgb(hex: &str) -> Result<[u8; 3], &'static str> {
 
 /// Parses 1 to 256 hex colors (`#rgb` or `#rrggbb`, `#` optional) and sorts them
 /// darkest first by luma, so the last, lightest color acts as paper.
-/// Invalid colors return an error with their input text and 1-based position.
+/// Invalid colors return an error with their input text and position counted from 1.
+///
+/// Dither indices refer to this sorted order, not the input order. Callers who
+/// edit `rgb` afterwards are responsible for keeping the order for Tone mode.
 pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, String> {
     if hexes.is_empty() || hexes.len() > 256 {
         return Err("palette must have 1 to 256 colors".into());
@@ -169,22 +246,41 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
-/// Returns one index into `options.palette` per pixel, in row major order. Alpha
-/// is ignored.
-///
-/// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
-/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
-/// is not positive.
-pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
+// Checks every array and numeric contract up front so the loops never index out
+// of range or quietly produce wrong output. Returns the pixel count. Panic
+// messages carry the actual and expected values, and track_caller points them at
+// the public entry point's caller.
+#[track_caller]
+fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     let palette = &options.palette;
     assert!(
         !palette.is_empty() && palette.len() <= 256,
-        "palette must have 1 to 256 colors"
+        "palette must have 1 to 256 colors, got {}",
+        palette.len()
     );
     let n = w.checked_mul(h).expect("image size overflow");
-    assert_eq!(Some(rgba.len()), n.checked_mul(4), "RGBA length mismatch");
+    let expected = n.checked_mul(4).expect("RGBA size overflow");
+    assert!(
+        rgba.len() == expected,
+        "rgba.len() is {}, expected w * h * 4 = {expected} for {w}x{h}",
+        rgba.len()
+    );
+    match options.algorithm {
+        Algorithm::Diffusion(d) => {
+            assert!(
+                d.strength.is_finite(),
+                "algorithm strength must be finite, got {}",
+                d.strength
+            );
+            assert!(
+                (0.0..=1.0).contains(&d.strength),
+                "algorithm strength must be within 0..=1, got {}",
+                d.strength
+            );
+        }
+        Algorithm::Bayer(_) | Algorithm::Noise { .. } => {}
+    }
     for (name, value) in [
-        ("strength", options.strength),
         ("brightness", options.tone.brightness),
         ("contrast", options.tone.contrast),
         ("gamma", options.tone.gamma),
@@ -192,13 +288,58 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         ("white", options.tone.white),
         ("sharpen", options.tone.sharpen),
     ] {
-        assert!(value.is_finite(), "{name} must be finite");
+        assert!(value.is_finite(), "tone.{name} must be finite, got {value}");
     }
-    assert!(options.tone.gamma > 0.0, "gamma must be positive");
-    // One color needs no work, and tone mode would divide by zero levels.
+    assert!(
+        options.tone.gamma > 0.0,
+        "tone.gamma must be positive, got {}",
+        options.tone.gamma
+    );
+    n
+}
+
+// Tone index for luma `v` among `levels + 1` evenly spaced steps. Diffusion
+// passes 0.5 to round and the threshold path passes its threshold. Both paths
+// call this and `nearest` so the selection rule lives in one place.
+fn tone_level(v: f64, levels: f64, offset: f64) -> usize {
+    (v * levels + offset).floor().clamp(0.0, levels) as usize
+}
+
+// Color index with the smallest 2, 4, 3 weighted squared RGB distance. The strict
+// comparison keeps the earliest index on ties.
+fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
+    let mut nearest = 0;
+    let mut best_distance = f64::INFINITY;
+    for (j, color) in colors.iter().enumerate() {
+        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color[c]);
+        let distance = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
+        if distance < best_distance {
+            best_distance = distance;
+            nearest = j;
+        }
+    }
+    nearest
+}
+
+/// Returns one index into `options.palette` per pixel, in row major order. Alpha
+/// is ignored.
+///
+/// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
+/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
+/// is not positive or algorithm strength is outside 0..=1. Panics report the
+/// caller's location. An empty image that meets these contracts returns an empty
+/// vector.
+#[track_caller]
+pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
+    let n = validate(rgba, w, h, options);
+    let palette = &options.palette;
+    // One color needs no work, and tone mode would divide by zero levels. This
+    // runs after validation so a single color palette cannot hide invalid options.
     if palette.len() == 1 {
         return vec![0; n];
     }
+    // Normalized palette for Color mode, built once per call. Tone mode never
+    // reads palette colors.
     let colors: Vec<_> = match options.mode {
         Mode::Tone => Vec::new(),
         Mode::Color => palette
@@ -207,9 +348,8 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
             .collect(),
     };
     let mut channels = to_channels(rgba, w, h, &options.tone);
-    let mut out = vec![0; n];
     let levels = (palette.len() - 1) as f64;
-    // Tone mode diffuses error through luminance alone.
+    // Tone mode quantizes luminance alone.
     let work = match options.mode {
         Mode::Tone => {
             // Luminance replaces the red buffer, rounded to f32 like every stored value.
@@ -221,58 +361,38 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         }
         Mode::Color => &mut channels[..],
     };
-    const KERNEL: [(isize, usize); 6] = [(1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)];
-    for y in 0..h {
-        let reverse = options.serpentine && y % 2 == 1;
-        for k in 0..w {
-            let x = if reverse { w - 1 - k } else { k };
-            let i = y * w + x;
-            let (q, target) = match options.mode {
-                Mode::Tone => {
-                    let v = f64::from(work[0][i]);
-                    let q = (v * levels + 0.5).floor().clamp(0.0, levels) as usize;
-                    (q, [q as f64 / levels; 3])
-                }
-                Mode::Color => {
-                    let px: [f64; 3] = std::array::from_fn(|c| f64::from(work[c][i]));
-                    let mut nearest = 0;
-                    let mut best_distance = f64::INFINITY;
-                    for (j, color) in colors.iter().enumerate() {
-                        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color[c]);
-                        let distance = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
-                        if distance < best_distance {
-                            best_distance = distance;
-                            nearest = j;
-                        }
-                    }
-                    (nearest, colors[nearest])
-                }
-            };
-            out[i] = q as u8;
-            for (channel, t) in work.iter_mut().zip(target) {
-                // Every Atkinson weight is 1, so each neighbor gets e/8.
-                let e = (f64::from(channel[i]) - t) * options.strength / 8.0;
-                for (dx, dy) in KERNEL {
-                    let xx = x.checked_add_signed(if reverse { -dx } else { dx });
-                    let yy = y + dy;
-                    if let Some(xx) = xx.filter(|&xx| xx < w)
-                        && yy < h
-                    {
-                        let j = yy * w + xx;
-                        // Compute in f64, convert to f32 only on store.
-                        channel[j] = (f64::from(channel[j]) + e) as f32;
-                    }
-                }
-            }
+    // Diffusion mutates `work` in place, while thresholds only read it.
+    match options.algorithm {
+        Algorithm::Diffusion(d) => {
+            diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d)
         }
+        Algorithm::Bayer(size) => threshold::threshold(
+            work,
+            w,
+            h,
+            options.mode,
+            levels,
+            &colors,
+            threshold::bayer::threshold(size),
+        ),
+        Algorithm::Noise { seed } => threshold::threshold(
+            work,
+            w,
+            h,
+            options.mode,
+            levels,
+            &colors,
+            threshold::noise::threshold(seed, w),
+        ),
     }
-    out
 }
 
 /// Expands a `gw` by `gh` index grid into opaque `ow` by `oh` RGBA pixels by
 /// nearest neighbor sampling, coloring each index with `color_of`.
 ///
-/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices.
+/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices, with
+/// the location of the caller.
+#[track_caller]
 pub fn rasterize(
     idx: &[u8],
     gw: usize,
@@ -281,8 +401,16 @@ pub fn rasterize(
     oh: usize,
     color_of: impl Fn(u8) -> [u8; 3],
 ) -> Vec<u8> {
-    assert!(gw > 0 && gh > 0, "source dimensions must be positive");
-    assert_eq!(Some(idx.len()), gw.checked_mul(gh), "index length mismatch");
+    assert!(
+        gw > 0 && gh > 0,
+        "source dimensions must be positive, got {gw}x{gh}"
+    );
+    let expected = gw.checked_mul(gh).expect("source size overflow");
+    assert!(
+        idx.len() == expected,
+        "idx.len() is {}, expected gw * gh = {expected} for {gw}x{gh}",
+        idx.len()
+    );
     let size = ow
         .checked_mul(oh)
         .and_then(|n| n.checked_mul(4))
@@ -303,6 +431,56 @@ pub fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn algorithms_return_valid_indices_for_small_images() {
+        let colors = ["#000", "#345", "#789", "#abc", "#fff"];
+        for algorithm in [
+            Kernel::Atkinson,
+            Kernel::FloydSteinberg,
+            Kernel::JarvisJudiceNinke,
+            Kernel::Stucki,
+            Kernel::SierraLite,
+        ]
+        .map(|kernel| {
+            Algorithm::Diffusion(Diffusion {
+                kernel,
+                ..Diffusion::default()
+            })
+        })
+        .into_iter()
+        .chain([
+            Algorithm::Bayer(BayerSize::Two),
+            Algorithm::Bayer(BayerSize::Four),
+            Algorithm::Bayer(BayerSize::Eight),
+            Algorithm::Noise { seed: 0 },
+        ]) {
+            for mode in [Mode::Tone, Mode::Color] {
+                for (w, h) in [(1, 1), (7, 1), (1, 7), (0, 0), (0, 3)] {
+                    let rgba: Vec<_> = (0..w * h)
+                        .flat_map(|i| [((i * 53 + 71) % 256) as u8, 137, 211, 255])
+                        .collect();
+                    for count in 1..=5 {
+                        let options = Options {
+                            palette: make_palette(&colors[..count]).unwrap(),
+                            mode,
+                            algorithm,
+                            ..Options::default()
+                        };
+                        let indices = dither(&rgba, w, h, &options);
+                        assert_eq!(indices.len(), w * h);
+                        assert!(
+                            indices.iter().all(|&index| usize::from(index) < count),
+                            "{algorithm:?} {mode:?} {w}x{h} palette {count}"
+                        );
+                        if count == 1 {
+                            assert_eq!(indices, vec![0; w * h]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_hex_colors() {
@@ -358,7 +536,12 @@ mod tests {
     #[test]
     fn rejects_invalid_numeric_options_even_for_one_color() {
         let setters: [fn(&mut Options, f64); 7] = [
-            |options, value| options.strength = value,
+            |options, value| {
+                options.algorithm = Algorithm::Diffusion(Diffusion {
+                    strength: value,
+                    ..Diffusion::default()
+                });
+            },
             |options, value| options.tone.brightness = value,
             |options, value| options.tone.contrast = value,
             |options, value| options.tone.gamma = value,
@@ -384,6 +567,87 @@ mod tests {
                 assert!(std::panic::catch_unwind(|| dither(&[0; 4], 1, 1, &invalid)).is_err());
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be within 0..=1, got -0.1")]
+    fn rejects_negative_strength() {
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: -0.1,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be within 0..=1, got 1.1")]
+    fn rejects_strength_above_one() {
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: 1.1,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be finite, got NaN")]
+    fn rejects_nan_strength() {
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: f64::NAN,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "palette must have 1 to 256 colors, got 0")]
+    fn reports_empty_palette() {
+        dither(
+            &[],
+            0,
+            0,
+            &Options {
+                palette: vec![],
+                ..Options::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rgba.len() is 3, expected w * h * 4 = 4 for 1x1")]
+    fn reports_rgba_length() {
+        dither(&[0; 3], 1, 1, &Options::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "tone.gamma must be positive, got 0")]
+    fn reports_nonpositive_gamma() {
+        let mut options = Options::default();
+        options.tone.gamma = 0.0;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "tone.brightness must be finite, got inf")]
+    fn reports_nonfinite_tone() {
+        let mut options = Options::default();
+        options.tone.brightness = f64::INFINITY;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "idx.len() is 5, expected gw * gh = 6 for 3x2")]
+    fn reports_index_length() {
+        rasterize(&[0; 5], 3, 2, 3, 2, |_| [0; 3]);
     }
 
     #[test]
@@ -431,7 +695,8 @@ mod tests {
         }
     }
 
-    fn gradient() -> Vec<u8> {
+    /// Shared pixels for quantization checks.
+    pub(crate) fn gradient() -> Vec<u8> {
         (0..128)
             .flat_map(|i| {
                 let (x, y) = (i % 16, i / 16);
@@ -459,8 +724,11 @@ mod tests {
         let options = Options {
             palette: make_palette(&["#f3e8c8", "#172438", "#c45238"]).unwrap(),
             mode: Mode::Color,
-            serpentine: false,
-            strength: 0.8,
+            algorithm: Algorithm::Diffusion(Diffusion {
+                kernel: Kernel::Atkinson,
+                serpentine: false,
+                strength: 0.8,
+            }),
             tone: Tone {
                 contrast: 0.15,
                 sharpen: 0.6,

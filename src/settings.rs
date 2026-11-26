@@ -1,7 +1,9 @@
 //! Editable settings and palette presets.
 
 use image::{RgbaImage, imageops};
-use rthid_dither::dither::{self, Mode, Options, PaletteColor, Tone};
+use rthid_dither::dither::{
+    self, Algorithm, BayerSize, Diffusion, Kernel, Mode, Options, PaletteColor, Tone,
+};
 
 /// Maximum number of characters in a preset or template name.
 pub const MAX_NAME_CHARS: usize = 32;
@@ -154,7 +156,106 @@ impl Palettes {
     }
 }
 
+/// Dither algorithm choices in panel order.
+///
+/// The app keeps its own enum for the nine choices and their short labels so the
+/// dither library stays free of UI and serde concerns. Five choices diffuse error
+/// and four use thresholds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dither {
+    /// Diffuses error to six nearby pixels.
+    #[default]
+    Atkinson,
+    /// Diffuses error to four nearby pixels.
+    FloydSteinberg,
+    /// Spreads error across two following rows.
+    Jarvis,
+    /// Spreads error with Stucki weights.
+    Stucki,
+    /// Diffuses error to three nearby pixels.
+    SierraLite,
+    /// Uses a two by two threshold matrix.
+    Bayer2,
+    /// Uses a four by four threshold matrix.
+    Bayer4,
+    /// Uses an eight by eight threshold matrix.
+    Bayer8,
+    /// Uses thresholds from a repeatable seed.
+    Noise,
+}
+
+impl Dither {
+    /// Fixed cycle order for the panel.
+    pub const ALL: [Self; 9] = [
+        Self::Atkinson,
+        Self::FloydSteinberg,
+        Self::Jarvis,
+        Self::Stucki,
+        Self::SierraLite,
+        Self::Bayer2,
+        Self::Bayer4,
+        Self::Bayer8,
+        Self::Noise,
+    ];
+
+    /// Short label for panels and templates.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Atkinson => "Atkinson",
+            Self::FloydSteinberg => "Floyd-Steinberg",
+            Self::Jarvis => "Jarvis",
+            Self::Stucki => "Stucki",
+            Self::SierraLite => "Sierra Lite",
+            Self::Bayer2 => "Bayer 2",
+            Self::Bayer4 => "Bayer 4",
+            Self::Bayer8 => "Bayer 8",
+            Self::Noise => "Noise",
+        }
+    }
+
+    /// Diffusion kernel used by this choice, if any. This is the only mapping from
+    /// app choices to library kernels, and `None` marks a threshold algorithm.
+    pub fn kernel(self) -> Option<Kernel> {
+        match self {
+            Self::Atkinson => Some(Kernel::Atkinson),
+            Self::FloydSteinberg => Some(Kernel::FloydSteinberg),
+            Self::Jarvis => Some(Kernel::JarvisJudiceNinke),
+            Self::Stucki => Some(Kernel::Stucki),
+            Self::SierraLite => Some(Kernel::SierraLite),
+            Self::Bayer2 | Self::Bayer4 | Self::Bayer8 | Self::Noise => None,
+        }
+    }
+
+    /// Uses only the parameters relevant to the selected algorithm.
+    ///
+    /// Diffusion choices take strength and serpentine, Noise takes the seed and
+    /// Bayer takes neither. The other values are dropped here, so the engine never
+    /// sees settings that do not apply. The app seed widens to the library u64.
+    pub fn algorithm(self, strength: f64, serpentine: bool, seed: u32) -> Algorithm {
+        if let Some(kernel) = self.kernel() {
+            return Algorithm::Diffusion(Diffusion {
+                kernel,
+                strength,
+                serpentine,
+            });
+        }
+        match self {
+            Self::Bayer2 => Algorithm::Bayer(BayerSize::Two),
+            Self::Bayer4 => Algorithm::Bayer(BayerSize::Four),
+            Self::Bayer8 => Algorithm::Bayer(BayerSize::Eight),
+            Self::Noise => Algorithm::Noise {
+                seed: u64::from(seed),
+            },
+            _ => unreachable!("diffusion kernels handled above"),
+        }
+    }
+}
+
 /// Saved settings with palette colors independent of the preset list.
+///
+/// The algorithm, seed and remembered diffusion values are all saved, even when
+/// the saved algorithm does not use some of them. Palette colors are copied rather
+/// than referenced by name, so later preset edits leave the snapshot intact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Template {
     /// Label shown in the template manager.
@@ -163,11 +264,15 @@ pub struct Template {
     pub palette_name: String,
     /// Authoritative colors in their original order.
     pub palette_hex: Vec<String>,
-    /// Color model used for diffusion.
+    /// Color model used for quantization.
     pub mode: Mode,
-    /// Fraction of error diffused.
+    /// Selected quantization algorithm.
+    pub dither: Dither,
+    /// Seed retained for noise patterns, saved even when another algorithm is selected.
+    pub seed: u32,
+    /// Fraction of error diffused, saved even when a threshold algorithm is selected.
     pub strength: f64,
-    /// Whether alternate rows run in reverse.
+    /// Whether alternate rows run in reverse, saved like strength.
     pub serpentine: bool,
     /// Source size percentage.
     pub scale: i32,
@@ -183,30 +288,33 @@ impl Template {
             name,
             palette_name: settings.palette_name.clone(),
             palette_hex: settings.palette_hex.clone(),
-            mode: settings.options.mode,
-            strength: settings.options.strength,
-            serpentine: settings.options.serpentine,
+            mode: settings.mode,
+            dither: settings.dither,
+            seed: settings.seed,
+            strength: settings.strength,
+            serpentine: settings.serpentine,
             scale: settings.scale,
-            tone: settings.options.tone,
+            tone: settings.tone,
         }
     }
 
-    /// Restores saved settings while retaining the current image rotation.
+    /// Restores saved settings while retaining the current rotation.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
-        Ok(Settings {
+        let next = Settings {
+            dither: self.dither,
+            strength: self.strength,
+            serpentine: self.serpentine,
+            seed: self.seed,
             scale: self.scale,
             rotation: settings.rotation,
             palette_name: self.palette_name.clone(),
             palette_hex: self.palette_hex.clone(),
-            options: rthid_dither::dither::Options {
-                palette,
-                mode: self.mode,
-                strength: self.strength,
-                serpentine: self.serpentine,
-                tone: self.tone,
-            },
-        })
+            palette,
+            mode: self.mode,
+            tone: self.tone,
+        };
+        Ok(next)
     }
 }
 
@@ -349,10 +457,14 @@ pub enum Setting {
     Mode,
     /// Palette preset.
     Palette,
+    /// Quantization algorithm.
+    Dither,
     /// Fraction of dither error diffused.
     Strength,
     /// Whether odd rows dither right to left.
     Serpentine,
+    /// Noise pattern seed.
+    Seed,
     /// Tone brightness offset.
     Brightness,
     /// Tone contrast adjustment.
@@ -369,12 +481,14 @@ pub enum Setting {
 
 impl Setting {
     /// Parameter panel order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Scale,
         Self::Mode,
         Self::Palette,
+        Self::Dither,
         Self::Strength,
         Self::Serpentine,
+        Self::Seed,
         Self::Brightness,
         Self::Contrast,
         Self::Gamma,
@@ -385,7 +499,7 @@ impl Setting {
 
     /// Label including the current value.
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
-        let o = &settings.options;
+        let o = settings;
         match self {
             Setting::Scale => format!("Scale: {}%", settings.scale),
             Setting::Mode => format!("Mode: {:?}", o.mode),
@@ -397,9 +511,14 @@ impl Setting {
                     if matches { "" } else { "*" }
                 )
             }
-            Setting::Strength => format!("Strength: {:.1}", o.strength),
+            Setting::Dither => format!("Dither: {}", settings.dither.label()),
+            Setting::Seed => format!("Seed: {}", settings.seed),
+            Setting::Strength => format!("Strength: {:.1}", settings.strength),
             Setting::Serpentine => {
-                format!("Serpentine: {}", if o.serpentine { "on" } else { "off" })
+                format!(
+                    "Serpentine: {}",
+                    if settings.serpentine { "on" } else { "off" }
+                )
             }
             Setting::Brightness => format!("Brightness: {:+.2}", o.tone.brightness),
             Setting::Contrast => format!("Contrast: {:+.2}", o.tone.contrast),
@@ -407,6 +526,35 @@ impl Setting {
             Setting::Black => format!("Black: {:.2}", o.tone.black),
             Setting::White => format!("White: {:.2}", o.tone.white),
             Setting::Sharpen => format!("Sharpen: {:.2}", o.tone.sharpen),
+        }
+    }
+
+    /// Whether the current algorithm uses this parameter. Strength and Serpentine
+    /// apply to diffusion and Seed applies to Noise.
+    ///
+    /// Inactive rows stay visible in place, shown dimmed. Adjusting, resetting and
+    /// reseeding leave them unchanged, so they keep their value for a later switch
+    /// back and never switch the preview.
+    pub fn is_active(self, settings: &Settings) -> bool {
+        match self {
+            Self::Strength | Self::Serpentine => settings.dither.kernel().is_some(),
+            Self::Seed => settings.dither == Dither::Noise,
+            _ => true,
+        }
+    }
+
+    /// Mutable numeric value for rows with float steps. It ignores whether the row
+    /// is active, so callers check [`Setting::is_active`] first.
+    pub fn value_mut(self, settings: &mut Settings) -> Option<&mut f64> {
+        match self {
+            Self::Strength => Some(&mut settings.strength),
+            Self::Brightness => Some(&mut settings.tone.brightness),
+            Self::Contrast => Some(&mut settings.tone.contrast),
+            Self::Gamma => Some(&mut settings.tone.gamma),
+            Self::Black => Some(&mut settings.tone.black),
+            Self::White => Some(&mut settings.tone.white),
+            Self::Sharpen => Some(&mut settings.tone.sharpen),
+            _ => None,
         }
     }
 
@@ -423,7 +571,7 @@ impl Setting {
             Self::Black => Some((100.0, 0.0, 0.5)),
             Self::White => Some((100.0, 0.5, 1.0)),
             Self::Sharpen => Some((20.0, 0.0, 3.0)),
-            Self::Mode | Self::Palette | Self::Serpentine => None,
+            Self::Mode | Self::Palette | Self::Dither | Self::Serpentine | Self::Seed => None,
         }
     }
 
@@ -442,7 +590,7 @@ impl Setting {
 
 /// Everything that affects the grid or the dither. d resets the selected row and
 /// D resets everything, including rotation.
-// TODO: Hold the palette as one Preset and derive options.palette from it. Name, hex list and
+// TODO: Hold the palette as one Preset and derive the palette from it. Name, hex list and
 // built palette are three copies that every setter must keep in sync.
 #[derive(Clone, PartialEq)]
 pub struct Settings {
@@ -454,8 +602,25 @@ pub struct Settings {
     pub palette_name: String,
     /// Hex colors preserved in the user's order.
     pub palette_hex: Vec<String>,
-    /// Dither and tone settings.
-    pub options: Options,
+    /// Selected quantization algorithm.
+    ///
+    /// Strength, serpentine and seed are kept as plain values next to it and are
+    /// remembered across algorithm switches. Only the values that apply to this
+    /// choice reach the engine, through [`Settings::options`].
+    pub dither: Dither,
+    /// Fraction of error diffused, used by diffusion algorithms only.
+    pub strength: f64,
+    /// Whether alternate rows run in reverse, used by diffusion algorithms only.
+    pub serpentine: bool,
+    /// Seed retained for noise patterns. The panel edits a u32 range while the
+    /// library accepts any u64.
+    pub seed: u32,
+    /// Colors sorted by brightness for quantization.
+    pub palette: Vec<PaletteColor>,
+    /// Color model used for quantization.
+    pub mode: Mode,
+    /// Adjustments before quantization.
+    pub tone: Tone,
 }
 
 impl Default for Settings {
@@ -465,13 +630,51 @@ impl Default for Settings {
             rotation: Rotation::R0,
             palette_name: String::new(),
             palette_hex: Vec::new(),
-            options: Options::default(),
+            dither: Dither::default(),
+            strength: 1.0,
+            serpentine: true,
+            seed: 0,
+            palette: Options::default().palette,
+            mode: Mode::default(),
+            tone: Tone::default(),
         }
         .with_preset(&Palettes::builtin().presets[0])
     }
 }
 
 impl Settings {
+    /// Builds library options from the current panel values.
+    ///
+    /// Options are derived on demand rather than stored, so there is no second
+    /// copy of the algorithm that could drift from the panel. Inactive values are
+    /// left out, which also keeps them out of the dither cache key.
+    pub fn options(&self) -> Options {
+        Options {
+            palette: self.palette.clone(),
+            mode: self.mode,
+            tone: self.tone,
+            algorithm: self
+                .dither
+                .algorithm(self.strength, self.serpentine, self.seed),
+        }
+    }
+
+    /// Changes an active Seed row, ensuring the pattern seed changes.
+    ///
+    /// The app supplies the entropy and this decides the seed, so the engine stays
+    /// deterministic and the rule is testable. A candidate equal to the current
+    /// seed moves up by one, wrapping at u32::MAX. Other rows are left unchanged.
+    pub fn reseeded(&self, setting: Setting, entropy: u64) -> Self {
+        let mut next = self.clone();
+        if setting == Setting::Seed && setting.is_active(self) {
+            next.seed = entropy as u32;
+            if next.seed == self.seed {
+                next.seed = next.seed.wrapping_add(1);
+            }
+        }
+        next
+    }
+
     /// Whether the selected name and colors still match this preset.
     pub fn uses(&self, preset: &Preset) -> bool {
         self.palette_name == preset.name && self.palette_hex == preset.colors
@@ -481,9 +684,9 @@ impl Settings {
         let palette = build_palette(&preset.colors)?;
         self.palette_name.clone_from(&preset.name);
         self.palette_hex.clone_from(&preset.colors);
-        self.options.palette = palette;
+        self.palette = palette;
         if let Some(mode) = preset.mode {
-            self.options.mode = mode;
+            self.mode = mode;
         }
         Ok(())
     }
@@ -498,19 +701,20 @@ impl Settings {
     /// Returns settings with one parameter restored to its default.
     pub fn with_default(&self, setting: Setting, palettes: &Palettes) -> Self {
         let mut next = self.clone();
-        let defaults = Self::default();
+        if !setting.is_active(self) {
+            return next;
+        }
+        let mut defaults = Self::default();
         match setting {
             Setting::Scale => next.scale = defaults.scale,
-            Setting::Mode => next.options.mode = defaults.options.mode,
+            Setting::Mode => next.mode = defaults.mode,
             Setting::Palette => next = next.with_preset(&palettes.presets[0]),
-            Setting::Strength => next.options.strength = defaults.options.strength,
-            Setting::Serpentine => next.options.serpentine = defaults.options.serpentine,
-            Setting::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
-            Setting::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
-            Setting::Gamma => next.options.tone.gamma = defaults.options.tone.gamma,
-            Setting::Black => next.options.tone.black = defaults.options.tone.black,
-            Setting::White => next.options.tone.white = defaults.options.tone.white,
-            Setting::Sharpen => next.options.tone.sharpen = defaults.options.tone.sharpen,
+            Setting::Dither => next.dither = defaults.dither,
+            Setting::Seed => next.seed = defaults.seed,
+            Setting::Serpentine => next.serpentine = defaults.serpentine,
+            _ => {
+                *setting.value_mut(&mut next).unwrap() = *setting.value_mut(&mut defaults).unwrap()
+            }
         }
         next
     }
@@ -519,6 +723,9 @@ impl Settings {
     /// Serpentine toggle, Palette wraps around the presets.
     pub fn adjusted(&self, setting: Setting, dir: i32, palettes: &Palettes) -> Self {
         let mut next = self.clone();
+        if !setting.is_active(self) {
+            return next;
+        }
         let step = |value: f64| {
             let (steps, _, _) = setting.range().expect("numeric parameter");
             setting.clamp(((value * steps).round() + f64::from(dir)) / steps)
@@ -529,35 +736,104 @@ impl Settings {
                 next.scale = setting.clamp(f64::from(self.scale) + f64::from(dir) / steps) as i32;
             }
             Setting::Mode => {
-                next.options.mode = match self.options.mode {
+                next.mode = match self.mode {
                     Mode::Tone => Mode::Color,
                     Mode::Color => Mode::Tone,
                 }
             }
             Setting::Palette => {
                 let current = palettes.find(&self.palette_name).unwrap_or(0);
-                let i =
-                    (current as i64 + i64::from(dir)).rem_euclid(palettes.len() as i64) as usize;
+                let i = wrap(current, dir, palettes.len());
                 next = next.with_preset(&palettes.presets[i]);
             }
-            Setting::Strength => next.options.strength = step(self.options.strength),
-            Setting::Serpentine => next.options.serpentine = !self.options.serpentine,
-            Setting::Brightness => {
-                next.options.tone.brightness = step(self.options.tone.brightness)
+            Setting::Dither => {
+                let current = Dither::ALL.iter().position(|&d| d == self.dither).unwrap();
+                let i = wrap(current, dir, Dither::ALL.len());
+                next.dither = Dither::ALL[i];
             }
-            Setting::Contrast => next.options.tone.contrast = step(self.options.tone.contrast),
-            Setting::Gamma => next.options.tone.gamma = step(self.options.tone.gamma),
-            Setting::Black => next.options.tone.black = step(self.options.tone.black),
-            Setting::White => next.options.tone.white = step(self.options.tone.white),
-            Setting::Sharpen => next.options.tone.sharpen = step(self.options.tone.sharpen),
+            Setting::Seed => next.seed = self.seed.saturating_add_signed(dir),
+            Setting::Serpentine => next.serpentine = !self.serpentine,
+            _ => {
+                let value = setting.value_mut(&mut next).unwrap();
+                *value = step(*value);
+            }
         }
         next
     }
 }
 
+fn wrap(index: usize, dir: i32, len: usize) -> usize {
+    (index as i64 + i64::from(dir)).rem_euclid(len as i64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dither_labels_fit_the_panel_and_stay_distinct() {
+        let palettes = Palettes::builtin();
+        let labels: Vec<_> = Dither::ALL
+            .iter()
+            .map(|&dither| {
+                let settings = Settings {
+                    dither,
+                    ..Settings::default()
+                };
+                Setting::Dither.label(&settings, &palettes)
+            })
+            .collect();
+        for label in &labels {
+            assert!(label.chars().count() <= 25, "{label}");
+        }
+        let mut unique = labels.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len());
+    }
+
+    #[test]
+    fn reseeding_changes_only_an_active_seed_row() {
+        let settings = Settings {
+            dither: Dither::Noise,
+            seed: u32::MAX,
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.reseeded(Setting::Seed, u64::from(u32::MAX)).seed,
+            0
+        );
+        assert_eq!(settings.reseeded(Setting::Seed, 42).seed, 42);
+        let settings = Settings {
+            seed: 42,
+            ..settings
+        };
+        assert_eq!(settings.reseeded(Setting::Seed, 42).seed, 43);
+        assert!(settings.reseeded(Setting::Strength, 42) == settings);
+        let inactive = Settings::default();
+        assert!(inactive.reseeded(Setting::Seed, 42) == inactive);
+    }
+
+    #[test]
+    fn seed_steps_saturate_at_both_bounds() {
+        let palettes = Palettes::builtin();
+        for (seed, dir, expected) in [
+            (0, -1, 0),
+            (0, i32::MIN, 0),
+            (u32::MAX, 1, u32::MAX),
+            (u32::MAX, i32::MAX, u32::MAX),
+        ] {
+            let settings = Settings {
+                dither: Dither::Noise,
+                seed,
+                ..Settings::default()
+            };
+            assert_eq!(
+                settings.adjusted(Setting::Seed, dir, &palettes).seed,
+                expected
+            );
+        }
+    }
 
     #[test]
     fn domain_limits_preserve_valid_entries_on_failure() {
@@ -714,9 +990,9 @@ mod tests {
             builtin: false,
         };
         let settings = Settings::default().with_preset(&preset);
-        assert_eq!(settings.options.mode, Mode::Color);
+        assert_eq!(settings.mode, Mode::Color);
         assert_eq!(settings.palette_hex, preset.colors);
-        assert_eq!(settings.options.palette[0].rgb, [0; 3]);
+        assert_eq!(settings.palette[0].rgb, [0; 3]);
         assert_eq!(
             Setting::Palette.label(&settings, &palettes),
             "Palette: Paper*"
@@ -735,7 +1011,7 @@ mod tests {
         assert!(settings.clone().set_palette(&preset).is_err());
         assert!(settings.with_preset(&preset) == settings);
         let builtin = settings.with_preset(palettes.get(0).unwrap());
-        assert_eq!(builtin.options.mode, Mode::Color);
+        assert_eq!(builtin.mode, Mode::Color);
         let unknown = Settings {
             palette_name: "Template".into(),
             ..settings
@@ -794,9 +1070,11 @@ mod tests {
                 builtin: false,
             })
         };
-        settings.options.strength = 0.85;
-        settings.options.serpentine = false;
-        settings.options.tone = Tone {
+        settings.dither = Dither::Bayer4;
+        settings.seed = 7;
+        settings.strength = 0.85;
+        settings.serpentine = false;
+        settings.tone = Tone {
             brightness: 0.1,
             contrast: 0.15,
             gamma: 1.2,

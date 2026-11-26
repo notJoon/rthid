@@ -22,7 +22,7 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::{
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct OpenRequest {
@@ -436,7 +436,7 @@ impl App {
                 self.grid_cache.dithered().expect("dithered grid"),
                 w,
                 h,
-                &self.settings.options.palette,
+                &self.settings.palette,
             );
             self.outbox.push((job, 0));
         }
@@ -462,7 +462,7 @@ impl App {
         } else {
             Pixels::Indexed {
                 indices: self.grid_cache.dithered().expect("dithered grid"),
-                palette: &self.settings.options.palette,
+                palette: &self.settings.palette,
             }
         })
     }
@@ -664,7 +664,18 @@ impl App {
         }
         match self.panel.handle_key(key, Setting::ALL.len()) {
             Outcome::Ignored => {}
-            Outcome::Consumed | Outcome::Submit(_) | Outcome::Cancel => return,
+            Outcome::Submit(_) => {
+                let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
+                // Enter picks a new seed on an active Seed row. The clock is read only
+                // here, Settings decides the seed and the engine stays deterministic.
+                let entropy = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                self.apply_setting(setting, self.settings.reseeded(setting, entropy));
+                return;
+            }
+            Outcome::Consumed | Outcome::Cancel => return,
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -743,7 +754,12 @@ impl App {
         let next = self
             .settings
             .adjusted(setting, direction, &self.library.palettes);
-        // Clamped presses preserve the current preview selection.
+        self.apply_setting(setting, next);
+    }
+
+    // Shared by Enter and by Left and Right so both follow one preview switch rule.
+    fn apply_setting(&mut self, setting: Setting, next: Settings) {
+        // Clamped presses and inactive rows preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
             self.apply(Effect::Preview(next)).expect("preview is valid");
         } else {
@@ -783,7 +799,7 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 mod tests {
     use super::*;
     use crate::{
-        settings::{Rotation, Templates},
+        settings::{Dither, Rotation, Templates},
         ui::Layout,
     };
     use ratatui::layout::Rect;
@@ -1007,7 +1023,7 @@ mod tests {
         assert!(
             matches!(queued.as_slice(), [Job::Export { path: output, grid }, Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
             if output == &path && protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images")
-                && (grid.w, grid.h) == (4, 2) && grid.indices.len() == 8 && grid.palette == app.settings.options.palette)
+                && (grid.w, grid.h) == (4, 2) && grid.indices.len() == 8 && grid.palette == app.settings.palette)
         );
         app.complete(done(&app, IoOutcome::Opened(Err(failure(Op::Decode)))));
         assert!(app.complete(done(&app, IoOutcome::Exported(Err(failure(Op::Encode))))));
@@ -1046,7 +1062,7 @@ mod tests {
         app.show_original = false;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
-        app.settings.options.strength = 0.5;
+        app.settings.strength = 0.5;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         assert!(!App::empty().sync(preview));
@@ -1206,7 +1222,7 @@ mod tests {
         app.settings = app
             .settings
             .with_preset(app.library.palettes.get(1).unwrap());
-        app.settings.options.tone.brightness = 0.2;
+        app.settings.tone.brightness = 0.2;
         app.settings.rotation = Rotation::R90;
         app.show_original = false;
         app.refresh();
@@ -1228,7 +1244,7 @@ mod tests {
         assert!(!app.viewport.hide_minimap);
         assert!(app.last_drag.is_none() && app.show_original);
         assert_eq!(app.settings.rotation, Rotation::R0);
-        assert_eq!(app.settings.options, settings.options);
+        assert_eq!(app.settings.options(), settings.options());
         assert_eq!(app.settings.palette_hex, settings.palette_hex);
         assert_eq!(app.settings.palette_name, settings.palette_name);
         assert_eq!(app.grid_size(), (3, 5));
@@ -1242,7 +1258,7 @@ mod tests {
     #[test]
     fn template_manager_saves_and_applies_settings() {
         let mut app = app_at(Setting::Strength);
-        app.settings.options.strength = 0.5;
+        app.settings.strength = 0.5;
         let saved = app.settings.clone();
         for code in [
             KeyCode::Char('T'),
@@ -1257,12 +1273,12 @@ mod tests {
             app.library.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
         );
-        app.settings.options.strength = 0.9;
+        app.settings.strength = 0.9;
         app.settings.rotation = Rotation::R90;
         for code in [KeyCode::Char('T'), KeyCode::Enter] {
             press(&mut app, code);
         }
-        assert_eq!(app.settings.options.strength, 0.5);
+        assert_eq!(app.settings.strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
     }
@@ -1737,9 +1753,14 @@ mod tests {
         before != versions(app)
     }
 
+    fn select(app: &mut App, setting: Setting) {
+        app.panel
+            .select(Setting::ALL.iter().position(|&row| row == setting).unwrap());
+    }
+
     fn app_at(setting: Setting) -> App {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
+        select(&mut app, setting);
         app
     }
 
@@ -1780,7 +1801,7 @@ mod tests {
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 1);
-        app.settings.options.strength = 0.5;
+        app.settings.strength = 0.5;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 2);
@@ -1837,12 +1858,7 @@ mod tests {
     #[test]
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::builtin(RgbaImage::new(20, 10), None);
-        app.panel = ListPicker::new(
-            Setting::ALL
-                .iter()
-                .position(|&p| p == Setting::Strength)
-                .unwrap(),
-        );
+        select(&mut app, Setting::Strength);
         assert!(app.show_original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
@@ -1908,17 +1924,83 @@ mod tests {
     }
 
     #[test]
+    fn algorithms_cycle_in_panel_order_and_back() {
+        let mut app = app_at(Setting::Dither);
+        for expected in Dither::ALL.into_iter().cycle().skip(1).take(9) {
+            assert!(press(&mut app, KeyCode::Right));
+            assert_eq!(app.settings.dither, expected);
+        }
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(app.settings.dither, Dither::Noise);
+    }
+
+    #[test]
+    fn bayer_ignores_diffusion_rows_and_retains_their_values() {
+        let mut app = app_at(Setting::Strength);
+        press(&mut app, KeyCode::Left);
+        app.settings.serpentine = false;
+        app.settings.dither = Dither::Bayer4;
+        app.settings.seed = 42;
+        app.sync(test_layout().preview);
+        app.show_original = true;
+        for setting in [Setting::Strength, Setting::Serpentine] {
+            select(&mut app, setting);
+            for key in [
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Char('d'),
+            ] {
+                let before = app.settings.clone();
+                assert!(!press(&mut app, key));
+                assert!(app.settings == before);
+                assert!(app.show_original);
+            }
+        }
+        select(&mut app, Setting::Dither);
+        app.show_original = false;
+        assert!(press(&mut app, KeyCode::Char('d')));
+        assert_eq!(app.settings.dither, Dither::Atkinson);
+        assert_eq!(app.settings.strength, 0.9);
+        assert!(!app.settings.serpentine);
+        assert_eq!(app.settings.seed, 42);
+    }
+
+    #[test]
+    fn seed_steps_and_enter_only_change_noise() {
+        let mut app = app_at(Setting::Seed);
+        let before = app.settings.clone();
+        assert!(!press(&mut app, KeyCode::Enter));
+        assert!(app.settings == before);
+        assert!(app.show_original);
+        app.settings.dither = Dither::Noise;
+        app.settings.seed = 0;
+        assert!(!press(&mut app, KeyCode::Left));
+        assert_eq!(app.settings.seed, 0);
+        assert!(app.show_original);
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(app.settings.seed, 1);
+        let seed = app.settings.seed;
+        app.show_original = true;
+        assert!(press(&mut app, KeyCode::Enter));
+        assert_ne!(app.settings.seed, seed);
+        assert!(!app.show_original);
+        assert!(press(&mut app, KeyCode::Char('d')));
+        assert_eq!(app.settings.seed, 0);
+    }
+
+    #[test]
     fn numeric_settings_clamp_without_redither() {
         type Getter = fn(&Settings) -> f64;
         let cases: [(Setting, Getter); 8] = [
             (Setting::Scale, |p| f64::from(p.scale)),
-            (Setting::Strength, |p| p.options.strength),
-            (Setting::Brightness, |p| p.options.tone.brightness),
-            (Setting::Contrast, |p| p.options.tone.contrast),
-            (Setting::Gamma, |p| p.options.tone.gamma),
-            (Setting::Black, |p| p.options.tone.black),
-            (Setting::White, |p| p.options.tone.white),
-            (Setting::Sharpen, |p| p.options.tone.sharpen),
+            (Setting::Strength, |p| p.strength),
+            (Setting::Brightness, |p| p.tone.brightness),
+            (Setting::Contrast, |p| p.tone.contrast),
+            (Setting::Gamma, |p| p.tone.gamma),
+            (Setting::Black, |p| p.tone.black),
+            (Setting::White, |p| p.tone.white),
+            (Setting::Sharpen, |p| p.tone.sharpen),
         ];
         for (setting, get) in cases {
             let (_, low, high) = setting.range().unwrap();
@@ -1940,19 +2022,20 @@ mod tests {
     fn toggles_and_palette_cycle() {
         let mut app = app_at(Setting::Mode);
         assert!(press(&mut app, KeyCode::Char('l')));
-        assert!(matches!(app.settings.options.mode, Mode::Color));
+        assert!(matches!(app.settings.mode, Mode::Color));
         let mut app = app_at(Setting::Serpentine);
         press(&mut app, KeyCode::Right);
-        assert!(!app.settings.options.serpentine);
+        let serpentine = app.settings.serpentine;
+        assert!(!serpentine);
         let mut app = app_at(Setting::Palette);
         // Wrapping back lands on the last built-in, which also switches to its Color mode.
         press(&mut app, KeyCode::Left);
         assert_eq!(app.settings.palette_name, "Pratt");
-        assert_eq!(app.settings.options.palette.len(), 5);
-        assert_eq!(app.settings.options.mode, Mode::Color);
+        assert_eq!(app.settings.palette.len(), 5);
+        assert_eq!(app.settings.mode, Mode::Color);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.settings.palette_name, "Black/white");
-        assert_eq!(app.settings.options.palette.len(), 2);
+        assert_eq!(app.settings.palette.len(), 2);
     }
 
     #[test]
@@ -1963,7 +2046,7 @@ mod tests {
         app.panel = ListPicker::new(1);
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
-        assert!(matches!(app.settings.options.mode, Mode::Tone));
+        assert!(matches!(app.settings.mode, Mode::Tone));
         assert_eq!(
             (app.settings.scale, app.settings.rotation),
             (110, Rotation::R90)
@@ -1974,18 +2057,40 @@ mod tests {
         let p = &app.settings;
         assert_eq!((p.scale, p.rotation), (100, Rotation::R0));
         assert_eq!(p.palette_name, "Black/white");
-        assert_eq!(p.options.palette.len(), 2);
+        assert_eq!(p.palette.len(), 2);
         assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 16);
     }
 
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
-        for setting in Setting::ALL {
+        for (setting, dither) in Setting::ALL
+            .into_iter()
+            .map(|setting| (setting, Dither::Atkinson))
+            .chain([(Setting::Seed, Dither::Noise)])
+        {
             let mut app = App::builtin(RgbaImage::new(20, 10), None);
-            app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
+            select(&mut app, setting);
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
-            let change = if matches!(setting, Setting::Black | Setting::Sharpen) {
+            app.settings.dither = dither;
+            app.settings.seed = 0;
+            app.sync(test_layout().preview);
+            if !setting.is_active(&app.settings) {
+                let before = app.settings.clone();
+                app.show_original = true;
+                for key in [
+                    KeyCode::Left,
+                    KeyCode::Right,
+                    KeyCode::Enter,
+                    KeyCode::Char('d'),
+                ] {
+                    assert!(!press(&mut app, key));
+                    assert!(app.settings == before);
+                    assert!(app.show_original);
+                }
+                continue;
+            }
+            let change = if matches!(setting, Setting::Black | Setting::Sharpen | Setting::Seed) {
                 KeyCode::Right
             } else {
                 KeyCode::Left
@@ -2001,11 +2106,11 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert!(!press(&mut app, KeyCode::Char('d')));
         assert!(press(&mut app, KeyCode::Char('D')));
-        app.settings.options.tone.gamma = 2.0;
+        app.settings.tone.gamma = 2.0;
         app.show_original = false;
         app.sync(test_layout().preview);
         assert!(press(&mut app, KeyCode::Char('D')));
-        assert_eq!(app.settings.options.tone.gamma, 1.0);
+        assert_eq!(app.settings.tone.gamma, 1.0);
         app.handle_key(
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &app.geometry(test_layout().preview),
