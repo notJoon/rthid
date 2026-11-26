@@ -273,11 +273,16 @@ impl From<FileMode> for Mode {
     }
 }
 
+/// Algorithm names stored in templates, kept apart from the app and library enums
+/// so renaming a Rust variant cannot change the file format. An unknown name fails
+/// only its own template entry, which is reported and kept raw on save rather than
+/// read as some default algorithm.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum FileDither {
     Atkinson,
     FloydSteinberg,
+    // The panel shows the short label Jarvis, but files store the full algorithm name.
     #[serde(rename = "jarvis-judice-ninke")]
     Jarvis,
     Stucki,
@@ -329,6 +334,8 @@ struct FilePreset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<FileMode>,
 }
+/// Missing fields take default settings, so older files without an algorithm or
+/// seed load as Atkinson with seed 0.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct FileTemplate {
@@ -337,6 +344,7 @@ struct FileTemplate {
     colors: Vec<String>,
     mode: FileMode,
     algorithm: FileDither,
+    // Read as u64 to match the library range, then clamped to the app's u32 seed.
     seed: u64,
     strength: f64,
     serpentine: bool,
@@ -372,6 +380,7 @@ impl From<FileTemplate> for Template {
             palette_hex: t.colors,
             mode: t.mode.into(),
             dither: t.algorithm.into(),
+            // Larger file seeds saturate at the app boundary instead of wrapping.
             seed: t.seed.min(u64::from(u32::MAX)) as u32,
             strength: t.strength,
             serpentine: t.serpentine,

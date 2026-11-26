@@ -16,6 +16,12 @@ pub(crate) struct GridKey {
 }
 
 /// Grid build version and the settings the indices were dithered with.
+///
+/// The options come from [`Settings::options`], which holds only the values the
+/// current algorithm uses. Remembered inactive values, such as a diffusion
+/// strength while Bayer is selected, therefore never trigger a new dither.
+/// Comparing whole Settings here, or keeping a second copy of the algorithm,
+/// would lose that property.
 #[derive(PartialEq)]
 pub(crate) struct DitherKey {
     grid: u64,

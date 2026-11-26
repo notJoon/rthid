@@ -1,6 +1,6 @@
-//! Stucki weights with divisor 42.
+//! Stucki kernel, divisor 42.
 
-/// Neighbor weights and the fraction of error they receive.
+/// Taps whose weights sum to the divisor, so all of the error is spread.
 pub(super) const STUCKI: super::Weights = super::Weights {
     taps: &[
         (1, 0, 8),

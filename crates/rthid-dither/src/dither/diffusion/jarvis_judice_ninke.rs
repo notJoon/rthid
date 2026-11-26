@@ -1,6 +1,6 @@
-//! Jarvis Judice Ninke weights with divisor 48.
+//! Jarvis Judice Ninke kernel, divisor 48.
 
-/// Neighbor weights and the fraction of error they receive.
+/// Taps whose weights sum to the divisor, so all of the error is spread.
 pub(super) const JARVIS_JUDICE_NINKE: super::Weights = super::Weights {
     taps: &[
         (1, 0, 7),

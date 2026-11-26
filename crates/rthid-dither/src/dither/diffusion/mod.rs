@@ -1,4 +1,14 @@
 //! Error diffusion with selectable neighbor weights and scan direction.
+//!
+//! Each kernel is data: a list of `(dx, dy, weight)` taps and an explicit
+//! divisor, kept in its own file. All kernels run through the one shared
+//! loop in `diffuse`, so traversal, quantization and numeric behavior stay
+//! identical across them.
+//!
+//! Adding a kernel means adding a table file, a `Kernel` variant with its
+//! entry in `Kernel::weights`, and contract and golden tests. The loop is
+//! never copied. There is no public kernel trait or registration on purpose,
+//! the supported set is a closed enum.
 
 mod atkinson;
 mod floyd_steinberg;
@@ -19,11 +29,12 @@ use super::{Mode, nearest, tone_level};
 pub struct Diffusion {
     /// Weights and neighbors that receive error.
     pub kernel: Kernel,
-    /// Rows 1, 3, 5 (counting from 0) run right to left with taps mirrored.
+    /// Rows 1, 3, 5 (counting from 0) run right to left and every tap `dx`
+    /// is mirrored. Without the mirror, error would go to pixels already done.
     pub serpentine: bool,
-    /// 1 diffuses the full kernel weights, spreading 3/4 of the error for Atkinson
-    /// and all of it for other kernels. 0 is plain nearest color quantization.
-    /// Dithering panics outside 0..=1 or for nonfinite values.
+    /// Scales the error before it is spread. 1 uses the kernel's own weights,
+    /// so Atkinson still spreads 3/4 of the error. 0 is plain quantization
+    /// with no diffusion. Dithering panics outside 0..=1 or for nonfinite values.
     pub strength: f64,
 }
 
@@ -38,26 +49,24 @@ impl Default for Diffusion {
 }
 
 /// Error diffusion weights. Atkinson is the default.
+///
+/// The fractions below hold for interior pixels. Taps that fall outside
+/// the image are dropped, not redistributed to the remaining taps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Kernel {
-    /// Weight sum 6, divisor 8. Spreads 3/4 of the error.
-    /// Choose for high contrast with clean highlights and shadows.
+    /// Six taps, weight sum 6, divisor 8. Spreads 3/4 of the error.
     #[default]
     Atkinson,
-    /// Weight sum 16, divisor 16. Spreads all of the error.
-    /// Choose for classic fine grain and speed.
+    /// Four taps, weight sum 16, divisor 16. Spreads all of the error.
     #[doc(alias = "Floyd-Steinberg")]
     FloydSteinberg,
-    /// Weight sum 48, divisor 48. Spreads all of the error.
-    /// Choose for smoother gradients with a wider spread at lower speed.
+    /// Twelve taps, weight sum 48, divisor 48. Spreads all of the error.
     #[doc(alias = "JJN")]
     #[doc(alias = "Jarvis")]
     JarvisJudiceNinke,
-    /// Weight sum 42, divisor 42. Spreads all of the error.
-    /// Choose for smoother gradients with a wider spread at lower speed.
+    /// Twelve taps, weight sum 42, divisor 42. Spreads all of the error.
     Stucki,
-    /// Weight sum 4, divisor 4. Spreads all of the error.
-    /// Choose for results close to Floyd Steinberg with fewer taps.
+    /// Three taps, weight sum 4, divisor 4. Spreads all of the error.
     #[doc(alias = "Sierra-2-4A")]
     SierraLite,
 }
@@ -74,12 +83,21 @@ impl Kernel {
     }
 }
 
+/// Taps relative to the current pixel and the divisor applied to each weight.
+/// The divisor is explicit instead of derived from the weight sum because
+/// Atkinson spreads 6/8 on purpose. Out of image taps are dropped, so the
+/// spread fraction applies to interior pixels only.
 struct Weights {
     taps: &'static [(isize, usize, u8)], // (dx, dy, weight)
     divisor: u8,
 }
 
 /// Quantizes prepared channels and spreads error to later pixels.
+///
+/// Error only reaches pixels not yet processed, so the result depends on the
+/// scan order. Tiling or parallel traversal would change the output.
+/// Channels are stored as f32, the math runs in f64, and each write is
+/// stored back to f32 immediately. That rounding point is part of the output.
 pub(super) fn diffuse(
     work: &mut [Vec<f32>],
     w: usize,
@@ -113,7 +131,9 @@ pub(super) fn diffuse(
                 let e = (f64::from(channel[i]) - t) * settings.strength;
                 for &(dx, dy, weight) in weights.taps {
                     let (weight, divisor) = (f64::from(weight), f64::from(weights.divisor));
-                    // The two forms differ in the last bit when the divisor is not a power of two.
+                    // Kept apart on purpose. The two forms differ in the last bit when
+                    // the divisor is not a power of two, and that bit can flip a later
+                    // quantization. Goldens guard both forms, so do not merge them.
                     let share = match mode {
                         Mode::Tone => e * weight / divisor,
                         Mode::Color => e * (weight / divisor),
@@ -124,7 +144,7 @@ pub(super) fn diffuse(
                         && yy < h
                     {
                         let j = yy * w + xx;
-                        // Compute in f64, convert to f32 only on store.
+                        // f64 math, rounded to f32 on every store.
                         channel[j] = (f64::from(channel[j]) + share) as f32;
                     }
                 }

@@ -1,6 +1,11 @@
 //! Recursive Bayer matrices for ordered thresholds.
+//!
+//! Each matrix grows from `[[0]]` by doubling. Every step multiplies the
+//! previous ranks by 4 and adds the quadrant offsets `0 2 / 3 1`.
 
 /// Ordered dithering matrix size.
+///
+/// Only 2, 4 and 8 exist, so an unsupported size cannot be expressed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum BayerSize {
     /// Repeats every two rows and columns.
@@ -34,6 +39,9 @@ fn matrix(size: BayerSize) -> ([[u8; 8]; 8], usize) {
 }
 
 /// Prepares a matrix once for all pixels in an image.
+///
+/// Rank r of an n by n matrix maps to the threshold `(r + 0.5) / n²`. The
+/// table is built once per call and the pattern repeats with `x % n` and `y % n`.
 pub(in crate::dither) fn threshold(size: BayerSize) -> impl Fn(usize, usize) -> f64 {
     let (matrix, n) = matrix(size);
     let thresholds: [[f64; 8]; 8] =

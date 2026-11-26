@@ -1,7 +1,6 @@
-//! Atkinson weights with divisor 8.
+//! Atkinson kernel, divisor 8.
 
-/// Neighbor weights and the fraction of error they receive. The divisor is
-/// explicit because Atkinson spreads only 6/8 of the error.
+/// Six taps of weight 1 over divisor 8, so 6/8 of the error is spread on purpose.
 pub(super) const ATKINSON: super::Weights = super::Weights {
     taps: &[
         (1, 0, 1),

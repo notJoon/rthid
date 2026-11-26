@@ -157,6 +157,10 @@ impl Palettes {
 }
 
 /// Dither algorithm choices in panel order.
+///
+/// The app keeps its own enum for the nine choices and their short labels so the
+/// dither library stays free of UI and serde concerns. Five choices diffuse error
+/// and four use thresholds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Dither {
     /// Diffuses error to six nearby pixels.
@@ -209,7 +213,8 @@ impl Dither {
         }
     }
 
-    /// Diffusion kernel used by this choice, if any.
+    /// Diffusion kernel used by this choice, if any. This is the only mapping from
+    /// app choices to library kernels, and `None` marks a threshold algorithm.
     pub fn kernel(self) -> Option<Kernel> {
         match self {
             Self::Atkinson => Some(Kernel::Atkinson),
@@ -222,6 +227,10 @@ impl Dither {
     }
 
     /// Uses only the parameters relevant to the selected algorithm.
+    ///
+    /// Diffusion choices take strength and serpentine, Noise takes the seed and
+    /// Bayer takes neither. The other values are dropped here, so the engine never
+    /// sees settings that do not apply. The app seed widens to the library u64.
     pub fn algorithm(self, strength: f64, serpentine: bool, seed: u32) -> Algorithm {
         if let Some(kernel) = self.kernel() {
             return Algorithm::Diffusion(Diffusion {
@@ -243,6 +252,10 @@ impl Dither {
 }
 
 /// Saved settings with palette colors independent of the preset list.
+///
+/// The algorithm, seed and remembered diffusion values are all saved, even when
+/// the saved algorithm does not use some of them. Palette colors are copied rather
+/// than referenced by name, so later preset edits leave the snapshot intact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Template {
     /// Label shown in the template manager.
@@ -255,11 +268,11 @@ pub struct Template {
     pub mode: Mode,
     /// Selected quantization algorithm.
     pub dither: Dither,
-    /// Seed retained for noise patterns.
+    /// Seed retained for noise patterns, saved even when another algorithm is selected.
     pub seed: u32,
-    /// Fraction of error diffused.
+    /// Fraction of error diffused, saved even when a threshold algorithm is selected.
     pub strength: f64,
-    /// Whether alternate rows run in reverse.
+    /// Whether alternate rows run in reverse, saved like strength.
     pub serpentine: bool,
     /// Source size percentage.
     pub scale: i32,
@@ -516,7 +529,12 @@ impl Setting {
         }
     }
 
-    /// Whether the current algorithm uses this parameter.
+    /// Whether the current algorithm uses this parameter. Strength and Serpentine
+    /// apply to diffusion and Seed applies to Noise.
+    ///
+    /// Inactive rows stay visible in place, shown dimmed. Adjusting, resetting and
+    /// reseeding leave them unchanged, so they keep their value for a later switch
+    /// back and never switch the preview.
     pub fn is_active(self, settings: &Settings) -> bool {
         match self {
             Self::Strength | Self::Serpentine => settings.dither.kernel().is_some(),
@@ -525,7 +543,8 @@ impl Setting {
         }
     }
 
-    /// Mutable numeric value for rows with float steps.
+    /// Mutable numeric value for rows with float steps. It ignores whether the row
+    /// is active, so callers check [`Setting::is_active`] first.
     pub fn value_mut(self, settings: &mut Settings) -> Option<&mut f64> {
         match self {
             Self::Strength => Some(&mut settings.strength),
@@ -584,12 +603,17 @@ pub struct Settings {
     /// Hex colors preserved in the user's order.
     pub palette_hex: Vec<String>,
     /// Selected quantization algorithm.
+    ///
+    /// Strength, serpentine and seed are kept as plain values next to it and are
+    /// remembered across algorithm switches. Only the values that apply to this
+    /// choice reach the engine, through [`Settings::options`].
     pub dither: Dither,
-    /// Fraction of error diffused.
+    /// Fraction of error diffused, used by diffusion algorithms only.
     pub strength: f64,
-    /// Whether alternate rows run in reverse.
+    /// Whether alternate rows run in reverse, used by diffusion algorithms only.
     pub serpentine: bool,
-    /// Seed retained for noise patterns.
+    /// Seed retained for noise patterns. The panel edits a u32 range while the
+    /// library accepts any u64.
     pub seed: u32,
     /// Colors sorted by brightness for quantization.
     pub palette: Vec<PaletteColor>,
@@ -620,6 +644,10 @@ impl Default for Settings {
 
 impl Settings {
     /// Builds library options from the current panel values.
+    ///
+    /// Options are derived on demand rather than stored, so there is no second
+    /// copy of the algorithm that could drift from the panel. Inactive values are
+    /// left out, which also keeps them out of the dither cache key.
     pub fn options(&self) -> Options {
         Options {
             palette: self.palette.clone(),
@@ -632,6 +660,10 @@ impl Settings {
     }
 
     /// Changes an active Seed row, ensuring the pattern seed changes.
+    ///
+    /// The app supplies the entropy and this decides the seed, so the engine stays
+    /// deterministic and the rule is testable. A candidate equal to the current
+    /// seed moves up by one, wrapping at u32::MAX. Other rows are left unchanged.
     pub fn reseeded(&self, setting: Setting, entropy: u64) -> Self {
         let mut next = self.clone();
         if setting == Setting::Seed && setting.is_active(self) {

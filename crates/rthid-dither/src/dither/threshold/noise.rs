@@ -1,4 +1,13 @@
 //! Reproducible noise thresholds from SplitMix64.
+//!
+//! This is random threshold dithering, not blue noise and not cryptographic.
+//! A seed is used instead of a random source because caching and tests need
+//! repeatable output. The contract is that the same input, size, options and
+//! seed give the same output. A different seed does not guarantee a different
+//! image, for example a flat input can quantize the same way.
+//!
+//! Changing the mixing constants or the index mapping changes the output for
+//! every seed, so it is a compatibility change.
 
 /// Maps the indexed generator output to a threshold in [0, 1).
 fn splitmix64(seed: u64, i: u64) -> f64 {
@@ -10,6 +19,10 @@ fn splitmix64(seed: u64, i: u64) -> f64 {
 }
 
 /// Prepares thresholds indexed by pixel position.
+///
+/// The generator is keyed by the row major index `i = y * width + x`, so a
+/// value does not depend on how many numbers earlier pixels used. Width is
+/// part of the index, so the pattern is not independent of image width.
 pub(in crate::dither) fn threshold(seed: u64, w: usize) -> impl Fn(usize, usize) -> f64 {
     move |x, y| splitmix64(seed, (y * w + x) as u64)
 }

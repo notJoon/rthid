@@ -1,4 +1,8 @@
 //! Quantization with ordered or seeded thresholds, without changing channels.
+//!
+//! Bayer and noise share this path. Each pixel is compared against its own
+//! threshold `t` in [0, 1) and no neighbor is ever written, so pixels are
+//! independent of each other.
 
 pub(super) mod bayer;
 pub(super) mod noise;
@@ -6,6 +10,11 @@ pub(super) mod noise;
 use super::{Mode, nearest, tone_level};
 
 /// Quantizes prepared channels in rows from left to right.
+///
+/// With N output levels, Tone picks `floor(v * (N - 1) + t)` clamped to
+/// 0..=N - 1. Color adds the offset `(t - 0.5) * 1.6 / max(1, N - 1)` equally to
+/// R, G and B, then picks the nearest palette color. This is not an
+/// optimized ordered quantizer that mixes the two closest colors.
 pub(super) fn threshold(
     work: &[Vec<f32>],
     w: usize,

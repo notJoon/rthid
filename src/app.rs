@@ -666,6 +666,8 @@ impl App {
             Outcome::Ignored => {}
             Outcome::Submit(_) => {
                 let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
+                // Enter picks a new seed on an active Seed row. The clock is read only
+                // here, Settings decides the seed and the engine stays deterministic.
                 let entropy = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -755,8 +757,9 @@ impl App {
         self.apply_setting(setting, next);
     }
 
+    // Shared by Enter and by Left and Right so both follow one preview switch rule.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        // Clamped presses preserve the current preview selection.
+        // Clamped presses and inactive rows preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
             self.apply(Effect::Preview(next)).expect("preview is valid");
         } else {

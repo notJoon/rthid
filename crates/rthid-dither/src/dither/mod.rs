@@ -3,6 +3,34 @@
 //! Atkinson is the default and spreads only 3/4 of the error to keep highlights
 //! and shadows clean. Tone mode quantizes luminance. Color mode picks the
 //! nearest palette color after diffusion or a threshold offset.
+//!
+//! # Two independent choices
+//!
+//! [`Algorithm`] decides how the pattern is made, from quantization error or
+//! from thresholds. [`Mode`] decides what a pixel is compared against to pick a
+//! palette index. Every algorithm supports both modes, so for example Floyd
+//! Steinberg can run with Color and Bayer 4 with Tone.
+//!
+//! # Two execution paths
+//!
+//! The diffusion kernels share one path where each pixel passes its error to
+//! pixels not yet visited, so the result depends on visiting order. Bayer and
+//! Noise share another path that only reads a threshold per position and never
+//! changes neighbors. Both paths share preprocessing and the palette selection
+//! rule.
+//!
+//! # Data flow
+//!
+//! A [`dither`] call validates the input and numeric options, returns all zeros
+//! for a single color palette, normalizes palette colors when Color mode needs
+//! them, converts RGB to `f32` channel buffers with [`Tone`] applied, collapses
+//! them to luma for Tone mode, then runs the selected path. The result is one
+//! palette index per pixel in row major order.
+//!
+//! Inputs are borrowed and never mutated. Diffusion only changes buffers owned by
+//! the call, so comparing algorithms on the same input leaves no error behind.
+//! Alpha is ignored and transparent pixels keep their RGB, so composite onto a
+//! background before calling if that matters.
 
 mod diffusion;
 mod threshold;
@@ -11,6 +39,9 @@ pub use diffusion::{Diffusion, Kernel};
 pub use threshold::bayer::BayerSize;
 
 /// A palette color in byte channels.
+///
+/// The bytes are the only stored form. Color mode derives normalized values once
+/// per call, so there is no second copy for callers to keep in sync.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
     /// Bytes used to paint the preview and the PNG.
@@ -20,18 +51,22 @@ pub struct PaletteColor {
 /// Per channel adjustments applied before dithering, in the order sharpen,
 /// contrast, brightness, gamma, then black and white points. The defaults leave
 /// pixels unchanged. All values must be finite and gamma must be positive.
+///
+/// These are preprocessing settings, unrelated to [`Mode::Tone`], which is a
+/// quantization mode. Black and white closer than 0.02, or reversed, are not an
+/// error. The span is floored at 0.02 instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
     /// Offset added after contrast, with the result clipped to 0..=1.
     pub brightness: f64,
     /// Scales the distance from middle gray by `1 + contrast`, so 0 keeps it.
     pub contrast: f64,
-    /// Positive gamma; channels are raised to `1 / gamma`, so values above 1 brighten midtones.
+    /// Positive gamma. Channels are raised to `1 / gamma`, so values above 1 brighten midtones.
     pub gamma: f64,
     /// Level mapped to 0 after gamma. Darker values clip to black.
     pub black: f64,
-    /// Level mapped to 1 after gamma. Lighter values clip to white. The black-to-white
-    /// span is floored at 0.02.
+    /// Level mapped to 1 after gamma. Lighter values clip to white. The span from
+    /// black to white is floored at 0.02.
     pub white: f64,
     /// Unsharp mask strength against a 3x3 box blur. 0 disables it.
     pub sharpen: f64,
@@ -50,30 +85,44 @@ impl Default for Tone {
     }
 }
 
-/// Color model used to quantize.
+/// Color model used to quantize, chosen independently of [`Algorithm`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Quantizes luminance to evenly spaced levels with diffusion or thresholds.
     /// Palette colors do not affect the choice, so use evenly spaced brightness.
+    ///
+    /// With N colors, luma maps to N - 1 equal steps and index 0 is the darkest
+    /// step. This assigns ink levels by brightness rather than finding
+    /// the closest color, so it suits palettes sorted darkest first with even gaps.
     #[default]
     Tone,
     /// Picks the nearest palette color after RGB diffusion or a threshold offset.
     /// Squared distance weights red, green and blue by 2, 4 and 3.
+    ///
+    /// Ties keep the earlier palette index. The distance is a fixed weighted RGB
+    /// metric, with no Lab distance or color management.
     Color,
 }
 
 /// How pixels become palette indices. Defaults to `Diffusion::default()`.
+///
+/// Each variant carries only the settings it uses. Strength and serpentine live in
+/// [`Diffusion`], so a Bayer strength or a Noise serpentine cannot be expressed
+/// and no setting is silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Algorithm {
     /// Passes quantization error to neighboring pixels.
     Diffusion(Diffusion),
-    /// Ordered dithering with a recursive Bayer matrix. Ignores serpentine and
+    /// Ordered dithering with a recursive Bayer matrix. Has no serpentine or
     /// strength and scans rows left to right.
     Bayer(BayerSize),
     /// Random thresholds from a seeded generator, reproducible for the same seed.
-    /// Ignores serpentine and strength and scans rows left to right.
+    /// Has no serpentine or strength and scans rows left to right.
+    ///
+    /// Each threshold depends only on the seed and the row major pixel index, so
+    /// the same input, size, options and seed always give the same output.
     Noise {
-        /// Initial state for reproducible thresholds.
+        /// Selects the threshold sequence. Any `u64` is valid.
         seed: u64,
     },
 }
@@ -86,6 +135,9 @@ impl Default for Algorithm {
 
 /// Palette and processing settings for dithering. Defaults to a black and white
 /// palette, Tone mode, `Algorithm::default()` and default tone.
+///
+/// The default algorithm is serpentine Atkinson at strength 1, even though
+/// [`BayerSize`] on its own defaults to Four.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     /// Colors sorted darkest first, as built by `make_palette`. Output indices
@@ -129,7 +181,10 @@ fn hex_to_rgb(hex: &str) -> Result<[u8; 3], &'static str> {
 
 /// Parses 1 to 256 hex colors (`#rgb` or `#rrggbb`, `#` optional) and sorts them
 /// darkest first by luma, so the last, lightest color acts as paper.
-/// Invalid colors return an error with their input text and 1-based position.
+/// Invalid colors return an error with their input text and position counted from 1.
+///
+/// Dither indices refer to this sorted order, not the input order. Callers who
+/// edit `rgb` afterwards are responsible for keeping the order for Tone mode.
 pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, String> {
     if hexes.is_empty() || hexes.len() > 256 {
         return Err("palette must have 1 to 256 colors".into());
@@ -191,6 +246,10 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
+// Checks every array and numeric contract up front so the loops never index out
+// of range or quietly produce wrong output. Returns the pixel count. Panic
+// messages carry the actual and expected values, and track_caller points them at
+// the public entry point's caller.
 #[track_caller]
 fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     let palette = &options.palette;
@@ -239,10 +298,15 @@ fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     n
 }
 
+// Tone index for luma `v` among `levels + 1` evenly spaced steps. Diffusion
+// passes 0.5 to round and the threshold path passes its threshold. Both paths
+// call this and `nearest` so the selection rule lives in one place.
 fn tone_level(v: f64, levels: f64, offset: f64) -> usize {
     (v * levels + offset).floor().clamp(0.0, levels) as usize
 }
 
+// Color index with the smallest 2, 4, 3 weighted squared RGB distance. The strict
+// comparison keeps the earliest index on ties.
 fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
     let mut nearest = 0;
     let mut best_distance = f64::INFINITY;
@@ -262,15 +326,20 @@ fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
 ///
 /// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
 /// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
-/// is not positive or algorithm strength is outside 0..=1.
+/// is not positive or algorithm strength is outside 0..=1. Panics report the
+/// caller's location. An empty image that meets these contracts returns an empty
+/// vector.
 #[track_caller]
 pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let n = validate(rgba, w, h, options);
     let palette = &options.palette;
-    // One color needs no work, and tone mode would divide by zero levels.
+    // One color needs no work, and tone mode would divide by zero levels. This
+    // runs after validation so a single color palette cannot hide invalid options.
     if palette.len() == 1 {
         return vec![0; n];
     }
+    // Normalized palette for Color mode, built once per call. Tone mode never
+    // reads palette colors.
     let colors: Vec<_> = match options.mode {
         Mode::Tone => Vec::new(),
         Mode::Color => palette
@@ -292,6 +361,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         }
         Mode::Color => &mut channels[..],
     };
+    // Diffusion mutates `work` in place, while thresholds only read it.
     match options.algorithm {
         Algorithm::Diffusion(d) => {
             diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d)
@@ -320,7 +390,8 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
 /// Expands a `gw` by `gh` index grid into opaque `ow` by `oh` RGBA pixels by
 /// nearest neighbor sampling, coloring each index with `color_of`.
 ///
-/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices.
+/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices, with
+/// the location of the caller.
 #[track_caller]
 pub fn rasterize(
     idx: &[u8],

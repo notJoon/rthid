@@ -1,6 +1,6 @@
-//! Sierra Lite weights with divisor 4.
+//! Sierra Lite kernel, divisor 4.
 
-/// Neighbor weights and the fraction of error they receive.
+/// Taps whose weights sum to the divisor, so all of the error is spread.
 pub(super) const SIERRA_LITE: super::Weights = super::Weights {
     taps: &[(1, 0, 2), (-1, 1, 1), (0, 1, 1)],
     divisor: 4,
