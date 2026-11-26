@@ -1,6 +1,12 @@
-//! Raw mode and alternate screen sessions, buffered frame output and synchronized updates per frame.
-//! Terminal mode guards release mouse capture and bracketed paste when the session ends.
-//! This crate does not know the app.
+//! Terminal session and frame output for a ratatui app.
+//!
+//! This crate owns the raw mode and alternate screen session, the buffered writer that frames go
+//! through, the synchronized update that brackets each frame, and the guards that release mouse
+//! capture and bracketed paste when the session ends. It does not know the app. The caller passes
+//! the work to run inside the session and the drawing to do inside each frame.
+//!
+//! Frames are buffered because panning is bound by terminal throughput, and stdout's line buffer
+//! would split each frame into many small writes.
 
 use std::{
     io::{self, BufWriter, Stdout, Write},
@@ -16,16 +22,33 @@ use ratatui::crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-// Keep typical full frames together instead of filling stdout's small line buffer.
+// 1 MB holds a typical full frame, so it reaches the terminal in a few writes instead of
+// filling stdout's small line buffer over and over.
 const FRAME_BUFFER_CAPACITY: usize = 1024 * 1024;
 
-/// A terminal with buffered stdout for frame output.
+/// The terminal that [`run_terminal`] hands to its closure.
+///
+/// Output collects in a large buffer and reaches the terminal only when the buffer fills or is
+/// flushed, which [`synchronized_draw`] does at the end of every frame. Anything written through
+/// the backend, such as mode changes, stays in order with the frames.
 pub type BufferedTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
-/// Sets up raw mode and the alternate screen like `ratatui::run`, with frames written through a large buffer.
+/// Runs `f` inside a raw mode and alternate screen session and restores the terminal afterwards.
+///
+/// This mirrors `ratatui::run`, except that frames go through a large buffer. Like `ratatui::run`,
+/// it panics if the terminal cannot be initialized. On normal exit, including when `f` returns an
+/// error, it flushes the buffered output before restoring the terminal and returns the result of
+/// `f`.
+///
+/// It installs a panic hook that ends any open synchronized update and restores the terminal
+/// before the previous hook runs. A panic leaks the terminal instead of dropping it while
+/// unwinding, so buffered bytes are never written after the restore. A hook that `f` installs
+/// later wraps this one and should still call it.
 pub fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> io::Result<()> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a frame leaves the update open, and the terminal could hold back the
+        // restore and the panic message.
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
         ratatui::restore();
         previous(info);
@@ -42,12 +65,20 @@ pub fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> 
     );
     let result = f(&mut terminal);
     let _ = terminal.backend_mut().flush();
+    // The restore writes to stdout directly, so every buffered byte has to land first.
     drop(ManuallyDrop::into_inner(terminal));
     ratatui::restore();
     result
 }
 
-/// Brackets one frame in a synchronized update so supporting terminals paint it whole.
+/// Wraps one frame in a synchronized update (mode 2026) so the terminal paints it whole.
+///
+/// Many modern terminal emulators honor mode 2026 and show the frame only once it is complete,
+/// which avoids tearing while panning. Terminals without support ignore the sequences.
+///
+/// The begin sequence is queued before `draw` runs. The end sequence is always sent and flushed,
+/// even when `draw` fails, so no update is left open and no frame bytes stay in the buffer. The
+/// error from `draw` takes precedence over an error from ending the update.
 pub fn synchronized_draw<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     draw: impl FnOnce(&mut Terminal<CrosstermBackend<W>>) -> io::Result<()>,
@@ -60,6 +91,11 @@ pub fn synchronized_draw<W: Write>(
 }
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
+///
+/// Create it before [`run_terminal`] and enable capture through the buffered terminal so the
+/// enable stays in order with the frames. The guard writes directly to stdout, so it must drop
+/// after the buffered terminal is flushed. Dropping it after [`run_terminal`] returns satisfies
+/// this, because [`run_terminal`] flushes on normal exit.
 pub struct MouseCapture;
 
 impl Drop for MouseCapture {
@@ -68,7 +104,11 @@ impl Drop for MouseCapture {
     }
 }
 
-/// Disables bracketed paste even when the terminal session fails.
+/// Disables bracketed paste on drop, so it is released even when the terminal session fails.
+///
+/// The same ordering rules as [`MouseCapture`] apply. The guard writes directly to stdout, so it
+/// must drop after the buffered terminal is flushed, which [`run_terminal`] guarantees on normal
+/// exit.
 pub struct BracketedPaste;
 
 impl Drop for BracketedPaste {
