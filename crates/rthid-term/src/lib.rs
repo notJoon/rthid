@@ -1,23 +1,22 @@
-//! Terminal session and frame output for a ratatui app.
-//!
-//! This crate owns the raw mode and alternate screen session, the buffered writer that frames go
-//! through, the synchronized update that brackets each frame, and the guards that release mouse
-//! capture and bracketed paste when the session ends. It does not know the app. The caller passes
-//! the work to run inside the session and the drawing to do inside each frame.
-//!
-//! Frames are buffered because panning is bound by terminal throughput, and stdout's line buffer
-//! would split each frame into many small writes.
+#![doc = include_str!("../README.md")]
 
 use std::{
+    cell::Cell,
     io::{self, BufWriter, Stdout, Write},
     mem::ManuallyDrop,
+    sync::{
+        Once,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ratatui::crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture},
+    cursor::Show,
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute, queue,
     terminal::{
-        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, enable_raw_mode,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
     },
 };
 use ratatui::{Terminal, backend::Backend};
@@ -26,53 +25,147 @@ mod backend;
 
 pub use backend::ElidingBackend;
 
-// 1 MB holds a typical full frame, so it reaches the terminal in a few writes instead of
-// filling stdout's small line buffer over and over.
+// 1 MB holds a typical full frame, avoiding repeated small stdout writes.
 const FRAME_BUFFER_CAPACITY: usize = 1024 * 1024;
+static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK: Once = Once::new();
+thread_local! {
+    static SESSION_OPTIONS: Cell<Option<SessionOptions>> = const { Cell::new(None) };
+}
 
-/// The terminal that [`run_terminal`] hands to its closure.
+/// The terminal supplied to the session closure.
 ///
-/// Output collects in a large buffer and reaches the terminal only when the buffer fills or is
-/// flushed, which [`synchronized_draw`] does at the end of every frame. Anything written through
-/// the backend, such as mode changes, stays in order with the frames.
+/// This is a standard ratatui terminal. Both [`Terminal::draw`] and [`synchronized_draw`]
+/// flush output; direct backend writes stay buffered until a flush or until the buffer fills.
 pub type BufferedTerminal = Terminal<ElidingBackend<BufWriter<Stdout>>>;
 
-/// Runs `f` inside a raw mode and alternate screen session and restores the terminal afterwards.
+/// Optional input modes owned by a terminal session. Both are disabled by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionOptions {
+    /// Capture mouse events for the duration of the session.
+    pub mouse_capture: bool,
+    /// Receive pasted text as bracketed paste events for the duration of the session.
+    pub bracketed_paste: bool,
+}
+
+/// Runs `f` in a fullscreen raw-mode session with default input modes.
 ///
-/// This mirrors `ratatui::run`, except that frames go through a large buffer. Like `ratatui::run`,
-/// it panics if the terminal cannot be initialized. On normal exit, including when `f` returns an
-/// error, it flushes the buffered output before restoring the terminal and returns the result of
-/// `f`.
+/// See [`run_terminal_with_options`] for error handling and panic behavior.
+pub fn run_terminal<T>(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<T>) -> io::Result<T> {
+    run_terminal_with_options(SessionOptions::default(), f)
+}
+
+/// Runs `f` with buffered frame output and restores terminal modes on exit.
 ///
-/// It installs a panic hook that ends any open synchronized update and restores the terminal
-/// before the previous hook runs. A panic leaks the terminal instead of dropping it while
-/// unwinding, so buffered bytes are never written after the restore. A hook that `f` installs
-/// later wraps this one and should still call it.
-pub fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> io::Result<()> {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // A panic inside a frame leaves the update open, and the terminal could hold back the
-        // restore and the panic message.
-        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
-        ratatui::restore();
-        previous(info);
-    }));
-    // Unwinding leaks the terminal, so pending output never follows the panic hook's restore.
-    let mut terminal = ManuallyDrop::new(
-        (|| {
-            enable_raw_mode()?;
-            let mut writer = BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, io::stdout());
-            execute!(writer, EnterAlternateScreen)?;
-            Terminal::new(ElidingBackend::new(writer))
-        })()
-        .expect("failed to initialize terminal"),
-    );
+/// Initialization failures return an I/O error. The closure's error takes precedence over a
+/// final flush error, which takes precedence over a cleanup error. Otherwise its value is returned.
+/// Nested or concurrent sessions return [`io::ErrorKind::AlreadyExists`].
+///
+/// The first session installs a process-wide panic hook, which restores only an active session
+/// on its owning thread before calling the previous hook. The hook remains installed but is inert
+/// outside a session. Later hooks must call the previous hook to preserve this behavior.
+/// A panic leaks buffered output so it cannot land after restoration. Catch panics outside the
+/// session; catching a panic inside `f` does not make its terminal usable again.
+pub fn run_terminal_with_options<T>(
+    options: SessionOptions,
+    f: impl FnOnce(&mut BufferedTerminal) -> io::Result<T>,
+) -> io::Result<T> {
+    let session = Session::acquire(options)?;
+    enable_raw_mode()?;
+    let mut writer = BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, io::stdout());
+    execute!(writer, EnterAlternateScreen)?;
+    enable_modes(&mut writer, options)?;
+    // Panic restoration happens before unwinding: never drop pending buffered output afterwards.
+    let mut terminal = ManuallyDrop::new(Terminal::new(ElidingBackend::new(writer))?);
     let result = f(&mut terminal);
-    let _ = Write::flush(terminal.backend_mut());
-    // The restore writes to stdout directly, so every buffered byte has to land first.
+    if SESSION_OPTIONS.get().is_none() {
+        return result.and(Err(io::Error::other(
+            "terminal session was interrupted by a caught panic",
+        )));
+    }
+    let result = finish_terminal(terminal, result);
+    let cleanup = session.restore();
+    result.and_then(|value| cleanup.map(|()| value))
+}
+
+fn finish_terminal<T, B: Backend<Error = io::Error> + Write>(
+    mut terminal: ManuallyDrop<Terminal<B>>,
+    result: io::Result<T>,
+) -> io::Result<T> {
+    let cursor = terminal.show_cursor();
+    let flush = Write::flush(terminal.backend_mut());
     drop(ManuallyDrop::into_inner(terminal));
-    ratatui::restore();
-    result
+    result.and_then(|value| flush.and(cursor).map(|()| value))
+}
+
+struct Session;
+
+impl Session {
+    fn acquire(options: SessionOptions) -> io::Result<Self> {
+        SESSION_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a terminal session is already active",
+                )
+            })?;
+        let session = Self;
+        PANIC_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if let Some(options) = SESSION_OPTIONS.replace(None) {
+                    let _ = restore_terminal(options);
+                }
+                previous(info);
+            }));
+        });
+        SESSION_OPTIONS.set(Some(options));
+        Ok(session)
+    }
+
+    fn restore(&self) -> io::Result<()> {
+        match SESSION_OPTIONS.replace(None) {
+            Some(options) => restore_terminal(options),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.restore();
+        SESSION_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn enable_modes(writer: &mut impl Write, options: SessionOptions) -> io::Result<()> {
+    if options.mouse_capture {
+        execute!(writer, EnableMouseCapture)?;
+    }
+    if options.bracketed_paste {
+        execute!(writer, EnableBracketedPaste)?;
+    }
+    Ok(())
+}
+
+fn restore_terminal(options: SessionOptions) -> io::Result<()> {
+    let raw = disable_raw_mode();
+    let output = restore_modes(&mut io::stdout(), options);
+    raw.and(output)
+}
+
+fn restore_modes(writer: &mut impl Write, options: SessionOptions) -> io::Result<()> {
+    // Attempt each restoration even if an earlier output operation failed.
+    let mut result = execute!(writer, EndSynchronizedUpdate);
+    if options.mouse_capture {
+        result = result.and(execute!(writer, DisableMouseCapture));
+    }
+    if options.bracketed_paste {
+        result = result.and(execute!(writer, DisableBracketedPaste));
+    }
+    result = result.and(execute!(writer, Show));
+    result.and(execute!(writer, LeaveAlternateScreen))
 }
 
 /// Wraps one frame in a synchronized update (mode 2026) so the terminal paints it whole.
@@ -94,36 +187,102 @@ pub fn synchronized_draw<B: Backend + Write>(
     result.and(end)
 }
 
-/// Disables mouse capture on drop, so it is released even when the terminal session fails.
-///
-/// Create it before [`run_terminal`] and enable capture through the buffered terminal so the
-/// enable stays in order with the frames. The guard writes directly to stdout, so it must drop
-/// after the buffered terminal is flushed. Dropping it after [`run_terminal`] returns satisfies
-/// this, because [`run_terminal`] flushes on normal exit.
-pub struct MouseCapture;
-
-impl Drop for MouseCapture {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
-}
-
-/// Disables bracketed paste on drop, so it is released even when the terminal session fails.
-///
-/// The same ordering rules as [`MouseCapture`] apply. The guard writes directly to stdout, so it
-/// must drop after the buffered terminal is flushed, which [`run_terminal`] guarantees on normal
-/// exit.
-pub struct BracketedPaste;
-
-impl Drop for BracketedPaste {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modes_are_opt_in_and_cleanup_continues_after_failure() {
+        let mut output = Vec::new();
+        enable_modes(&mut output, SessionOptions::default()).unwrap();
+        assert!(output.is_empty());
+        restore_modes(&mut output, SessionOptions::default()).unwrap();
+        assert!(!output.windows(7).any(|bytes| bytes == b"\x1b[?1000"));
+        assert!(!output.windows(7).any(|bytes| bytes == b"\x1b[?2004"));
+
+        struct FailingWriter {
+            output: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Err(io::Error::new(
+                    if self.flushes == 1 {
+                        io::ErrorKind::BrokenPipe
+                    } else {
+                        io::ErrorKind::Other
+                    },
+                    "flush failed",
+                ))
+            }
+        }
+        let options = SessionOptions {
+            mouse_capture: true,
+            bracketed_paste: true,
+        };
+        let mut enabled = Vec::new();
+        enable_modes(&mut enabled, options).unwrap();
+        assert!(enabled.ends_with(b"\x1b[?2004h"));
+        let mut writer = FailingWriter {
+            output: Vec::new(),
+            flushes: 0,
+        };
+        assert_eq!(
+            restore_modes(&mut writer, options).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(writer.flushes, 5);
+        assert!(writer.output.ends_with(b"\x1b[?25h\x1b[?1049l"));
+        assert!(
+            writer
+                .output
+                .windows(8)
+                .any(|bytes| bytes == b"\x1b[?2004l")
+        );
+    }
+
+    #[test]
+    fn final_flush_errors_are_returned_without_replacing_app_errors() {
+        use ratatui::{TerminalOptions, Viewport, layout::Rect};
+
+        struct FailingFlush;
+        impl Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+            }
+        }
+        for app_failed in [false, true] {
+            let terminal = Terminal::with_options(
+                ElidingBackend::new(FailingFlush),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 10, 1)),
+                },
+            )
+            .unwrap();
+            let app_result = if app_failed {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "app failed"))
+            } else {
+                Ok(42)
+            };
+            let error = finish_terminal(ManuallyDrop::new(terminal), app_result).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if app_failed {
+                    io::ErrorKind::InvalidData
+                } else {
+                    io::ErrorKind::BrokenPipe
+                }
+            );
+        }
+    }
 
     #[test]
     fn synchronized_frames_flush_before_cleanup_even_on_error() {

@@ -3,6 +3,41 @@
 Terminal session and frame output for ratatui apps that redraw much of the screen
 every frame.
 
+## Quick start
+
+This crate is not published to crates.io. Add a path dependency to your app's
+`Cargo.toml`, adjusting the path to your checkout:
+
+```toml
+[dependencies]
+ratatui = "0.30.2"
+rthid-term = { path = "../rthid/crates/rthid-term" }
+```
+
+Put this in `src/main.rs`, then run `cargo run` in an interactive terminal:
+
+```rust,no_run
+use ratatui::crossterm::event;
+use rthid_term::{run_terminal, synchronized_draw};
+
+fn main() -> std::io::Result<()> {
+    run_terminal(|terminal| loop {
+        synchronized_draw(terminal, |terminal| {
+            terminal.draw(|frame| {
+                frame.render_widget("Hello! Press any key to quit.", frame.area());
+            })?;
+            Ok(())
+        })?;
+        if event::read()?.is_key_press() {
+            return Ok(());
+        }
+    })
+}
+```
+
+No app type or event loop trait is required. The closure receives a normal
+ratatui `Terminal`, so existing widgets and rendering code work unchanged.
+
 ## Why
 
 Apps that repaint many colored cells per frame, such as image previews,
@@ -24,33 +59,65 @@ makes this worse: a frame contains no newlines, so it leaves in many small write
   update (mode 2026) and flushes it, so supporting terminals paint whole frames.
   Other terminals ignore the sequences.
 - **Session setup and restore.** `run_terminal` enters raw mode and the alternate
-  screen and restores them afterwards, like `ratatui::run`. On panic it leaks the
-  terminal, so buffered output never lands after the panic hook has restored the
-  screen.
-- **Mode guards.** `MouseCapture` and `BracketedPaste` disable their modes on
-  drop. Create them before `run_terminal` and enable the modes through the
-  buffered terminal, so the enable sequences stay in order with the frames.
+  screen and restores them afterwards. Initialization failures return an error.
+- **Optional input modes.** `SessionOptions` opts into mouse capture and bracketed
+  paste. The session enables and disables them, including cleanup on failure.
 
-## Usage
+## Mouse capture and bracketed paste
 
-```rust
-use ratatui::crossterm::{event::{self, EnableBracketedPaste, EnableMouseCapture}, execute};
-use rthid_term::{BracketedPaste, MouseCapture, run_terminal, synchronized_draw};
+Both modes are off by default. Use `run_terminal_with_options` when your app
+handles mouse or paste events:
 
-// run_terminal supplies Terminal<ElidingBackend<BufWriter<Stdout>>>.
-let _mouse = MouseCapture;
-let _paste = BracketedPaste;
-run_terminal(|terminal| {
-    execute!(terminal.backend_mut(), EnableMouseCapture, EnableBracketedPaste)?;
-    while !app.quit {
+```rust,no_run
+use ratatui::crossterm::event;
+use rthid_term::{SessionOptions, run_terminal_with_options, synchronized_draw};
+
+fn main() -> std::io::Result<()> {
+    let options = SessionOptions {
+        mouse_capture: true,
+        bracketed_paste: true,
+    };
+    run_terminal_with_options(options, |terminal| loop {
         synchronized_draw(terminal, |terminal| {
-            terminal.draw(|frame| app.render(frame))?;
+            terminal.draw(|frame| {
+                frame.render_widget("Mouse and paste enabled. Press any key to quit.", frame.area());
+            })?;
             Ok(())
         })?;
-        app.handle(event::read()?);
-    }
-    Ok(())
-})?;
+        match event::read()? {
+            event::Event::Key(key) if key.is_press() => return Ok(()),
+            event::Event::Mouse(_mouse) => { /* Update your app here. */ }
+            event::Event::Paste(_text) => { /* Update your app here. */ }
+            _ => {}
+        }
+    })
+}
 ```
+
+Do not enable these modes separately or manage their cleanup guards yourself.
+For custom writers or viewports, construct `Terminal<ElidingBackend<W>>` directly
+and keep using `synchronized_draw`; terminal session setup is then your responsibility.
+
+## Results and session ownership
+
+Both run functions return the closure's successful value in `std::io::Result<T>`.
+Initialization, final flush and cleanup failures also return `io::Error`. If more
+than one operation fails, the application error takes precedence, then the flush
+error, then the cleanup error. Cleanup is attempted even after an earlier error.
+Closures use `io::Error`; convert application-specific errors at this seam if needed.
+
+Only one session can run at a time in a process. Nested or concurrent calls return
+`io::ErrorKind::AlreadyExists`; they do not take over another session's terminal.
+
+The crate installs a process-wide panic hook once. It restores the terminal only
+for a panic on the active session's owning thread and is inactive outside that
+session. If you install a hook afterwards, call the previous hook to retain this
+cleanup. Other threads' panics continue through the previous hook without ending
+the session.
+
+Catch panics outside the session. On panic, its buffered terminal is leaked so
+pending output cannot arrive after restoration. If a panic is caught inside the
+closure, the session returns an error when the closure finishes; its terminal
+must no longer be used.
 
 See the crate docs (`cargo doc -p rthid-term --open`) for the API.
