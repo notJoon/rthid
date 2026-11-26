@@ -129,8 +129,9 @@ impl<W: Write> Backend for ElidingBackend<W> {
         self.inner.append_lines(n)
     }
 
-    /// Hides the cursor and parks it, see [`ElidingBackend::park_cursor`]. Ratatui calls this
-    /// after every frame that does not show a cursor. Without a terminal size the cursor
+    /// Hides the cursor and moves it to the start of the last row. Ratatui calls this after
+    /// every frame that does not show a cursor, so terminals that mark the cursor row, like
+    /// iTerm2's cursor guide, keep that mark in one place. Without a terminal size the cursor
     /// stays put, since parking only affects how the hidden cursor looks.
     fn hide_cursor(&mut self) -> io::Result<()> {
         self.inner.hide_cursor()?;
