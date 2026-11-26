@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
-- Move rasterization: `rthid_dither::dither::rasterize` -> `rthid_render::rasterize`
+- `rasterize` removed. Use `rthid_render::write_png` to produce images.
 
 - Move `serpentine` and `strength` from `Options` into the `Diffusion` payload of
   `Algorithm::Diffusion`. Atkinson stays the default with unchanged output.
@@ -31,7 +31,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `PaletteColor::f` removed. Migration: `color.f` -> `color.rgb.map(|v| f64::from(v) / 255.0)`
 - `make_palette` returns `PaletteError`. Migration: string errors -> match `Count` or `Parse`, or call `error.to_string()`
-- `rasterize` takes size tuples. Migration: `rasterize(idx, gw, gh, ow, oh, color_of)` -> `rasterize(idx, (gw, gh), (ow, oh), color_of)`
 - Tone mode panics on an unsorted palette with every algorithm. Migration: arbitrary palette order -> nondecreasing luma order from `make_palette`
 
 ### Added
@@ -46,9 +45,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Reject algorithm strength outside `0.0..=1.0`
 - Report actual and expected values in clearer panic messages with caller locations
-- Return an empty raster for zero output width or height, including with an empty grid
-- Include actual lengths and expected dimensions in RGBA and index mismatch panics
-- Document rasterization size checks and callback panic propagation
+- Include actual lengths and expected dimensions in RGBA mismatch panics
 - Keep palette RGB bytes as the single source of color data; derive normalized
   channels privately when dithering in Color mode
 - Include the color's position and input text in palette parsing errors

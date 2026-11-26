@@ -29,7 +29,7 @@ fn main() {
 Defaults use a black and white palette, Tone mode, serpentine Atkinson error
 diffusion at strength 1, and no tone adjustment.
 
-Use [rthid-render](../rthid-render) to rasterize indices and encode PNG output.
+Use [rthid-render](../rthid-render) to turn indices into PNG output with `write_png`.
 
 ## Choosing an algorithm
 

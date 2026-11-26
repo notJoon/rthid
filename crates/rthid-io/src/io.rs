@@ -66,6 +66,7 @@ pub enum Job {
         /// Export destination.
         path: PathBuf,
         /// Encoder carrying its owned output snapshot.
+        // Archive formats may need Seek, and the file stays the single owner of the temporary path.
         #[allow(clippy::type_complexity)]
         write: Box<dyn FnOnce(&mut File) -> io::Result<()> + Send>,
     },

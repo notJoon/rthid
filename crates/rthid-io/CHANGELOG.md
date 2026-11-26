@@ -7,8 +7,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
-- Remove the `png` module. Migrate grids and PNG encoding to `rthid_render`
-- `Job::Export { grid }` -> `Job::Export { write }`, pass an owned closure calling `rthid_render::write_png`
+- Remove the `png` module. Use `rthid_render` for grids and PNG encoding,
+  and `rthid_io::atomic::replace` for atomic file replacement.
+  `Job::Export { grid }` becomes `Job::Export { write }`. The closure chooses the
+  output size. Grid errors no longer embed the path, read `IoError::path`.
+
+  Before:
+  ```rust,ignore
+  use rthid_io::{png::{Grid, preview_scale, write_atomic}, io::Job};
+
+  let grid = Grid::new(indices, w, h, palette)?;
+  write_atomic(&path, &grid, preview_scale(grid.w, grid.h))?;
+  let job = Job::Export { path, grid };
+  ```
+
+  After:
+  ```rust,ignore
+  use rthid_render::{Grid, preview_size, write_png};
+  use rthid_io::{atomic::replace, io::Job};
+
+  let grid = Grid::new(indices, w, h, palette)?;
+  replace(&path, |file| write_png(file, &grid, preview_size(grid.w, grid.h)))?;
+  let job = Job::Export {
+      path,
+      write: Box::new(move |file| {
+          write_png(file, &grid, preview_size(grid.w, grid.h))
+      }),
+  };
+  ```
 
 - Open filesystem errors: `Cause::Decode(ImageError::IoError(error))` -> `Cause::Io(error)`, match `kind()` directly
 - Source protection: `Cause::IsSource` -> `Cause::IsSource(path)`, match the carried source path

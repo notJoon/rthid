@@ -232,7 +232,7 @@ possible. `dither` and the validation helpers use `#[track_caller]` so panics
 point at the caller. Rasterization now lives in `rthid-render`.
 
 Palette parsing is a user editing path, so `make_palette` returns
-`Result<Vec<PaletteColor>, String>` with the invalid text and its one based
+`Result<Vec<PaletteColor>, PaletteError>` with the invalid text and its one based
 position. These two error styles are deliberately not merged.
 
 Validation does not promise that any size can be allocated or that extreme
