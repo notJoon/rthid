@@ -30,8 +30,9 @@ import subprocess
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+from drive import DEFAULT_BIN, DEFAULT_IMAGE, REPO
+
+HERE = os.path.join(REPO, "scripts", "profile")
 
 
 def osa(script):
@@ -47,6 +48,9 @@ def build_matrix(a):
     py = sys.executable
     drive = os.path.join(HERE, "drive.py")
     common = ["--bin", a.bin, "--image", a.image, "--out-dir", out, "--rate", str(a.rate)]
+    def drive_cmd(m, k, *extra):
+        return " ".join(q(x) for x in [py, drive, *common, "--mode", m, "--zoom", str(k), *extra])
+
     lines = [
         "#!/bin/bash",
         f"cd {q(out)}",
@@ -67,16 +71,14 @@ def build_matrix(a):
     if not a.skip_app:
         cases = [(m, int(k)) for m in a.modes.split(",") for k in a.zooms.split(",")]
         for m, k in cases:
-            lines.append(" ".join(q(x) for x in [py, drive, *common, "--mode", m, "--zoom", str(k), "--debug-log",
-                                                  "--drag-secs", "1.5", "--sample-secs", "0", "--save-stream",
-                                                  "--tag", f"calib_{m}_k{k}"]))
+            lines.append(drive_cmd(m, k, "--debug-log", "--drag-secs", "1.5", "--sample-secs", "0",
+                                   "--save-stream", "--tag", f"calib_{m}_k{k}"))
         for r in range(a.repeats):
             for m, k in cases:
                 tag = f"{m}_k{k}" + (f"_r{r + 1}" if a.repeats > 1 else "")
-                lines.append(" ".join(q(x) for x in [py, drive, *common, "--mode", m, "--zoom", str(k),
-                                                      "--plus-from", f"{out}/summary_calib_{m}_k{k}.json",
-                                                      "--drag-secs", str(a.drag_secs), "--sample-secs", str(a.sample_secs),
-                                                      "--tag", tag]))
+                lines.append(drive_cmd(m, k, "--plus-from", f"{out}/summary_calib_{m}_k{k}.json",
+                                       "--drag-secs", str(a.drag_secs), "--sample-secs", str(a.sample_secs),
+                                       "--tag", tag))
     lines.append(f"touch {q(out)}/done")
     path = os.path.join(out, "matrix.sh")
     with open(path, "w") as f:
@@ -90,8 +92,8 @@ def main():
     p.add_argument("--out-dir", default="/tmp/rthid-prof/run")
     p.add_argument("--cols", type=int, default=200)
     p.add_argument("--rows", type=int, default=60)
-    p.add_argument("--image", default=os.path.join(REPO, "tests/fixtures/IMG_7139.PNG"))
-    p.add_argument("--bin", default=os.path.expanduser("~/.cache/cargo-target/release/rthid"))
+    p.add_argument("--image", default=DEFAULT_IMAGE)
+    p.add_argument("--bin", default=DEFAULT_BIN)
     p.add_argument("--modes", default="orig,dith")
     p.add_argument("--zooms", default="1,2")
     p.add_argument("--drag-secs", type=float, default=6.0)

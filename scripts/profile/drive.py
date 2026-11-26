@@ -44,13 +44,15 @@ import time
 import tty
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_BIN = os.path.expanduser("~/.cache/cargo-target/release/rthid")
+DEFAULT_IMAGE = os.path.join(REPO, "tests/fixtures/IMG_7139.PNG")
 MARKER = b"\x1b[?25l"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--bin", default=os.path.expanduser("~/.cache/cargo-target/release/rthid"))
-    p.add_argument("--image", default=os.path.join(REPO, "tests/fixtures/IMG_7139.PNG"))
+    p.add_argument("--bin", default=DEFAULT_BIN)
+    p.add_argument("--image", default=DEFAULT_IMAGE)
     p.add_argument("--mode", choices=["orig", "dith"], required=True)
     p.add_argument("--zoom", type=int, default=1, help="target Zoom::In(k)")
     p.add_argument("--plus", type=int, help="press '+' exactly N times instead of reading the log")
@@ -195,21 +197,17 @@ def main():
             time.sleep(0.5)
         target = f"In({a.zoom})"
         presses = 0
-        if a.plus is not None:
-            for _ in range(a.plus):
-                press(b"+")
-                presses += 1
-            time.sleep(0.5)
-            zoom_seen = last_zoom(log_path) if a.debug_log else None
-        else:
-            for _ in range(10):
-                press(b"+")
-                presses += 1
+        for _ in range(a.plus if a.plus is not None else 10):
+            press(b"+")
+            presses += 1
+            if a.plus is None:
                 time.sleep(0.2)
                 zoom_seen = last_zoom(log_path)
                 if zoom_seen and zoom_seen[2] == target:
                     break
-            time.sleep(0.5)
+        time.sleep(0.5)
+        if a.plus is not None:
+            zoom_seen = last_zoom(log_path) if a.debug_log else None
         summary["plus_presses"] = presses
         summary["zoom_seen"] = zoom_seen
 

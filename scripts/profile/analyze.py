@@ -20,6 +20,8 @@ import json
 import os
 import re
 
+from drive import MARKER
+
 HEADER = re.compile(r"^    (\d+) Thread_\d+")
 LINE = re.compile(r"^([\s+!:|]*?)(\d+) (.*)$")
 
@@ -111,8 +113,7 @@ def main():
     for f in sorted(glob.glob(os.path.join(a.out_dir, "cat_*.txt"))):
         name = os.path.basename(f)[4:-4]
         t = cat_times(f)
-        out["cat"][name] = {"real": t, "fps": [round(a.frames / x, 1) for x in t if x > 0],
-                            "bytes": None}
+        out["cat"][name] = {"real": t, "fps": [round(a.frames / x, 1) for x in t if x > 0]}
     for f in sorted(glob.glob(os.path.join(a.out_dir, "summary_*.json"))):
         s = json.load(open(f))
         tag = s["tag"]
@@ -126,7 +127,7 @@ def main():
         if os.path.exists(stream) and os.path.exists(log):
             # Validates the frame proxy: ESC[?25l count vs logged frames.
             r["marker_check"] = {
-                "stream_markers": open(stream, "rb").read().count(b"\x1b[?25l"),
+                "stream_markers": open(stream, "rb").read().count(MARKER),
                 "logged_frames": sum(1 for l in open(log, errors="replace") if l.startswith("[minimap] frame=")),
             }
         sp = os.path.join(a.out_dir, f"sample_{tag}.txt")
