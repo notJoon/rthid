@@ -555,16 +555,12 @@ impl App {
 
     /// Routes modal mouse input or pans and recenters the preview.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry, screen: Rect) {
-        if let Some(modal) = &mut self.modal {
+        if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
-            let ctx = Ctx {
-                palettes: &self.palettes,
-                templates: &self.templates,
-                settings: &self.settings,
-                show_original: self.show_original,
-            };
+            let ctx = self.modal_ctx();
             let layout = modal.layout(geometry.area, screen, &ctx);
             let step = modal.handle_mouse(mouse, &layout, ctx);
+            self.modal = Some(modal);
             self.apply_step(step);
             return;
         }
@@ -665,17 +661,9 @@ impl App {
         {
             return;
         }
-        // Borrowing fields one by one lets the modal stay in place while it reads the rest of App.
-        if let Some(modal) = &mut self.modal {
-            let step = modal.handle_key(
-                key,
-                Ctx {
-                    palettes: &self.palettes,
-                    templates: &self.templates,
-                    settings: &self.settings,
-                    show_original: self.show_original,
-                },
-            );
+        if let Some(mut modal) = self.modal.take() {
+            let step = modal.handle_key(key, self.modal_ctx());
+            self.modal = Some(modal);
             self.apply_step(step);
             return;
         }
