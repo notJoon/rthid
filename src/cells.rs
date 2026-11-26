@@ -180,6 +180,7 @@ fn half_block(cell: &mut Cell, top: Color, bottom: Color) {
     cell.set_symbol(symbol).set_fg(fg).set_bg(bottom);
 }
 
+/// Paints In(k) dot by dot, as drawn in the In(k) diagrams on [`Zoom`].
 fn render_exact(
     pixels: Pixels<'_>,
     geometry: &PreviewGeometry,
@@ -249,7 +250,8 @@ fn draw_minimap(
     }
 }
 
-// Samples the visible region into its target cells.
+/// Samples the visible region into its target cells at Fit and Out(n), as drawn in
+/// the sampled cell diagram on [`Zoom`].
 fn render_overview(
     pixels: Pixels<'_>,
     glyphs: Glyphs,
@@ -269,8 +271,9 @@ fn render_overview(
     }
 }
 
-// Draws averaged half blocks. Colors rebuild only when the grid version or target
-// size changes.
+/// Draws averaged half blocks for Original, see the Original column on [`Zoom`].
+/// Colors rebuild only when the grid version, visible region, zoom, target size or
+/// coarse flag changes.
 fn render_overview_rgb(
     pixels: &RgbaImage,
     version: u64,
@@ -305,8 +308,9 @@ fn render_overview_rgb(
     }
 }
 
-// Samples one dot at each subcell center without averaging and draws one glyph per
-// cell. Returns whether any cell was approximated.
+/// Samples one dot at each subcell center without averaging and draws one glyph per
+/// cell, see the Quadrant and Sextant columns on [`Zoom`]. Returns whether any cell
+/// was approximated.
 fn render_overview_indexed(
     indices: &[u8],
     palette: &[PaletteColor],
@@ -359,11 +363,11 @@ fn render_overview_indexed(
     approximate
 }
 
-// Reduces a cell to two colors. The most frequent sample becomes the background and
-// the next ranked distinct one the foreground, with count ties going to the lower
-// palette index. Other samples map to the nearer of the two, ties to the background.
-// Returns the foreground mask, foreground, background, and whether any sample
-// changed its RGB color.
+/// Reduces a cell to two colors. The most frequent sample becomes the background and
+/// the next ranked distinct one the foreground, with count ties going to the lower
+/// palette index. Other samples map to the nearer of the two, ties to the background.
+/// Returns the foreground mask, foreground, background, and whether any sample
+/// changed its RGB color.
 fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) {
     let mut approximate = false;
     let mut counts = [0u8; 256];
@@ -423,8 +427,8 @@ fn rgb_to_ansi256(rgb: [u8; 3]) -> u8 {
     }
 }
 
-// Averages the dots under each half cell. Returns two color rows per cell row, in
-// row major order.
+/// Averages the dots under each half cell, see the Original column on [`Zoom`].
+/// Returns two color rows per cell row, in row major order.
 fn average_rgb(pixels: &RgbaImage, geometry: &PreviewGeometry, coarse: bool) -> Vec<Color> {
     let (cw, ch) = (geometry.target.width, geometry.target.height);
     let (w, h) = geometry.visible;
