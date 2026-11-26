@@ -39,7 +39,7 @@ env = { RUSTDOCFLAGS = "-D warnings" }
 run = [
   "cargo fmt -p rthid-term --check",
   "cargo clippy -p rthid-term --all-targets -- -D warnings",
-  "cargo test -p rthid-term --lib",
+  "cargo test -p rthid-term",
   "cargo doc -p rthid-term --no-deps",
 ]
 

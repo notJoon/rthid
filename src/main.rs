@@ -53,15 +53,12 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use ratatui::crossterm::{
-    event::{self, EnableBracketedPaste, EnableMouseCapture, Event},
-    execute,
-};
+use ratatui::crossterm::event::{self, Event};
 use rthid_io::{
     image::{check_not_source, load_image},
     io::{Done, IO, Outcome},
 };
-use rthid_term::{BracketedPaste, BufferedTerminal, MouseCapture, run_terminal, synchronized_draw};
+use rthid_term::{BufferedTerminal, SessionOptions, run_terminal_with_options, synchronized_draw};
 
 use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
 
@@ -170,10 +167,12 @@ fn main() -> std::io::Result<()> {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
-    let mouse_capture = MouseCapture;
-    let bracketed_paste = BracketedPaste;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
-    let mut terminal_result = run_terminal(|terminal| {
+    let options = SessionOptions {
+        mouse_capture: true,
+        bracketed_paste: true,
+    };
+    let mut terminal_result = run_terminal_with_options(options, |terminal| {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
         let previous = std::panic::take_hook();
@@ -192,24 +191,15 @@ fn main() -> std::io::Result<()> {
         }));
         // Detection queries stdout directly, before any frame output is buffered.
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
-        execute!(
-            terminal.backend_mut(),
-            EnableMouseCapture,
-            EnableBracketedPaste
+        event_loop(
+            terminal,
+            &mut app,
+            &mut renderer,
+            debug_log.as_mut(),
+            config_path.as_deref(),
+            &mut io,
         )
-        .and_then(|()| {
-            event_loop(
-                terminal,
-                &mut app,
-                &mut renderer,
-                debug_log.as_mut(),
-                config_path.as_deref(),
-                &mut io,
-            )
-        })
     });
-    drop(bracketed_paste);
-    drop(mouse_capture);
     app.finish();
     for (job, tag) in app.take_jobs() {
         io.submit(job, tag);
