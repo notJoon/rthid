@@ -20,6 +20,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Debug` when the writer supports it
 - `ElidingBackend` parks the hidden cursor at the start of the last row after
   each frame instead of leaving it on the last cell the frame wrote
+- `ElidingBackend` moves the cursor explicitly after a cell whose symbol holds
+  escape sequences, such as an inline image, instead of assuming where the
+  terminal left it
 - `ElidingBackend` clears the whole screen one line at a time instead of with
   erase-display, which some terminals, like iTerm2, copy into the shell's
   scrollback

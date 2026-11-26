@@ -96,7 +96,6 @@ impl<W: Write> Backend for ElidingBackend<W> {
             if !matches!(previous, Some((px, py)) if px.checked_add(1) == Some(x) && py == y) {
                 queue!(self.inner, MoveTo(x, y))?;
             }
-            previous = Some((x, y));
             if modifiers != cell.modifier {
                 change_modifiers(&mut self.inner, modifiers, cell.modifier)?;
                 modifiers = cell.modifier;
@@ -132,6 +131,9 @@ impl<W: Write> Backend for ElidingBackend<W> {
                 underline = cell.underline_color;
             }
             queue!(self.inner, Print(cell.symbol()))?;
+            // A symbol carrying escape sequences, such as an inline image, leaves the cursor
+            // wherever that protocol and terminal put it, so the next cell moves explicitly.
+            previous = (!cell.symbol().contains(char::is_control)).then_some((x, y));
         }
         // SGR 0 resets colors too, so it belongs after the frame's last cell.
         queue!(
@@ -478,6 +480,26 @@ mod tests {
         backend.park_cursor(24).unwrap();
         backend.park_cursor(0).unwrap();
         assert_eq!(backend.writer(), b"\x1b[24;1H\x1b[1;1H");
+    }
+
+    #[test]
+    fn cells_after_escape_sequences_move_the_cursor_explicitly() {
+        let mut frame = Buffer::empty(Rect::new(0, 0, 3, 1));
+        // Image protocols mark the cell one column wide, as ratatui-image does.
+        frame[(0, 0)]
+            .set_symbol("\x1b]1337;File=inline=1:AAAA\x07")
+            .set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(
+                std::num::NonZeroU16::MIN,
+            ));
+        frame[(1, 0)].set_symbol("x");
+        frame[(2, 0)].set_symbol("y");
+        let mut backend = ElidingBackend::new(Vec::new());
+        backend
+            .draw(Buffer::empty(frame.area).diff(&frame).into_iter())
+            .unwrap();
+        let output = String::from_utf8(backend.writer().clone()).unwrap();
+        // The image cell's successor is placed explicitly, ordinary neighbours are not.
+        assert!(output.contains("\x07\x1b[1;2Hxy"), "{output:?}");
     }
 
     #[test]
