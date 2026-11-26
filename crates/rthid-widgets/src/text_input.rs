@@ -37,8 +37,9 @@ pub struct TextInput {
 }
 
 impl TextInput {
-    /// Creates a field holding at most `max` characters of `text`, with the
-    /// cursor after the last character.
+    /// Creates a field holding at most `max` printable characters of `text`,
+    /// with the cursor after the last character. Control characters are removed
+    /// before applying the limit, as with [`Self::insert_str`].
     ///
     /// # Examples
     ///
@@ -48,7 +49,12 @@ impl TextInput {
     /// assert_eq!(TextInput::new("é界ab", 3).text(), "é界a");
     /// ```
     pub fn new(text: impl Into<String>, max: usize) -> Self {
-        let text: String = text.into().chars().take(max).collect();
+        let text: String = text
+            .into()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect();
         Self {
             cursor: text.chars().count(),
             text,
@@ -239,6 +245,19 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn initial_text_and_paste_apply_the_same_printable_character_limit() {
+        for max in [0, 1, 3, 10] {
+            let text = "\n\té界\r\0ab";
+            let initial = TextInput::new(text, max);
+            let mut pasted = TextInput::new("", max);
+            pasted.insert_str(text);
+            assert_eq!(initial.text(), pasted.text());
+            assert!(initial.text().chars().all(|c| !c.is_control()));
+            assert!(initial.text().chars().count() <= max);
+        }
     }
 
     #[test]

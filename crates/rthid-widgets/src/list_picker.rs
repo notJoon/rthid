@@ -18,7 +18,7 @@ use crate::{Outcome, outcome::is_release};
 /// The picker stores only the selected index and the scroll offset of the
 /// last draw. The offset lives in a [`Cell`] so that drawing through `&self`
 /// still keeps the view from jumping between frames. Because the item count
-/// can change between calls, the index is clamped whenever it is used.
+/// can change between calls, selection queries and drawing clamp to its current length.
 ///
 /// # Examples
 ///
@@ -40,8 +40,8 @@ pub struct ListPicker {
 impl ListPicker {
     /// Creates a picker with `selected` as the initial index and no scroll.
     ///
-    /// An index past the end is allowed and is clamped to the last item on
-    /// the next key or draw.
+    /// An index past the end is allowed and is clamped to the last item when
+    /// queried, handled or drawn.
     ///
     /// # Examples
     ///
@@ -49,7 +49,7 @@ impl ListPicker {
     /// use rthid_widgets::ListPicker;
     ///
     /// let picker = ListPicker::new(2);
-    /// assert_eq!(picker.selected(), 2);
+    /// assert_eq!(picker.selected(5), Some(2));
     /// assert_eq!(picker.offset(), 0);
     /// ```
     pub fn new(selected: usize) -> Self {
@@ -59,10 +59,10 @@ impl ListPicker {
         }
     }
 
-    /// Returns the selected index as stored.
+    /// Returns the selected index clamped to the current list length.
     ///
-    /// Keys and handled mouse events clamp the stored index. Drawing clamps
-    /// a copy, so this may exceed the item count until the next input.
+    /// An empty list has no selection. This matches the highlighted row when
+    /// drawing the same list, even if items were removed since the last input.
     ///
     /// # Examples
     ///
@@ -71,15 +71,15 @@ impl ListPicker {
     /// use rthid_widgets::ListPicker;
     ///
     /// let mut picker = ListPicker::new(5);
-    /// assert_eq!(picker.selected(), 5);
+    /// assert_eq!(picker.selected(3), Some(2));
     /// picker.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 3);
-    /// assert_eq!(picker.selected(), 1);
+    /// assert_eq!(picker.selected(3), Some(1));
     /// ```
-    pub fn selected(&self) -> usize {
-        self.selected
+    pub fn selected(&self, len: usize) -> Option<usize> {
+        len.checked_sub(1).map(|last| self.selected.min(last))
     }
 
-    /// Sets the index, clamped on the next key or draw as with [`Self::new`].
+    /// Sets the preferred index, clamped when queried, handled or drawn.
     ///
     /// # Examples
     ///
@@ -87,7 +87,7 @@ impl ListPicker {
     /// use rthid_widgets::ListPicker;
     /// let mut picker = ListPicker::new(0);
     /// picker.select(3);
-    /// assert_eq!(picker.selected(), 3);
+    /// assert_eq!(picker.selected(5), Some(3));
     /// ```
     pub fn select(&mut self, index: usize) {
         self.selected = index;
@@ -142,7 +142,7 @@ impl ListPicker {
                 let Some(index) = self.index_at(area, position, len) else {
                     return Outcome::Ignored;
                 };
-                if index == self.selected.min(len.saturating_sub(1)) {
+                if Some(index) == self.selected(len) {
                     self.select(index);
                     return Outcome::Submit(index);
                 }
@@ -187,7 +187,7 @@ impl ListPicker {
     /// let mut picker = ListPicker::new(0);
     /// let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
     /// assert_eq!(picker.handle_key(key(KeyCode::Char('k')), 3), Outcome::Consumed);
-    /// assert_eq!(picker.selected(), 0);
+    /// assert_eq!(picker.selected(3), Some(0));
     /// assert_eq!(picker.handle_key(key(KeyCode::Char('x')), 3), Outcome::Ignored);
     /// assert_eq!(picker.handle_key(key(KeyCode::Enter), 0), Outcome::Consumed);
     /// assert_eq!(picker.handle_key(key(KeyCode::Esc), 3), Outcome::Cancel);
@@ -284,11 +284,7 @@ impl ListPicker {
         buf: &mut Buffer,
     ) {
         let items: Vec<_> = items.into_iter().collect();
-        let selected = if items.is_empty() {
-            None
-        } else {
-            Some(self.selected.min(items.len() - 1))
-        };
+        let selected = self.selected(items.len());
         let mut state = ListState::default()
             .with_selected(selected)
             .with_offset(self.offset.get());
@@ -313,6 +309,25 @@ mod tests {
     }
 
     #[test]
+    fn selection_matches_drawing_after_items_are_removed() {
+        let picker = ListPicker::new(4);
+        let area = Rect::new(0, 0, 5, 2);
+        assert_eq!(picker.selected(5), Some(4));
+        let mut buf = Buffer::empty(area);
+        picker.render(
+            ["a", "b"].map(Line::raw),
+            None,
+            Style::default(),
+            area,
+            &mut buf,
+        );
+        assert_eq!(picker.selected(2), Some(1));
+        assert_eq!(buf, Buffer::with_lines(["  a  ", "> b  "]));
+        picker.render([], None, Style::default(), area, &mut Buffer::empty(area));
+        assert_eq!(picker.selected(0), None);
+    }
+
+    #[test]
     fn mouse_uses_scrolled_rows_and_ignores_empty_space() {
         let area = Rect::new(2, 3, 10, 3);
         let mut picker = ListPicker::new(4);
@@ -331,14 +346,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
-        assert_eq!(picker.selected(), 2);
+        assert_eq!(picker.selected(5), Some(2));
         assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Submit(2));
         mouse.kind = MouseEventKind::ScrollDown;
         assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
-        assert_eq!(picker.selected(), 3);
+        assert_eq!(picker.selected(5), Some(3));
         mouse.kind = MouseEventKind::ScrollUp;
         assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Consumed);
-        assert_eq!(picker.selected(), 2);
+        assert_eq!(picker.selected(5), Some(2));
         mouse.column = 1;
         assert_eq!(picker.handle_mouse(mouse, area, 5), Outcome::Ignored);
         mouse.column = 2;
@@ -353,12 +368,12 @@ mod tests {
         let mut picker = ListPicker::new(0);
         for code in [KeyCode::Up, KeyCode::Char('k')] {
             assert_eq!(picker.handle_key(key(code), 3), Outcome::Consumed);
-            assert_eq!(picker.selected(), 0);
+            assert_eq!(picker.selected(3), Some(0));
         }
         for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::Down] {
             assert_eq!(picker.handle_key(key(code), 3), Outcome::Consumed);
         }
-        assert_eq!(picker.selected(), 2);
+        assert_eq!(picker.selected(3), Some(2));
         assert_eq!(
             picker.handle_key(key(KeyCode::Enter), 1),
             Outcome::Submit(0)
@@ -375,7 +390,7 @@ mod tests {
             assert_eq!(picker.handle_key(key(code), 3), Outcome::Ignored);
         }
         assert_eq!(picker.handle_key(key(KeyCode::Enter), 0), Outcome::Consumed);
-        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.selected(0), None);
         assert_eq!(picker.handle_key(key(KeyCode::Esc), 0), Outcome::Cancel);
     }
 

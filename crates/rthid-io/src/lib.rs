@@ -1,5 +1,4 @@
-//! The filesystem side of rthid, with everything that reads or writes files,
-//! so the binary's App and dialogs stay IO free.
+#![doc = include_str!("../README.md")]
 
 pub mod atomic;
 pub mod dir;

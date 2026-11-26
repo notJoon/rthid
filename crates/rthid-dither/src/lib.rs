@@ -1,3 +1,3 @@
-//! Terminal independent palette dithering used by the rthid binary.
+#![doc = include_str!("../README.md")]
 
 pub mod dither;

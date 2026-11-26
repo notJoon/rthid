@@ -5,6 +5,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.1] - Unreleased
 
+### Added
+
+- Executable, compile-checked examples for synchronous config updates and background PNG exports
+- Public contracts for latest-only jobs across paths, full unsaved Update snapshots, bounded
+  shutdown, temporary-file cleanup, and preview image limits
+
 ### Fixed
 
 - A config save that reached the file lock after shutdown gave up waiting for

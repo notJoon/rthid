@@ -1,30 +1,12 @@
-//! Reusable input components for ratatui applications.
-//!
-//! Each component owns its state, turns key events into an [`Outcome`] and
-//! draws itself into a ratatui [`Buffer`](ratatui::buffer::Buffer). None of
-//! them know anything about the application that hosts them.
-//!
-//! Components compose through a small contract:
-//!
-//! - A key handler returns an [`Outcome`]. `Ignored` means the component did
-//!   not use the key, so the parent should try its own bindings.
-//! - The application decides what `Submit` and `Cancel` mean, such as
-//!   validating a value, closing a dialog or asking a follow up question.
-//! - Drawing takes `&self`, so it works from an immutable borrow of the app
-//!   inside a draw closure.
-//! - [`TextInput::render`] returns the cursor [`Position`](ratatui::layout::Position)
-//!   instead of moving the cursor. Callers pass it to
-//!   `Frame::set_cursor_position`.
-//!
-//! [`Dialog`] places and frames a popup and [`key_hints`] formats help text.
-//!
-//! # Examples
+#![doc = include_str!("../README.md")]
+
+//! # Composing a list with confirmation
 //!
 //! A modal list where d asks before deleting the selected item, and keys the
 //! modal does not use fall back to the caller.
 //!
 //! ```
-//! use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+//! use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 //! use rthid_widgets::{Confirm, ListPicker, Outcome};
 //!
 //! struct Modal {
@@ -34,15 +16,26 @@
 //!
 //! /// Returns false when the caller should handle the key.
 //! fn on_key(modal: &mut Modal, items: &mut Vec<&str>, key: KeyEvent) -> bool {
-//!     if let Some(confirm) = modal.confirm.take() {
-//!         if confirm.handle_key(key) == Outcome::Submit(()) {
-//!             items.remove(modal.picker.selected());
+//!     if let Some(confirm) = &modal.confirm {
+//!         match confirm.handle_key(key) {
+//!             Outcome::Submit(()) => {
+//!                 if let Some(index) = modal.picker.selected(items.len()) {
+//!                     items.remove(index);
+//!                 }
+//!                 modal.confirm = None;
+//!             }
+//!             Outcome::Cancel => modal.confirm = None,
+//!             Outcome::Ignored | Outcome::Consumed => {}
 //!         }
 //!         return true;
 //!     }
 //!     match modal.picker.handle_key(key, items.len()) {
-//!         Outcome::Ignored if key.code == KeyCode::Char('d') && !items.is_empty() => {
-//!             let name = items[modal.picker.selected()];
+//!         Outcome::Ignored
+//!             if key.code == KeyCode::Char('d')
+//!                 && key.kind != KeyEventKind::Release
+//!                 && key.modifiers.is_empty() => {
+//!             let Some(index) = modal.picker.selected(items.len()) else { return false };
+//!             let name = items[index];
 //!             modal.confirm = Some(Confirm::new(format!("Delete {name}?")));
 //!             true
 //!         }
@@ -57,6 +50,10 @@
 //! assert!(on_key(&mut modal, &mut items, key('j')));
 //! assert!(on_key(&mut modal, &mut items, key('d')));
 //! assert_eq!(modal.confirm.as_ref().map(Confirm::message), Some("Delete cool?"));
+//! let mut release = key('d');
+//! release.kind = KeyEventKind::Release;
+//! assert!(on_key(&mut modal, &mut items, release));
+//! assert!(modal.confirm.is_some());
 //! assert!(on_key(&mut modal, &mut items, key('y')));
 //! assert_eq!(items, ["warm"]);
 //! assert!(!on_key(&mut modal, &mut items, key('q')));

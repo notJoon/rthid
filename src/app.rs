@@ -493,11 +493,16 @@ impl App {
         if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
             let selection = |modal: &Modal| match modal {
-                Modal::OpenFile(picker) => (picker.list.selected(), picker.typed),
-                Modal::Presets { list, .. } | Modal::Templates { list, .. } => {
-                    (list.selected(), false)
+                Modal::OpenFile(picker) => {
+                    (picker.list.selected(picker.entries.len()), picker.typed)
                 }
-                Modal::Editor(editor) => (editor.rows.selected(), false),
+                Modal::Presets { list, .. } => (list.selected(self.library.palettes.len()), false),
+                Modal::Templates { list, .. } => {
+                    (list.selected(self.library.templates.len()), false)
+                }
+                Modal::Editor(editor) => {
+                    (editor.rows.selected(editor.draft.colors.len() + 2), false)
+                }
             };
             let before = selection(&modal);
             let ctx = self.modal_ctx();
@@ -666,9 +671,10 @@ impl App {
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
-                self.settings = self
-                    .settings
-                    .with_default(Setting::ALL[self.panel.selected()], &self.library.palettes)
+                self.settings = self.settings.with_default(
+                    Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()],
+                    &self.library.palettes,
+                )
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -733,7 +739,7 @@ impl App {
     }
 
     fn adjust(&mut self, direction: i32) {
-        let setting = Setting::ALL[self.panel.selected()];
+        let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
         let next = self
             .settings
             .adjusted(setting, direction, &self.library.palettes);
@@ -1275,7 +1281,7 @@ mod tests {
             &app.geometry(test_layout().preview),
         );
         assert!(
-            matches!(&app.modal, Some(Modal::Editor(editor)) if editor.draft.colors == app.settings.palette_hex && editor.rows.selected() == 1 && editor.input.is_none())
+            matches!(&app.modal, Some(Modal::Editor(editor)) if editor.draft.colors == app.settings.palette_hex && editor.rows.selected(editor.draft.colors.len() + 2) == Some(1) && editor.input.is_none())
         );
         press(&mut app, KeyCode::Up);
         for code in [
@@ -1883,14 +1889,20 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Setting::Scale);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.panel.selected(), 0);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(0));
         for _ in 0..Setting::ALL.len() + 2 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(Setting::ALL[app.panel.selected()], Setting::Sharpen);
+        assert_eq!(
+            Setting::ALL[app.panel.selected(Setting::ALL.len()).unwrap()],
+            Setting::Sharpen
+        );
         for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
             assert!(!press(&mut app, code));
-            assert_eq!(app.panel.selected(), Setting::ALL.len() - 1);
+            assert_eq!(
+                app.panel.selected(Setting::ALL.len()),
+                Some(Setting::ALL.len() - 1)
+            );
             assert!(!app.quit);
         }
     }

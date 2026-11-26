@@ -3,6 +3,24 @@
 All notable changes to rthid-widgets are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- `ListPicker::selected(len)` returns the clamped highlighted index, or `None`
+  for an empty list, and drawing uses the same selection
+- `TextInput::new` removes control characters before applying the length limit,
+  matching pasted text
+- `Confirm` accepts only an unmodified lowercase y; modified keys cancel
+
+### Fixed
+
+- The confirmation composition example keeps its question on ignored key releases
+
+### Added
+
+- Path dependency setup and a complete input example, compiled as a documentation test
+
 ## [0.1.0] - 2026-11-26
 
 ### Added
