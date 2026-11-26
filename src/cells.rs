@@ -9,7 +9,7 @@ use crate::{
 };
 use image::RgbaImage;
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     style::Color,
     widgets::{Block, Clear, Widget},
 };
@@ -170,6 +170,16 @@ pub fn render(
     approximate
 }
 
+// Solid backgrounds avoid redundant foreground color output.
+fn half_block(cell: &mut Cell, top: Color, bottom: Color) {
+    let (symbol, fg) = if top == bottom {
+        (" ", Color::Reset)
+    } else {
+        ("▀", top)
+    };
+    cell.set_symbol(symbol).set_fg(fg).set_bg(bottom);
+}
+
 fn render_exact(
     pixels: Pixels<'_>,
     geometry: &PreviewGeometry,
@@ -199,10 +209,11 @@ fn render_exact(
     };
     for y in 0..area.height {
         for x in 0..area.width {
-            buffer[(area.x + x, area.y + y)]
-                .set_symbol("▀")
-                .set_fg(color(u32::from(x), u32::from(y) * 2))
-                .set_bg(color(u32::from(x), u32::from(y) * 2 + 1));
+            half_block(
+                &mut buffer[(area.x + x, area.y + y)],
+                color(u32::from(x), u32::from(y) * 2),
+                color(u32::from(x), u32::from(y) * 2 + 1),
+            );
         }
     }
 }
@@ -285,10 +296,11 @@ fn render_overview_rgb(
     for cy in 0..target.height {
         for cx in 0..target.width {
             let index = usize::from(cy) * 2 * cw + usize::from(cx);
-            buffer[(target.x + cx, target.y + cy)]
-                .set_symbol("▀")
-                .set_fg(colors[index])
-                .set_bg(colors[index + cw]);
+            half_block(
+                &mut buffer[(target.x + cx, target.y + cy)],
+                colors[index],
+                colors[index + cw],
+            );
         }
     }
 }
@@ -336,10 +348,12 @@ fn render_overview_indexed(
             let (mask, fg, bg, reduced) = reduce_cell(samples, palette);
             approximate |= reduced;
             let glyph = glyphs.glyph(mask);
-            buffer[(target.x + cx, target.y + cy)]
-                .set_char(glyph)
-                .set_fg(color(fg))
-                .set_bg(color(bg));
+            let cell = &mut buffer[(target.x + cx, target.y + cy)];
+            if glyph == '▀' {
+                half_block(cell, color(fg), color(bg));
+            } else {
+                cell.set_char(glyph).set_fg(color(fg)).set_bg(color(bg));
+            }
         }
     }
     approximate
@@ -517,13 +531,12 @@ mod tests {
                     );
                     if matches!(source, Pixels::Rgb(..)) {
                         for pos in g.target.positions() {
-                            for color in [buffer[pos].fg, buffer[pos].bg] {
-                                assert!(if coarse {
-                                    matches!(color, Color::Indexed(_))
-                                } else {
-                                    matches!(color, Color::Rgb(..))
-                                });
-                            }
+                            assert_eq!(buffer[pos].fg, Color::Reset);
+                            assert!(if coarse {
+                                matches!(buffer[pos].bg, Color::Indexed(_))
+                            } else {
+                                matches!(buffer[pos].bg, Color::Rgb(..))
+                            });
                         }
                     } else if let Some(expected) = &dithered {
                         assert_eq!(&buffer, expected);
@@ -894,7 +907,8 @@ mod tests {
                     &mut OverviewCaches::default(),
                     false,
                 );
-                assert_eq!(buffer[full].fg, Color::Rgb(255, 0, 0));
+                assert_eq!(buffer[full].symbol(), " ");
+                assert_eq!(buffer[full].fg, Color::Reset);
                 assert_eq!(buffer[full].bg, Color::Rgb(255, 0, 0));
             }
         }
@@ -946,8 +960,8 @@ mod tests {
             assert_eq!((cw, ch), (width, 1));
             for (x, value) in expected.into_iter().enumerate() {
                 let cell = &buffer[(target.x + x as u16, target.y)];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::Rgb(value, value, value));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::Rgb(value, value, value));
             }
             assert!(
@@ -996,8 +1010,8 @@ mod tests {
             for x in 0..cw {
                 let cell = &buffer[(target.x + x, target.y + y)];
                 let [r, g, b] = pixels[y as usize];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::Rgb(r, g, b));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::Rgb(r, g, b));
             }
         }
@@ -1079,6 +1093,43 @@ mod tests {
         }
     }
     #[test]
+    fn enlarged_solid_cells_use_spaces_and_distinct_halves_keep_half_blocks() {
+        let area = Rect::new(2, 3, 2, 2);
+        let palette = make_palette(&["#f00", "#00f"]).unwrap();
+        let pixels = rgb(1, 2, &[palette[0].rgb, palette[1].rgb]);
+        for zoom in [Zoom::In(2), Zoom::In(1)] {
+            let viewport = Viewport {
+                zoom,
+                hide_minimap: true,
+                ..Viewport::default()
+            };
+            let g = geometry(&viewport, (1, 2), area);
+            for source in [indexed(&[0, 1], &palette), Pixels::Rgb(&pixels, 1)] {
+                let mut buffer = Buffer::empty(area);
+                render(
+                    source,
+                    Glyphs::Quadrant,
+                    &g,
+                    &mut buffer,
+                    &mut OverviewCaches::default(),
+                    false,
+                );
+                for pos in g.target.positions() {
+                    let cell = &buffer[pos];
+                    if zoom == Zoom::In(2) {
+                        assert_eq!(cell.symbol(), " ");
+                        assert_eq!(cell.fg, Color::Reset);
+                    } else {
+                        assert_eq!(cell.symbol(), "▀");
+                        assert_eq!(cell.fg, Color::from(palette[0].rgb));
+                        assert_eq!(cell.bg, Color::from(palette[1].rgb));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn in_two_draws_each_dot_as_two_columns_and_two_halves() {
         let area = Rect::new(2, 3, 4, 2);
         let pixels = rgb(2, 2, &[[255, 0, 0], [0, 255, 0], [0, 0, 255], [255; 3]]);
@@ -1112,8 +1163,8 @@ mod tests {
                 (5, 4, [255; 3]),
             ] {
                 let cell = &buffer[(x, y)];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::from(rgb));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::from(rgb));
             }
         }
@@ -1146,7 +1197,14 @@ mod tests {
                     false,
                 ));
                 for pos in area.positions() {
-                    assert_eq!(buffer[pos].fg, Color::Rgb(expected, expected, expected));
+                    assert_eq!(
+                        buffer[pos].fg,
+                        if matches!(pixels, Pixels::Rgb(..)) {
+                            Color::Reset
+                        } else {
+                            Color::Rgb(expected, expected, expected)
+                        }
+                    );
                     assert_eq!(buffer[pos].bg, Color::Rgb(expected, expected, expected));
                 }
             }

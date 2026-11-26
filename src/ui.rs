@@ -564,12 +564,12 @@ mod tests {
             draw_text(&mut terminal, &app, &mut renderer);
             for pos in g.target.positions() {
                 let cell = &terminal.backend().buffer()[pos];
-                for color in [cell.fg, cell.bg] {
-                    assert!(match kind {
-                        MouseEventKind::Down(_) => matches!(color, Color::Indexed(_)),
-                        _ => matches!(color, Color::Rgb(..)),
-                    });
-                }
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
+                assert!(match kind {
+                    MouseEventKind::Down(_) => matches!(cell.bg, Color::Indexed(_)),
+                    _ => matches!(cell.bg, Color::Rgb(..)),
+                });
             }
         }
     }
@@ -885,18 +885,18 @@ mod tests {
             .unwrap();
         let (displayed, overview) = corner.split_once(" overview=").unwrap();
         for cell in [displayed, overview] {
-            assert!(cell.contains("fg: Rgb(255, 255, 255)"));
+            assert!(cell.contains("fg: Reset"));
             assert!(cell.contains("bg: Rgb(255, 255, 255)"));
         }
-        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), "▀");
+        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), " ");
         let outside = text
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.right() - 1, map.bottom() - 1)))
             .unwrap();
         let (displayed, overview) = outside.split_once(" overview=").unwrap();
-        assert!(displayed.contains("fg: Rgb(127, 127, 127)"));
+        assert!(displayed.contains("fg: Reset"));
         assert!(displayed.contains("bg: Rgb(127, 127, 127)"));
-        assert!(overview.contains("fg: Rgb(255, 255, 255)"));
+        assert!(overview.contains("fg: Reset"));
         assert!(overview.contains("bg: Rgb(255, 255, 255)"));
 
         assert!(
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn draws_settings_and_truecolor_half_blocks() {
+    fn draws_settings_and_truecolor_backgrounds() {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
@@ -941,9 +941,9 @@ mod tests {
         let cell = buffer
             .content
             .iter()
-            .find(|cell| cell.symbol() == "▀")
+            .find(|cell| cell.symbol() == " " && cell.bg == Color::Rgb(255, 255, 255))
             .unwrap();
-        assert_eq!(cell.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(cell.fg, Color::Reset);
         assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
         // Tiny terminals must not panic.
         for (width, height) in [(1, 1), (20, 5), (60, 12)] {
