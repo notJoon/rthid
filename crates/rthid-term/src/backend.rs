@@ -4,12 +4,13 @@ use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend, IntoCrossterm, WindowSize},
     buffer::Cell,
     crossterm::{
-        cursor::MoveTo,
-        queue,
+        cursor::{MoveTo, RestorePosition, SavePosition},
+        execute, queue,
         style::{
             Attribute, Color as TerminalColor, Colors, ContentStyle, Print, SetAttribute,
             SetAttributes, SetBackgroundColor, SetColors, SetForegroundColor, SetUnderlineColor,
         },
+        terminal::{Clear, ClearType as TerminalClear},
     },
     layout::{Position, Size},
     style::{Color, Modifier, Style},
@@ -40,6 +41,19 @@ impl<W: Write> ElidingBackend<W> {
     /// Mutably borrows the writer receiving terminal output.
     pub fn writer_mut(&mut self) -> &mut W {
         self.inner.writer_mut()
+    }
+
+    /// Erases `rows` screen rows with one erase-line each and keeps the cursor where it was.
+    ///
+    /// Terminals disagree on what an erase-display (`ESC[2J`) does beyond blanking cells, such as
+    /// iTerm2 copying the alternate screen into the shell's scrollback. Erasing each line only
+    /// blanks cells everywhere.
+    fn erase_rows(&mut self, rows: u16) -> io::Result<()> {
+        queue!(self.inner, SavePosition)?;
+        for row in 0..rows {
+            queue!(self.inner, MoveTo(0, row), Clear(TerminalClear::CurrentLine))?;
+        }
+        execute!(self.inner, RestorePosition)
     }
 }
 
@@ -137,11 +151,16 @@ impl<W: Write> Backend for ElidingBackend<W> {
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.inner.clear()
+        self.clear_region(ClearType::All)
     }
 
+    /// Clears the whole screen one row at a time, see [`ElidingBackend::erase_rows`].
     fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
-        self.inner.clear_region(clear_type)
+        if clear_type != ClearType::All {
+            return self.inner.clear_region(clear_type);
+        }
+        let rows = self.inner.size()?.height;
+        self.erase_rows(rows)
     }
 
     fn size(&self) -> io::Result<Size> {
@@ -429,6 +448,19 @@ mod tests {
             .draw(Buffer::empty(frame.area).diff(&frame).into_iter())
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn full_clears_erase_each_row_and_keep_the_cursor() {
+        let mut backend = ElidingBackend::new(Vec::new());
+        backend.erase_rows(3).unwrap();
+        assert_eq!(
+            String::from_utf8(backend.writer().clone()).unwrap(),
+            "\x1b7\x1b[1;1H\x1b[2K\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b8"
+        );
+        let mut backend = ElidingBackend::new(Vec::new());
+        backend.clear_region(ClearType::AfterCursor).unwrap();
+        assert_eq!(backend.writer(), b"\x1b[J");
     }
 
     #[test]
