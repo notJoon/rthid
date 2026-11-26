@@ -50,7 +50,7 @@ pub enum Pixels<'a> {
         /// Colors referenced by the indices.
         palette: &'a [PaletteColor],
     },
-    /// Original layer as the scaled and rotated grid and its build version.
+    /// Original layer as the composed card grid and its build version.
     /// The version keys the RGB overview caches.
     // TODO: Name the fields { image, version }.
     Rgb(&'a RgbaImage, u64),

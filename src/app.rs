@@ -86,7 +86,7 @@ pub struct App {
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
     pub panel: ListPicker,
-    /// Whether the preview shows Original (the scaled grid) instead of Dithered.
+    /// Whether the preview shows Original (the card grid) instead of Dithered.
     /// Starts true.
     pub show_original: bool,
     /// Whether the event loop should exit.
@@ -172,13 +172,16 @@ impl App {
         self.source_path.as_deref()
     }
 
-    /// Replaces the source and resets preview navigation while retaining settings.
+    /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.source_path = Some(path);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
         self.settings.rotation = Rotation::R0;
+        self.settings.zoom = 100;
+        self.settings.pan_x = 0;
+        self.settings.pan_y = 0;
         self.show_original = true;
         self.refresh();
     }
@@ -390,15 +393,11 @@ impl App {
         }
     }
 
-    /// Grid size for the current settings after rotation, known before `sync`
-    /// rebuilds the grid.
+    /// Card grid dimensions, known before the next cache refresh.
     pub fn grid_size(&self) -> (u32, u32) {
-        let (w, h) = self.grid_cache.scaled_size(&self.settings);
-        if self.settings.rotation.swaps_axes() {
-            (h, w)
-        } else {
-            (w, h)
-        }
+        self.grid_cache
+            .placement(&self.settings)
+            .map_or((0, 0), |p| (p.width, p.height))
     }
 
     /// Rebuilds the grid and dither if settings changed, sends a new dither to the
@@ -904,7 +903,7 @@ mod tests {
         assert!(app.modal.is_none());
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
-        assert_eq!(app.grid_size(), (2, 3));
+        assert_eq!(app.grid_size(), (250, 450));
     }
 
     #[test]
@@ -1040,7 +1039,7 @@ mod tests {
         let mut queued = jobs(&mut app);
         let (output, image) = encoded_export(queued.remove(0));
         assert_eq!(output, path);
-        assert_eq!(image.dimensions(), (16, 8));
+        assert_eq!(image.dimensions(), (1000, 1800));
         assert!(
             image
                 .pixels()
@@ -1081,7 +1080,7 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(4, 2), None);
         let preview = test_layout().preview;
         assert!(!app.sync(preview));
-        app.settings.scale = 200;
+        app.settings.dot = 10;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         app.show_original = false;
@@ -1188,7 +1187,7 @@ mod tests {
         assert!(app.source_path().is_none());
         assert!(app.displayed().is_none());
         assert_eq!(app.grid_size(), (0, 0));
-        assert_eq!(app.grid_cache.source_size(), None);
+        assert!(app.grid_cache.source.is_none());
         for focus in [false, true] {
             app.preview_focus = focus;
             for code in [' ', '+', '=', '-', '0', 'm'] {
@@ -1226,10 +1225,10 @@ mod tests {
         }
         app.preview_focus = false;
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.settings.scale, 110);
+        assert_eq!(app.settings.card, crate::settings::CARDS[1]);
         assert!(app.displayed().is_none());
         app.open_image(PathBuf::from("first.png"), RgbaImage::new(20, 10));
-        assert_eq!(app.grid_size(), (22, 11));
+        assert_eq!(app.grid_size(), (450, 250));
         assert!(app.displayed().is_some());
         assert!(app.show_original);
         assert_eq!(versions(&app), (1, 0));
@@ -1242,12 +1241,15 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(4, 2), Some(output.clone()));
         let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
         assert_eq!(path, output);
-        assert_eq!(image.dimensions(), (16, 8));
+        assert_eq!(image.dimensions(), (1000, 1800));
         app.settings = app
             .settings
             .with_preset(app.library.palettes.get(1).unwrap());
         app.settings.tone.brightness = 0.2;
         app.settings.rotation = Rotation::R90;
+        app.settings.zoom = 150;
+        app.settings.pan_x = 25;
+        app.settings.pan_y = -40;
         app.show_original = false;
         app.refresh();
         let settings = app.settings.clone();
@@ -1268,14 +1270,18 @@ mod tests {
         assert!(!app.viewport.hide_minimap);
         assert!(app.last_drag.is_none() && app.show_original);
         assert_eq!(app.settings.rotation, Rotation::R0);
+        assert_eq!(
+            (app.settings.zoom, app.settings.pan_x, app.settings.pan_y),
+            (100, 0, 0)
+        );
         assert_eq!(app.settings.options(), settings.options());
         assert_eq!(app.settings.palette_hex, settings.palette_hex);
         assert_eq!(app.settings.palette_name, settings.palette_name);
-        assert_eq!(app.grid_size(), (3, 5));
+        assert_eq!(app.grid_size(), (250, 450));
         assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
         let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
         assert_eq!(path, output);
-        assert_eq!(image.dimensions(), (12, 20));
+        assert_eq!(image.dimensions(), (1000, 1800));
     }
 
     #[test]
@@ -1833,14 +1839,14 @@ mod tests {
         assert_eq!(app.grid_cache.dithered.version(), 2);
         app.show_original = true;
         app.settings.rotation = Rotation::R180;
-        app.settings.scale = 110;
+        app.settings.dot = 19;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 2);
         assert_eq!(app.grid_cache.dithered.version(), 2);
         app.show_original = false;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.dithered.version(), 3);
-        assert_eq!(app.grid_size(), (22, 11));
+        assert_eq!(app.grid_size(), (263, 474));
         let (w, h) = app.grid_size();
         assert_eq!(
             app.grid_cache.dithered.get().unwrap().len(),
@@ -1862,13 +1868,14 @@ mod tests {
     fn sync_clamps_after_layout_and_grid_changes() {
         let mut app = App::builtin(RgbaImage::new(120, 80), None);
         app.viewport.zoom = Zoom::In(1);
-        for (screen, scale, rotation, expected) in [
+        for (screen, dot, rotation, expected) in [
             (Rect::new(0, 0, 41, 9), 100, Rotation::R0, (110, 70)),
             (Rect::new(0, 0, 100, 40), 100, Rotation::R0, (51, 8)),
-            (Rect::new(0, 0, 100, 40), 50, Rotation::R0, (0, 0)),
-            (Rect::new(0, 0, 100, 40), 100, Rotation::R90, (11, 48)),
+            (Rect::new(0, 0, 100, 40), 200, Rotation::R0, (0, 0)),
+            (Rect::new(0, 0, 100, 40), 100, Rotation::R90, (51, 8)),
         ] {
-            app.settings.scale = scale;
+            app.settings.card = Settings::for_pixels(120, 80).card;
+            app.settings.dot = dot;
             app.settings.rotation = rotation;
             app.viewport.x = 999;
             app.viewport.y = 999;
@@ -1910,26 +1917,22 @@ mod tests {
 
     #[test]
     fn original_preserves_rgb_and_alpha() {
-        let source = RgbaImage::from_raw(
-            3,
-            1,
-            vec![255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255],
-        )
-        .unwrap();
-        let app = App::builtin(source, None);
+        let source =
+            RgbaImage::from_raw(8, 8, [255, 0, 0, 0, 25, 26, 128, 255].repeat(32)).unwrap();
+        let expected = source.as_raw().clone();
+        let mut app = App::builtin(source, None);
+        app.settings = Settings::for_pixels(8, 8);
+        app.refresh();
         let Some(Pixels::Rgb(pixels, _)) = app.displayed() else {
             panic!("expected original RGB pixels");
         };
-        assert_eq!(
-            pixels.as_raw(),
-            &[255, 0, 0, 0, 25, 26, 128, 255, 255, 255, 255, 255]
-        );
+        assert_eq!(pixels.as_raw(), &expected);
         assert_eq!(app.grid_cache.grid.get().unwrap(), pixels);
     }
 
     #[test]
     fn navigation_stays_in_range_and_skips_redither() {
-        let mut app = app_at(Setting::Scale);
+        let mut app = app_at(Setting::Card);
         assert!(!press(&mut app, KeyCode::Up));
         assert_eq!(app.panel.selected(Setting::ALL.len()), Some(0));
         for _ in 0..Setting::ALL.len() + 2 {
@@ -2019,7 +2022,7 @@ mod tests {
     fn numeric_settings_clamp_without_redither() {
         type Getter = fn(&Settings) -> f64;
         let cases: [(Setting, Getter); 8] = [
-            (Setting::Scale, |p| f64::from(p.scale)),
+            (Setting::Dot, |p| f64::from(p.dot)),
             (Setting::Strength, |p| p.strength),
             (Setting::Brightness, |p| p.tone.brightness),
             (Setting::Contrast, |p| p.tone.contrast),
@@ -2066,25 +2069,28 @@ mod tests {
 
     #[test]
     fn reset_restores_selected_or_all_defaults() {
-        let mut app = app_at(Setting::Scale);
+        let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
-        app.panel = ListPicker::new(1);
+        select(&mut app, Setting::Mode);
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.settings.mode, Mode::Tone));
         assert_eq!(
-            (app.settings.scale, app.settings.rotation),
-            (110, Rotation::R90)
+            (app.settings.card, app.settings.rotation),
+            (crate::settings::CARDS[1], Rotation::R90)
         );
-        app.panel = ListPicker::new(2);
+        select(&mut app, Setting::Palette);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('D'));
         let p = &app.settings;
-        assert_eq!((p.scale, p.rotation), (100, Rotation::R0));
+        assert_eq!(
+            (p.card, p.rotation),
+            (crate::settings::CARDS[0], Rotation::R0)
+        );
         assert_eq!(p.palette_name, "Black/white");
         assert_eq!(p.palette.len(), 2);
-        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 16);
+        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 250 * 450);
     }
 
     #[test]
@@ -2116,19 +2122,26 @@ mod tests {
                 }
                 continue;
             }
-            let change = if matches!(setting, Setting::Black | Setting::Sharpen | Setting::Seed) {
+            let change = if matches!(
+                setting,
+                Setting::Black
+                    | Setting::Sharpen
+                    | Setting::Seed
+                    | Setting::Margin
+                    | Setting::Bleed
+            ) {
                 KeyCode::Right
             } else {
                 KeyCode::Left
             };
-            assert!(press(&mut app, change));
+            assert!(press(&mut app, change), "{setting:?}");
             assert!(press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
-            assert!(press(&mut app, change));
+            assert!(press(&mut app, change), "{setting:?}");
             assert!(press(&mut app, KeyCode::Char('D')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
         }
-        let mut app = app_at(Setting::Scale);
+        let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Char('r'));
         assert!(!press(&mut app, KeyCode::Char('d')));
         assert!(press(&mut app, KeyCode::Char('D')));
@@ -2152,7 +2165,7 @@ mod tests {
 
     #[test]
     fn quit_keys_and_ctrl_chords() {
-        let mut app = app_at(Setting::Scale);
+        let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Esc);
         assert!(!app.preview_focus);
@@ -2160,7 +2173,7 @@ mod tests {
         assert!(!app.quit);
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
-        let mut app = app_at(Setting::Scale);
+        let mut app = app_at(Setting::Card);
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         app.handle_key(release, &app.geometry(test_layout().preview));
@@ -2175,32 +2188,31 @@ mod tests {
     }
 
     #[test]
-    fn rotation_and_scale_set_the_actual_dither_grid() {
+    fn rotation_keeps_the_actual_dither_grid() {
         let mut app = App::builtin(RgbaImage::new(256, 128), None);
         app.show_original = false;
-        assert_eq!(app.grid_size(), (256, 128));
-        press(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.grid_size(), (128, 256));
-        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 128 * 256);
-        press(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.grid_size(), (256, 128));
-        press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.settings.rotation, Rotation::R90);
-        press(&mut app, KeyCode::Char('R'));
-        press(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.settings.rotation, Rotation::R270);
-        assert_eq!(app.grid_size(), (128, 256));
-        let mut app = App::builtin(RgbaImage::new(15, 1), None);
-        app.show_original = false;
-        for _ in 0..9 {
-            press(&mut app, KeyCode::Left);
+        let size = app.grid_size();
+        for (key, expected) in [
+            ('r', Rotation::R90),
+            ('r', Rotation::R180),
+            ('R', Rotation::R90),
+            ('R', Rotation::R0),
+            ('R', Rotation::R270),
+        ] {
+            assert!(press(&mut app, KeyCode::Char(key)));
+            assert_eq!(app.settings.rotation, expected);
+            assert_eq!(app.grid_size(), size);
+            assert_eq!(
+                app.grid_cache.dithered().unwrap().len(),
+                (size.0 * size.1) as usize
+            );
         }
-        assert_eq!(app.grid_size(), (2, 1));
-        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 2);
     }
     #[test]
     fn global_zoom_and_preview_pans_skip_redithering() {
         let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        app.settings = Settings::for_pixels(400, 400);
+        app.refresh();
         for focus in [false, true] {
             app.preview_focus = focus;
             assert!(!press(&mut app, KeyCode::Char('0')));
@@ -2234,7 +2246,7 @@ mod tests {
         assert_eq!(app.viewport.zoom, Zoom::Fit);
         press(&mut app, KeyCode::Tab);
         assert!(press(&mut app, KeyCode::Right));
-        assert_eq!(app.settings.scale, 110);
+        assert_eq!(app.settings.card, crate::settings::CARDS[1]);
     }
 
     #[test]
@@ -2268,6 +2280,8 @@ mod tests {
     #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.settings = Settings::for_pixels(120, 120);
+        app.refresh();
         let area = Rect::new(2, 3, 48, 18);
         app.viewport.zoom = Zoom::In(1);
         let map = app.geometry(area).minimap.unwrap().map;
@@ -2414,7 +2428,63 @@ mod tests {
         app.finish();
         let (output, image) = encoded_export(jobs(&mut app).pop().unwrap());
         assert_eq!(output, path);
-        assert_eq!(image.dimensions(), (8, 16));
+        assert_eq!(image.dimensions(), (1000, 1800));
         assert!(jobs(&mut app).is_empty());
+    }
+    #[test]
+    fn print_controls_rebuild_once_and_preserve_the_layer() {
+        let mut app = App::builtin(RgbaImage::new(20, 10), None);
+        select(&mut app, Setting::Dot);
+        let before = versions(&app);
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(app.grid_size(), (238, 429));
+        assert_eq!(versions(&app), (before.0 + 1, before.1));
+        assert!(app.show_original);
+        assert!(!app.sync(test_layout().preview));
+        app.show_original = false;
+        app.refresh();
+        for (setting, key) in [
+            (Setting::Zoom, KeyCode::Right),
+            (Setting::PanX, KeyCode::Right),
+            (Setting::PanY, KeyCode::Left),
+        ] {
+            select(&mut app, setting);
+            let before = versions(&app);
+            assert!(press(&mut app, key));
+            assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
+            assert!(!app.show_original);
+            assert!(!app.sync(test_layout().preview));
+        }
+        for setting in [Setting::Zoom, Setting::PanX, Setting::PanY] {
+            app.settings.zoom = 400;
+            app.settings.pan_x = 100;
+            app.settings.pan_y = 100;
+            app.refresh();
+            select(&mut app, setting);
+            let before = versions(&app);
+            assert!(!press(&mut app, KeyCode::Right));
+            assert_eq!(versions(&app), before);
+        }
+    }
+
+    #[test]
+    fn margin_consuming_card_builds_only_paper() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.settings = Settings {
+            margin: 100,
+            ..Settings::for_pixels(8, 8)
+        };
+        app.settings.tone.brightness = -0.5;
+        app.show_original = false;
+        app.refresh();
+        assert_eq!(app.grid_size(), (8, 8));
+        assert_eq!(app.grid_cache.dithered().unwrap(), &vec![1; 64]);
+        assert!(
+            app.grid_cache
+                .grid()
+                .unwrap()
+                .pixels()
+                .all(|p| p.0 == [255; 4])
+        );
     }
 }

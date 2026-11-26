@@ -17,13 +17,13 @@ with Unicode half block support and support for the selected overview glyphs
 Original / Dithered selects the image layer. Zoom selects its display scale.
 The preview starts with Original at Fit.
 
-- **Original / Dithered**: Original shows the scaled, rotated source as real pixels
+- **Original / Dithered**: Original shows the composed card grid, including white paper outside the image, as real pixels
   via Kitty, iTerm2, or Sixel at Fit when supported. The status line names the
   protocol only while drawing an image. Graphics preserve aspect using the
   terminal's cell pixel size. Otherwise Original uses truecolor half blocks,
   averaged at Fit and reduced zoom levels. Press `Space` to toggle the layer.
   Dithering is deferred while Original is shown unless a companion PNG is enabled.
-  Changing a dither parameter reveals Dithered. Scale, rotation, and resets keep
+  Changing a dither parameter reveals Dithered. Print controls, rotation, and resets keep
   the selected layer. PNG exports always use the dithered result.
 - **Fit**: shows the whole grid with terminal cell aspect correction. For Dithered,
   `Fit (sextant)` or `Fit (quadrant)` names the sampling glyphs. `approximate`
@@ -40,6 +40,43 @@ The preview starts with Original at Fit.
 - **Minimap**: appears in the upper right whenever the image overflows the preview.
   The visible region keeps its colors and the rest is dimmed. It is hidden when
   the terminal is too small. Press `m` in either focus to hide or show it.
+
+## Print grid
+
+The card and dot size determine the grid independently of the source image.
+Card cycles through Business 50x90, Business 90x50, Euro business 55x85,
+Trading 63x88, Square 65x65 and Postcard 100x148, all in millimetres.
+The default is Business 50x90 with 0.20 mm dots, giving 250x450 dots.
+
+| Parameter | Range | Step | Default |
+| --- | --- | --- | --- |
+| Dot | 0.08 to 0.60 mm | 0.01 mm | 0.20 mm |
+| Margin | 0 to 10 mm | 0.5 mm | 0 mm |
+| Bleed | 0 to 3 mm | 1 mm | 0 mm |
+| Zoom | 0.30x to 4.00x | 0.05x | 1.00x |
+| Pan X / Pan Y | -1.00 to +1.00 | 0.05 | 0.00 |
+
+Bleed extends every edge of the card. Each axis rounds to the nearest dot,
+with halves rounded up, and has a minimum of eight dots. Grids above four
+million dots are rejected. Every preset fits this limit at every allowed setting.
+Margin zero fills the bleed. A positive margin reserves both bleed and margin
+as paper. If either remaining image axis is at most two dots, the whole grid is
+paper and the status shows `no image area`.
+
+The source covers the image area at Zoom 1.00x. Smaller values can expose paper.
+Rotation turns the source inside the fixed card. Positive Pan X moves toward
+right edge alignment and positive Pan Y toward bottom edge alignment. Negative
+values align the opposite edges. Paper always uses the brightest palette color
+in Dithered, regardless of tone settings. Original uses white RGB for paper.
+
+These composition controls change the output. The preview zoom keys and preview
+panning only navigate the result. `d` restores the selected control and `D`
+restores all settings, including composition.
+
+The status includes `Card 50x90 mm | Dots 250x450 | Dot 0.20 mm | Rot 0°`.
+With bleed it shows, for example, `Card 50x90 mm (+3 mm bleed)`.
+The layer and preview navigation information remain before these fields.
+Long status lines are clipped to the terminal width.
 
 ## Keys
 
@@ -86,7 +123,7 @@ it and click it again to open it. The wheel moves the selection.
 You can also drag and drop an image outside a dialog when your terminal sends
 bracketed paste. Quoted paths, escaped spaces and local file URIs are accepted.
 Only the first path is opened. Pasting into a dialog inserts text in its active
-field. Opening an image keeps processing settings, resets rotation and navigation,
+field. Opening an image keeps processing settings, resets rotation, image zoom, image pan and preview navigation,
 and shows Original at Fit. A failed open keeps the current image.
 
 ## Presets and templates
@@ -97,7 +134,7 @@ editor, `Enter` edits a field, `a` adds a color, `x` removes a color, and `s` sa
 `Esc` cancels an edit or closes the dialog.
 
 `T` opens templates: arrows or `j`/`k` select, `Enter` restores settings and
-shows Dithered while keeping rotation, `n` saves current settings under a name
+shows Dithered while keeping rotation, image zoom and image pan, `n` saves current settings under a name
 of up to 32 characters, and `x` asks to delete. Names must be nonempty and
 cannot match a built-in preset. Reusing a template name asks to overwrite with
 `y`; any other key returns to the name prompt. `Esc` returns from naming to
@@ -129,6 +166,10 @@ mode = "color"
 algorithm = "bayer4"
 seed = 0
 strength = 0.8
+card = "business-portrait"
+dot_mm = 0.2
+margin_mm = 1.5
+bleed_mm = 3
 ```
 
 Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
@@ -137,7 +178,12 @@ Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
 Strength and Serpentine apply to diffusion algorithms. Seed applies to Noise.
 Unused rows stay visible and dimmed, and their values survive algorithm changes.
 
-Templates keep their own colors, so later preset edits or removal do not alter them.
+Templates keep their own colors, card, dot size, margin and bleed, so later
+preset edits or removal do not alter them. Card ids are `business-portrait`,
+`business-landscape`, `euro-business`, `trading`, `square` and `postcard`.
+Unknown ids use the default card. Numeric print values round to their stored
+units and clamp to the control bounds. Old `scale` fields are ignored and missing
+print fields use defaults. The config version remains 1.
 
 ## Mouse
 

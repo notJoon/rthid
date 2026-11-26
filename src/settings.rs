@@ -5,6 +5,9 @@ use rthid_dither::dither::{
     self, Algorithm, BayerSize, Diffusion, Kernel, Mode, Options, PaletteColor, Tone,
 };
 
+/// Maximum dot count accepted before image allocation.
+pub const MAX_DOTS: u64 = 4_000_000;
+
 /// Maximum number of characters in a preset or template name.
 pub const MAX_NAME_CHARS: usize = 32;
 /// Maximum number of colors in an editable palette.
@@ -252,6 +255,70 @@ impl Dither {
     }
 }
 
+/// Physical card dimensions before bleed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Card {
+    /// Stable template identifier.
+    pub id: &'static str,
+    /// Panel label.
+    pub label: &'static str,
+    /// Width in whole millimetres.
+    pub w_mm: u32,
+    /// Height in whole millimetres.
+    pub h_mm: u32,
+}
+
+/// Card choices in panel order, with the default first.
+pub const CARDS: [Card; 6] = [
+    Card {
+        id: "business-portrait",
+        label: "Business 50x90",
+        w_mm: 50,
+        h_mm: 90,
+    },
+    Card {
+        id: "business-landscape",
+        label: "Business 90x50",
+        w_mm: 90,
+        h_mm: 50,
+    },
+    Card {
+        id: "euro-business",
+        label: "Euro business 55x85",
+        w_mm: 55,
+        h_mm: 85,
+    },
+    Card {
+        id: "trading",
+        label: "Trading 63x88",
+        w_mm: 63,
+        h_mm: 88,
+    },
+    Card {
+        id: "square",
+        label: "Square 65x65",
+        w_mm: 65,
+        h_mm: 65,
+    },
+    Card {
+        id: "postcard",
+        label: "Postcard 100x148",
+        w_mm: 100,
+        h_mm: 148,
+    },
+];
+
+impl Card {
+    /// Unknown template identifiers select the default card.
+    pub fn from_id(id: &str) -> Self {
+        CARDS
+            .iter()
+            .find(|card| card.id == id)
+            .copied()
+            .unwrap_or(CARDS[0])
+    }
+}
+
 /// Saved settings with palette colors independent of the preset list.
 ///
 /// The algorithm, seed and remembered diffusion values are all saved, even when
@@ -275,13 +342,18 @@ pub struct Template {
     pub strength: f64,
     /// Whether alternate rows run in reverse, saved like strength.
     pub serpentine: bool,
-    /// Source size percentage.
-    pub scale: i32,
+    /// Stable card preset identifier.
+    pub card: &'static str,
+    /// Dot size in hundredths of a millimetre.
+    pub dot: i32,
+    /// Margin in tenths of a millimetre.
+    pub margin: i32,
+    /// Bleed in whole millimetres.
+    pub bleed: i32,
     /// Adjustments before quantization.
     pub tone: Tone,
 }
 
-// TODO: Make rotation optional in templates because it depends on the image.
 impl Template {
     /// Copies settings so later preset edits cannot alter this template.
     pub fn capture(name: String, settings: &Settings) -> Self {
@@ -294,12 +366,15 @@ impl Template {
             seed: settings.seed,
             strength: settings.strength,
             serpentine: settings.serpentine,
-            scale: settings.scale,
+            card: settings.card.id,
+            dot: settings.dot,
+            margin: settings.margin,
+            bleed: settings.bleed,
             tone: settings.tone,
         }
     }
 
-    /// Restores saved settings while retaining the current rotation.
+    /// Restores saved settings while retaining the current rotation, zoom and pan.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
         let next = Settings {
@@ -307,7 +382,13 @@ impl Template {
             strength: self.strength,
             serpentine: self.serpentine,
             seed: self.seed,
-            scale: self.scale,
+            card: Card::from_id(self.card),
+            dot: self.dot,
+            margin: self.margin,
+            bleed: self.bleed,
+            zoom: settings.zoom,
+            pan_x: settings.pan_x,
+            pan_y: settings.pan_y,
             rotation: settings.rotation,
             palette_name: self.palette_name.clone(),
             palette_hex: self.palette_hex.clone(),
@@ -362,7 +443,9 @@ impl Templates {
             return Err("template name must not match a built-in preset".into());
         }
         build_palette(&template.palette_hex)?;
-        template.scale = Setting::Scale.clamp(f64::from(template.scale)) as i32;
+        template.dot = Setting::Dot.clamp(f64::from(template.dot)).round() as i32;
+        template.margin = Setting::Margin.clamp(f64::from(template.margin)).round() as i32;
+        template.bleed = Setting::Bleed.clamp(f64::from(template.bleed)).round() as i32;
         template.strength = Setting::Strength.clamp(template.strength);
         template.tone.brightness = Setting::Brightness.clamp(template.tone.brightness);
         template.tone.contrast = Setting::Contrast.clamp(template.tone.contrast);
@@ -387,8 +470,7 @@ impl Templates {
     }
 }
 
-/// Clockwise rotation applied to the grid after scaling. Not a panel row, the r
-/// and R keys change it.
+/// Clockwise source rotation inside the fixed card, changed by r and R.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rotation {
     /// Original orientation.
@@ -452,8 +534,20 @@ impl Rotation {
 /// Editable rows in the parameter panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Setting {
-    /// Grid size as a percentage of the source.
-    Scale,
+    /// Physical card preset.
+    Card,
+    /// Physical size of one dot.
+    Dot,
+    /// Paper border inside the card.
+    Margin,
+    /// Extra print area on every side.
+    Bleed,
+    /// Image magnification relative to cover.
+    Zoom,
+    /// Horizontal image alignment.
+    PanX,
+    /// Vertical image alignment.
+    PanY,
     /// Dither color model.
     Mode,
     /// Palette preset.
@@ -482,8 +576,14 @@ pub enum Setting {
 
 impl Setting {
     /// Parameter panel order.
-    pub const ALL: [Self; 13] = [
-        Self::Scale,
+    pub const ALL: [Self; 19] = [
+        Self::Card,
+        Self::Dot,
+        Self::Margin,
+        Self::Bleed,
+        Self::Zoom,
+        Self::PanX,
+        Self::PanY,
         Self::Mode,
         Self::Palette,
         Self::Dither,
@@ -502,7 +602,13 @@ impl Setting {
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
         let o = settings;
         match self {
-            Setting::Scale => format!("Scale: {}%", settings.scale),
+            Setting::Card => format!("Card: {}", o.card.label),
+            Setting::Dot => format!("Dot: {:.2} mm", f64::from(o.dot) / 100.0),
+            Setting::Margin => format!("Margin: {:.1} mm", f64::from(o.margin) / 10.0),
+            Setting::Bleed => format!("Bleed: {} mm", o.bleed),
+            Setting::Zoom => format!("Zoom: {:.2}x", f64::from(o.zoom) / 100.0),
+            Setting::PanX => format!("Pan X: {:+.2}", f64::from(o.pan_x) / 100.0),
+            Setting::PanY => format!("Pan Y: {:+.2}", f64::from(o.pan_y) / 100.0),
             Setting::Mode => format!("Mode: {:?}", o.mode),
             Setting::Palette => {
                 let matches = palettes.iter().any(|preset| settings.uses(preset));
@@ -559,12 +665,27 @@ impl Setting {
         }
     }
 
+    fn integer_mut(self, settings: &mut Settings) -> Option<&mut i32> {
+        match self {
+            Self::Dot => Some(&mut settings.dot),
+            Self::Margin => Some(&mut settings.margin),
+            Self::Bleed => Some(&mut settings.bleed),
+            Self::Zoom => Some(&mut settings.zoom),
+            Self::PanX => Some(&mut settings.pan_x),
+            Self::PanY => Some(&mut settings.pan_y),
+            _ => None,
+        }
+    }
+
     /// `(steps per unit, min, max)` for numeric parameters, with inclusive bounds.
-    /// Values snap to multiples of `1 / steps`, except Scale, which moves 10
-    /// percentage points per step.
+    /// Print controls use their stored integer units.
     pub fn range(self) -> Option<(f64, f64, f64)> {
         match self {
-            Self::Scale => Some((0.1, 10.0, 200.0)),
+            Self::Dot => Some((1.0, 8.0, 60.0)),
+            Self::Margin => Some((0.2, 0.0, 100.0)),
+            Self::Bleed => Some((1.0, 0.0, 3.0)),
+            Self::Zoom => Some((0.2, 30.0, 400.0)),
+            Self::PanX | Self::PanY => Some((0.2, -100.0, 100.0)),
             Self::Strength => Some((10.0, 0.0, 1.0)),
             Self::Brightness => Some((20.0, -0.5, 0.5)),
             Self::Contrast => Some((20.0, -0.5, 1.0)),
@@ -572,7 +693,12 @@ impl Setting {
             Self::Black => Some((100.0, 0.0, 0.5)),
             Self::White => Some((100.0, 0.5, 1.0)),
             Self::Sharpen => Some((20.0, 0.0, 3.0)),
-            Self::Mode | Self::Palette | Self::Dither | Self::Serpentine | Self::Seed => None,
+            Self::Card
+            | Self::Mode
+            | Self::Palette
+            | Self::Dither
+            | Self::Serpentine
+            | Self::Seed => None,
         }
     }
 
@@ -582,10 +708,18 @@ impl Setting {
         value.max(low).min(high)
     }
 
-    /// Whether changing this parameter switches the preview to Dithered. Scale
-    /// leaves the current choice alone.
+    /// Geometry controls retain the selected preview layer.
     pub fn shows_dithered(self) -> bool {
-        self != Self::Scale
+        !matches!(
+            self,
+            Self::Card
+                | Self::Dot
+                | Self::Margin
+                | Self::Bleed
+                | Self::Zoom
+                | Self::PanX
+                | Self::PanY
+        )
     }
 }
 
@@ -595,9 +729,21 @@ impl Setting {
 // built palette are three copies that every setter must keep in sync.
 #[derive(Clone, PartialEq)]
 pub struct Settings {
-    /// Grid size as a percentage of the source, 10 to 200.
-    pub scale: i32,
-    /// Rotation applied after scaling.
+    /// Physical card before bleed.
+    pub card: Card,
+    /// Dot size in hundredths of a millimetre.
+    pub dot: i32,
+    /// Margin in tenths of a millimetre.
+    pub margin: i32,
+    /// Bleed in whole millimetres.
+    pub bleed: i32,
+    /// Cover magnification in hundredths.
+    pub zoom: i32,
+    /// Horizontal alignment in hundredths.
+    pub pan_x: i32,
+    /// Vertical alignment in hundredths.
+    pub pan_y: i32,
+    /// Source rotation inside the card.
     pub rotation: Rotation,
     /// Selected preset name, also retained for palettes stored in templates.
     pub palette_name: String,
@@ -627,7 +773,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            scale: 100,
+            card: CARDS[0],
+            dot: 20,
+            margin: 0,
+            bleed: 0,
+            zoom: 100,
+            pan_x: 0,
+            pan_y: 0,
             rotation: Rotation::R0,
             palette_name: String::new(),
             palette_hex: Vec::new(),
@@ -644,6 +796,42 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Uses one millimetre per dot to preserve source pixels in grid tests.
+    #[cfg(test)]
+    pub fn for_pixels(w: u32, h: u32) -> Self {
+        Self {
+            card: Card {
+                id: "test",
+                label: "Test",
+                w_mm: w,
+                h_mm: h,
+            },
+            dot: 100,
+            ..Self::default()
+        }
+    }
+
+    /// Rejects grids above four million dots before allocation.
+    /// Preset cards and panel bounds always fit this limit.
+    pub fn grid_dimensions(&self) -> Result<(u32, u32), &'static str> {
+        if self.dot <= 0 || self.bleed < 0 {
+            return Err("invalid print dimensions");
+        }
+        let axis = |mm: u32| -> Option<u32> {
+            let units = u64::from(mm)
+                .checked_add(u64::try_from(self.bleed).ok()?.checked_mul(2)?)?
+                .checked_mul(100)?;
+            let dot = u64::try_from(self.dot).ok()?;
+            u32::try_from(((units.checked_mul(2)?.checked_add(dot)?) / (dot * 2)).max(8)).ok()
+        };
+        let w = axis(self.card.w_mm).ok_or("grid overflows")?;
+        let h = axis(self.card.h_mm).ok_or("grid overflows")?;
+        if u64::from(w) * u64::from(h) > MAX_DOTS {
+            return Err("grid exceeds four million dots");
+        }
+        Ok((w, h))
+    }
+
     /// Builds library options from the current panel values.
     ///
     /// Options are derived on demand rather than stored, so there is no second
@@ -707,7 +895,16 @@ impl Settings {
         }
         let mut defaults = Self::default();
         match setting {
-            Setting::Scale => next.scale = defaults.scale,
+            Setting::Card => next.card = defaults.card,
+            Setting::Dot
+            | Setting::Margin
+            | Setting::Bleed
+            | Setting::Zoom
+            | Setting::PanX
+            | Setting::PanY => {
+                *setting.integer_mut(&mut next).unwrap() =
+                    *setting.integer_mut(&mut defaults).unwrap();
+            }
             Setting::Mode => next.mode = defaults.mode,
             Setting::Palette => next = next.with_preset(&palettes.presets[0]),
             Setting::Dither => next.dither = defaults.dither,
@@ -732,9 +929,24 @@ impl Settings {
             setting.clamp(((value * steps).round() + f64::from(dir)) / steps)
         };
         match setting {
-            Setting::Scale => {
-                let (steps, _, _) = setting.range().expect("numeric parameter");
-                next.scale = setting.clamp(f64::from(self.scale) + f64::from(dir) / steps) as i32;
+            Setting::Card => {
+                let current = CARDS
+                    .iter()
+                    .position(|card| *card == self.card)
+                    .unwrap_or(0);
+                next.card = CARDS[wrap(current, dir, CARDS.len())];
+            }
+            Setting::Dot
+            | Setting::Margin
+            | Setting::Bleed
+            | Setting::Zoom
+            | Setting::PanX
+            | Setting::PanY => {
+                let (steps, _, _) = setting.range().unwrap();
+                let value = setting.integer_mut(&mut next).unwrap();
+                *value = setting
+                    .clamp(f64::from(*value) + f64::from(dir) / steps)
+                    .round() as i32;
             }
             Setting::Mode => {
                 next.mode = match self.mode {
@@ -758,6 +970,9 @@ impl Settings {
                 let value = setting.value_mut(&mut next).unwrap();
                 *value = step(*value);
             }
+        }
+        if next.grid_dimensions().is_err() {
+            return self.clone();
         }
         next
     }
@@ -1047,12 +1262,12 @@ mod tests {
     fn adjustments_use_unsnapped_steps_and_restore_each_default() {
         let palettes = Palettes::builtin();
         let settings = Settings {
-            scale: 105,
+            zoom: 103,
             ..Settings::default()
         };
-        let next = settings.adjusted(Setting::Scale, 1, &palettes);
-        assert_eq!(next.scale, 115);
-        assert_eq!(next.with_default(Setting::Scale, &palettes).scale, 100);
+        let next = settings.adjusted(Setting::Zoom, 1, &palettes);
+        assert_eq!(next.zoom, 108);
+        assert_eq!(next.with_default(Setting::Zoom, &palettes).zoom, 100);
         for setting in Setting::ALL {
             let next = settings.adjusted(setting, -1, &palettes);
             let reset = next.with_default(setting, &palettes);
@@ -1072,9 +1287,9 @@ mod tests {
         }
     }
     #[test]
-    fn templates_restore_snapshots_while_retaining_rotation() {
+    fn templates_restore_snapshots_while_retaining_composition() {
         let mut settings = Settings {
-            scale: 60,
+            dot: 60,
             rotation: Rotation::R90,
             ..Settings::default().with_preset(&Preset {
                 name: "Paper".into(),
@@ -1098,6 +1313,9 @@ mod tests {
         let mut template = Template::capture("Zine".into(), &settings);
         let current = Settings {
             rotation: Rotation::R270,
+            zoom: 135,
+            pan_x: -25,
+            pan_y: 45,
             ..Settings::default()
         };
         let restored = template.apply(&current).unwrap();
@@ -1105,16 +1323,19 @@ mod tests {
             restored
                 == Settings {
                     rotation: current.rotation,
+                    zoom: current.zoom,
+                    pan_x: current.pan_x,
+                    pan_y: current.pan_y,
                     ..settings
                 }
         );
-        template.scale = 100_000;
+        template.dot = 100_000;
         template.strength = f64::NAN;
         template.tone.gamma = 9.0;
         let mut templates = Templates::default();
         templates.upsert(template.clone()).unwrap();
         let clamped = templates.get(0).unwrap();
-        assert_eq!(clamped.scale, 200);
+        assert_eq!(clamped.dot, 60);
         assert_eq!(clamped.strength, 0.0);
         assert_eq!(clamped.tone.gamma, 2.5);
         template.palette_hex = vec!["invalid".into()];

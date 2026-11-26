@@ -27,7 +27,7 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
 
 /// Preview scale, ordered from the fitted image to enlarged dots.
 ///
-/// A dot is one pixel of the scaled and rotated grid. A terminal cell is about
+/// A dot is one pixel of the composed card grid. A terminal cell is about
 /// [`CELL_ASPECT`] times taller than wide, so it splits into a top and a bottom
 /// half cell that are nearly square. The status line prints [`Zoom::scale`] as a
 /// percentage, so 100% means one dot per cell column.

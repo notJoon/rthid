@@ -1,13 +1,13 @@
 //! rthid previews dithering of an image in the terminal.
 //!
-//! The source is loaded and shrunk once. `grid::GridCache` scales and rotates it into
+//! The source is loaded and shrunk once. `grid::GridCache` places it inside
 //! the grid and, when Dithered or a companion PNG needs it, dithers the grid
 //! into palette indices. `app::App` holds `settings::Settings` and the
 //! `viewport::Viewport`. `ui::draw` turns them into a frame through `cells` (cell glyphs) or `graphics`
 //! (terminal images), and `Export` writes the dithered grid to the companion PNG.
 //!
 //! Glossary:
-//! - Grid: the scaled and rotated image. Its pixels are also called dots.
+//! - Grid: the composed card image. Its pixels are also called dots.
 //! - Cell: one terminal character position.
 //! - Half block: the `▀` glyph whose fg and bg colors show two stacked dots in one cell.
 //! - Sextant and Quadrant: glyph sets for the sampled Dithered preview and minimap that split a
@@ -28,12 +28,14 @@ mod cells;
 mod export;
 /// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for Original at Fit.
 mod graphics;
-/// Source image, scaled grid and dithered indices caches.
+/// Source image, card grid and dithered indices caches.
 mod grid;
 /// Single entry caches with build versions.
 mod memo;
 /// Modal input and preset editing.
 mod modal;
+/// Physical card composition.
+mod print;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
