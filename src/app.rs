@@ -39,16 +39,26 @@ struct Drag {
     moved: bool,
 }
 
+enum Source {
+    Config,
+    Other,
+}
+
+struct Notice {
+    source: Source,
+    text: String,
+}
+
 /// All interactive state: settings, focus, preview viewport, grid caches and
 /// the optional companion PNG.
 pub struct App {
     export: Option<Export>,
     source_path: Option<PathBuf>,
-    notice: Option<String>,
+    notice: Option<Notice>,
     // TODO: Derive the Loading text from `open_request` and render it ahead of `notice` in the
     //       status line. Notices would then never need deferring, and this field and every
     //       `loading()` guard could go.
-    deferred_notice: Option<String>,
+    deferred_notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
     open_request: Option<OpenRequest>,
     // Last value handed out as a dialog generation or Open token.
@@ -85,7 +95,10 @@ impl App {
         preview_png: Option<PathBuf>,
         loaded: Loaded,
     ) -> Self {
-        let notice = loaded.notice();
+        let notice = loaded.notice().map(|text| Notice {
+            source: Source::Config,
+            text,
+        });
         let mut app = Self {
             export: preview_png.map(Export::new),
             source_path: None,
@@ -161,16 +174,23 @@ impl App {
 
     /// Current configuration diagnostic for the status line.
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.notice.as_ref().map(|notice| notice.text.as_str())
     }
 
     /// Reports a notice or defers it during loading, returning whether the display changed.
     pub fn set_notice(&mut self, notice: String) -> bool {
+        self.report_notice(Notice {
+            source: Source::Other,
+            text: notice,
+        })
+    }
+
+    fn report_notice(&mut self, notice: Notice) -> bool {
         if self.loading() {
             self.deferred_notice = Some(notice);
             return false;
         }
-        let changed = self.notice.as_ref() != Some(&notice);
+        let changed = self.notice() != Some(notice.text.as_str());
         self.notice = Some(notice);
         changed
     }
@@ -195,7 +215,10 @@ impl App {
     fn save_notice(&mut self, notice: SaveNotice) {
         match notice {
             SaveNotice::Show(notice) => {
-                self.set_notice(notice);
+                self.report_notice(Notice {
+                    source: Source::Config,
+                    text: notice,
+                });
             }
             SaveNotice::ClearConfig => {
                 let notice = if self.loading() {
@@ -203,7 +226,10 @@ impl App {
                 } else {
                     &mut self.notice
                 };
-                if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
+                if notice
+                    .as_ref()
+                    .is_some_and(|notice| matches!(notice.source, Source::Config))
+                {
                     *notice = None;
                 }
             }
@@ -260,8 +286,8 @@ impl App {
                     if result.is_ok()
                         && self
                             .notice
-                            .as_deref()
-                            .is_some_and(|notice| Some(notice) == export.status())
+                            .as_ref()
+                            .is_some_and(|notice| Some(notice.text.as_str()) == export.status())
                     {
                         self.notice = None;
                         changed = true;
@@ -326,12 +352,15 @@ impl App {
             token,
             dialog: self.dialog(),
         });
-        self.notice = Some(format!(
-            "Loading {}",
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-        ));
+        self.notice = Some(Notice {
+            source: Source::Other,
+            text: format!(
+                "Loading {}",
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+            ),
+        });
         let job = Job::Open {
             path,
             dir,
@@ -1299,7 +1328,12 @@ mod tests {
 
     #[test]
     fn save_notices_preserve_unrelated_errors() {
-        let mut app = App::empty();
+        let loaded =
+            crate::store::parse("version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n");
+        let mut app = App::new(None, None, loaded);
+        assert!(app.notice().unwrap().starts_with("config:"));
+        saved(&mut app, "");
+        assert!(app.notice().is_none());
         save_failed(&mut app);
         assert_eq!(app.notice(), Some("config: config is busy"));
         app.set_notice("open: failed".into());
@@ -1311,6 +1345,32 @@ mod tests {
         assert_eq!(app.notice(), Some("config: config is busy"));
         saved(&mut app, "");
         assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn successful_save_clears_only_deferred_config_notices() {
+        for config in [false, true] {
+            let mut app = App::empty();
+            app.request_open("photo.png".into(), None);
+            save_failed(&mut app);
+            if !config {
+                app.set_notice("open: failed".into());
+            }
+            saved(&mut app, "");
+            assert_eq!(app.notice(), Some("Loading photo.png"));
+            app.complete(done(
+                &app,
+                IoOutcome::Opened(Ok(Opened::Image {
+                    path: "photo.png".into(),
+                    image: RgbaImage::new(2, 3),
+                })),
+            ));
+            assert_eq!(
+                app.notice(),
+                if config { None } else { Some("open: failed") }
+            );
+            assert!(app.deferred_notice.is_none());
+        }
     }
 
     #[test]
