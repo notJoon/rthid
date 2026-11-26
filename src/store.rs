@@ -377,7 +377,7 @@ impl From<Template> for FileTemplate {
             seed: u64::from(t.seed),
             strength: t.strength,
             serpentine: t.serpentine,
-            card: t.card.into(),
+            card: t.card.id.into(),
             dot_mm: f64::from(t.dot) / 100.0,
             margin_mm: f64::from(t.margin) / 10.0,
             bleed_mm: f64::from(t.bleed),
@@ -397,10 +397,11 @@ impl From<FileTemplate> for Template {
             seed: t.seed.min(u64::from(u32::MAX)) as u32,
             strength: t.strength,
             serpentine: t.serpentine,
-            card: Card::from_id(&t.card).id,
-            dot: crate::settings::Setting::Dot.clamp((t.dot_mm * 100.0).round()) as i32,
-            margin: crate::settings::Setting::Margin.clamp((t.margin_mm * 10.0).round()) as i32,
-            bleed: crate::settings::Setting::Bleed.clamp(t.bleed_mm.round()) as i32,
+            card: Card::from_id(&t.card),
+            // Saturating casts only; `Templates::upsert` snaps and clamps every template.
+            dot: (t.dot_mm * 100.0).round() as i32,
+            margin: (t.margin_mm * 10.0).round() as i32,
+            bleed: t.bleed_mm.round() as i32,
             tone: t.tone.into(),
         }
     }
@@ -1141,7 +1142,7 @@ mod tests {
             "version = 1\n[[template]]\nname = 'Rounded'\ncard = 'unknown'\ndot_mm = 0.235\nmargin_mm = 1.56\nbleed_mm = 2.5\n",
         );
         let t = loaded.templates.get(0).unwrap();
-        assert_eq!(t.card, crate::settings::CARDS[0].id);
+        assert_eq!(t.card, crate::settings::CARDS[0]);
         assert_eq!((t.dot, t.margin, t.bleed), (24, 15, 3));
         for (mm, margin) in [("1.26", 15), ("1.24", 10), ("1.25", 15)] {
             let loaded = parse(&format!(

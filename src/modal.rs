@@ -453,7 +453,7 @@ pub(crate) fn template_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
                     template.palette_name,
                     crate::settings::mode_label(template.mode),
                     template.dither.label(),
-                    crate::settings::Card::from_id(template.card).label,
+                    template.card.label,
                     f64::from(template.dot) / 100.0
                 );
                 if template.margin != 0 {

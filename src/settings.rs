@@ -342,8 +342,8 @@ pub struct Template {
     pub strength: f64,
     /// Whether alternate rows run in reverse, saved like strength.
     pub serpentine: bool,
-    /// Stable card preset identifier.
-    pub card: &'static str,
+    /// Card preset, stored by id in configuration files.
+    pub card: Card,
     /// Dot size in hundredths of a millimetre.
     pub dot: i32,
     /// Margin in tenths of a millimetre.
@@ -366,7 +366,7 @@ impl Template {
             seed: settings.seed,
             strength: settings.strength,
             serpentine: settings.serpentine,
-            card: settings.card.id,
+            card: settings.card,
             dot: settings.dot,
             margin: settings.margin,
             bleed: settings.bleed,
@@ -382,7 +382,7 @@ impl Template {
             strength: self.strength,
             serpentine: self.serpentine,
             seed: self.seed,
-            card: Card::from_id(self.card),
+            card: self.card,
             dot: self.dot,
             margin: self.margin,
             bleed: self.bleed,
@@ -444,11 +444,13 @@ impl Templates {
             return Err("template name must not match a built-in preset".into());
         }
         build_palette(&template.palette_hex)?;
-        template.dot = Setting::Dot.clamp(f64::from(template.dot)).round() as i32;
-        // Margin steps by 0.5 mm (5 stored units), so snap off-grid values onto that grid.
-        template.margin =
-            Setting::Margin.clamp((f64::from(template.margin) / 5.0).round() * 5.0) as i32;
-        template.bleed = Setting::Bleed.clamp(f64::from(template.bleed)).round() as i32;
+        for (setting, value) in [
+            (Setting::Dot, &mut template.dot),
+            (Setting::Margin, &mut template.margin),
+            (Setting::Bleed, &mut template.bleed),
+        ] {
+            *value = setting.snap(f64::from(*value)).round() as i32;
+        }
         template.strength = Setting::Strength.clamp(template.strength);
         template.tone.brightness = Setting::Brightness.clamp(template.tone.brightness);
         template.tone.contrast = Setting::Contrast.clamp(template.tone.contrast);
@@ -711,6 +713,12 @@ impl Setting {
         value.max(low).min(high)
     }
 
+    /// Rounds to the nearest panel step, then clamps, so loaded values match keyboard steps.
+    pub fn snap(self, value: f64) -> f64 {
+        let (steps, _, _) = self.range().expect("numeric parameter");
+        self.clamp((value * steps).round() / steps)
+    }
+
     /// Geometry controls retain the selected preview layer.
     pub fn shows_dithered(self) -> bool {
         !matches!(
@@ -900,17 +908,12 @@ impl Settings {
             return next;
         }
         let mut defaults = Self::default();
+        if let Some(default) = setting.integer_mut(&mut defaults) {
+            *setting.integer_mut(&mut next).expect("integer setting") = *default;
+            return next;
+        }
         match setting {
             Setting::Card => next.card = defaults.card,
-            Setting::Dot
-            | Setting::Margin
-            | Setting::Bleed
-            | Setting::Zoom
-            | Setting::PanX
-            | Setting::PanY => {
-                *setting.integer_mut(&mut next).unwrap() =
-                    *setting.integer_mut(&mut defaults).unwrap();
-            }
             Setting::Mode => next.mode = defaults.mode,
             Setting::Palette => next = next.with_preset(&palettes.presets[0]),
             Setting::Dither => next.dither = defaults.dither,
@@ -934,47 +937,42 @@ impl Settings {
             let (steps, _, _) = setting.range().expect("numeric parameter");
             setting.clamp(((value * steps).round() + f64::from(dir)) / steps)
         };
-        match setting {
-            Setting::Card => {
-                let current = CARDS
-                    .iter()
-                    .position(|card| *card == self.card)
-                    .unwrap_or(0);
-                next.card = CARDS[wrap(current, dir, CARDS.len())];
-            }
-            Setting::Dot
-            | Setting::Margin
-            | Setting::Bleed
-            | Setting::Zoom
-            | Setting::PanX
-            | Setting::PanY => {
-                let (steps, _, _) = setting.range().unwrap();
-                let value = setting.integer_mut(&mut next).unwrap();
-                *value = setting
-                    .clamp(f64::from(*value) + f64::from(dir) / steps)
-                    .round() as i32;
-            }
-            Setting::Mode => {
-                next.mode = match self.mode {
-                    Mode::Tone => Mode::Color,
-                    Mode::Color => Mode::Tone,
+        if let Some(value) = setting.integer_mut(&mut next) {
+            let (steps, _, _) = setting.range().expect("numeric parameter");
+            *value = setting
+                .clamp(f64::from(*value) + f64::from(dir) / steps)
+                .round() as i32;
+        } else {
+            match setting {
+                Setting::Card => {
+                    let current = CARDS
+                        .iter()
+                        .position(|card| *card == self.card)
+                        .unwrap_or(0);
+                    next.card = CARDS[wrap(current, dir, CARDS.len())];
                 }
-            }
-            Setting::Palette => {
-                let current = palettes.find(&self.palette_name).unwrap_or(0);
-                let i = wrap(current, dir, palettes.len());
-                next = next.with_preset(&palettes.presets[i]);
-            }
-            Setting::Dither => {
-                let current = Dither::ALL.iter().position(|&d| d == self.dither).unwrap();
-                let i = wrap(current, dir, Dither::ALL.len());
-                next.dither = Dither::ALL[i];
-            }
-            Setting::Seed => next.seed = self.seed.saturating_add_signed(dir),
-            Setting::Serpentine => next.serpentine = !self.serpentine,
-            _ => {
-                let value = setting.value_mut(&mut next).unwrap();
-                *value = step(*value);
+                Setting::Mode => {
+                    next.mode = match self.mode {
+                        Mode::Tone => Mode::Color,
+                        Mode::Color => Mode::Tone,
+                    }
+                }
+                Setting::Palette => {
+                    let current = palettes.find(&self.palette_name).unwrap_or(0);
+                    let i = wrap(current, dir, palettes.len());
+                    next = next.with_preset(&palettes.presets[i]);
+                }
+                Setting::Dither => {
+                    let current = Dither::ALL.iter().position(|&d| d == self.dither).unwrap();
+                    let i = wrap(current, dir, Dither::ALL.len());
+                    next.dither = Dither::ALL[i];
+                }
+                Setting::Seed => next.seed = self.seed.saturating_add_signed(dir),
+                Setting::Serpentine => next.serpentine = !self.serpentine,
+                _ => {
+                    let value = setting.value_mut(&mut next).unwrap();
+                    *value = step(*value);
+                }
             }
         }
         if next.grid_dimensions().is_err() {

@@ -570,7 +570,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             f64::from(app.settings.dot) / 100.0,
             app.settings.rotation.degrees(),
             if app.settings.flip { " Flip" } else { "" },
-            app.dpi
+            app.export_dpi()
                 .and_then(|dpi| crate::print::png_size(&app.settings, dpi)
                     .ok()
                     .map(|(w, h)| { format!(" | PNG {w}x{h} @{dpi}dpi") }))
@@ -862,7 +862,8 @@ mod tests {
                     .contains("Z | Black/white | tone | Atkinson | Business 50x90 0.20 mm")
             );
             let mut print = crate::settings::Template::capture("P".into(), &Settings::default());
-            (print.card, print.dot, print.margin, print.bleed) = ("postcard", 12, 15, 3);
+            (print.card, print.dot, print.margin, print.bleed) =
+                (crate::settings::CARDS[5], 12, 15, 3);
             app.library.templates.upsert(print).unwrap();
             assert!(
                 template_rows(&app.modal_ctx()).iter().any(|row| row.to_string()
@@ -1407,18 +1408,26 @@ mod tests {
         let text = status(&app, &geometry, PreviewReport::default());
         assert!(text.starts_with("Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | "));
         assert!(!text.contains("PNG"));
-        app.dpi = Some(600);
+        let with_dpi = |dpi| {
+            let mut exporting = App::new(
+                Some(("test.png".into(), RgbaImage::new(8, 8))),
+                Some("p.png".into()),
+                Some(dpi),
+                crate::store::Loaded::default(),
+            );
+            exporting.settings = app.settings.clone();
+            exporting
+        };
         assert!(
-            status(&app, &geometry, PreviewReport::default())
+            status(&with_dpi(600), &geometry, PreviewReport::default())
                 .contains("Rot 90° Flip | PNG 1323x2268 @600dpi | ")
         );
         // Worst case: the widest PNG size and DPI still fit in 80 columns.
-        app.dpi = Some(4800);
         let report = PreviewReport {
             approximate: true,
             ..PreviewReport::default()
         };
-        let text = status(&app, &geometry, report);
+        let text = status(&with_dpi(4800), &geometry, report);
         let print =
             "Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | PNG 10583x18142 @4800dpi";
         assert!(text.starts_with(print), "{text}");

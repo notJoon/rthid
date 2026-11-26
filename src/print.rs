@@ -120,6 +120,20 @@ impl Placement {
             round(-(sh - f64::from(ah)) * (100.0 + f64::from(settings.pan_y)) / 200.0) as i64;
         Ok(result)
     }
+
+    /// Image area cells the resized source covers, as `(x0, y0, x1, y1)` with exclusive ends.
+    pub fn covered(&self) -> (u32, u32, u32, u32) {
+        let clip = |offset: i64, size: u32, area: u32| {
+            let area = i64::from(area);
+            (
+                offset.clamp(0, area) as u32,
+                (offset + i64::from(size)).clamp(0, area) as u32,
+            )
+        };
+        let (x0, x1) = clip(self.x, self.sw, self.aw);
+        let (y0, y1) = clip(self.y, self.sh, self.ah);
+        (x0, y0, x1, y1)
+    }
 }
 
 #[cfg(test)]

@@ -66,34 +66,20 @@ impl GridCache {
                 if placement.flip {
                     imageops::flip_horizontal_in_place(&mut rotated);
                 }
-                let left = (-placement.x).max(0) as u32;
-                let top = (-placement.y).max(0) as u32;
-                let right =
-                    (i64::from(placement.aw) - placement.x).min(i64::from(placement.sw)) as u32;
-                let bottom =
-                    (i64::from(placement.ah) - placement.y).min(i64::from(placement.sh)) as u32;
+                let (x0, y0, x1, y1) = placement.covered();
+                let left = (i64::from(x0) - placement.x) as u32;
+                let top = (i64::from(y0) - placement.y) as u32;
                 let resized = resize_region(
                     &rotated,
                     (placement.sw, placement.sh),
-                    (left, top, right - left, bottom - top),
+                    (left, top, x1 - x0, y1 - y0),
                 );
-                for y in 0..placement.ah {
-                    for x in 0..placement.aw {
-                        let sx = i64::from(x) - placement.x;
-                        let sy = i64::from(y) - placement.y;
-                        if sx >= 0
-                            && sx < i64::from(placement.sw)
-                            && sy >= 0
-                            && sy < i64::from(placement.sh)
-                        {
-                            grid.put_pixel(
-                                x + placement.inset,
-                                y + placement.inset,
-                                *resized.get_pixel(sx as u32 - left, sy as u32 - top),
-                            );
-                        }
-                    }
-                }
+                imageops::replace(
+                    &mut grid,
+                    &resized,
+                    i64::from(placement.inset + x0),
+                    i64::from(placement.inset + y0),
+                );
             }
             grid
         });
@@ -127,21 +113,13 @@ impl GridCache {
                         placement.ah as usize,
                         &options,
                     );
-                    for y in 0..placement.ah {
-                        for x in 0..placement.aw {
-                            let sx = i64::from(x) - placement.x;
-                            let sy = i64::from(y) - placement.y;
-                            if sx >= 0
-                                && sx < i64::from(placement.sw)
-                                && sy >= 0
-                                && sy < i64::from(placement.sh)
-                            {
-                                indices[((y + placement.inset) * placement.width
-                                    + x
-                                    + placement.inset)
-                                    as usize] = pixels[(y * placement.aw + x) as usize];
-                            }
-                        }
+                    let (x0, y0, x1, y1) = placement.covered();
+                    let (x0, x1) = (x0 as usize, x1 as usize);
+                    for y in y0..y1 {
+                        let src = (y * placement.aw) as usize;
+                        let dst =
+                            ((y + placement.inset) * placement.width + placement.inset) as usize;
+                        indices[dst + x0..dst + x1].copy_from_slice(&pixels[src + x0..src + x1]);
                     }
                 }
                 indices

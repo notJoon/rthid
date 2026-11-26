@@ -1,8 +1,8 @@
 //! Companion PNG destination and latest write error.
 
-use rthid_dither::dither::PaletteColor;
+use crate::settings::Settings;
 use rthid_io::io::{Cause, IoError, Job, Op};
-use rthid_render::{Grid, check_output_size};
+use rthid_render::{Grid, check_output_size, preview_size};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -11,13 +11,23 @@ use std::{
 /// Companion PNG destination and latest status.
 pub struct Export {
     path: PathBuf,
+    dpi: Option<u32>,
     error: Option<String>,
 }
 
 impl Export {
-    /// Retains the destination for future writes.
-    pub fn new(path: PathBuf) -> Self {
-        Self { path, error: None }
+    /// Retains the destination and optional physical resolution for future writes.
+    pub fn new(path: PathBuf, dpi: Option<u32>) -> Self {
+        Self {
+            path,
+            dpi,
+            error: None,
+        }
+    }
+
+    /// Physical PNG resolution, `None` for the integer preview scale.
+    pub fn dpi(&self) -> Option<u32> {
+        self.dpi
     }
 
     /// Destination protected from being opened as the source.
@@ -29,22 +39,20 @@ impl Export {
     ///
     /// # Errors
     /// Returns an export error if the grid, palette indices or output size are invalid.
-    pub fn job(
-        &self,
-        indices: &[u8],
-        w: u32,
-        h: u32,
-        palette: &[PaletteColor],
-        size: (u32, u32),
-        dpi: Option<u32>,
-    ) -> Result<Job, IoError> {
+    pub fn job(&self, indices: &[u8], w: u32, h: u32, settings: &Settings) -> Result<Job, IoError> {
         let invalid = |error| IoError {
             op: Op::Encode,
             path: self.path.clone(),
             cause: Cause::Io(error),
         };
-        check_output_size(size).map_err(invalid)?;
-        let grid = Grid::new(indices.to_vec(), w, h, palette.to_vec()).map_err(invalid)?;
+        let size = match self.dpi {
+            Some(dpi) => crate::print::png_size(settings, dpi),
+            None => Ok(preview_size(w, h)),
+        }
+        .and_then(|size| check_output_size(size).map(|()| size))
+        .map_err(invalid)?;
+        let grid = Grid::new(indices.to_vec(), w, h, settings.palette.clone()).map_err(invalid)?;
+        let dpi = self.dpi;
         Ok(Job::Export {
             path: self.path.clone(),
             write: Box::new(move |file| rthid_render::write_png(file, &grid, size, dpi)),
@@ -79,8 +87,8 @@ mod tests {
 
     #[test]
     fn invalid_grid_fails_before_submission() {
-        let mut export = Export::new("preview.png".into());
-        let error = export.job(&[], 1, 1, &[], (1, 1), None).err().unwrap();
+        let mut export = Export::new("preview.png".into(), None);
+        let error = export.job(&[], 1, 1, &Settings::default()).err().unwrap();
         assert!(
             matches!(&error.cause, Cause::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
         );

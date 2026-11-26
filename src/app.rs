@@ -73,8 +73,6 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
-    /// Optional physical PNG resolution selected at startup.
-    pub dpi: Option<u32>,
     /// Preview zoom, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
@@ -104,8 +102,7 @@ impl App {
         loaded: Loaded,
     ) -> Self {
         let mut app = Self {
-            export: preview_png.map(Export::new),
-            dpi,
+            export: preview_png.map(|path| Export::new(path, dpi)),
             source_path: None,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
@@ -437,26 +434,12 @@ impl App {
             && let Some(export) = &mut self.export
         {
             let (w, h) = self.grid_cache.grid().expect("processed grid").dimensions();
-            let size = match self.dpi {
-                Some(dpi) => crate::print::png_size(&self.settings, dpi),
-                None => Ok(rthid_render::preview_size(w, h)),
-            };
-            let job = size
-                .map_err(|error| rthid_io::io::IoError {
-                    op: rthid_io::io::Op::Encode,
-                    path: export.path().to_owned(),
-                    cause: rthid_io::io::Cause::Io(error),
-                })
-                .and_then(|size| {
-                    export.job(
-                        self.grid_cache.dithered().expect("dithered grid"),
-                        w,
-                        h,
-                        &self.settings.palette,
-                        size,
-                        self.dpi,
-                    )
-                });
+            let job = export.job(
+                self.grid_cache.dithered().expect("dithered grid"),
+                w,
+                h,
+                &self.settings,
+            );
             match job {
                 Ok(job) => self.outbox.push((job, 0)),
                 Err(error) => {
@@ -469,6 +452,11 @@ impl App {
     /// Whether companion PNG output needs every new dither while Original is shown.
     pub fn has_export(&self) -> bool {
         self.export.is_some()
+    }
+
+    /// Physical companion PNG resolution, when `--dpi` was given.
+    pub fn export_dpi(&self) -> Option<u32> {
+        self.export.as_ref().and_then(Export::dpi)
     }
 
     /// Latest companion PNG error for the status line.
