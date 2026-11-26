@@ -18,6 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The hidden cursor stays on the status line between frames, so terminals that
+  mark the cursor row, like iTerm2 with its cursor guide, no longer show that
+  mark jumping around the preview
 - Original at Fit is visible again in iTerm2, which answered the Kitty graphics
   query but drew nothing for its placeholder cells, so the preview went blank
   at Fit and after zooming back out; iTerm2 now uses its own image protocol
