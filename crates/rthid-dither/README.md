@@ -37,6 +37,14 @@ Atkinson, Floyd Steinberg, Jarvis Judice Ninke, Stucki or Sierra Lite through it
 `kernel` field, with `serpentine` and `strength` controlling traversal and error.
 Atkinson spreads only 3/4 of the error. The other kernels spread the full error.
 
+Bayer offers ordered thresholds at sizes 2, 4 and 8, while Noise offers reproducible seeded thresholds.
+
+```rust
+# use rthid_dither::dither::{Algorithm, BayerSize, Options};
+let bayer = Options { algorithm: Algorithm::Bayer(BayerSize::Four), ..Options::default() };
+let noise = Options { algorithm: Algorithm::Noise { seed: 0 }, ..Options::default() };
+```
+
 `rasterize` expands the indices to opaque RGBA pixels using nearest-neighbor sampling; its output width
 and height may differ from the input grid's dimensions.
 
@@ -76,7 +84,7 @@ color callback can map indices differently without changing dithering.
 errors include the input text and its 1-based position.
 
 `dither` panics on mismatched RGBA dimensions or palettes outside 1 to 256 colors.
-All numeric options must be finite, gamma must be positive, and algorithm strength
+All numeric options must be finite, gamma must be positive, and diffusion strength
 must be within `0.0..=1.0`. These checks also
 apply to single-color palettes. Other finite adjustments are accepted without
 imposing UI-specific ranges. Alpha is ignored rather than composited.

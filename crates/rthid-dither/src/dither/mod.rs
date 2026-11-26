@@ -1,12 +1,14 @@
-//! Error diffusion into palette indices with a selectable kernel.
+//! Palette indices from error diffusion or thresholds.
 //!
 //! Atkinson is the default and spreads only 3/4 of the error to keep highlights
-//! and shadows clean. Tone mode diffuses luminance only. Color mode diffuses RGB
-//! and picks the nearest palette color.
+//! and shadows clean. Tone mode quantizes luminance. Color mode picks the
+//! nearest palette color after diffusion or a threshold offset.
 
 mod diffusion;
+mod threshold;
 
 pub use diffusion::{Diffusion, Kernel};
+pub use threshold::bayer::BayerSize;
 
 /// A palette color in byte channels.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,16 +50,15 @@ impl Default for Tone {
     }
 }
 
-/// Color space used to diffuse quantization error.
+/// Color model used to quantize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
-    /// Quantizes luminance to evenly spaced levels, one per palette index, and
-    /// diffuses luminance error. The palette colors themselves do not affect the
-    /// choice, so this suits palettes evenly spaced in brightness.
+    /// Quantizes luminance to evenly spaced levels with diffusion or thresholds.
+    /// Palette colors do not affect the choice, so use evenly spaced brightness.
     #[default]
     Tone,
-    /// Diffuses RGB error and picks the nearest palette color by squared
-    /// distance weighted 2, 4 and 3 for red, green and blue.
+    /// Picks the nearest palette color after RGB diffusion or a threshold offset.
+    /// Squared distance weights red, green and blue by 2, 4 and 3.
     Color,
 }
 
@@ -66,6 +67,15 @@ pub enum Mode {
 pub enum Algorithm {
     /// Passes quantization error to neighboring pixels.
     Diffusion(Diffusion),
+    /// Ordered dithering with a recursive Bayer matrix. Ignores serpentine and
+    /// strength and scans rows left to right.
+    Bayer(BayerSize),
+    /// Random thresholds from a seeded generator, reproducible for the same seed.
+    /// Ignores serpentine and strength and scans rows left to right.
+    Noise {
+        /// Initial state for reproducible thresholds.
+        seed: u64,
+    },
 }
 
 impl Default for Algorithm {
@@ -79,6 +89,7 @@ impl Algorithm {
     pub fn diffusion(&self) -> Option<&Diffusion> {
         match self {
             Self::Diffusion(d) => Some(d),
+            Self::Bayer(_) | Self::Noise { .. } => None,
         }
     }
 
@@ -86,6 +97,7 @@ impl Algorithm {
     pub fn diffusion_mut(&mut self) -> Option<&mut Diffusion> {
         match self {
             Self::Diffusion(d) => Some(d),
+            Self::Bayer(_) | Self::Noise { .. } => None,
         }
     }
 }
@@ -97,7 +109,7 @@ pub struct Options {
     /// Colors sorted darkest first, as built by `make_palette`. Output indices
     /// point into it, and Tone mode relies on the order.
     pub palette: Vec<PaletteColor>,
-    /// Error diffusion color model.
+    /// Color model used to quantize.
     pub mode: Mode,
     /// Method used to quantize pixels.
     pub algorithm: Algorithm,
@@ -225,6 +237,7 @@ fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
                 d.strength
             );
         }
+        Algorithm::Bayer(_) | Algorithm::Noise { .. } => {}
     }
     for (name, value) in [
         ("brightness", options.tone.brightness),
@@ -286,7 +299,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let mut channels = to_channels(rgba, w, h, &options.tone);
     let mut out = vec![0; n];
     let levels = (palette.len() - 1) as f64;
-    // Tone mode diffuses error through luminance alone.
+    // Tone mode quantizes luminance alone.
     let work = match options.mode {
         Mode::Tone => {
             // Luminance replaces the red buffer, rounded to f32 like every stored value.
@@ -302,6 +315,26 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         Algorithm::Diffusion(d) => {
             diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d, &mut out)
         }
+        Algorithm::Bayer(size) => threshold::threshold(
+            work,
+            w,
+            h,
+            options.mode,
+            levels,
+            &colors,
+            threshold::bayer::threshold(size),
+            &mut out,
+        ),
+        Algorithm::Noise { seed } => threshold::threshold(
+            work,
+            w,
+            h,
+            options.mode,
+            levels,
+            &colors,
+            |x, y| threshold::noise::splitmix64(seed, (y * w + x) as u64),
+            &mut out,
+        ),
     }
     out
 }

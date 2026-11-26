@@ -179,9 +179,13 @@ pub struct Template {
 impl Template {
     /// Copies settings so later preset edits cannot alter this template.
     pub fn capture(name: String, settings: &Settings) -> Self {
-        let (strength, serpentine) = match settings.options.algorithm {
-            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
-        };
+        let d = settings
+            .options
+            .algorithm
+            .diffusion()
+            .copied()
+            .unwrap_or_default();
+        let (strength, serpentine) = (d.strength, d.serpentine);
         Self {
             name,
             palette_name: settings.palette_name.clone(),
@@ -197,9 +201,13 @@ impl Template {
     /// Restores saved settings while retaining the current rotation and kernel.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
-        let kernel = match settings.options.algorithm {
-            Algorithm::Diffusion(d) => d.kernel,
-        };
+        let kernel = settings
+            .options
+            .algorithm
+            .diffusion()
+            .copied()
+            .unwrap_or_default()
+            .kernel;
         Ok(Settings {
             scale: self.scale,
             rotation: settings.rotation,
@@ -395,9 +403,8 @@ impl Setting {
     /// Label including the current value.
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
         let o = &settings.options;
-        let (strength, serpentine) = match o.algorithm {
-            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
-        };
+        let d = o.algorithm.diffusion().copied().unwrap_or_default();
+        let (strength, serpentine) = (d.strength, d.serpentine);
         match self {
             Setting::Scale => format!("Scale: {}%", settings.scale),
             Setting::Mode => format!("Mode: {:?}", o.mode),
@@ -511,9 +518,13 @@ impl Settings {
     pub fn with_default(&self, setting: Setting, palettes: &Palettes) -> Self {
         let mut next = self.clone();
         let defaults = Self::default();
-        let (strength, serpentine) = match defaults.options.algorithm {
-            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
-        };
+        let d = defaults
+            .options
+            .algorithm
+            .diffusion()
+            .copied()
+            .unwrap_or_default();
+        let (strength, serpentine) = (d.strength, d.serpentine);
         match setting {
             Setting::Scale => next.scale = defaults.scale,
             Setting::Mode => next.options.mode = defaults.options.mode,

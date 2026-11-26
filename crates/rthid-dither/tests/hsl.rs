@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use image::RgbaImage;
 use rthid_dither::dither::{
-    Algorithm, Diffusion, Kernel, Mode, Options, Tone, dither, make_palette,
+    Algorithm, BayerSize, Diffusion, Kernel, Mode, Options, Tone, dither, make_palette,
 };
 
 const PALETTE: [&str; 4] = ["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"];
@@ -123,5 +123,93 @@ fn hsl_color_sierra_lite_matches_golden() {
     check(
         color_options(Kernel::SierraLite),
         include_bytes!("fixtures/hsl_color_sierra_lite.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_bayer2_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Two),
+            ..tone_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_tone_bayer2.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_bayer4_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Four),
+            ..tone_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_tone_bayer4.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_bayer8_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Eight),
+            ..tone_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_tone_bayer8.idx"),
+    );
+}
+
+#[test]
+fn hsl_tone_noise_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Noise { seed: 0 },
+            ..tone_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_tone_noise.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_bayer2_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Two),
+            ..color_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_color_bayer2.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_bayer4_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Four),
+            ..color_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_color_bayer4.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_bayer8_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Bayer(BayerSize::Eight),
+            ..color_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_color_bayer8.idx"),
+    );
+}
+
+#[test]
+fn hsl_color_noise_matches_golden() {
+    check(
+        Options {
+            algorithm: Algorithm::Noise { seed: 0 },
+            ..color_options(Kernel::Atkinson)
+        },
+        include_bytes!("fixtures/hsl_color_noise.idx"),
     );
 }
