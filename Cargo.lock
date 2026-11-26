@@ -2105,6 +2105,7 @@ dependencies = [
  "ratatui-image",
  "rthid-dither",
  "rthid-io",
+ "rthid-render",
  "rthid-term",
  "rthid-widgets",
  "serde",
@@ -2125,6 +2126,14 @@ version = "0.2.0"
 dependencies = [
  "image",
  "libc",
+ "tempfile",
+]
+
+[[package]]
+name = "rthid-render"
+version = "0.1.0"
+dependencies = [
+ "image",
  "rthid-dither",
  "tempfile",
 ]

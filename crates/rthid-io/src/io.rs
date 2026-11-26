@@ -3,11 +3,13 @@
 //! This is not a queue that guarantees every submission will run. See [`IO`] for replacement
 //! and shutdown policies.
 
-use crate::{dir::Listing, png};
+use crate::dir::Listing;
 use image::RgbaImage;
 use std::{
     collections::VecDeque,
-    fmt, io,
+    fmt,
+    fs::File,
+    io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -26,7 +28,7 @@ pub(crate) enum Kind {
     Open,
     /// List a directory.
     List,
-    /// Write a PNG grid. Coalesces across paths because the companion path is fixed for a run.
+    /// Write an export. Coalesces across paths because the export destination is fixed for a run.
     Export,
     /// Replace a text file under its lock. Coalesces across paths, so each edit carries every
     /// unsaved change.
@@ -52,19 +54,21 @@ pub enum Job {
         path: PathBuf,
         /// Base directory for relative paths.
         dir: Option<PathBuf>,
-        /// Companion PNG path that must never be opened as the source.
+        /// Protected export destination that must never be opened as the source.
         protect: Option<PathBuf>,
     },
     /// List the given directory.
     List(PathBuf),
-    /// Encode a grid at the destination.
+    /// Runs an encoder into a temporary file and replaces the destination only on success.
     ///
     /// A newer Export replaces a queued Export regardless of its destination path.
     Export {
-        /// PNG destination.
+        /// Export destination.
         path: PathBuf,
-        /// Pixels and palette to encode.
-        grid: png::Grid,
+        /// Encoder carrying its owned output snapshot.
+        // Archive formats may need Seek, and the file stays the single owner of the temporary path.
+        #[allow(clippy::type_complexity)]
+        write: Box<dyn FnOnce(&mut File) -> io::Result<()> + Send>,
     },
     /// Rewrite a text file from its current contents under an advisory lock.
     ///
@@ -126,7 +130,7 @@ pub enum Outcome {
     Opened(Result<Opened, IoError>),
     /// A directory was listed.
     Listed(Result<Listing, IoError>),
-    /// A PNG was exported.
+    /// A file was exported.
     Exported(Result<PathBuf, IoError>),
     /// A text file was replaced.
     Updated(Result<Updated, IoError>),
@@ -222,7 +226,7 @@ pub enum Op {
     Decode,
     /// List a directory.
     List,
-    /// Encode a PNG.
+    /// Run an export encoder.
     Encode,
     /// Replace a text file.
     Save,
@@ -257,7 +261,7 @@ pub enum Cause {
     Io(io::Error),
     /// Image decoding failed.
     Decode(image::ImageError),
-    /// The companion PNG resolves to this source path, which must not be overwritten.
+    /// The protected export destination resolves to this source path, which must not be overwritten.
     IsSource(PathBuf),
     /// A job panicked, with its message when available.
     Panicked(String),
@@ -655,9 +659,8 @@ fn execute(
             })))
         }
         Job::List(_) => listing(path).map(|listing| Outcome::Listed(Ok(listing))),
-        Job::Export { grid, .. } => {
-            png::write_atomic(path, &grid, png::preview_scale(grid.w, grid.h))
-                .map_err(Cause::Io)?;
+        Job::Export { write, .. } => {
+            crate::atomic::replace(path, write).map_err(Cause::Io)?;
             Ok(Outcome::Exported(Ok(path.clone())))
         }
         Job::Update { wait, edit, .. } => {
@@ -692,17 +695,12 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rthid_dither::dither::make_palette;
+    use std::io::Write;
 
     fn export(path: PathBuf, white: bool) -> Job {
         Job::Export {
             path,
-            grid: png::Grid {
-                indices: vec![u8::from(white)],
-                w: 1,
-                h: 1,
-                palette: make_palette(&["#000", "#fff"]).unwrap(),
-            },
+            write: Box::new(move |file| file.write_all(&[u8::from(white)])),
         }
     }
 
@@ -734,6 +732,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_export_preserves_destination_and_reports_encode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export");
+        std::fs::write(&path, b"old").unwrap();
+        let mut worker = IO::new(None).unwrap();
+        worker.submit(
+            Job::Export {
+                path: path.clone(),
+                write: Box::new(|file| {
+                    file.write_all(b"partial")?;
+                    Err(io::Error::other("encoder failed"))
+                }),
+            },
+            7,
+        );
+        let done = wait(&mut worker);
+        assert_eq!(
+            (done.tag, done.op(), done.path()),
+            (7, Op::Encode, path.as_path())
+        );
+        assert!(matches!(done.outcome,
+            Outcome::Exported(Err(IoError { cause: Cause::Io(error), .. }))
+                if error.to_string() == "encoder failed"));
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        assert!(worker.finish().is_empty());
+    }
+
+    #[test]
     fn exports_coalesce_and_only_the_latest_completion_is_polled() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
@@ -757,9 +783,7 @@ mod tests {
         assert!(done.elapsed > Duration::ZERO);
         let path = done.path().to_path_buf();
         assert!(matches!(done.outcome, Outcome::Exported(Ok(_))));
-        let image = image::open(path).unwrap().to_rgba8();
-        assert_eq!(image.dimensions(), (4, 4));
-        assert!(image.pixels().all(|pixel| pixel.0 == [255; 4]));
+        assert_eq!(std::fs::read(path).unwrap(), [1]);
         assert!(!worker.busy());
         assert!(worker.poll().is_none());
         assert!(worker.finish().is_empty());

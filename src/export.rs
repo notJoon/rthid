@@ -1,10 +1,8 @@
 //! Companion PNG destination and latest write error.
 
 use rthid_dither::dither::PaletteColor;
-use rthid_io::{
-    io::{Cause, IoError, Job, Op},
-    png::Grid,
-};
+use rthid_io::io::{Cause, IoError, Job, Op};
+use rthid_render::{Grid, preview_size};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -30,7 +28,7 @@ impl Export {
     /// Copies the current grid into an owned export job.
     ///
     /// # Errors
-    /// Returns an export error if the grid cannot be encoded at the preview scale.
+    /// Returns an export error if the grid dimensions or palette indices are invalid.
     pub fn job(
         &self,
         indices: &[u8],
@@ -46,7 +44,9 @@ impl Export {
             })?;
         Ok(Job::Export {
             path: self.path.clone(),
-            grid,
+            write: Box::new(move |file| {
+                rthid_render::write_png(file, &grid, preview_size(grid.w, grid.h))
+            }),
         })
     }
 
@@ -86,7 +86,7 @@ mod tests {
         export.complete(Err(&error));
         assert_eq!(
             export.status(),
-            Some("PNG preview.png: PNG grid size mismatch")
+            Some("PNG preview.png: grid has 0 indices, expected 1x1 = 1")
         );
     }
 }

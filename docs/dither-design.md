@@ -228,11 +228,11 @@ at the entry point so loops never hit range errors or silently wrong results:
 An empty image that meets the contract returns empty indices. A single color
 palette returns all zeros only after validation, so it never bypasses the gamma
 or strength checks. Messages include the actual and expected values where
-possible. `dither`, the validation helpers and `rasterize` use `#[track_caller]`
-so panics point at the caller.
+possible. `dither` and the validation helpers use `#[track_caller]` so panics
+point at the caller. Rasterization now lives in `rthid-render`.
 
 Palette parsing is a user editing path, so `make_palette` returns
-`Result<Vec<PaletteColor>, String>` with the invalid text and its one based
+`Result<Vec<PaletteColor>, PaletteError>` with the invalid text and its one based
 position. These two error styles are deliberately not merged.
 
 Validation does not promise that any size can be allocated or that extreme
@@ -354,12 +354,10 @@ themselves establish image quality or results on every platform.
 
 ## Out of scope and planned later
 
-The algorithm engine and its app, settings and cache wiring are done. These are
-later steps:
+The algorithm engine and its app, settings and cache wiring are done.
+`rthid-render` owns rasterization and PNG encoding. The app passes an owned
+encoder closure to `rthid-io` for atomic replacement. These are later steps:
 
-- A render crate that takes over `rasterize` and PNG encoding. Today
-  `rasterize` lives in `rthid-dither` and files go through `rthid-io`.
-- General output jobs from the app instead of PNG and grid specific IO jobs.
 - Cards, bleed, margins, dot size, composition and exact print sizes from DPI.
 - A ZIP export with one plate per ink, a composite PNG and a description file,
   all built from the same indices.

@@ -32,6 +32,7 @@ jobs:
       widgets: ${{ steps.filter.outputs.widgets }}
       dither: ${{ steps.filter.outputs.dither }}
       io: ${{ steps.filter.outputs.io }}
+      render: ${{ steps.filter.outputs.render }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -48,10 +49,13 @@ jobs:
             dither:
               - *shared
               - 'crates/rthid-dither/**'
+            render:
+              - *shared
+              - 'crates/rthid-render/**'
+              - 'crates/rthid-dither/**'
             io:
               - *shared
               - 'crates/rthid-io/**'
-              - 'crates/rthid-dither/**'
             term:
               - *shared
               - 'crates/rthid-term/**'
@@ -116,6 +120,18 @@ jobs:
       - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:io
+
+  render:
+    # Unit tests, doctests and rustdoc warnings for rthid-render.
+    # The crate has no platform sensitive goldens, so one runner is enough.
+    needs: changes
+    if: needs.changes.outputs.render == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci:render
 
   coverage:
     # Report only. Coverage does not depend on the OS, so one runner is enough.

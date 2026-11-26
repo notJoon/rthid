@@ -7,6 +7,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- Remove the `png` module. Use `rthid_render` for grids and PNG encoding,
+  and `rthid_io::atomic::replace` for atomic file replacement.
+  `Job::Export { grid }` becomes `Job::Export { write }`. The closure chooses the
+  output size. Grid errors no longer embed the path, read `IoError::path`.
+
+  Before:
+  ```rust,ignore
+  use rthid_io::{png::{Grid, preview_scale, write_atomic}, io::Job};
+
+  let grid = Grid::new(indices, w, h, palette)?;
+  write_atomic(&path, &grid, preview_scale(grid.w, grid.h))?;
+  let job = Job::Export { path, grid };
+  ```
+
+  After:
+  ```rust,ignore
+  use rthid_render::{Grid, preview_size, write_png};
+  use rthid_io::{atomic::replace, io::Job};
+
+  let grid = Grid::new(indices, w, h, palette)?;
+  replace(&path, |file| write_png(file, &grid, preview_size(grid.w, grid.h)))?;
+  let job = Job::Export {
+      path,
+      write: Box::new(move |file| {
+          write_png(file, &grid, preview_size(grid.w, grid.h))
+      }),
+  };
+  ```
+
 - Open filesystem errors: `Cause::Decode(ImageError::IoError(error))` -> `Cause::Io(error)`, match `kind()` directly
 - Source protection: `Cause::IsSource` -> `Cause::IsSource(path)`, match the carried source path
 - Error text: config wording and generic grid failures -> path aware file errors and specific grid checks, update text assertions while retaining error kind checks
@@ -14,9 +43,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `Grid::new` validates sizes, palette indices and preview scale before submission
 - Error contracts for fallible APIs and process panic hook guidance for `WORKER_NAME` and `panic_message`
-- Executable, compile-checked examples for synchronous config updates and background PNG exports
+- Executable, compile-checked examples for synchronous config updates and background exports
 - Public contracts for latest-only jobs across paths, full unsaved Update snapshots, bounded
   shutdown, temporary-file cleanup, and preview image limits
 

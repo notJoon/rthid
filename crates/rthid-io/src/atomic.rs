@@ -1,4 +1,4 @@
-//! Shared file replacement for PNG exports and configuration.
+//! Atomic file replacement for exports and configuration.
 //!
 //! Saving splits hard links and replaces read only destinations when the parent permits it.
 //! A config bind mounted as a single file cannot be replaced and fails to save.
@@ -186,6 +186,40 @@ pub fn update<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn replacements_through_symlinks_keep_the_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("actual.jpg");
+        let alias = dir.path().join("link.png");
+        symlink("actual.jpg", &alias).unwrap();
+        let bytes = b"image bytes";
+        replace(&alias, |file| file.write_all(bytes)).unwrap();
+        assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn updates_reject_a_fifo() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("config");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = crate::atomic::update::<()>(&fifo, std::time::Duration::from_secs(1), |_| {
+            panic!("must not read a FIFO")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+    }
 
     #[test]
     fn regular_file_checks_include_the_path() {
@@ -385,15 +419,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/file");
         assert!(replace(&path, |file| file.write_all(b"original")).is_err());
+        assert!(!path.parent().unwrap().exists());
         fs::create_dir(path.parent().unwrap()).unwrap();
         replace(&path, |file| file.write_all(b"original")).unwrap();
-        assert!(
-            replace(&path, |file| {
-                file.write_all(b"partial")?;
-                Err(io::Error::other("failed"))
-            })
-            .is_err()
-        );
+        let error = replace(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "failed");
         assert!(std::panic::catch_unwind(|| replace(&path, |_| panic!("write panic"))).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);

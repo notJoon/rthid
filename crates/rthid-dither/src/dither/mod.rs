@@ -440,53 +440,6 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     }
 }
 
-/// Convenience helper to turn indices into opaque RGBA for previews and examples.
-/// Both `grid` and `out` are `(width, height)`. Uses nearest neighbor sampling.
-/// Returns an empty vector if either output dimension is zero.
-///
-/// Panics if the grid is empty with nonempty output, if the grid size overflows
-/// or does not match `idx.len()`, or if the output byte count overflows. Panics
-/// report the caller's location. `color_of` must accept every index in `idx`. It
-/// is called for sampled indices and any panic inside it propagates.
-#[track_caller]
-pub fn rasterize(
-    idx: &[u8],
-    grid: (usize, usize),
-    out: (usize, usize),
-    color_of: impl Fn(u8) -> [u8; 3],
-) -> Vec<u8> {
-    let (gw, gh) = grid;
-    let (ow, oh) = out;
-    let n = gw.checked_mul(gh).expect("grid size overflow");
-    assert!(
-        idx.len() == n,
-        "idx has {} indices, expected {gw}x{gh} = {n}",
-        idx.len()
-    );
-    let size = ow
-        .checked_mul(oh)
-        .and_then(|n| n.checked_mul(4))
-        .expect("output size overflow");
-    if size == 0 {
-        return Vec::new();
-    }
-    assert!(
-        gw > 0 && gh > 0,
-        "source dimensions must be positive, got {gw}x{gh}"
-    );
-    let mut rgba = vec![0; size];
-    for y in 0..oh {
-        let row = y * gh / oh * gw;
-        for x in 0..ow {
-            let color = color_of(idx[row + x * gw / ow]);
-            let offset = (y * ow + x) * 4;
-            rgba[offset..offset + 3].copy_from_slice(&color);
-            rgba[offset + 3] = 255;
-        }
-    }
-    rgba
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,11 +591,7 @@ mod tests {
         options.palette[1].rgb = [0; 3];
         let indices = dither(&white, 1, 1, &options);
         assert_eq!(indices, [0]);
-        assert_eq!(
-            rasterize(&indices, (1, 1), (1, 1), |i| options.palette[i as usize]
-                .rgb),
-            white
-        );
+        assert_eq!(options.palette[usize::from(indices[0])].rgb, [255; 3]);
     }
 
     #[test]
@@ -856,54 +805,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rasterize_scales_nearest_neighbor() {
-        let result = rasterize(&[0, 1], (2, 1), (4, 2), |i| {
-            if i == 0 {
-                [10, 20, 30]
-            } else {
-                [200, 210, 220]
-            }
-        });
-        let row = [
-            10, 20, 30, 255, 10, 20, 30, 255, 200, 210, 220, 255, 200, 210, 220, 255,
-        ];
-        assert_eq!(result, row.repeat(2));
-    }
-
-    #[test]
-    fn rasterize_empty_output_accepts_empty_grids() {
-        for grid in [(0, 0), (0, 1), (1, 0)] {
-            for out in [(0, 0), (0, 2), (2, 0)] {
-                assert!(rasterize(&[], grid, out, |_| panic!("empty output")).is_empty());
-            }
-            assert!(std::panic::catch_unwind(|| rasterize(&[], grid, (1, 1), |_| [0; 3])).is_err());
-        }
-        assert!(rasterize(&[0], (1, 1), (0, 2), |_| panic!("empty output")).is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "idx has 1 indices, expected 2x3 = 6")]
-    fn index_mismatch_reports_actual_and_expected_size() {
-        rasterize(&[0], (2, 3), (1, 1), |_| [0; 3]);
-    }
-
-    #[test]
-    fn rasterize_rejects_size_overflow() {
-        for (grid, out) in [
-            ((usize::MAX, 2), (1, 1)),
-            ((1, 1), (usize::MAX, 2)),
-            ((1, 1), (usize::MAX / 4 + 1, 1)),
-        ] {
-            assert!(std::panic::catch_unwind(|| rasterize(&[0], grid, out, |_| [0; 3])).is_err());
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "unsupported index 7")]
-    fn rasterize_propagates_callback_panics() {
-        rasterize(&[7], (1, 1), (1, 1), |i| panic!("unsupported index {i}"));
-    }
     const TONE_GOLDEN: [u8; 128] = [
         0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2,
         2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
