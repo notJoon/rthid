@@ -4,6 +4,10 @@
 //! and shadows clean. Tone mode diffuses luminance only. Color mode diffuses RGB
 //! and picks the nearest palette color.
 
+mod diffusion;
+
+pub use diffusion::{Diffusion, Kernel};
+
 /// A palette color in byte channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
@@ -45,7 +49,7 @@ impl Default for Tone {
 }
 
 /// Color space used to diffuse quantization error.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Quantizes luminance to evenly spaced levels, one per palette index, and
     /// diffuses luminance error. The palette colors themselves do not affect the
@@ -57,60 +61,37 @@ pub enum Mode {
     Color,
 }
 
-/// Error diffusion weights.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Kernel {
-    /// Spreads 3/4 of the error across six neighbors.
-    #[default]
-    Atkinson,
-    /// Spreads the full error across four neighbors.
-    FloydSteinberg,
-    /// Spreads the full error across twelve neighbors.
-    JarvisJudiceNinke,
-    /// Spreads the full error across twelve neighbors with more weight nearby.
-    Stucki,
-    /// Spreads the full error across three neighbors.
-    SierraLite,
-}
-
-impl Kernel {
-    fn weights(self) -> &'static Weights {
-        match self {
-            Self::Atkinson => &ATKINSON,
-            Self::FloydSteinberg => &FLOYD_STEINBERG,
-            Self::JarvisJudiceNinke => &JARVIS_JUDICE_NINKE,
-            Self::Stucki => &STUCKI,
-            Self::SierraLite => &SIERRA_LITE,
-        }
-    }
-}
-
-/// How pixels become palette indices.
+/// How pixels become palette indices. Defaults to `Diffusion::default()`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Algorithm {
     /// Passes quantization error to neighboring pixels.
-    Diffusion {
-        /// Weights and neighbors that receive error.
-        kernel: Kernel,
-        /// Whether odd rows run right to left to reduce diagonal streaks.
-        serpentine: bool,
-        /// Scales the diffused error. 1 is the full kernel and 0 is plain nearest
-        /// color quantization. Must be finite.
-        strength: f64,
-    },
+    Diffusion(Diffusion),
 }
 
 impl Default for Algorithm {
     fn default() -> Self {
-        Self::Diffusion {
-            kernel: Kernel::Atkinson,
-            serpentine: true,
-            strength: 1.0,
+        Self::Diffusion(Diffusion::default())
+    }
+}
+
+impl Algorithm {
+    /// Returns error diffusion settings, or None for algorithms that do not diffuse error.
+    pub fn diffusion(&self) -> Option<&Diffusion> {
+        match self {
+            Self::Diffusion(d) => Some(d),
+        }
+    }
+
+    /// Returns mutable error diffusion settings, or None for algorithms that do not diffuse error.
+    pub fn diffusion_mut(&mut self) -> Option<&mut Diffusion> {
+        match self {
+            Self::Diffusion(d) => Some(d),
         }
     }
 }
 
-/// Palette and processing settings for dithering.
+/// Palette and processing settings for dithering. Defaults to a black and white
+/// palette, Tone mode, `Algorithm::default()` and default tone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     /// Colors sorted darkest first, as built by `make_palette`. Output indices
@@ -216,17 +197,36 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
+#[track_caller]
 fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     let palette = &options.palette;
     assert!(
         !palette.is_empty() && palette.len() <= 256,
-        "palette must have 1 to 256 colors"
+        "palette must have 1 to 256 colors, got {}",
+        palette.len()
     );
     let n = w.checked_mul(h).expect("image size overflow");
-    assert_eq!(Some(rgba.len()), n.checked_mul(4), "RGBA length mismatch");
-    let Algorithm::Diffusion { strength, .. } = options.algorithm;
+    let expected = n.checked_mul(4).expect("RGBA size overflow");
+    assert!(
+        rgba.len() == expected,
+        "rgba.len() is {}, expected w * h * 4 = {expected} for {w}x{h}",
+        rgba.len()
+    );
+    match options.algorithm {
+        Algorithm::Diffusion(d) => {
+            assert!(
+                d.strength.is_finite(),
+                "algorithm strength must be finite, got {}",
+                d.strength
+            );
+            assert!(
+                (0.0..=1.0).contains(&d.strength),
+                "algorithm strength must be within 0..=1, got {}",
+                d.strength
+            );
+        }
+    }
     for (name, value) in [
-        ("strength", strength),
         ("brightness", options.tone.brightness),
         ("contrast", options.tone.contrast),
         ("gamma", options.tone.gamma),
@@ -234,9 +234,13 @@ fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
         ("white", options.tone.white),
         ("sharpen", options.tone.sharpen),
     ] {
-        assert!(value.is_finite(), "{name} must be finite");
+        assert!(value.is_finite(), "tone.{name} must be finite, got {value}");
     }
-    assert!(options.tone.gamma > 0.0, "gamma must be positive");
+    assert!(
+        options.tone.gamma > 0.0,
+        "tone.gamma must be positive, got {}",
+        options.tone.gamma
+    );
     n
 }
 
@@ -258,76 +262,13 @@ fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
     nearest
 }
 
-struct Weights {
-    taps: &'static [(isize, usize, u8)], // (dx, dy, weight)
-    divisor: u8,
-}
-
-// The divisor is explicit because Atkinson spreads only 6/8 of the error.
-const ATKINSON: Weights = Weights {
-    taps: &[
-        (1, 0, 1),
-        (2, 0, 1),
-        (-1, 1, 1),
-        (0, 1, 1),
-        (1, 1, 1),
-        (0, 2, 1),
-    ],
-    divisor: 8,
-};
-
-const FLOYD_STEINBERG: Weights = Weights {
-    taps: &[(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)],
-    divisor: 16,
-};
-
-const JARVIS_JUDICE_NINKE: Weights = Weights {
-    taps: &[
-        (1, 0, 7),
-        (2, 0, 5),
-        (-2, 1, 3),
-        (-1, 1, 5),
-        (0, 1, 7),
-        (1, 1, 5),
-        (2, 1, 3),
-        (-2, 2, 1),
-        (-1, 2, 3),
-        (0, 2, 5),
-        (1, 2, 3),
-        (2, 2, 1),
-    ],
-    divisor: 48,
-};
-
-const STUCKI: Weights = Weights {
-    taps: &[
-        (1, 0, 8),
-        (2, 0, 4),
-        (-2, 1, 2),
-        (-1, 1, 4),
-        (0, 1, 8),
-        (1, 1, 4),
-        (2, 1, 2),
-        (-2, 2, 1),
-        (-1, 2, 2),
-        (0, 2, 4),
-        (1, 2, 2),
-        (2, 2, 1),
-    ],
-    divisor: 42,
-};
-
-const SIERRA_LITE: Weights = Weights {
-    taps: &[(1, 0, 2), (-1, 1, 1), (0, 1, 1)],
-    divisor: 4,
-};
-
 /// Returns one index into `options.palette` per pixel, in row major order. Alpha
 /// is ignored.
 ///
 /// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
 /// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
-/// is not positive.
+/// is not positive or algorithm strength is outside 0..=1.
+#[track_caller]
 pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let n = validate(rgba, w, h, options);
     let palette = &options.palette;
@@ -357,50 +298,9 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         }
         Mode::Color => &mut channels[..],
     };
-    let Algorithm::Diffusion {
-        kernel,
-        serpentine,
-        strength,
-    } = options.algorithm;
-    let weights = kernel.weights();
-    for y in 0..h {
-        let reverse = serpentine && y % 2 == 1;
-        for k in 0..w {
-            let x = if reverse { w - 1 - k } else { k };
-            let i = y * w + x;
-            let (q, target) = match options.mode {
-                Mode::Tone => {
-                    let v = f64::from(work[0][i]);
-                    let q = tone_level(v, levels);
-                    (q, [q as f64 / levels; 3])
-                }
-                Mode::Color => {
-                    let px: [f64; 3] = std::array::from_fn(|c| f64::from(work[c][i]));
-                    let q = nearest(px, &colors);
-                    (q, colors[q])
-                }
-            };
-            out[i] = q as u8;
-            for (channel, t) in work.iter_mut().zip(target) {
-                let e = (f64::from(channel[i]) - t) * strength;
-                for &(dx, dy, weight) in weights.taps {
-                    let (weight, divisor) = (f64::from(weight), f64::from(weights.divisor));
-                    // The two forms differ in the last bit when the divisor is not a power of two.
-                    let share = match options.mode {
-                        Mode::Tone => e * weight / divisor,
-                        Mode::Color => e * (weight / divisor),
-                    };
-                    let xx = x.checked_add_signed(if reverse { -dx } else { dx });
-                    let yy = y + dy;
-                    if let Some(xx) = xx.filter(|&xx| xx < w)
-                        && yy < h
-                    {
-                        let j = yy * w + xx;
-                        // Compute in f64, convert to f32 only on store.
-                        channel[j] = (f64::from(channel[j]) + share) as f32;
-                    }
-                }
-            }
+    match options.algorithm {
+        Algorithm::Diffusion(d) => {
+            diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d, &mut out)
         }
     }
     out
@@ -410,6 +310,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
 /// nearest neighbor sampling, coloring each index with `color_of`.
 ///
 /// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices.
+#[track_caller]
 pub fn rasterize(
     idx: &[u8],
     gw: usize,
@@ -418,8 +319,16 @@ pub fn rasterize(
     oh: usize,
     color_of: impl Fn(u8) -> [u8; 3],
 ) -> Vec<u8> {
-    assert!(gw > 0 && gh > 0, "source dimensions must be positive");
-    assert_eq!(Some(idx.len()), gw.checked_mul(gh), "index length mismatch");
+    assert!(
+        gw > 0 && gh > 0,
+        "source dimensions must be positive, got {gw}x{gh}"
+    );
+    let expected = gw.checked_mul(gh).expect("source size overflow");
+    assert!(
+        idx.len() == expected,
+        "idx.len() is {}, expected gw * gh = {expected} for {gw}x{gh}",
+        idx.len()
+    );
     let size = ow
         .checked_mul(oh)
         .and_then(|n| n.checked_mul(4))
@@ -440,117 +349,6 @@ pub fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const KERNELS: [Kernel; 5] = [
-        Kernel::Atkinson,
-        Kernel::FloydSteinberg,
-        Kernel::JarvisJudiceNinke,
-        Kernel::Stucki,
-        Kernel::SierraLite,
-    ];
-
-    #[test]
-    fn kernel_tables_preserve_error_fraction_and_bounds() {
-        for kernel in KERNELS {
-            let weights = kernel.weights();
-            let sum = if kernel == Kernel::Atkinson {
-                6
-            } else {
-                weights.divisor
-            };
-            assert_eq!(weights.taps.iter().map(|tap| tap.2).sum::<u8>(), sum);
-            for &(dx, dy, _) in weights.taps {
-                assert!((0..=2).contains(&dy));
-                assert!(dx.abs() <= 2);
-                assert!(dy != 0 || dx > 0);
-            }
-        }
-    }
-
-    #[test]
-    fn serpentine_mirrors_the_second_row() {
-        let w = 17;
-        let row: Vec<_> = (0..w)
-            .map(|x| {
-                [
-                    (x * 13 + 17) as u8,
-                    (x * 7 + 3) as u8,
-                    (x * 11 + 37) as u8,
-                    255,
-                ]
-            })
-            .collect();
-        let rgba: Vec<_> = [vec![[0, 0, 0, 255]; w], row.clone()]
-            .concat()
-            .into_iter()
-            .flatten()
-            .collect();
-        let mirrored: Vec<_> = [vec![[0, 0, 0, 255]; w], row.into_iter().rev().collect()]
-            .concat()
-            .into_iter()
-            .flatten()
-            .collect();
-        for kernel in KERNELS {
-            for mode in [Mode::Tone, Mode::Color] {
-                let mut options = Options {
-                    mode,
-                    algorithm: Algorithm::Diffusion {
-                        kernel,
-                        serpentine: true,
-                        strength: 1.0,
-                    },
-                    ..Options::default()
-                };
-                let forward = dither(&rgba, w, 2, &options);
-                options.algorithm = Algorithm::Diffusion {
-                    kernel,
-                    serpentine: false,
-                    strength: 1.0,
-                };
-                let reverse = dither(&mirrored, w, 2, &options);
-                assert_eq!(
-                    &forward[w..],
-                    reverse[w..].iter().rev().copied().collect::<Vec<_>>(),
-                    "{kernel:?} {mode:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn kernels_return_valid_indices_for_small_images() {
-        let colors = ["#000", "#345", "#789", "#abc", "#fff"];
-        for kernel in KERNELS {
-            for mode in [Mode::Tone, Mode::Color] {
-                for (w, h) in [(1, 1), (7, 1), (1, 7), (0, 0), (0, 3)] {
-                    let rgba: Vec<_> = (0..w * h)
-                        .flat_map(|i| [((i * 53 + 71) % 256) as u8, 137, 211, 255])
-                        .collect();
-                    for count in 1..=5 {
-                        let options = Options {
-                            palette: make_palette(&colors[..count]).unwrap(),
-                            mode,
-                            algorithm: Algorithm::Diffusion {
-                                kernel,
-                                serpentine: true,
-                                strength: 1.0,
-                            },
-                            ..Options::default()
-                        };
-                        let indices = dither(&rgba, w, h, &options);
-                        assert_eq!(indices.len(), w * h);
-                        assert!(
-                            indices.iter().all(|&index| usize::from(index) < count),
-                            "{kernel:?} {mode:?} {w}x{h} palette {count}"
-                        );
-                        if count == 1 {
-                            assert_eq!(indices, vec![0; w * h]);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     #[test]
     fn parses_hex_colors() {
@@ -607,8 +405,7 @@ mod tests {
     fn rejects_invalid_numeric_options_even_for_one_color() {
         let setters: [fn(&mut Options, f64); 7] = [
             |options, value| {
-                let Algorithm::Diffusion { strength, .. } = &mut options.algorithm;
-                *strength = value;
+                options.algorithm.diffusion_mut().unwrap().strength = value;
             },
             |options, value| options.tone.brightness = value,
             |options, value| options.tone.contrast = value,
@@ -635,6 +432,72 @@ mod tests {
                 assert!(std::panic::catch_unwind(|| dither(&[0; 4], 1, 1, &invalid)).is_err());
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be within 0..=1, got -0.1")]
+    fn rejects_negative_strength() {
+        let mut options = Options::default();
+        options.algorithm.diffusion_mut().unwrap().strength = -0.1;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be within 0..=1, got 1.1")]
+    fn rejects_strength_above_one() {
+        let mut options = Options::default();
+        options.algorithm.diffusion_mut().unwrap().strength = 1.1;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "algorithm strength must be finite, got NaN")]
+    fn rejects_nan_strength() {
+        let mut options = Options::default();
+        options.algorithm.diffusion_mut().unwrap().strength = f64::NAN;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "palette must have 1 to 256 colors, got 0")]
+    fn reports_empty_palette() {
+        dither(
+            &[],
+            0,
+            0,
+            &Options {
+                palette: vec![],
+                ..Options::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rgba.len() is 3, expected w * h * 4 = 4 for 1x1")]
+    fn reports_rgba_length() {
+        dither(&[0; 3], 1, 1, &Options::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "tone.gamma must be positive, got 0")]
+    fn reports_nonpositive_gamma() {
+        let mut options = Options::default();
+        options.tone.gamma = 0.0;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "tone.brightness must be finite, got inf")]
+    fn reports_nonfinite_tone() {
+        let mut options = Options::default();
+        options.tone.brightness = f64::INFINITY;
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "idx.len() is 5, expected gw * gh = 6 for 3x2")]
+    fn reports_index_length() {
+        rasterize(&[0; 5], 3, 2, 3, 2, |_| [0; 3]);
     }
 
     #[test]
@@ -710,11 +573,11 @@ mod tests {
         let options = Options {
             palette: make_palette(&["#f3e8c8", "#172438", "#c45238"]).unwrap(),
             mode: Mode::Color,
-            algorithm: Algorithm::Diffusion {
+            algorithm: Algorithm::Diffusion(Diffusion {
                 kernel: Kernel::Atkinson,
                 serpentine: false,
                 strength: 0.8,
-            },
+            }),
             tone: Tone {
                 contrast: 0.15,
                 sharpen: 0.6,

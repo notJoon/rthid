@@ -1,16 +1,7 @@
 //! Editable settings and palette presets.
 
 use image::{RgbaImage, imageops};
-use rthid_dither::dither::{self, Algorithm, Mode, Options, PaletteColor, Tone};
-
-fn diffusion(options: &mut Options) -> (&mut f64, &mut bool) {
-    let Algorithm::Diffusion {
-        strength,
-        serpentine,
-        ..
-    } = &mut options.algorithm;
-    (strength, serpentine)
-}
+use rthid_dither::dither::{self, Algorithm, Diffusion, Mode, Options, PaletteColor, Tone};
 
 /// Maximum number of characters in a preset or template name.
 pub const MAX_NAME_CHARS: usize = 32;
@@ -188,11 +179,9 @@ pub struct Template {
 impl Template {
     /// Copies settings so later preset edits cannot alter this template.
     pub fn capture(name: String, settings: &Settings) -> Self {
-        let Algorithm::Diffusion {
-            strength,
-            serpentine,
-            ..
-        } = settings.options.algorithm;
+        let (strength, serpentine) = match settings.options.algorithm {
+            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
+        };
         Self {
             name,
             palette_name: settings.palette_name.clone(),
@@ -208,7 +197,9 @@ impl Template {
     /// Restores saved settings while retaining the current rotation and kernel.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
-        let Algorithm::Diffusion { kernel, .. } = settings.options.algorithm;
+        let kernel = match settings.options.algorithm {
+            Algorithm::Diffusion(d) => d.kernel,
+        };
         Ok(Settings {
             scale: self.scale,
             rotation: settings.rotation,
@@ -217,11 +208,11 @@ impl Template {
             options: rthid_dither::dither::Options {
                 palette,
                 mode: self.mode,
-                algorithm: Algorithm::Diffusion {
+                algorithm: Algorithm::Diffusion(Diffusion {
                     kernel,
                     strength: self.strength,
                     serpentine: self.serpentine,
-                },
+                }),
                 tone: self.tone,
             },
         })
@@ -404,11 +395,9 @@ impl Setting {
     /// Label including the current value.
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
         let o = &settings.options;
-        let Algorithm::Diffusion {
-            strength,
-            serpentine,
-            ..
-        } = o.algorithm;
+        let (strength, serpentine) = match o.algorithm {
+            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
+        };
         match self {
             Setting::Scale => format!("Scale: {}%", settings.scale),
             Setting::Mode => format!("Mode: {:?}", o.mode),
@@ -522,17 +511,23 @@ impl Settings {
     pub fn with_default(&self, setting: Setting, palettes: &Palettes) -> Self {
         let mut next = self.clone();
         let defaults = Self::default();
-        let Algorithm::Diffusion {
-            strength,
-            serpentine,
-            ..
-        } = defaults.options.algorithm;
+        let (strength, serpentine) = match defaults.options.algorithm {
+            Algorithm::Diffusion(d) => (d.strength, d.serpentine),
+        };
         match setting {
             Setting::Scale => next.scale = defaults.scale,
             Setting::Mode => next.options.mode = defaults.options.mode,
             Setting::Palette => next = next.with_preset(&palettes.presets[0]),
-            Setting::Strength => *diffusion(&mut next.options).0 = strength,
-            Setting::Serpentine => *diffusion(&mut next.options).1 = serpentine,
+            Setting::Strength => {
+                if let Some(d) = next.options.algorithm.diffusion_mut() {
+                    d.strength = strength;
+                }
+            }
+            Setting::Serpentine => {
+                if let Some(d) = next.options.algorithm.diffusion_mut() {
+                    d.serpentine = serpentine;
+                }
+            }
             Setting::Brightness => next.options.tone.brightness = defaults.options.tone.brightness,
             Setting::Contrast => next.options.tone.contrast = defaults.options.tone.contrast,
             Setting::Gamma => next.options.tone.gamma = defaults.options.tone.gamma,
@@ -569,12 +564,14 @@ impl Settings {
                 next = next.with_preset(&palettes.presets[i]);
             }
             Setting::Strength => {
-                let (strength, _) = diffusion(&mut next.options);
-                *strength = step(*strength);
+                if let Some(d) = next.options.algorithm.diffusion_mut() {
+                    d.strength = step(d.strength);
+                }
             }
             Setting::Serpentine => {
-                let (_, serpentine) = diffusion(&mut next.options);
-                *serpentine = !*serpentine;
+                if let Some(d) = next.options.algorithm.diffusion_mut() {
+                    d.serpentine = !d.serpentine;
+                }
             }
             Setting::Brightness => {
                 next.options.tone.brightness = step(self.options.tone.brightness)
@@ -828,8 +825,13 @@ mod tests {
                 builtin: false,
             })
         };
-        *diffusion(&mut settings.options).0 = 0.85;
-        *diffusion(&mut settings.options).1 = false;
+        settings.options.algorithm.diffusion_mut().unwrap().strength = 0.85;
+        settings
+            .options
+            .algorithm
+            .diffusion_mut()
+            .unwrap()
+            .serpentine = false;
         settings.options.tone = Tone {
             brightness: 0.1,
             contrast: 0.15,
@@ -843,11 +845,9 @@ mod tests {
             rotation: Rotation::R270,
             ..Settings::default()
         };
-        let Algorithm::Diffusion { kernel, .. } = &mut current.options.algorithm;
-        *kernel = dither::Kernel::Stucki;
+        current.options.algorithm.diffusion_mut().unwrap().kernel = dither::Kernel::Stucki;
         let restored = template.apply(&current).unwrap();
-        let Algorithm::Diffusion { kernel, .. } = &mut settings.options.algorithm;
-        *kernel = dither::Kernel::Stucki;
+        settings.options.algorithm.diffusion_mut().unwrap().kernel = dither::Kernel::Stucki;
         assert!(
             restored
                 == Settings {

@@ -787,7 +787,15 @@ mod tests {
         ui::Layout,
     };
     use ratatui::layout::Rect;
-    use rthid_dither::dither::{Algorithm, Mode};
+    use rthid_dither::dither::{Diffusion, Mode};
+
+    fn diffusion(settings: &Settings) -> &Diffusion {
+        settings.options.algorithm.diffusion().unwrap()
+    }
+
+    fn diffusion_mut(settings: &mut Settings) -> &mut Diffusion {
+        settings.options.algorithm.diffusion_mut().unwrap()
+    }
 
     fn opened_photo() -> IoOutcome {
         IoOutcome::Opened(Ok(Opened::Image {
@@ -1047,8 +1055,7 @@ mod tests {
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         {
-            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
-            *strength = 0.5;
+            diffusion_mut(&mut app.settings).strength = 0.5;
         }
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
@@ -1246,8 +1253,7 @@ mod tests {
     fn template_manager_saves_and_applies_settings() {
         let mut app = app_at(Setting::Strength);
         {
-            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
-            *strength = 0.5;
+            diffusion_mut(&mut app.settings).strength = 0.5;
         }
         let saved = app.settings.clone();
         for code in [
@@ -1264,14 +1270,13 @@ mod tests {
             Some(&Template::capture("Z".into(), &saved))
         );
         {
-            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
-            *strength = 0.9;
+            diffusion_mut(&mut app.settings).strength = 0.9;
         }
         app.settings.rotation = Rotation::R90;
         for code in [KeyCode::Char('T'), KeyCode::Enter] {
             press(&mut app, code);
         }
-        let Algorithm::Diffusion { strength, .. } = app.settings.options.algorithm;
+        let strength = diffusion(&app.settings).strength;
         assert_eq!(strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
@@ -1791,8 +1796,7 @@ mod tests {
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 1);
         {
-            let Algorithm::Diffusion { strength, .. } = &mut app.settings.options.algorithm;
-            *strength = 0.5;
+            diffusion_mut(&mut app.settings).strength = 0.5;
         }
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
@@ -1925,10 +1929,7 @@ mod tests {
         type Getter = fn(&Settings) -> f64;
         let cases: [(Setting, Getter); 8] = [
             (Setting::Scale, |p| f64::from(p.scale)),
-            (Setting::Strength, |p| {
-                let Algorithm::Diffusion { strength, .. } = p.options.algorithm;
-                strength
-            }),
+            (Setting::Strength, |p| diffusion(p).strength),
             (Setting::Brightness, |p| p.options.tone.brightness),
             (Setting::Contrast, |p| p.options.tone.contrast),
             (Setting::Gamma, |p| p.options.tone.gamma),
@@ -1959,7 +1960,7 @@ mod tests {
         assert!(matches!(app.settings.options.mode, Mode::Color));
         let mut app = app_at(Setting::Serpentine);
         press(&mut app, KeyCode::Right);
-        let Algorithm::Diffusion { serpentine, .. } = app.settings.options.algorithm;
+        let serpentine = diffusion(&app.settings).serpentine;
         assert!(!serpentine);
         let mut app = app_at(Setting::Palette);
         // Wrapping back lands on the last built-in, which also switches to its Color mode.

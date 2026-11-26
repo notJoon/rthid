@@ -3,7 +3,9 @@
 use std::sync::LazyLock;
 
 use image::RgbaImage;
-use rthid_dither::dither::{Algorithm, Kernel, Mode, Options, Tone, dither, make_palette};
+use rthid_dither::dither::{
+    Algorithm, Diffusion, Kernel, Mode, Options, Tone, dither, make_palette,
+};
 
 const PALETTE: [&str; 4] = ["#ffffff", "#ee6a45", "#a3300f", "#1c0d07"];
 
@@ -21,11 +23,11 @@ fn check(options: Options, golden: &[u8]) {
 fn tone_options(kernel: Kernel) -> Options {
     Options {
         palette: make_palette(&PALETTE).unwrap(),
-        algorithm: Algorithm::Diffusion {
+        algorithm: Algorithm::Diffusion(Diffusion {
             kernel,
             serpentine: true,
             strength: 1.0,
-        },
+        }),
         ..Options::default()
     }
 }
@@ -77,18 +79,18 @@ fn hsl_color_floyd_steinberg_matches_golden() {
 }
 
 #[test]
-fn hsl_tone_jarvis_matches_golden() {
+fn hsl_tone_jarvis_judice_ninke_matches_golden() {
     check(
         tone_options(Kernel::JarvisJudiceNinke),
-        include_bytes!("fixtures/hsl_tone_jarvis.idx"),
+        include_bytes!("fixtures/hsl_tone_jarvis_judice_ninke.idx"),
     );
 }
 
 #[test]
-fn hsl_color_jarvis_matches_golden() {
+fn hsl_color_jarvis_judice_ninke_matches_golden() {
     check(
         color_options(Kernel::JarvisJudiceNinke),
-        include_bytes!("fixtures/hsl_color_jarvis.idx"),
+        include_bytes!("fixtures/hsl_color_jarvis_judice_ninke.idx"),
     );
 }
 

@@ -12,7 +12,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Move `serpentine` and `strength` from `Options` into `Algorithm::Diffusion`
+- **Breaking**: Move `serpentine` and `strength` from `Options` into the `Diffusion`
+  payload of `Algorithm::Diffusion`. Atkinson stays the default with unchanged output.
+
+  Before:
+  ```rust,ignore
+  Options { serpentine: false, strength: 0.8, ..Options::default() }
+  ```
+
+  After:
+  ```rust,ignore
+  Options {
+      algorithm: Algorithm::Diffusion(Diffusion {
+          serpentine: false,
+          strength: 0.8,
+          ..Diffusion::default()
+      }),
+      ..Options::default()
+  }
+  ```
+
+- Reject algorithm strength outside `0.0..=1.0`
+- Report actual and expected values in clearer panic messages with caller locations
 - Keep palette RGB bytes as the single source of color data; derive normalized
   channels privately when dithering in Color mode
 - Include the color's position and input text in palette parsing errors

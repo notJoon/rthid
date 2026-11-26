@@ -47,17 +47,16 @@ indices refer to this sorted palette. Tone mode quantizes evenly spaced luminanc
 levels; use Color mode to choose the nearest actual RGB color:
 
 ```rust
-use rthid_dither::dither::{Algorithm, Kernel, Mode, Options, Tone, dither, make_palette};
+use rthid_dither::dither::{Algorithm, Diffusion, Kernel, Mode, Options, Tone, dither, make_palette};
 
 fn main() -> Result<(), String> {
     let options = Options {
         palette: make_palette(&["#172438", "#c45238", "#f3e8c8"])?,
         mode: Mode::Color,
-        algorithm: Algorithm::Diffusion {
+        algorithm: Algorithm::Diffusion(Diffusion {
             kernel: Kernel::FloydSteinberg,
-            serpentine: true,
-            strength: 1.0,
-        },
+            ..Diffusion::default()
+        }),
         tone: Tone { gamma: 1.2, ..Tone::default() },
         ..Options::default()
     };
@@ -77,7 +76,8 @@ color callback can map indices differently without changing dithering.
 errors include the input text and its 1-based position.
 
 `dither` panics on mismatched RGBA dimensions or palettes outside 1 to 256 colors.
-All numeric options must be finite, and gamma must be positive. These checks also
+All numeric options must be finite, gamma must be positive, and algorithm strength
+must be within `0.0..=1.0`. These checks also
 apply to single-color palettes. Other finite adjustments are accepted without
 imposing UI-specific ranges. Alpha is ignored rather than composited.
 
