@@ -44,6 +44,13 @@ enum Source {
     Other,
 }
 
+enum PreviewKey {
+    ToggleOriginal,
+    ToggleMinimap,
+    Zoom(Zoom),
+    Pan(i64, i64),
+}
+
 struct Notice {
     source: Source,
     text: String,
@@ -628,15 +635,8 @@ impl App {
             self.preview_focus = !self.preview_focus;
             return;
         }
-        if self.source_path().is_none()
-            && (matches!(key.code, KeyCode::Char(' ' | 'm' | '+' | '=' | '-' | '0'))
-                || (self.preview_focus
-                    && pan_delta(key.code, geometry.visible, geometry.pan_step()).is_some()))
-        {
-            return;
-        }
-        if key.code == KeyCode::Char(' ') {
-            self.show_original = !self.show_original;
+        let preview_key = self.preview_key(key.code, geometry);
+        if self.source_path().is_none() && preview_key.is_some() {
             return;
         }
         // Esc leaves preview focus. Only q or Ctrl+C exits.
@@ -644,31 +644,18 @@ impl App {
             self.preview_focus = false;
             return;
         }
-        match key.code {
-            KeyCode::Char('m') => {
-                self.viewport.hide_minimap = !self.viewport.hide_minimap;
-                return;
+        if let Some(preview_key) = preview_key {
+            match preview_key {
+                PreviewKey::ToggleOriginal => self.show_original = !self.show_original,
+                PreviewKey::ToggleMinimap => {
+                    self.viewport.hide_minimap = !self.viewport.hide_minimap;
+                }
+                PreviewKey::Zoom(zoom) => {
+                    self.viewport.set_zoom(zoom, geometry);
+                    self.last_drag = None;
+                }
+                PreviewKey::Pan(dx, dy) => self.viewport.pan(dx, dy, geometry),
             }
-            KeyCode::Char('+' | '=' | '-' | '0') => {
-                let zoom = if key.code == KeyCode::Char('0') {
-                    Zoom::Fit
-                } else {
-                    self.viewport.zoom.step(
-                        key.code != KeyCode::Char('-'),
-                        geometry.grid,
-                        geometry.area,
-                    )
-                };
-                self.viewport.set_zoom(zoom, geometry);
-                self.last_drag = None;
-                return;
-            }
-            _ => {}
-        }
-        if self.preview_focus
-            && let Some((dx, dy)) = pan_delta(key.code, geometry.visible, geometry.pan_step())
-        {
-            self.viewport.pan(dx, dy, geometry);
             return;
         }
         match self.panel.handle_key(key, Setting::ALL.len()) {
@@ -688,6 +675,22 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
             _ => {}
+        }
+    }
+
+    fn preview_key(&self, code: KeyCode, geometry: &PreviewGeometry) -> Option<PreviewKey> {
+        match code {
+            KeyCode::Char(' ') => Some(PreviewKey::ToggleOriginal),
+            KeyCode::Char('m') => Some(PreviewKey::ToggleMinimap),
+            KeyCode::Char('0') => Some(PreviewKey::Zoom(Zoom::Fit)),
+            KeyCode::Char('+' | '=' | '-') => Some(PreviewKey::Zoom(self.viewport.zoom.step(
+                code != KeyCode::Char('-'),
+                geometry.grid,
+                geometry.area,
+            ))),
+            _ if self.preview_focus => pan_delta(code, geometry.visible, geometry.pan_step())
+                .map(|(dx, dy)| PreviewKey::Pan(dx, dy)),
+            _ => None,
         }
     }
 
