@@ -1,0 +1,4 @@
+# TLC output, regenerated on every run
+states/
+*_TTrace_*
+*.out
