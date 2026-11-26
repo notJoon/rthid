@@ -150,7 +150,6 @@ pub fn log_minimap(
             &viewport::geometry(&viewport::Viewport::default(), geometry.grid, area),
             &mut overview,
             &mut cells::OverviewCaches::default(),
-            false,
         );
         writeln!(log, "inset={inset:?} map={map:?} viewport={viewport:?}")?;
         for pos in inset.positions() {
@@ -404,6 +403,30 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
     }
 }
 
+// Chooses the nearest fixed xterm color to shorten Original preview output during dragging.
+fn rgb_to_ansi256(rgb: [u8; 3]) -> u8 {
+    let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let cube = rgb.map(|v| match v {
+        0..=47 => 0,
+        48..=114 => 1,
+        _ => 2 + (v - 115) / 40,
+    });
+    let sum: i32 = rgb.into_iter().map(i32::from).sum();
+    let gray = ((sum - 24 + 15) / 30).clamp(0, 23) as u8;
+    let mut cube_distance = 0;
+    let mut gray_distance = 0;
+    for channel in 0..3 {
+        cube_distance +=
+            (i32::from(rgb[channel]) - i32::from(levels[usize::from(cube[channel])])).pow(2);
+        gray_distance += (i32::from(rgb[channel]) - i32::from(8 + 10 * gray)).pow(2);
+    }
+    if gray_distance < cube_distance {
+        232 + gray
+    } else {
+        16 + 36 * cube[0] + 6 * cube[1] + cube[2]
+    }
+}
+
 // Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
 // Calls present every frame so a hidden image is cleared.
 fn draw_preview(
@@ -433,14 +456,27 @@ fn draw_preview(
     let approximate = if image_mode {
         false
     } else {
-        cells::render(
+        let approximate = cells::render(
             pixels,
             app.glyphs,
             geometry,
             frame.buffer_mut(),
             &mut renderer.overviews,
-            app.dragging(),
-        )
+        );
+        if app.dragging() && matches!(pixels, cells::Pixels::Rgb(..)) {
+            for pos in geometry.target.positions() {
+                if geometry.minimap.is_some_and(|map| map.frame.contains(pos)) {
+                    continue;
+                }
+                let cell = &mut frame.buffer_mut()[pos];
+                for color in [&mut cell.fg, &mut cell.bg] {
+                    if let Color::Rgb(r, g, b) = *color {
+                        *color = Color::Indexed(rgb_to_ansi256([r, g, b]));
+                    }
+                }
+            }
+        }
+        approximate
     };
     let mut report = PreviewReport {
         approximate,
@@ -520,6 +556,23 @@ mod tests {
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn ansi256_uses_nearest_cube_or_gray() {
+        for (rgb, expected) in [
+            ([0, 0, 0], 16),
+            ([255, 255, 255], 231),
+            ([255, 0, 0], 196),
+            ([0, 255, 0], 46),
+            ([0, 0, 255], 21),
+            ([128, 128, 128], 244),
+            ([95, 135, 175], 67),
+            ([8, 8, 8], 232),
+            ([238, 238, 238], 255),
+        ] {
+            assert_eq!(rgb_to_ansi256(rgb), expected, "{rgb:?}");
+        }
+    }
+
     fn draw_text(
         terminal: &mut Terminal<TestBackend>,
         app: &App,
@@ -535,6 +588,97 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn drag_colors_preserve_minimap_dithered_and_exact_cache() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let area = Rect::new(0, 0, 48, 18);
+        let image = RgbaImage::from_fn(120, 120, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
+        let mut app = App::builtin(image, None);
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        for zoom in [
+            viewport::Zoom::In(1),
+            viewport::Zoom::Out(2),
+            viewport::Zoom::Fit,
+        ] {
+            for original in [true, false] {
+                app.viewport.zoom = viewport::Zoom::In(1);
+                app.show_original = original;
+                app.sync(area);
+                let g = app.geometry(area);
+                for (kind, column) in [
+                    (MouseEventKind::Down(MouseButton::Left), 2),
+                    (MouseEventKind::Drag(MouseButton::Left), 1),
+                ] {
+                    app.handle_mouse(
+                        MouseEvent {
+                            kind,
+                            column,
+                            row: 10,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &g,
+                        area,
+                    );
+                }
+                assert!(app.dragging());
+                app.viewport.zoom = zoom;
+                let g = app.geometry(area);
+                terminal
+                    .draw(|frame| {
+                        draw_preview(frame, &app, &g, &mut renderer);
+                    })
+                    .unwrap();
+                let dragging = terminal.backend().buffer().clone();
+                let cache_version = renderer.overviews.full.version();
+                assert!(app.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Moved,
+                        column: 1,
+                        row: 10,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &g,
+                    area,
+                ));
+                terminal
+                    .draw(|frame| {
+                        draw_preview(frame, &app, &g, &mut renderer);
+                    })
+                    .unwrap();
+                assert_eq!(renderer.overviews.full.version(), cache_version);
+                let released = terminal.backend().buffer();
+                if !original {
+                    assert_eq!(&dragging, released);
+                    continue;
+                }
+                if let Some(map) = g.minimap {
+                    for pos in map.frame.positions() {
+                        assert_eq!(dragging[pos], released[pos]);
+                    }
+                }
+                let mut converted = 0;
+                for pos in g
+                    .target
+                    .positions()
+                    .filter(|&pos| !g.minimap.is_some_and(|map| map.frame.contains(pos)))
+                {
+                    let mut expected = released[pos].clone();
+                    for color in [&mut expected.fg, &mut expected.bg] {
+                        if let Color::Rgb(r, g, b) = *color {
+                            converted += 1;
+                            *color = Color::Indexed(rgb_to_ansi256([r, g, b]));
+                        }
+                    }
+                    assert_eq!(dragging[pos], expected);
+                }
+                assert!(converted > 0);
+            }
+        }
     }
 
     #[test]

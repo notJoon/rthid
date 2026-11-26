@@ -495,25 +495,43 @@ impl App {
         self.last_drag.is_some_and(|drag| drag.moved)
     }
 
-    /// Routes modal mouse input or pans and recenters the preview.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry, screen: Rect) {
+    /// Routes mouse input and reports whether the display needs redrawing.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        geometry: &PreviewGeometry,
+        screen: Rect,
+    ) -> bool {
+        let was_dragging = self.dragging();
         if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
+            let selection = |modal: &Modal| match modal {
+                Modal::OpenFile(picker) => (picker.list.selected(), picker.typed),
+                Modal::Presets { list, .. } | Modal::Templates { list, .. } => {
+                    (list.selected(), false)
+                }
+                Modal::Editor(editor) => (editor.rows.selected(), false),
+            };
+            let before = selection(&modal);
             let ctx = self.modal_ctx();
             let layout = modal.layout(geometry.area, screen, &ctx);
             let step = modal.handle_mouse(mouse, &layout, ctx);
+            let changed = before != selection(&modal)
+                || step.effect.is_some()
+                || !matches!(step.next, Next::Stay);
             self.modal = Some(modal);
             self.apply_step(step);
-            return;
+            return was_dragging || changed;
         }
         if self.source_path().is_none() {
             self.last_drag = None;
-            return;
+            return was_dragging;
         }
+        let before = (self.viewport.x, self.viewport.y);
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
         if !geometry.overflows() || !geometry.area.contains(point.into()) {
-            return;
+            return was_dragging;
         }
         let (dx, dy) = geometry.zoom.dots_per_cell(geometry.grid, geometry.area);
         let (sx, sy) = ((dx * 6.0).round() as i64, (dy * 6.0).round() as i64);
@@ -556,6 +574,7 @@ impl App {
             MouseEventKind::ScrollRight => self.viewport.pan(sx, 0, geometry),
             _ => {}
         }
+        before != (self.viewport.x, self.viewport.y) || was_dragging != self.dragging()
     }
 
     /// Borrows the preview and saved entries needed by dialogs.

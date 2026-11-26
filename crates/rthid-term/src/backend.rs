@@ -282,11 +282,7 @@ mod tests {
                 assert_eq!(actual.symbol(), expected.symbol(), "symbol at {index}");
                 assert_eq!(actual.bg, expected.bg, "background at {index}");
                 assert_eq!(actual.modifier, expected.modifier, "modifiers at {index}");
-                if expected.symbol() != " "
-                    || expected.modifier.intersects(
-                        Modifier::REVERSED | Modifier::UNDERLINED | Modifier::CROSSED_OUT,
-                    )
-                {
+                if needs_foreground(expected) {
                     assert_eq!(actual.fg, expected.fg, "foreground at {index}");
                 }
                 assert_eq!(
@@ -295,14 +291,12 @@ mod tests {
                 );
             }
             assert_eq!(self.cursor, other.cursor);
-            assert_eq!(self.pen.fg, Color::Reset);
-            assert_eq!(other.pen.fg, Color::Reset);
-            assert_eq!(self.pen.bg, Color::Reset);
-            assert_eq!(other.pen.bg, Color::Reset);
-            assert_eq!(self.pen.underline_color, Color::Reset);
-            assert_eq!(other.pen.underline_color, Color::Reset);
-            assert!(self.pen.modifier.is_empty());
-            assert!(other.pen.modifier.is_empty());
+            for pen in [&self.pen, &other.pen] {
+                assert_eq!(pen.fg, Color::Reset);
+                assert_eq!(pen.bg, Color::Reset);
+                assert_eq!(pen.underline_color, Color::Reset);
+                assert!(pen.modifier.is_empty());
+            }
         }
     }
 

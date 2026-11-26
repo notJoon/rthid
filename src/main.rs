@@ -54,7 +54,7 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use ratatui::crossterm::{
-    event::{self, EnableBracketedPaste, EnableMouseCapture, Event, MouseEventKind},
+    event::{self, EnableBracketedPaste, EnableMouseCapture, Event},
     execute,
 };
 use rthid_io::{
@@ -117,12 +117,6 @@ fn log_timing(
 
 fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
     log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
-}
-
-// Pointer motion redraws only when it ends coarse preview rendering.
-fn needs_redraw(event: &Event, was_dragging: bool, dragging: bool) -> bool {
-    (was_dragging && !dragging)
-        || !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
 }
 
 fn main() -> std::io::Result<()> {
@@ -310,11 +304,11 @@ fn event_loop(
                 if let Some(log) = &mut debug_log {
                     writeln!(log, "event {event:?}")?;
                 }
-                let was_dragging = app.dragging();
                 match &event {
                     Event::Key(key) => app.handle_key(*key, &app.geometry(layout.preview)),
                     Event::Mouse(mouse) => {
-                        app.handle_mouse(*mouse, &app.geometry(layout.preview), layout.screen)
+                        redraw |=
+                            app.handle_mouse(*mouse, &app.geometry(layout.preview), layout.screen);
                     }
                     Event::Paste(text) => app.handle_paste(text),
                     Event::Resize(width, height) => {
@@ -323,7 +317,7 @@ fn event_loop(
                     }
                     _ => {}
                 }
-                redraw |= needs_redraw(&event, was_dragging, app.dragging());
+                redraw |= !matches!(event, Event::Mouse(_));
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -459,16 +453,21 @@ mod tests {
 
     #[test]
     fn pointer_motion_after_drag_requests_redraw() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent};
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::builtin(image::RgbaImage::new(120, 120), None);
         app.viewport.zoom = viewport::Zoom::In(1);
         app.viewport.hide_minimap = true;
         let layout = ui::layout(ratatui::layout::Size::new(100, 24));
         for (kind, column, dragging, redraw) in [
-            (MouseEventKind::Down(MouseButton::Left), 10, false, true),
+            (MouseEventKind::Down(MouseButton::Left), 10, false, false),
             (MouseEventKind::Drag(MouseButton::Left), 9, true, true),
+            (MouseEventKind::Drag(MouseButton::Left), 9, true, false),
             (MouseEventKind::Moved, 9, false, true),
             (MouseEventKind::Moved, 10, false, false),
+            (MouseEventKind::Up(MouseButton::Left), 10, false, false),
+            (MouseEventKind::ScrollUp, 10, false, false),
+            (MouseEventKind::ScrollDown, 10, false, true),
+            (MouseEventKind::ScrollRight, 10, false, true),
         ] {
             let mouse = MouseEvent {
                 kind,
@@ -476,38 +475,9 @@ mod tests {
                 row: layout.preview.y + 1,
                 modifiers: KeyModifiers::NONE,
             };
-            let was_dragging = app.dragging();
-            app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen);
+            let changed = app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen);
             assert_eq!(app.dragging(), dragging);
-            assert_eq!(
-                needs_redraw(&Event::Mouse(mouse), was_dragging, app.dragging()),
-                redraw,
-            );
-        }
-    }
-
-    #[test]
-    fn pointer_motion_alone_does_not_request_redraw() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-        let mouse = |kind| {
-            Event::Mouse(MouseEvent {
-                kind,
-                column: 1,
-                row: 2,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        let moved = mouse(MouseEventKind::Moved);
-        assert!(!needs_redraw(&moved, false, false));
-        assert!(!needs_redraw(&moved, true, true));
-        assert!(needs_redraw(&moved, true, false));
-        for event in [
-            mouse(MouseEventKind::ScrollDown),
-            mouse(MouseEventKind::Up(event::MouseButton::Left)),
-            Event::Resize(80, 24),
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        ] {
-            assert!(needs_redraw(&event, false, false));
+            assert_eq!(changed, redraw);
         }
     }
 }
