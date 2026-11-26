@@ -46,27 +46,73 @@ mod viewport;
 use std::{
     fmt::Display,
     fs::File,
-    io::{self, Write},
+    io::{self, BufWriter, Stdout, Write},
+    mem::ManuallyDrop,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use clap::{Parser, ValueEnum};
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, MouseEventKind,
     },
-    execute,
+    execute, queue,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, enable_raw_mode,
+    },
 };
+use ratatui::{Terminal, backend::CrosstermBackend};
 use rthid_io::{
     image::{check_not_source, load_image},
     io::{Done, IO, Outcome},
 };
 
 use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
+
+// Keep typical full frames together instead of filling stdout's small line buffer.
+const FRAME_BUFFER_CAPACITY: usize = 1024 * 1024;
+
+type BufferedTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+// Sets up raw mode and the alternate screen like `ratatui::run`, with frames written through a large buffer.
+fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> io::Result<()> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+        ratatui::restore();
+        previous(info);
+    }));
+    // Unwinding leaks the terminal, so pending output never follows the panic hook's restore.
+    let mut terminal = ManuallyDrop::new(
+        (|| {
+            enable_raw_mode()?;
+            let mut writer = BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, io::stdout());
+            execute!(writer, EnterAlternateScreen)?;
+            Terminal::new(CrosstermBackend::new(writer))
+        })()
+        .expect("failed to initialize terminal"),
+    );
+    let result = f(&mut terminal);
+    let _ = terminal.backend_mut().flush();
+    drop(ManuallyDrop::into_inner(terminal));
+    ratatui::restore();
+    result
+}
+
+// Brackets one frame in a synchronized update so supporting terminals paint it whole.
+fn synchronized_draw<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    draw: impl FnOnce(&mut Terminal<CrosstermBackend<W>>) -> io::Result<()>,
+) -> io::Result<()> {
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let result = draw(terminal);
+    // End the update even when drawing fails, before any direct stdout cleanup.
+    let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    result.and(end)
+}
 
 /// Disables mouse capture on drop, so it is released even when the terminal session fails.
 struct MouseCapture;
@@ -207,7 +253,7 @@ fn main() -> std::io::Result<()> {
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
-    let mut terminal_result = ratatui::run(|terminal| {
+    let mut terminal_result = run_terminal(|terminal| {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
         let previous = std::panic::take_hook();
@@ -224,16 +270,23 @@ fn main() -> std::io::Result<()> {
                 previous(info);
             }
         }));
+        // Detection queries stdout directly, before any frame output is buffered.
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
-        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-        event_loop(
-            terminal,
-            &mut app,
-            &mut renderer,
-            debug_log.as_mut(),
-            config_path.as_deref(),
-            &mut io,
+        execute!(
+            terminal.backend_mut(),
+            EnableMouseCapture,
+            EnableBracketedPaste
         )
+        .and_then(|()| {
+            event_loop(
+                terminal,
+                &mut app,
+                &mut renderer,
+                debug_log.as_mut(),
+                config_path.as_deref(),
+                &mut io,
+            )
+        })
     });
     drop(bracketed_paste);
     drop(mouse_capture);
@@ -280,7 +333,7 @@ fn save_on_quit(
 // Syncs and draws when something changed, then waits for input and applies
 // every queued event before the next draw. Runs until the app requests quit.
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut BufferedTerminal,
     app: &mut App,
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
@@ -300,12 +353,15 @@ fn event_loop(
             if rebuilt {
                 log_timing(&mut debug_log, "sync", started.elapsed(), None)?;
             }
-            let frame = terminal.draw(|frame| {
-                ui::draw(frame, app, &layout, renderer);
+            synchronized_draw(terminal, |terminal| {
+                let frame = terminal.draw(|frame| {
+                    ui::draw(frame, app, &layout, renderer);
+                })?;
+                if let Some(log) = &mut debug_log {
+                    ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
+                }
+                Ok(())
             })?;
-            if let Some(log) = &mut debug_log {
-                ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
-            }
         }
         for (job, tag) in app.take_jobs() {
             io.submit(job, tag);
@@ -360,6 +416,57 @@ fn event_loop(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn synchronized_frames_flush_before_cleanup_even_on_error() {
+        use std::{cell::RefCell, rc::Rc};
+
+        use ratatui::{TerminalOptions, Viewport, layout::Rect};
+
+        struct SharedWriter(Rc<RefCell<Vec<u8>>>);
+
+        impl Write for SharedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(BufWriter::with_capacity(
+                FRAME_BUFFER_CAPACITY,
+                SharedWriter(Rc::clone(&output)),
+            )),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 10, 1)),
+            },
+        )
+        .unwrap();
+        for fail in [false, true] {
+            let start = output.borrow().len();
+            let result = synchronized_draw(&mut terminal, |terminal| {
+                terminal.draw(|frame| frame.render_widget("frame", frame.area()))?;
+                terminal.backend_mut().write_all(b"pending")?;
+                if fail {
+                    return Err(io::Error::other("draw failed"));
+                }
+                Ok(())
+            });
+            assert_eq!(result.is_err(), fail);
+            let end = output.borrow().len();
+            terminal.backend_mut().flush().unwrap();
+            assert_eq!(output.borrow().len(), end);
+            let output = output.borrow();
+            let frame = &output[start..];
+            assert!(frame.starts_with(b"\x1b[?2026h"));
+            assert!(frame.ends_with(b"pending\x1b[?2026l"));
+        }
+    }
 
     #[test]
     fn quit_retries_pending_changes_and_returns_save_errors() {
