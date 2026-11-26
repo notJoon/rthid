@@ -16,9 +16,10 @@ makes this worse: a frame contains no newlines, so it leaves in many small write
 - **Buffered frames.** `run_terminal` hands the closure a `BufferedTerminal` that
   writes through a 1 MB `BufWriter`, so a full frame takes a few writes instead
   of hundreds. This cuts syscalls and encode time, but it does not raise the frame
-  rate when the terminal's intake is the limit. The real lever is fewer bytes per
-  frame (fewer color changes, fewer changed cells), which is the caller's
-  rendering job.
+  rate when the terminal's intake is the limit.
+- **Fewer color escapes.** `ElidingBackend` sends only changed color channels and
+  skips foreground changes for spaces without reverse, underline or strikeout,
+  reducing the bytes the terminal must process while preserving visible output.
 - **Synchronized updates.** `synchronized_draw` wraps one frame in a synchronized
   update (mode 2026) and flushes it, so supporting terminals paint whole frames.
   Other terminals ignore the sequences.
@@ -36,6 +37,7 @@ makes this worse: a frame contains no newlines, so it leaves in many small write
 use ratatui::crossterm::{event::{self, EnableBracketedPaste, EnableMouseCapture}, execute};
 use rthid_term::{BracketedPaste, MouseCapture, run_terminal, synchronized_draw};
 
+// run_terminal supplies Terminal<ElidingBackend<BufWriter<Stdout>>>.
 let _mouse = MouseCapture;
 let _paste = BracketedPaste;
 run_terminal(|terminal| {

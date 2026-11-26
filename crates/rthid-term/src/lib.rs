@@ -20,7 +20,11 @@ use ratatui::crossterm::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, enable_raw_mode,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::Backend};
+
+mod backend;
+
+pub use backend::ElidingBackend;
 
 // 1 MB holds a typical full frame, so it reaches the terminal in a few writes instead of
 // filling stdout's small line buffer over and over.
@@ -31,7 +35,7 @@ const FRAME_BUFFER_CAPACITY: usize = 1024 * 1024;
 /// Output collects in a large buffer and reaches the terminal only when the buffer fills or is
 /// flushed, which [`synchronized_draw`] does at the end of every frame. Anything written through
 /// the backend, such as mode changes, stays in order with the frames.
-pub type BufferedTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+pub type BufferedTerminal = Terminal<ElidingBackend<BufWriter<Stdout>>>;
 
 /// Runs `f` inside a raw mode and alternate screen session and restores the terminal afterwards.
 ///
@@ -59,12 +63,12 @@ pub fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> 
             enable_raw_mode()?;
             let mut writer = BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, io::stdout());
             execute!(writer, EnterAlternateScreen)?;
-            Terminal::new(CrosstermBackend::new(writer))
+            Terminal::new(ElidingBackend::new(writer))
         })()
         .expect("failed to initialize terminal"),
     );
     let result = f(&mut terminal);
-    let _ = terminal.backend_mut().flush();
+    let _ = Write::flush(terminal.backend_mut());
     // The restore writes to stdout directly, so every buffered byte has to land first.
     drop(ManuallyDrop::into_inner(terminal));
     ratatui::restore();
@@ -79,9 +83,9 @@ pub fn run_terminal(f: impl FnOnce(&mut BufferedTerminal) -> io::Result<()>) -> 
 /// The begin sequence is queued before `draw` runs. The end sequence is always sent and flushed,
 /// even when `draw` fails, so no update is left open and no frame bytes stay in the buffer. The
 /// error from `draw` takes precedence over an error from ending the update.
-pub fn synchronized_draw<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    draw: impl FnOnce(&mut Terminal<CrosstermBackend<W>>) -> io::Result<()>,
+pub fn synchronized_draw<B: Backend + Write>(
+    terminal: &mut Terminal<B>,
+    draw: impl FnOnce(&mut Terminal<B>) -> io::Result<()>,
 ) -> io::Result<()> {
     queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
     let result = draw(terminal);
@@ -142,7 +146,7 @@ mod tests {
 
         let output = Rc::new(RefCell::new(Vec::new()));
         let mut terminal = Terminal::with_options(
-            CrosstermBackend::new(BufWriter::with_capacity(
+            ElidingBackend::new(BufWriter::with_capacity(
                 FRAME_BUFFER_CAPACITY,
                 SharedWriter(Rc::clone(&output)),
             )),
@@ -163,7 +167,7 @@ mod tests {
             });
             assert_eq!(result.is_err(), fail);
             let end = output.borrow().len();
-            terminal.backend_mut().flush().unwrap();
+            Write::flush(terminal.backend_mut()).unwrap();
             assert_eq!(output.borrow().len(), end);
             let output = output.borrow();
             let frame = &output[start..];
