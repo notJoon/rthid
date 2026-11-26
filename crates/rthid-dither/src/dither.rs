@@ -169,13 +169,7 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
     blurred
 }
 
-/// Returns one index into `options.palette` per pixel, in row major order. Alpha
-/// is ignored.
-///
-/// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
-/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
-/// is not positive.
-pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
+fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     let palette = &options.palette;
     assert!(
         !palette.is_empty() && palette.len() <= 256,
@@ -195,6 +189,54 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         assert!(value.is_finite(), "{name} must be finite");
     }
     assert!(options.tone.gamma > 0.0, "gamma must be positive");
+    n
+}
+
+fn tone_level(v: f64, levels: f64) -> usize {
+    (v * levels + 0.5).floor().clamp(0.0, levels) as usize
+}
+
+fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
+    let mut nearest = 0;
+    let mut best_distance = f64::INFINITY;
+    for (j, color) in colors.iter().enumerate() {
+        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color[c]);
+        let distance = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
+        if distance < best_distance {
+            best_distance = distance;
+            nearest = j;
+        }
+    }
+    nearest
+}
+
+struct Kernel {
+    taps: &'static [(isize, usize, u8)], // (dx, dy, weight)
+    divisor: u8,
+}
+
+// The divisor is explicit because Atkinson spreads only 6/8 of the error.
+const ATKINSON: Kernel = Kernel {
+    taps: &[
+        (1, 0, 1),
+        (2, 0, 1),
+        (-1, 1, 1),
+        (0, 1, 1),
+        (1, 1, 1),
+        (0, 2, 1),
+    ],
+    divisor: 8,
+};
+
+/// Returns one index into `options.palette` per pixel, in row major order. Alpha
+/// is ignored.
+///
+/// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
+/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
+/// is not positive.
+pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
+    let n = validate(rgba, w, h, options);
+    let palette = &options.palette;
     // One color needs no work, and tone mode would divide by zero levels.
     if palette.len() == 1 {
         return vec![0; n];
@@ -221,7 +263,6 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
         }
         Mode::Color => &mut channels[..],
     };
-    const KERNEL: [(isize, usize); 6] = [(1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)];
     for y in 0..h {
         let reverse = options.serpentine && y % 2 == 1;
         for k in 0..w {
@@ -230,29 +271,25 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
             let (q, target) = match options.mode {
                 Mode::Tone => {
                     let v = f64::from(work[0][i]);
-                    let q = (v * levels + 0.5).floor().clamp(0.0, levels) as usize;
+                    let q = tone_level(v, levels);
                     (q, [q as f64 / levels; 3])
                 }
                 Mode::Color => {
                     let px: [f64; 3] = std::array::from_fn(|c| f64::from(work[c][i]));
-                    let mut nearest = 0;
-                    let mut best_distance = f64::INFINITY;
-                    for (j, color) in colors.iter().enumerate() {
-                        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color[c]);
-                        let distance = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
-                        if distance < best_distance {
-                            best_distance = distance;
-                            nearest = j;
-                        }
-                    }
-                    (nearest, colors[nearest])
+                    let q = nearest(px, &colors);
+                    (q, colors[q])
                 }
             };
             out[i] = q as u8;
             for (channel, t) in work.iter_mut().zip(target) {
-                // Every Atkinson weight is 1, so each neighbor gets e/8.
-                let e = (f64::from(channel[i]) - t) * options.strength / 8.0;
-                for (dx, dy) in KERNEL {
+                let e = (f64::from(channel[i]) - t) * options.strength;
+                for &(dx, dy, weight) in ATKINSON.taps {
+                    let (weight, divisor) = (f64::from(weight), f64::from(ATKINSON.divisor));
+                    // The two forms differ in the last bit when the divisor is not a power of two.
+                    let share = match options.mode {
+                        Mode::Tone => e * weight / divisor,
+                        Mode::Color => e * (weight / divisor),
+                    };
                     let xx = x.checked_add_signed(if reverse { -dx } else { dx });
                     let yy = y + dy;
                     if let Some(xx) = xx.filter(|&xx| xx < w)
@@ -260,7 +297,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
                     {
                         let j = yy * w + xx;
                         // Compute in f64, convert to f32 only on store.
-                        channel[j] = (f64::from(channel[j]) + e) as f32;
+                        channel[j] = (f64::from(channel[j]) + share) as f32;
                     }
                 }
             }
@@ -303,6 +340,17 @@ pub fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atkinson_table_preserves_error_fraction_and_bounds() {
+        assert_eq!(ATKINSON.divisor, 8);
+        assert_eq!(ATKINSON.taps.iter().map(|tap| tap.2).sum::<u8>(), 6);
+        for &(dx, dy, _) in ATKINSON.taps {
+            assert!((0..=2).contains(&dy));
+            assert!(dx.abs() <= 2);
+            assert!(dy != 0 || dx > 0);
+        }
+    }
 
     #[test]
     fn parses_hex_colors() {
