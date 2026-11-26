@@ -346,6 +346,7 @@ pub struct IO {
     pending: [Option<Pending>; 4],
     next_id: u64,
     stopping: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     // Disconnects when the worker exits, including by panic.
     exited: Receiver<()>,
@@ -364,12 +365,14 @@ impl IO {
         let (finished, results) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandon = Arc::clone(&abandoned);
         let (alive, exited) = mpsc::channel();
         let thread = thread::Builder::new()
             .name(WORKER_NAME.into())
             .spawn(move || {
                 let _alive: Sender<()> = alive;
-                run(queued, finished, home, stop)
+                run(queued, finished, home, stop, abandon)
             })?;
         Ok(Self {
             jobs,
@@ -378,6 +381,7 @@ impl IO {
             pending: [None, None, None, None],
             next_id: 0,
             stopping,
+            abandoned,
             thread: Some(thread),
             exited,
         })
@@ -473,13 +477,14 @@ impl IO {
         self.jobs.ready.notify_one();
         drop(slots);
         // A worker still running at the deadline is detached.
-        if let Some(thread) = self.thread.take()
-            && matches!(
-                self.exited.recv_timeout(timeout),
-                Err(RecvTimeoutError::Disconnected)
-            )
-        {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take() {
+            match self.exited.recv_timeout(timeout) {
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = thread.join();
+                }
+                Err(RecvTimeoutError::Timeout) => self.abandoned.store(true, Ordering::SeqCst),
+                Ok(()) => {}
+            }
         }
     }
 }
@@ -515,7 +520,13 @@ fn failure(
 
 // TODO: One thread runs every kind, so a listing or open waits behind a running export.
 //       Give each kind its own thread on the same slots, or at least split Export off.
-fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: Arc<AtomicBool>) {
+fn run(
+    queued: Arc<Queue>,
+    finished: Sender<Done>,
+    home: Option<PathBuf>,
+    stop: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
+) {
     loop {
         let (id, tag, job) = {
             let mut slots = queued.slots.lock().unwrap();
@@ -542,7 +553,7 @@ fn run(queued: Arc<Queue>, finished: Sender<Done>, home: Option<PathBuf>, stop: 
             if stop.load(Ordering::SeqCst) && kind != Kind::Export {
                 return Err(Cause::Stopped);
             }
-            execute(job, home.as_deref(), &mut op, &mut path)
+            execute(job, home.as_deref(), &mut op, &mut path, &abandoned)
         }));
         let result = result
             .unwrap_or_else(|payload| Err(Cause::Panicked(panic_message(&*payload).to_owned())));
@@ -570,6 +581,7 @@ fn execute(
     home: Option<&Path>,
     op: &mut Op,
     path: &mut PathBuf,
+    abandoned: &AtomicBool,
 ) -> Result<Outcome, Cause> {
     match job {
         Job::Open { dir, protect, .. } => {
@@ -600,6 +612,13 @@ fn execute(
         }
         Job::Update { wait, edit, .. } => {
             let text = crate::atomic::update(path, wait, |text| {
+                // A detached save must not overwrite the final save after shutdown.
+                if abandoned.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "IO worker stopped",
+                    ));
+                }
                 let text = edit.apply(text)?;
                 Ok((text.clone(), text))
             })
@@ -711,6 +730,51 @@ mod tests {
         fn apply(&self, _: Option<String>) -> io::Result<String> {
             Err(io::Error::other("rejected"))
         }
+    }
+
+    #[test]
+    fn update_reaching_the_lock_after_abandonment_preserves_the_latest_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().join("config");
+        std::fs::write(&path, "newest").unwrap();
+        let abandoned = AtomicBool::new(true);
+        let job = Job::Update {
+            path: path.clone(),
+            wait: Duration::ZERO,
+            edit: Box::new(Append("old")),
+        };
+
+        // The job passed the worker's initial stop check before shutdown.
+        let result = execute(job, None, &mut Op::Save, &mut path, &abandoned);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newest");
+        assert!(
+            matches!(result, Err(Cause::Io(error)) if error.kind() == io::ErrorKind::Interrupted)
+        );
+    }
+
+    #[test]
+    fn update_reaching_the_lock_while_stopping_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().join("config");
+        std::fs::write(&path, "current").unwrap();
+        let mut worker = IO::new(None).unwrap();
+        worker.stop_timeout(SHUTDOWN_WAIT);
+        assert!(worker.stopping.load(Ordering::SeqCst));
+        assert!(!worker.abandoned.load(Ordering::SeqCst));
+        let job = Job::Update {
+            path: path.clone(),
+            wait: Duration::ZERO,
+            edit: Box::new(Append("new")),
+        };
+
+        // The save passed the worker's initial stop check before shutdown.
+        let result = execute(job, None, &mut Op::Save, &mut path, &worker.abandoned);
+
+        assert!(
+            matches!(result, Ok(Outcome::Updated(Ok(updated))) if updated.text == "currentnew")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "currentnew");
     }
 
     #[test]
@@ -928,7 +992,9 @@ mod tests {
         let resume = pause(&mut worker);
         let exported = worker.enqueue(export("unused.png".into(), false), 6);
         let started = Instant::now();
+        let abandoned = Arc::clone(&worker.abandoned);
         let done = worker.finish_timeout(Duration::from_millis(50));
+        assert!(abandoned.load(Ordering::SeqCst));
         assert_eq!(done.len(), 3);
         assert_eq!(done[0].id, opened);
         assert!(matches!(done[0].outcome, Outcome::Opened(Ok(_))));
