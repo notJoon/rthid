@@ -32,7 +32,6 @@
 //!     match modal.picker.handle_key(key, items.len()) {
 //!         Outcome::Ignored
 //!             if key.code == KeyCode::Char('d')
-//!                 && key.kind != KeyEventKind::Release
 //!                 && key.modifiers.is_empty() => {
 //!             let Some(index) = modal.picker.selected(items.len()) else { return false };
 //!             let name = items[index];
@@ -47,11 +46,13 @@
 //! let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
 //! let mut items = vec!["warm", "cool"];
 //! let mut modal = Modal { picker: ListPicker::new(0), confirm: None };
+//! let mut release = key('d');
+//! release.kind = KeyEventKind::Release;
+//! assert!(on_key(&mut modal, &mut items, release));
+//! assert!(modal.confirm.is_none());
 //! assert!(on_key(&mut modal, &mut items, key('j')));
 //! assert!(on_key(&mut modal, &mut items, key('d')));
 //! assert_eq!(modal.confirm.as_ref().map(Confirm::message), Some("Delete cool?"));
-//! let mut release = key('d');
-//! release.kind = KeyEventKind::Release;
 //! assert!(on_key(&mut modal, &mut items, release));
 //! assert!(modal.confirm.is_some());
 //! assert!(on_key(&mut modal, &mut items, key('y')));

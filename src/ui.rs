@@ -390,7 +390,13 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
         invalid,
         swatch,
     }) = editing
-        && let Some(text_area) = layout.field
+        && let Some(text_area) = modal
+            .layout(
+                screen_layout.preview,
+                screen_layout.screen,
+                &app.modal_ctx(),
+            )
+            .field
     {
         frame.render_widget(Paragraph::new("").style(highlight), text_area);
         let style = highlight.fg(if invalid { Color::Red } else { Color::Reset });
@@ -849,6 +855,45 @@ mod tests {
                         .width
                 ) >= Line::raw("A template with a long name | A palette with a long name | tone")
                     .width()
+            );
+        }
+    }
+
+    #[test]
+    fn editor_field_tracks_selected_row_after_resize() {
+        use crate::{modal::Editor, settings::Preset};
+
+        let mut app = App::builtin(RgbaImage::new(12, 12), None);
+        let mut editor = Editor::new(
+            &app.modal_ctx(),
+            Preset {
+                name: "Paper".into(),
+                colors: vec!["#000".into(); 8],
+                mode: None,
+                builtin: false,
+            },
+        );
+        editor.rows.select(8);
+        editor.input = Some(TextInput::new("oops", 7));
+        app.modal = Some(Modal::Editor(Box::new(editor)));
+        let mut renderer = Renderer::new(None);
+        for height in [24, 7, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+            draw_text(&mut terminal, &app, &mut renderer);
+            let modal = app.modal.as_ref().unwrap();
+            let screen = layout(terminal.size().unwrap());
+            let field = modal
+                .layout(screen.preview, screen.screen, &app.modal_ctx())
+                .field
+                .unwrap();
+            assert_eq!(terminal.get_cursor_position().unwrap().y, field.y);
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "o" && cell.fg == Color::Red)
             );
         }
     }

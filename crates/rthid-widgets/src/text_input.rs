@@ -126,7 +126,7 @@ impl TextInput {
     /// - Enter returns `Submit(())` and Esc returns `Cancel`.
     /// - Any other key, including Tab, Up, Down, control characters and
     ///   characters with Ctrl or Alt, returns `Ignored`.
-    /// - A key release returns `Ignored`, so each press edits once.
+    /// - A key release returns `Consumed`, so each press edits once.
     ///
     /// # Examples
     ///
@@ -145,7 +145,7 @@ impl TextInput {
     /// ```
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome<()> {
         if is_release(&key) {
-            return Outcome::Ignored;
+            return Outcome::Consumed;
         }
         match key.code {
             KeyCode::Char(c)
