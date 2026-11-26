@@ -74,11 +74,12 @@ These composition controls change the output. The preview zoom keys and preview
 panning only navigate the result. `d` restores the selected control and `D`
 restores all settings, including composition.
 
-The status includes `Card 50x90 mm | Dots 250x450 | Dot 0.20 mm | Rot 0°`.
-When flipped, the rotation reads, for example, `Rot 90° Flip`.
-With bleed it shows, for example, `Card 50x90 mm (+3 mm bleed)`.
-The layer and preview navigation information remain before these fields.
-Long status lines are clipped to the terminal width.
+The status starts with `Card 50x90mm | Dots 250x450 @0.20mm | Rot 0°`, where
+`@0.20mm` is the dot size. When flipped, the rotation reads, for example,
+`Rot 90° Flip`. With bleed it shows, for example, `Card 50x90+3mm`.
+The layer and preview navigation information follow these fields.
+Long status lines are clipped to the terminal width, so in 80 columns the print
+fields stay visible and the layer and navigation fields are cut first.
 
 ## Keys
 

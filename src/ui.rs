@@ -558,27 +558,28 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
-            "{displayed} | {mode} | Card {}x{} mm{} | Dots {gw}x{gh} | Dot {:.2} mm | Rot {}°{}{}{}",
+            // Print fields lead so an 80 column terminal clips navigation, not them.
+            "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}",
             app.settings.card.w_mm,
             app.settings.card.h_mm,
             if app.settings.bleed > 0 {
-                format!(" (+{} mm bleed)", app.settings.bleed)
+                format!("+{}", app.settings.bleed)
             } else {
                 String::new()
             },
             f64::from(app.settings.dot) / 100.0,
             app.settings.rotation.degrees(),
             if app.settings.flip { " Flip" } else { "" },
+            app.dpi
+                .and_then(|dpi| crate::print::png_size(&app.settings, dpi)
+                    .ok()
+                    .map(|(w, h)| { format!(" | PNG {w}x{h} @{dpi}dpi") }))
+                .unwrap_or_default(),
             if placement.aw == 0 {
                 " | no image area"
             } else {
                 ""
             },
-            app.dpi
-                .and_then(|dpi| crate::print::png_size(&app.settings, dpi).ok().map(|(w, h)| {
-                    format!(" | PNG {w}x{h} @{dpi}dpi")
-                }))
-                .unwrap_or_default(),
         )
     })
 }
@@ -962,7 +963,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original | Fit (sextant) approximate |")
+            .ends_with(" | Original | Fit (sextant) approximate")
         );
         assert!(
             status(
@@ -973,7 +974,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original (kitty) | Fit (sextant) |")
+            .ends_with(" | Original (kitty) | Fit (sextant)")
         );
         let dir = tempfile::tempdir().unwrap();
         for with_export in [false, true] {
@@ -1138,11 +1139,7 @@ mod tests {
             "Black: 0.00",
             "White: 1.00",
             "Sharpen: 0.00",
-            "Original | 100%",
-            "Card 50x90 mm",
-            "Dots 250x450",
-            "Dot 0.20 mm",
-            "Rot 0",
+            "Card 50x90mm | Dots 250x450 @0.20mm | Rot 0° | Original | 100%",
         ] {
             assert!(text.contains(label), "missing {label}");
         }
@@ -1400,16 +1397,24 @@ mod tests {
         app.settings.flip = true;
         let geometry = app.geometry(Rect::new(0, 0, 100, 20));
         let text = status(&app, &geometry, PreviewReport::default());
-        assert!(
-            text.contains(
-                "Card 50x90 mm (+3 mm bleed) | Dots 280x480 | Dot 0.20 mm | Rot 90° Flip"
-            )
-        );
+        assert!(text.starts_with("Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | "));
         assert!(!text.contains("PNG"));
         app.dpi = Some(600);
         assert!(
-            status(&app, &geometry, PreviewReport::default()).contains("PNG 1323x2268 @600dpi")
+            status(&app, &geometry, PreviewReport::default())
+                .contains("Rot 90° Flip | PNG 1323x2268 @600dpi | ")
         );
+        // Worst case: the widest PNG size and DPI still fit in 80 columns.
+        app.dpi = Some(4800);
+        let report = PreviewReport {
+            approximate: true,
+            ..PreviewReport::default()
+        };
+        let text = status(&app, &geometry, report);
+        let print =
+            "Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | PNG 10583x18142 @4800dpi";
+        assert!(text.starts_with(print), "{text}");
+        assert!(print.chars().count() <= 80);
         app.settings = crate::settings::Settings {
             margin: 100,
             ..crate::settings::Settings::for_pixels(8, 8)

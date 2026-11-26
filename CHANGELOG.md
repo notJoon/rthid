@@ -20,7 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Scale is replaced by card, dot, margin, bleed, zoom and pan controls. Rotation
   turns the image inside the fixed card grid, and uncovered areas stay paper
-- The status line shows card size, dot count and dot size. Templates save physical
+- The status line starts with card size, dot count and dot size, ahead of the
+  layer and navigation fields, so they stay visible in 80 columns. Templates save physical
   print settings and ignore old `scale` fields, retaining config version 1
 
 - Faster panning of a zoomed image: Original cells use 256 colors while the
