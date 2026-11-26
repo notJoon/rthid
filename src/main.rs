@@ -223,7 +223,7 @@ fn main() -> std::io::Result<()> {
     // Edits whose background save did not finish are saved here.
     terminal_result = terminal_result.and(save_on_quit(
         config_path.as_deref(),
-        &app.unsaved(),
+        &app.library.unsaved(),
         &mut debug_log.as_mut(),
     ));
     if debug_log.is_none()
@@ -290,7 +290,8 @@ fn event_loop(
         // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
         //       when a job finishes instead.
         let timeout = [
-            app.save_retry()
+            app.library
+                .retry_at()
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
             io.busy().then_some(Duration::from_millis(30)),
         ]

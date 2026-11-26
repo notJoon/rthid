@@ -7,7 +7,7 @@ use crate::{
     memo::Memo,
     modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
     settings::{Rotation, Setting, Settings, Template},
-    store::{Change, Library, Loaded, SaveNotice},
+    store::{Change, Library, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -42,7 +42,6 @@ struct Drag {
 }
 
 enum Source {
-    Config,
     Export,
     Other,
 }
@@ -67,7 +66,7 @@ pub struct App {
     notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
     open_request: Option<OpenRequest>,
-    // Last value handed out as a dialog generation or Open token.
+    // Last value handed out as a dialog generation or job token.
     // Zero tags requests without a dialog.
     last_token: u64,
     /// Active dialog, which receives input before global bindings.
@@ -101,10 +100,6 @@ impl App {
         preview_png: Option<PathBuf>,
         loaded: Loaded,
     ) -> Self {
-        let notice = loaded.notice().map(|text| Notice {
-            source: Source::Config,
-            text,
-        });
         let mut app = Self {
             export: preview_png.map(Export::new),
             source_path: None,
@@ -131,7 +126,6 @@ impl App {
         if let Some((path, image)) = source {
             app.open_image(path, image);
         }
-        app.notice = notice;
         app
     }
 
@@ -169,10 +163,14 @@ impl App {
 
     /// Supplies directory entries to the open dialog if it is still open.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        self.route_listing(dir, entries);
+        self.notice = None;
+    }
+
+    fn route_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
         if let Some(Modal::OpenFile(picker)) = &mut self.modal {
             picker.set_listing(dir, entries);
         }
-        self.notice = None;
     }
 
     /// Status text with loading and the current notice before persistent diagnostics.
@@ -200,40 +198,11 @@ impl App {
         changed
     }
 
-    /// Edits not yet confirmed saved, empty when configuration loading blocked writes.
-    pub fn unsaved(&self) -> Vec<Change> {
-        self.library.unsaved()
-    }
-
-    /// When a failed save is due to be tried again.
-    pub fn save_retry(&self) -> Option<Instant> {
-        self.library.retry_at()
-    }
-
     /// Queues a save when edits arrived or the retry deadline passed.
     pub fn queue_save(&mut self, path: &Path, now: Instant) {
-        if let Some(job) = self.library.save_job(path, now) {
+        let token = self.next_token();
+        if let Some(job) = self.library.save_job(path, now, token) {
             self.outbox.push(job);
-        }
-    }
-
-    fn save_notice(&mut self, notice: SaveNotice) {
-        match notice {
-            SaveNotice::Show(notice) => {
-                self.report_notice(Notice {
-                    source: Source::Config,
-                    text: notice,
-                });
-            }
-            SaveNotice::ClearConfig => {
-                if self
-                    .notice
-                    .as_ref()
-                    .is_some_and(|notice| matches!(notice.source, Source::Config))
-                {
-                    self.notice = None;
-                }
-            }
         }
     }
 
@@ -280,9 +249,7 @@ impl App {
                 };
                 if routed {
                     if opened {
-                        if let Some(Modal::OpenFile(picker)) = &mut self.modal {
-                            picker.set_listing(listing.dir, listing.entries);
-                        }
+                        self.route_listing(listing.dir, listing.entries);
                     } else {
                         self.set_listing(listing.dir, listing.entries);
                     }
@@ -310,10 +277,13 @@ impl App {
                 }
             }
             IoOutcome::Updated(result) => {
-                let Some(notice) = self.library.complete(done.tag, result, Instant::now()) else {
+                let Some(()) = self.library.complete(done.tag, result, Instant::now()) else {
                     return false;
                 };
-                self.save_notice(notice);
+                // A failure or a newly blocked save shows through the persistent fallback.
+                if self.library.notice().is_some() {
+                    self.notice = None;
+                }
                 changed = true;
             }
             IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
@@ -321,11 +291,6 @@ impl App {
             }
         }
         changed
-    }
-
-    #[cfg(test)]
-    fn loading(&self) -> bool {
-        self.open_request.is_some()
     }
 
     fn next_token(&mut self) -> u64 {
@@ -726,7 +691,7 @@ impl App {
             }
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
-                self.commit(Change::UpsertPreset(preset))?;
+                self.library.commit(Change::UpsertPreset(preset))?;
                 let preset = self
                     .library
                     .palettes
@@ -735,18 +700,14 @@ impl App {
                 let settings = base.with_preset(preset.unwrap());
                 self.apply(Effect::Preview(settings))?;
             }
-            Effect::RemovePreset(name) => self.commit(Change::RemovePreset(name))?,
+            Effect::RemovePreset(name) => self.library.commit(Change::RemovePreset(name))?,
             Effect::SaveTemplate(name) => {
                 let template = Template::capture(name, &self.settings);
-                self.commit(Change::UpsertTemplate(template))?;
+                self.library.commit(Change::UpsertTemplate(template))?;
             }
-            Effect::RemoveTemplate(name) => self.commit(Change::RemoveTemplate(name))?,
+            Effect::RemoveTemplate(name) => self.library.commit(Change::RemoveTemplate(name))?,
         }
         Ok(())
-    }
-
-    fn commit(&mut self, change: Change) -> Result<(), String> {
-        self.library.commit(change)
     }
 
     fn adjust(&mut self, direction: i32) {
@@ -795,15 +756,14 @@ mod tests {
         let tag = match outcome {
             IoOutcome::Opened(_) => app.open_request.as_ref().map_or(0, |r| r.token),
             IoOutcome::Listed(_) => app.dialog().unwrap_or(0),
-            IoOutcome::Exported(_) => 0,
-            IoOutcome::Updated(_) => panic!("use the queued save tag"),
+            _ => app.last_token,
         };
         Done::new(tag, std::time::Duration::ZERO, outcome)
     }
 
     // Drains unsaved edits as a save that succeeded would.
     fn take_changes(app: &mut App) -> Vec<Change> {
-        let changes = app.unsaved();
+        let changes = app.library.unsaved();
         if !changes.is_empty() {
             app.queue_save(Path::new("config.toml"), Instant::now());
             let (tag, path, edit) = save_job(app);
@@ -962,7 +922,7 @@ mod tests {
                 image: RgbaImage::new(2, 3),
             })),
         )));
-        assert!(!app.loading());
+        assert!(app.open_request.is_none());
         assert_eq!(
             app.source_path(),
             Some(std::path::Path::new("/first/a.png"))
@@ -1317,7 +1277,9 @@ mod tests {
     }
 
     fn saved(app: &mut App, text: &str) {
-        app.commit(Change::RemoveTemplate("Absent".into())).unwrap();
+        app.library
+            .commit(Change::RemoveTemplate("Absent".into()))
+            .unwrap();
         app.queue_save(Path::new("config.toml"), Instant::now());
         let (tag, path, _) = save_job(app);
         app.complete(save_done(
@@ -1330,7 +1292,9 @@ mod tests {
     }
 
     fn save_failed(app: &mut App) {
-        app.commit(Change::RemoveTemplate("Absent".into())).unwrap();
+        app.library
+            .commit(Change::RemoveTemplate("Absent".into()))
+            .unwrap();
         app.queue_save(Path::new("config.toml"), Instant::now());
         let (tag, path, _) = save_job(app);
         let error = rthid_io::io::IoError {
@@ -1510,15 +1474,9 @@ mod tests {
         let error = failure(rthid_io::io::Op::Encode);
         let text = error.to_string();
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
-        for config in [false, true] {
-            if config {
-                app.save_notice(SaveNotice::Show(text.clone()));
-            } else {
-                app.set_notice(text.clone());
-            }
-            app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
-            assert_eq!(app.notice(), Some(text.as_str()));
-        }
+        app.set_notice(text.clone());
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        assert_eq!(app.notice(), Some(text.as_str()));
     }
 
     #[test]
@@ -1575,9 +1533,9 @@ mod tests {
             for result_kind in 0..3 {
                 let mut app = App::empty();
                 app.set_notice("Loading is only text".into());
-                assert!(!app.loading());
+                assert!(app.open_request.is_none());
                 app.request_open("photo.png".into(), None);
-                assert!(app.loading());
+                assert!(app.open_request.is_some());
                 app.set_notice("earlier notice".into());
                 let expected = match notice_kind {
                     0 => {
@@ -1617,7 +1575,7 @@ mod tests {
                     expected
                 };
                 assert!(app.complete(done(&app, outcome)));
-                assert!(!app.loading());
+                assert!(app.open_request.is_none());
                 assert_eq!(app.notice(), Some(expected.as_str()));
             }
         }
@@ -1703,7 +1661,7 @@ mod tests {
             app.set_notice("config warning".into());
             assert_eq!(app.library.templates, templates);
             assert_eq!(app.notice(), Some("config warning"));
-            assert!(app.unsaved().is_empty());
+            assert!(app.library.unsaved().is_empty());
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &app.geometry(Rect::new(0, 0, 20, 10)),
@@ -1713,7 +1671,7 @@ mod tests {
                 blocked.then_some("config: saving disabled: broken file")
             );
             app.apply(Effect::SaveTemplate("Another".into())).unwrap();
-            assert_eq!(app.unsaved().is_empty(), blocked);
+            assert_eq!(app.library.unsaved().is_empty(), blocked);
             app.queue_save(Path::new("config.toml"), Instant::now());
             assert_eq!(
                 matches!(jobs(&mut app).as_slice(), [Job::Update { .. }]),
