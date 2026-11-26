@@ -85,7 +85,9 @@ pub fn detect(mode: Mode, term_program: Option<&str>) -> Option<Graphics> {
 /// Deletes the pinned Kitty image so it does not linger after exit.
 impl Drop for Graphics {
     fn drop(&mut self) {
-        if !self.kitty {
+        // Tests build Kitty renderers without a terminal, so the delete would leak into
+        // cargo test output.
+        if !self.kitty || cfg!(test) {
             return;
         }
         let (start, escape, end) = Parser::tmux_start_escape_end(self.picker.tmux_detected());
