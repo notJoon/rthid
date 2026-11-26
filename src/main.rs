@@ -454,10 +454,8 @@ mod tests {
 
     #[test]
     fn pointer_motion_after_drag_requests_redraw() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let mut app = App::builtin(image::RgbaImage::new(120, 120), None);
-        app.viewport.zoom = viewport::Zoom::In(1);
-        app.viewport.hide_minimap = true;
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::drag_fixture();
         let layout = ui::layout(ratatui::layout::Size::new(100, 24));
         for (kind, column, dragging, redraw) in [
             (MouseEventKind::Down(MouseButton::Left), 10, false, false),
@@ -470,13 +468,13 @@ mod tests {
             (MouseEventKind::ScrollDown, 10, false, true),
             (MouseEventKind::ScrollRight, 10, false, true),
         ] {
-            let mouse = MouseEvent {
+            let changed = app.mouse_at(
                 kind,
                 column,
-                row: layout.preview.y + 1,
-                modifiers: KeyModifiers::NONE,
-            };
-            let changed = app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen);
+                layout.preview.y + 1,
+                &app.geometry(layout.preview),
+                layout.screen,
+            );
             assert_eq!(app.dragging(), dragging);
             assert_eq!(changed, redraw);
         }

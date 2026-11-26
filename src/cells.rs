@@ -433,6 +433,21 @@ mod tests {
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid_dither::dither::make_palette;
 
+    fn render_with_new_caches(
+        pixels: Pixels<'_>,
+        glyphs: Glyphs,
+        geometry: &PreviewGeometry,
+        buffer: &mut Buffer,
+    ) -> bool {
+        render(
+            pixels,
+            glyphs,
+            geometry,
+            buffer,
+            &mut OverviewCaches::default(),
+        )
+    }
+
     #[test]
     fn solid_cells_reset_foreground_for_every_glyph() {
         for glyph in [' ', '▀', '▌', '█', '\u{1fb00}'] {
@@ -512,12 +527,11 @@ mod tests {
         let area = Rect::new(2, 3, 60, 30);
         let mut buffer = Buffer::empty(area);
         viewport.zoom = Zoom::Fit;
-        render(
+        render_with_new_caches(
             indexed(&indices, &palette),
             Glyphs::Quadrant,
             &crate::viewport::geometry(&viewport, (w, h), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         );
         let is_block = |cell: &ratatui::buffer::Cell| {
             cell.symbol()
@@ -575,12 +589,11 @@ mod tests {
             viewport.x = x;
             viewport.y = y;
             let viewport_rect = viewport.viewport_rect(w, h, viewport.visible(w, h, area), map);
-            render(
+            render_with_new_caches(
                 indexed(&indices, &palette),
                 Glyphs::default(),
                 &crate::viewport::geometry(&viewport, (w, h), area),
                 &mut current,
-                &mut OverviewCaches::default(),
             );
             for pos in frame.positions() {
                 let original = &baseline[pos];
@@ -660,12 +673,11 @@ mod tests {
         ] {
             let mut buffer = Buffer::empty(area);
             assert_eq!(
-                render(
+                render_with_new_caches(
                     indexed(&indices, &palette),
                     glyphs,
                     &geometry(&Viewport::default(), size, area),
                     &mut buffer,
-                    &mut OverviewCaches::default(),
                 ),
                 approximate,
                 "{glyphs:?} {size:?}"
@@ -748,21 +760,9 @@ mod tests {
             viewport.pan(i64::MAX, i64::MAX, &before);
             let after = geometry(&viewport, (16, 16), area);
             for source in [indexed(&indices, &palette), Pixels::Rgb(&pixels, 1)] {
-                render(
-                    source,
-                    Glyphs::default(),
-                    &before,
-                    &mut buffer,
-                    &mut OverviewCaches::default(),
-                );
+                render_with_new_caches(source, Glyphs::default(), &before, &mut buffer);
                 assert_eq!(buffer[partial].bg, Color::Rgb(255, 0, 0));
-                render(
-                    source,
-                    Glyphs::default(),
-                    &after,
-                    &mut buffer,
-                    &mut OverviewCaches::default(),
-                );
+                render_with_new_caches(source, Glyphs::default(), &after, &mut buffer);
                 assert_eq!(buffer[full].symbol(), " ");
                 assert_eq!(buffer[full].fg, Color::Reset);
                 assert_eq!(buffer[full].bg, Color::Rgb(255, 0, 0));
@@ -775,7 +775,7 @@ mod tests {
         let pixels = RgbaImage::from_raw(1, 2, vec![25, 26, 128, 0, 231, 47, 93, 128]).unwrap();
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&pixels, 1),
             Glyphs::default(),
             &crate::viewport::geometry(
@@ -787,7 +787,6 @@ mod tests {
                 area
             ),
             &mut buffer,
-            &mut OverviewCaches::default(),
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(25, 26, 128));
@@ -802,12 +801,11 @@ mod tests {
         for (width, expected) in [(2, vec![0, 255]), (1, vec![127])] {
             let area = Rect::new(2, 3, width, 3);
             let mut buffer = Buffer::empty(area);
-            assert!(!render(
+            assert!(!render_with_new_caches(
                 Pixels::Rgb(&rgb(4, 4, &pixels), 1),
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
                 &mut buffer,
-                &mut OverviewCaches::default(),
             ));
             let (cw, ch) = fit_aspect(4, 4, area, CELL_ASPECT);
             let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
@@ -831,12 +829,11 @@ mod tests {
         let pixels = [[0, 20, 100], [100, 40, 200], [200, 60, 0], [254, 80, 100]];
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&rgb(1, 4, &pixels), 1),
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(50, 30, 150));
@@ -848,12 +845,11 @@ mod tests {
         let pixels = [[25, 26, 128], [231, 47, 93]];
         let area = Rect::new(0, 0, 3, 3);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&rgb(1, 2, &pixels), 1),
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         ));
         let (cw, ch) = fit_aspect(1, 2, area, CELL_ASPECT);
         let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
@@ -874,7 +870,7 @@ mod tests {
         let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
         let area = Rect::new(0, 0, 1, 2);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             indexed(&[0, 1, 2], &palette),
             Glyphs::default(),
             &crate::viewport::geometry(
@@ -886,7 +882,6 @@ mod tests {
                 area
             ),
             &mut buffer,
-            &mut OverviewCaches::default(),
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
@@ -903,12 +898,11 @@ mod tests {
             zoom: Zoom::In(1),
             ..Viewport::default()
         };
-        render(
+        render_with_new_caches(
             indexed(&vec![0; 120 * 120], &palette),
             Glyphs::default(),
             &crate::viewport::geometry(&viewport, (120, 120), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         );
         // The square grid fits 9x4 cells inside the 14x4 border of a 16x6 frame at x 32.
         assert_eq!(buffer[(32, 0)].symbol(), "┌");
@@ -955,13 +949,7 @@ mod tests {
             let g = geometry(&viewport, (1, 2), area);
             for source in [indexed(&[0, 1], &palette), Pixels::Rgb(&pixels, 1)] {
                 let mut buffer = Buffer::empty(area);
-                render(
-                    source,
-                    Glyphs::Quadrant,
-                    &g,
-                    &mut buffer,
-                    &mut OverviewCaches::default(),
-                );
+                render_with_new_caches(source, Glyphs::Quadrant, &g, &mut buffer);
                 for pos in g.target.positions() {
                     let cell = &buffer[pos];
                     if zoom == Zoom::In(2) {
@@ -992,12 +980,11 @@ mod tests {
             .collect();
         for pixels in [Pixels::Rgb(&pixels, 1), indexed(&indices, &palette)] {
             let mut buffer = Buffer::empty(area);
-            assert!(!render(
+            assert!(!render_with_new_caches(
                 pixels,
                 Glyphs::default(),
                 &geometry(&viewport, (2, 2), area),
                 &mut buffer,
-                &mut OverviewCaches::default(),
             ));
             for (x, y, rgb) in [
                 (2, 3, [255, 0, 0]),
@@ -1062,12 +1049,11 @@ mod tests {
         let g = geometry(&viewport, (20, 20), area);
         assert_eq!(g.visible, (4, 13));
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             indexed(&indices, &palette),
             Glyphs::Quadrant,
             &g,
             &mut buffer,
-            &mut OverviewCaches::default(),
         ));
         for x in 0..2 {
             let cell = &buffer[(x, 2)];

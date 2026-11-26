@@ -139,6 +139,28 @@ impl App {
         )
     }
 
+    /// Builds a scrollable image with the minimap hidden for drag tests.
+    #[cfg(test)]
+    pub(crate) fn drag_fixture() -> Self {
+        let mut app = Self::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = Zoom::In(1);
+        app.viewport.hide_minimap = true;
+        app
+    }
+
+    /// Sends a mouse event at a cell using the supplied preview geometry.
+    #[cfg(test)]
+    pub(crate) fn mouse_at(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        geometry: &PreviewGeometry,
+        screen: Rect,
+    ) -> bool {
+        self.handle_mouse(mouse_event(kind, column, row), geometry, screen)
+    }
+
     /// Builds an app without an image for tests.
     #[cfg(test)]
     pub fn empty() -> Self {
@@ -742,6 +764,16 @@ fn pan_delta(code: KeyCode, visible: (u32, u32), step: (u32, u32)) -> Option<(i6
 }
 
 #[cfg(test)]
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -750,6 +782,13 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    fn opened_photo() -> IoOutcome {
+        IoOutcome::Opened(Ok(Opened::Image {
+            path: "photo.png".into(),
+            image: RgbaImage::new(2, 3),
+        }))
+    }
 
     // Echoes the tag of the newest matching request, as the worker would.
     fn done(app: &App, outcome: IoOutcome) -> Done {
@@ -765,8 +804,7 @@ mod tests {
     fn take_changes(app: &mut App) -> Vec<Change> {
         let changes = app.library.unsaved();
         if !changes.is_empty() {
-            app.queue_save(Path::new("config.toml"), Instant::now());
-            let (tag, path, edit) = save_job(app);
+            let (tag, path, edit) = queued_save(app);
             let text = edit.apply(None).unwrap();
             app.complete(save_done(tag, Ok(rthid_io::io::Updated { path, text })));
         }
@@ -822,13 +860,7 @@ mod tests {
         assert!(app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
         assert!(app.notice().is_none());
         app.request_open("photo.png".into(), None);
-        assert!(app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            }))
-        )));
+        assert!(app.complete(done(&app, opened_photo())));
         assert!(app.modal.is_none());
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
@@ -1134,12 +1166,7 @@ mod tests {
                 }
             }
             app.handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: 2,
-                    row: 3,
-                    modifiers: KeyModifiers::NONE,
-                },
+                mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 3),
                 &app.geometry(test_layout().preview),
                 test_layout().screen,
             );
@@ -1265,7 +1292,8 @@ mod tests {
     }
 
     // Takes the queued save job with the tag its result echoes.
-    fn save_job(app: &mut App) -> (u64, PathBuf, Box<dyn rthid_io::io::Edit>) {
+    fn queued_save(app: &mut App) -> (u64, PathBuf, Box<dyn rthid_io::io::Edit>) {
+        app.queue_save(Path::new("config.toml"), Instant::now());
         match app.take_jobs().pop() {
             Some((Job::Update { path, edit, .. }, tag)) => (tag, path, edit),
             _ => panic!("save job expected"),
@@ -1280,8 +1308,7 @@ mod tests {
         app.library
             .commit(Change::RemoveTemplate("Absent".into()))
             .unwrap();
-        app.queue_save(Path::new("config.toml"), Instant::now());
-        let (tag, path, _) = save_job(app);
+        let (tag, path, _) = queued_save(app);
         app.complete(save_done(
             tag,
             Ok(rthid_io::io::Updated {
@@ -1295,8 +1322,7 @@ mod tests {
         app.library
             .commit(Change::RemoveTemplate("Absent".into()))
             .unwrap();
-        app.queue_save(Path::new("config.toml"), Instant::now());
-        let (tag, path, _) = save_job(app);
+        let (tag, path, _) = queued_save(app);
         let error = rthid_io::io::IoError {
             op: rthid_io::io::Op::Save,
             path,
@@ -1321,13 +1347,7 @@ mod tests {
             press(&mut app, code);
         }
         assert!(app.library.palettes.find("Z").is_some());
-        app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            })),
-        ));
+        app.complete(done(&app, opened_photo()));
         assert!(app.notice().is_none());
     }
 
@@ -1340,13 +1360,7 @@ mod tests {
             IoOutcome::Exported(Err(failure(rthid_io::io::Op::Encode))),
         ));
         app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
-        app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            })),
-        ));
+        app.complete(done(&app, opened_photo()));
         assert!(app.notice().is_none());
     }
 
@@ -1366,13 +1380,7 @@ mod tests {
                 entries: vec![],
             })),
         ));
-        app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            })),
-        ));
+        app.complete(done(&app, opened_photo()));
         assert!(app.notice().is_none());
     }
 
@@ -1383,13 +1391,7 @@ mod tests {
         save_failed(&mut app);
         app.set_notice("validation".into());
         press(&mut app, KeyCode::Char('x'));
-        app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            })),
-        ));
+        app.complete(done(&app, opened_photo()));
         assert_eq!(app.notice(), Some("config: config is busy"));
         app.set_notice("validation".into());
         save_failed(&mut app);
@@ -1427,12 +1429,11 @@ mod tests {
         app.set_notice("open: failed".into());
         let layout = test_layout();
         app.handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Moved,
-                column: layout.screen.width / 2,
-                row: layout.screen.height / 2,
-                modifiers: KeyModifiers::NONE,
-            },
+            mouse_event(
+                MouseEventKind::Moved,
+                layout.screen.width / 2,
+                layout.screen.height / 2,
+            ),
             &app.geometry(layout.preview),
             layout.screen,
         );
@@ -1512,13 +1513,7 @@ mod tests {
             }
             saved(&mut app, "");
             assert_eq!(app.notice(), Some("Loading photo.png"));
-            app.complete(done(
-                &app,
-                IoOutcome::Opened(Ok(Opened::Image {
-                    path: "photo.png".into(),
-                    image: RgbaImage::new(2, 3),
-                })),
-            ));
+            app.complete(done(&app, opened_photo()));
             assert_eq!(
                 app.notice(),
                 if config { None } else { Some("open: failed") }
@@ -1559,10 +1554,7 @@ mod tests {
                 };
                 assert_eq!(app.notice(), Some("Loading photo.png"));
                 let outcome = match result_kind {
-                    0 => IoOutcome::Opened(Ok(Opened::Image {
-                        path: "photo.png".into(),
-                        image: RgbaImage::new(2, 3),
-                    })),
+                    0 => opened_photo(),
                     1 => IoOutcome::Opened(Ok(Opened::Dir(Listing {
                         dir: "/images".into(),
                         entries: vec![],
@@ -2104,21 +2096,16 @@ mod tests {
 
     #[test]
     fn directory_completion_opens_modal_and_ends_drag() {
-        let mut app = App::builtin(RgbaImage::new(120, 120), None);
-        app.viewport.zoom = Zoom::In(1);
-        app.viewport.hide_minimap = true;
+        let mut app = App::drag_fixture();
         let layout = test_layout();
         for (kind, column) in [
             (MouseEventKind::Down(MouseButton::Left), 10),
             (MouseEventKind::Drag(MouseButton::Left), 9),
         ] {
-            app.handle_mouse(
-                MouseEvent {
-                    kind,
-                    column,
-                    row: layout.preview.y + 1,
-                    modifiers: KeyModifiers::NONE,
-                },
+            app.mouse_at(
+                kind,
+                column,
+                layout.preview.y + 1,
                 &app.geometry(layout.preview),
                 layout.screen,
             );
@@ -2144,12 +2131,7 @@ mod tests {
         let mouse = |app: &mut App, kind, column, row| {
             let version = versions(app);
             app.handle_mouse(
-                MouseEvent {
-                    kind,
-                    column,
-                    row,
-                    modifiers: KeyModifiers::NONE,
-                },
+                mouse_event(kind, column, row),
                 &app.geometry(area),
                 test_layout().screen,
             );
@@ -2254,12 +2236,7 @@ mod tests {
                 (MouseEventKind::Drag(MouseButton::Left), 7, 8),
             ] {
                 app.handle_mouse(
-                    MouseEvent {
-                        kind,
-                        column,
-                        row,
-                        modifiers: KeyModifiers::NONE,
-                    },
+                    mouse_event(kind, column, row),
                     &app.geometry(area),
                     test_layout().screen,
                 );
@@ -2267,12 +2244,7 @@ mod tests {
             assert_eq!((app.viewport.x, app.viewport.y), dragged, "{zoom:?}");
             for kind in [MouseEventKind::ScrollRight, MouseEventKind::ScrollDown] {
                 app.handle_mouse(
-                    MouseEvent {
-                        kind,
-                        column: 7,
-                        row: 8,
-                        modifiers: KeyModifiers::NONE,
-                    },
+                    mouse_event(kind, 7, 8),
                     &app.geometry(area),
                     test_layout().screen,
                 );

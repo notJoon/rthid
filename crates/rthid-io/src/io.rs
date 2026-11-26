@@ -733,48 +733,38 @@ mod tests {
     }
 
     #[test]
-    fn update_reaching_the_lock_after_abandonment_preserves_the_latest_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut path = dir.path().join("config");
-        std::fs::write(&path, "newest").unwrap();
-        let abandoned = AtomicBool::new(true);
-        let job = Job::Update {
-            path: path.clone(),
-            wait: Duration::ZERO,
-            edit: Box::new(Append("old")),
-        };
+    fn update_reaching_the_lock_checks_abandonment() {
+        for abandoned in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut path = dir.path().join("config");
+            std::fs::write(&path, "current").unwrap();
+            let job = Job::Update {
+                path: path.clone(),
+                wait: Duration::ZERO,
+                edit: Box::new(Append("new")),
+            };
 
-        // The job passed the worker's initial stop check before shutdown.
-        let result = execute(job, None, &mut Op::Save, &mut path, &abandoned);
+            // The save passed the worker's initial stop check before shutdown.
+            let result = execute(
+                job,
+                None,
+                &mut Op::Save,
+                &mut path,
+                &AtomicBool::new(abandoned),
+            );
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newest");
-        assert!(
-            matches!(result, Err(Cause::Io(error)) if error.kind() == io::ErrorKind::Interrupted)
-        );
-    }
-
-    #[test]
-    fn update_reaching_the_lock_while_stopping_still_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut path = dir.path().join("config");
-        std::fs::write(&path, "current").unwrap();
-        let mut worker = IO::new(None).unwrap();
-        worker.stop_timeout(SHUTDOWN_WAIT);
-        assert!(worker.stopping.load(Ordering::SeqCst));
-        assert!(!worker.abandoned.load(Ordering::SeqCst));
-        let job = Job::Update {
-            path: path.clone(),
-            wait: Duration::ZERO,
-            edit: Box::new(Append("new")),
-        };
-
-        // The save passed the worker's initial stop check before shutdown.
-        let result = execute(job, None, &mut Op::Save, &mut path, &worker.abandoned);
-
-        assert!(
-            matches!(result, Ok(Outcome::Updated(Ok(updated))) if updated.text == "currentnew")
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "currentnew");
+            if abandoned {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "current");
+                assert!(
+                    matches!(result, Err(Cause::Io(error)) if error.kind() == io::ErrorKind::Interrupted)
+                );
+            } else {
+                assert!(
+                    matches!(result, Ok(Outcome::Updated(Ok(updated))) if updated.text == "currentnew")
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "currentnew");
+            }
+        }
     }
 
     #[test]
@@ -939,6 +929,7 @@ mod tests {
         assert_eq!(wait(&mut worker).kind(), Kind::List);
         assert_eq!(wait(&mut worker).id, latest);
         worker.stop_timeout(SHUTDOWN_WAIT);
+        assert!(!worker.abandoned.load(Ordering::SeqCst));
         for _ in 0..2 {
             let id = worker.enqueue(open(dir.path().to_path_buf()), 3);
             assert!(worker.busy());

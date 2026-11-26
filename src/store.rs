@@ -567,22 +567,26 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn update(job: Job) -> (PathBuf, Box<dyn rthid_io::io::Edit>) {
+        match job {
+            Job::Update { path, edit, .. } => (path, edit),
+            _ => panic!("save job expected"),
+        }
+    }
+
+    fn template(name: &str) -> Change {
+        Change::UpsertTemplate(Template::capture(name.into(), &Settings::default()))
+    }
+
     #[test]
     fn failed_saves_keep_edits_and_retry_after_the_deadline() {
         use rthid_io::io::{Cause, IoError, Op, Updated};
         let config = Path::new("config.toml");
         let mut library = Library::new(Loaded::default());
-        library
-            .commit(Change::UpsertTemplate(Template::capture(
-                "Zine".into(),
-                &Settings::default(),
-            )))
-            .unwrap();
+        library.commit(template("Zine")).unwrap();
         let started = Instant::now();
         let (job, tag) = library.save_job(config, started, 1).unwrap();
-        let Job::Update { path, .. } = job else {
-            panic!("save job expected")
-        };
+        let (path, _) = update(job);
         let busy = IoError {
             op: Op::Save,
             path,
@@ -603,9 +607,7 @@ mod tests {
         );
         let (job, tag) = library.save_job(config, deadline, 2).unwrap();
         assert!(library.retry_at().is_none());
-        let Job::Update { path, edit, .. } = job else {
-            panic!("save job expected")
-        };
+        let (path, edit) = update(job);
         let text = edit.apply(None).unwrap();
         assert_eq!(
             library.complete(tag, Ok(Updated { path, text }), Instant::now()),
@@ -619,12 +621,10 @@ mod tests {
     fn equal_edit_made_during_a_save_remains_unsaved() {
         let now = Instant::now();
         let mut library = Library::new(Loaded::default());
-        let change = Change::UpsertTemplate(Template::capture("T".into(), &Settings::default()));
+        let change = template("T");
         library.commit(change.clone()).unwrap();
         let (job, tag) = library.save_job(Path::new("config.toml"), now, 1).unwrap();
-        let Job::Update { path, edit, .. } = job else {
-            panic!("save job expected")
-        };
+        let (path, edit) = update(job);
         let text = edit.apply(None).unwrap();
         library.commit(change.clone()).unwrap();
 
@@ -640,22 +640,10 @@ mod tests {
         use rthid_io::io::Updated;
         let config = Path::new("config.toml");
         let mut library = Library::new(Loaded::default());
-        library
-            .commit(Change::UpsertTemplate(Template::capture(
-                "First".into(),
-                &Settings::default(),
-            )))
-            .unwrap();
+        library.commit(template("First")).unwrap();
         let (job, tag) = library.save_job(config, Instant::now(), 1).unwrap();
-        let Job::Update { path, edit, .. } = job else {
-            panic!("save job expected")
-        };
-        library
-            .commit(Change::UpsertTemplate(Template::capture(
-                "Second".into(),
-                &Settings::default(),
-            )))
-            .unwrap();
+        let (path, edit) = update(job);
+        library.commit(template("Second")).unwrap();
         let text = edit.apply(None).unwrap();
         let first = || Updated {
             path: path.clone(),
@@ -671,9 +659,7 @@ mod tests {
         assert!(library.templates.find("First").is_some());
         assert!(library.templates.find("Second").is_some());
         let (job, tag) = library.save_job(config, Instant::now(), 2).unwrap();
-        let Job::Update { path, edit, .. } = job else {
-            panic!("save job expected")
-        };
+        let (path, edit) = update(job);
         let text = edit.apply(Some(text)).unwrap();
         assert_eq!(
             library.complete(tag, Ok(Updated { path, text }), Instant::now()),
@@ -688,12 +674,7 @@ mod tests {
     #[test]
     fn failed_save_reports_repeated_errors() {
         let mut library = Library::new(Loaded::default());
-        library
-            .commit(Change::UpsertTemplate(Template::capture(
-                "First".into(),
-                &Settings::default(),
-            )))
-            .unwrap();
+        library.commit(template("First")).unwrap();
         library
             .commit(Change::RemoveTemplate("First".into()))
             .unwrap();
@@ -713,7 +694,7 @@ mod tests {
     #[test]
     fn unsaved_edits_keep_the_last_change_per_list_and_name() {
         let mut library = Library::new(Loaded::default());
-        let last = Change::UpsertTemplate(Template::capture("Shared".into(), &Settings::default()));
+        let last = template("Shared");
         for change in [
             Change::RemovePreset("Shared".into()),
             Change::RemoveTemplate("Shared".into()),
@@ -785,8 +766,7 @@ mod tests {
     fn empty_and_versionless_files_accept_saves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let change =
-            Change::UpsertTemplate(Template::capture("Saved".into(), &Settings::default()));
+        let change = template("Saved");
         for text in ["", " \n\t", "[[template]]\nname = 'Existing'\n"] {
             fs::write(&path, text).unwrap();
             assert!(load(&path).save_blocked.is_none());
@@ -805,10 +785,7 @@ mod tests {
         use rthid_io::io::Edit;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let changes = vec![Change::UpsertTemplate(Template::capture(
-            "Zine".into(),
-            &Settings::default(),
-        ))];
+        let changes = vec![template("Zine")];
         let existing = "[[template]]\nname = 'Existing'\n";
         let text = Merge(changes.clone()).apply(Some(existing.into())).unwrap();
         fs::write(&path, existing).unwrap();
@@ -888,15 +865,7 @@ mod tests {
         let original = "version = 1\nunknown = { enabled = true }\n[[palette]]\nname = 'Bad'\ncolors = 42\n[[palette]]\nname = 'Good'\ncolors = ['#fff']\n[[template]]\nname = 'Broken'\nmode = 'future'\n";
         fs::write(&path, original).unwrap();
         let before: toml::Table = toml::from_str(original).unwrap();
-        let loaded = save(
-            &path,
-            Duration::from_secs(1),
-            &[Change::UpsertTemplate(Template::capture(
-                "New".into(),
-                &Settings::default(),
-            ))],
-        )
-        .unwrap();
+        let loaded = save(&path, Duration::from_secs(1), &[template("New")]).unwrap();
         assert_eq!(loaded.warnings.len(), 2);
         let after: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["unknown"], before["unknown"]);
@@ -905,10 +874,7 @@ mod tests {
         save(
             &path,
             Duration::from_secs(1),
-            &[
-                Change::RemovePreset("Bad".into()),
-                Change::UpsertTemplate(Template::capture("Broken".into(), &Settings::default())),
-            ],
+            &[Change::RemovePreset("Bad".into()), template("Broken")],
         )
         .unwrap();
         assert!(load(&path).warnings.is_empty());
@@ -918,7 +884,7 @@ mod tests {
     fn save_rechecks_current_file_and_recovers_after_repair() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let change = Change::UpsertTemplate(Template::capture("Zine".into(), &Settings::default()));
+        let change = template("Zine");
         save(&path, Duration::from_secs(1), &[]).unwrap();
         for text in ["version = [", "version = 2\n"] {
             fs::write(&path, text).unwrap();

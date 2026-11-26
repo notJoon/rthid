@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn drag_colors_preserve_minimap_dithered_and_exact_cache() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         let area = Rect::new(0, 0, 48, 18);
         let image = RgbaImage::from_fn(120, 120, |x, y| {
             image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
@@ -614,16 +614,7 @@ mod tests {
                     (MouseEventKind::Down(MouseButton::Left), 2),
                     (MouseEventKind::Drag(MouseButton::Left), 1),
                 ] {
-                    app.handle_mouse(
-                        MouseEvent {
-                            kind,
-                            column,
-                            row: 10,
-                            modifiers: KeyModifiers::NONE,
-                        },
-                        &g,
-                        area,
-                    );
+                    app.mouse_at(kind, column, 10, &g, area);
                 }
                 assert!(app.dragging());
                 app.viewport.zoom = zoom;
@@ -635,16 +626,7 @@ mod tests {
                     .unwrap();
                 let dragging = terminal.backend().buffer().clone();
                 let cache_version = renderer.overviews.full.version();
-                assert!(app.handle_mouse(
-                    MouseEvent {
-                        kind: MouseEventKind::Moved,
-                        column: 1,
-                        row: 10,
-                        modifiers: KeyModifiers::NONE
-                    },
-                    &g,
-                    area,
-                ));
+                assert!(app.mouse_at(MouseEventKind::Moved, 1, 10, &g, area));
                 terminal
                     .draw(|frame| {
                         draw_preview(frame, &app, &g, &mut renderer);
@@ -683,10 +665,8 @@ mod tests {
 
     #[test]
     fn original_click_and_drag_end_keep_full_color() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let mut app = App::builtin(RgbaImage::new(120, 120), None);
-        app.viewport.zoom = viewport::Zoom::In(1);
-        app.viewport.hide_minimap = true;
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::drag_fixture();
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let layout = layout(terminal.size().unwrap());
@@ -700,13 +680,10 @@ mod tests {
             MouseEventKind::Moved,
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            app.handle_mouse(
-                MouseEvent {
-                    kind,
-                    column: g.target.x + u16::from(matches!(kind, MouseEventKind::Down(_))),
-                    row: g.target.y,
-                    modifiers: KeyModifiers::NONE,
-                },
+            app.mouse_at(
+                kind,
+                g.target.x + u16::from(matches!(kind, MouseEventKind::Down(_))),
+                g.target.y,
                 &g,
                 layout.screen,
             );
