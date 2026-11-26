@@ -225,7 +225,7 @@ Without `--dpi`, each dot becomes a solid square at an integer scale of 1 to 4,
 keeping the long side within 2048 pixels unless the grid itself is larger.
 The PNG contains no resolution metadata and retains the existing encoder bytes.
 
-`--dpi N` accepts integers from 1 to 4800. Each PNG axis is
+`--dpi N` requires `--preview-png` and accepts integers from 1 to 4800. Each PNG axis is
 `round((card mm + 2 * bleed mm) / 25.4 * N)`. Dot size does not change these
 pixel dimensions. Nearest sampling keeps dot boundaries, including when pixels
 per dot are not integers. The PNG records resolution in pixels per metre on both

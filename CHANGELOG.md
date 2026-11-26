@@ -8,8 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `--dpi 1..4800` sizes companion PNGs from the card including bleed and records
-  resolution metadata. The status shows PNG dimensions and DPI. Oversized outputs
-  are rejected before submission. Omitting DPI preserves preview sizing and bytes
+  resolution metadata. It requires `--preview-png`. The status shows PNG dimensions
+  and DPI. Oversized outputs are rejected before submission. Omitting DPI preserves
+  preview sizing and bytes
 
 - `f` mirrors left and right on the card after rotation, keeping pan directions
   and the current layer. The status shows `Flip` beside rotation. Templates keep

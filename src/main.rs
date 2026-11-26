@@ -72,8 +72,8 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
-    /// Size the PNG from card and bleed at N DPI (1 to 4800), with resolution metadata.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=4800))]
+    /// Size the PNG at N DPI (1 to 4800), requiring --preview-png.
+    #[arg(long, value_name = "N", requires = "preview_png", value_parser = clap::value_parser!(u32).range(1..=4800))]
     dpi: Option<u32>,
     /// Load user presets and templates from this TOML file.
     #[arg(long, value_name = "PATH")]
@@ -453,12 +453,17 @@ mod tests {
     fn cli_validates_dpi_range() {
         for dpi in ["1", "600", "4800"] {
             assert_eq!(
-                Args::try_parse_from(["rthid", "--dpi", dpi]).unwrap().dpi,
+                Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi])
+                    .unwrap()
+                    .dpi,
                 Some(dpi.parse().unwrap())
             );
         }
+        assert!(Args::try_parse_from(["rthid", "--dpi", "600"]).is_err());
         for dpi in ["0", "4801", "-1", "1.5", "abc", "4294967296"] {
-            assert!(Args::try_parse_from(["rthid", "--dpi", dpi]).is_err());
+            assert!(
+                Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi]).is_err()
+            );
         }
     }
 
