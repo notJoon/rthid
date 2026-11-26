@@ -116,7 +116,17 @@ fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
     log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> io::Result<()> {
     let Args {
         image: path,
         preview_png,
