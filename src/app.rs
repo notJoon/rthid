@@ -6,8 +6,8 @@ use crate::{
     grid::GridCache,
     memo::Memo,
     modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
-    settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
-    store::{Change, Loaded, Merge},
+    settings::{Rotation, Setting, Settings, Template},
+    store::{Change, Library, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -22,27 +22,40 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
-
-/// Longest wait for the config lock during a background save.
-const SAVE_WAIT: Duration = Duration::from_millis(50);
-/// Delay before a failed save is tried again.
-const SAVE_RETRY: Duration = Duration::from_secs(2);
-
-// The edits carried by the newest save job.
-struct Saving {
-    /// Tag the result echoes.
-    token: u64,
-    /// Edits included in the job.
-    changes: Vec<Change>,
-}
 
 struct OpenRequest {
     /// Tag the result echoes, unique to this request.
     token: u64,
     /// Generation of the dialog that asked, if any.
     dialog: Option<u64>,
+    /// Status label shown until this request finishes.
+    label: String,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    point: (u16, u16),
+    origin: (u32, u32),
+    moved: bool,
+}
+
+enum Source {
+    Export,
+    Other,
+}
+
+enum PreviewKey {
+    ToggleOriginal,
+    ToggleMinimap,
+    Zoom(Zoom),
+    Pan(i64, i64),
+}
+
+struct Notice {
+    source: Source,
+    text: String,
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -50,39 +63,25 @@ struct OpenRequest {
 pub struct App {
     export: Option<Export>,
     source_path: Option<PathBuf>,
-    notice: Option<String>,
-    // TODO: Derive the Loading text from `open_request` and render it ahead of `notice` in the
-    //       status line. Notices would then never need deferring, and this field and every
-    //       `loading()` guard could go.
-    deferred_notice: Option<String>,
-    save_blocked: Option<String>,
+    notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
-    // Edits not yet confirmed saved, with only the last one for each list and name.
-    unsaved: Vec<Change>,
-    // Whether edits arrived since the last save job.
-    dirty: bool,
-    saving: Option<Saving>,
-    save_retry: Option<Instant>,
     open_request: Option<OpenRequest>,
-    // Last value handed out as a dialog generation or Open token.
+    // Last value handed out as a dialog generation or job token.
     // Zero tags requests without a dialog.
     last_token: u64,
-    save_error: Option<String>,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
-    /// Saved settings with independent palette colors.
-    pub templates: Templates,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
     /// Preview zoom, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
-    last_drag: Option<((u16, u16), (u32, u32))>,
+    last_drag: Option<Drag>,
     /// Image processing caches.
     pub grid_cache: GridCache,
-    /// Built-in and user palette presets in selection order.
-    pub palettes: Palettes,
+    /// Named configuration lists and their pending saves.
+    pub library: Library,
     /// Current image settings.
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
@@ -99,10 +98,7 @@ impl App {
     pub fn new(
         source: Option<(PathBuf, RgbaImage)>,
         preview_png: Option<PathBuf>,
-        palettes: Palettes,
-        templates: Templates,
-        notice: Option<String>,
-        save_blocked: Option<String>,
+        loaded: Loaded,
     ) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
@@ -116,19 +112,11 @@ impl App {
                 grid: Memo::default(),
                 dithered: Memo::default(),
             },
-            palettes,
-            templates,
+            library: Library::new(loaded),
             notice: None,
-            deferred_notice: None,
-            save_blocked,
             outbox: Vec::new(),
-            unsaved: Vec::new(),
-            dirty: false,
-            saving: None,
-            save_retry: None,
             open_request: None,
             last_token: 0,
-            save_error: None,
             modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
@@ -138,7 +126,6 @@ impl App {
         if let Some((path, image)) = source {
             app.open_image(path, image);
         }
-        app.notice = notice;
         app
     }
 
@@ -148,24 +135,36 @@ impl App {
         Self::new(
             Some((PathBuf::from("test.png"), source)),
             preview_png,
-            Palettes::builtin(),
-            Templates::default(),
-            None,
-            None,
+            Loaded::default(),
         )
+    }
+
+    /// Builds a scrollable image with the minimap hidden for drag tests.
+    #[cfg(test)]
+    pub(crate) fn drag_fixture() -> Self {
+        let mut app = Self::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = Zoom::In(1);
+        app.viewport.hide_minimap = true;
+        app
+    }
+
+    /// Sends a mouse event at a cell using the supplied preview geometry.
+    #[cfg(test)]
+    pub(crate) fn mouse_at(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        geometry: &PreviewGeometry,
+        screen: Rect,
+    ) -> bool {
+        self.handle_mouse(mouse_event(kind, column, row), geometry, screen)
     }
 
     /// Builds an app without an image for tests.
     #[cfg(test)]
     pub fn empty() -> Self {
-        Self::new(
-            None,
-            None,
-            Palettes::builtin(),
-            Templates::default(),
-            None,
-            None,
-        )
+        Self::new(None, None, Loaded::default())
     }
 
     /// Path of the loaded source, if any.
@@ -186,95 +185,46 @@ impl App {
 
     /// Supplies directory entries to the open dialog if it is still open.
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        self.route_listing(dir, entries);
+        self.notice = None;
+    }
+
+    fn route_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
         if let Some(Modal::OpenFile(picker)) = &mut self.modal {
             picker.set_listing(dir, entries);
         }
-        if !self.loading() {
-            self.notice = None;
-        }
     }
 
-    /// Current configuration diagnostic for the status line.
+    /// Status text with loading and the current notice before persistent diagnostics.
+    /// Fallbacks are save errors, load warnings and blocked saving, then export status.
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.open_request
+            .as_ref()
+            .map(|request| request.label.as_str())
+            .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
+            .or_else(|| self.library.notice())
+            .or_else(|| self.export_status())
     }
 
-    /// Reports a notice or defers it during loading, returning whether the display changed.
+    /// Reports a notice and returns whether the display changed.
     pub fn set_notice(&mut self, notice: String) -> bool {
-        if self.loading() {
-            self.deferred_notice = Some(notice);
-            return false;
-        }
-        let changed = self.notice.as_ref() != Some(&notice);
+        self.report_notice(Notice {
+            source: Source::Other,
+            text: notice,
+        })
+    }
+
+    fn report_notice(&mut self, notice: Notice) -> bool {
+        let changed = self.open_request.is_none() && self.notice() != Some(notice.text.as_str());
         self.notice = Some(notice);
         changed
     }
 
-    /// Edits not yet confirmed saved, empty when configuration loading blocked writes.
-    pub fn unsaved(&self) -> &[Change] {
-        if self.save_blocked.is_some() {
-            &[]
-        } else {
-            &self.unsaved
-        }
-    }
-
-    /// When a failed save is due to be tried again.
-    pub fn save_retry(&self) -> Option<Instant> {
-        self.save_retry
-    }
-
-    /// Queues a background save of every unsaved edit to `path` when edits arrived since the
-    /// last save or the retry deadline passed by `now`.
+    /// Queues a save when edits arrived or the retry deadline passed.
     pub fn queue_save(&mut self, path: &Path, now: Instant) {
-        if !self.dirty && self.save_retry.is_none_or(|deadline| now < deadline) {
-            return;
-        }
-        self.dirty = false;
-        self.save_retry = None;
-        if self.unsaved().is_empty() {
-            return;
-        }
         let token = self.next_token();
-        let changes = self.unsaved.clone();
-        let job = Job::Update {
-            path: path.to_path_buf(),
-            wait: SAVE_WAIT,
-            edit: Box::new(Merge(changes.clone())),
-        };
-        self.outbox.push((job, token));
-        self.saving = Some(Saving { token, changes });
-    }
-
-    /// Replaces saved lists while retaining the current palette selection by name.
-    fn saved(&mut self, loaded: Loaded) {
-        let notice = loaded.notice();
-        if let Some(notice) = notice {
-            self.set_notice(notice);
-        } else {
-            let notice = if self.loading() {
-                &mut self.deferred_notice
-            } else {
-                &mut self.notice
-            };
-            // TODO: Notice ownership is decided by comparing text here and in the Exported arm of
-            //       `complete`. Give config, export and open errors their own slots, or tag the notice
-            //       with its source, so each source clears only its own message and `save_error` goes.
-            if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
-                *notice = None;
-            }
-        }
-        self.save_error = None;
-        self.palettes = loaded.palettes;
-        self.templates = loaded.templates;
-        self.save_blocked = loaded.save_blocked;
-    }
-
-    /// Reports the save error once per distinct message.
-    fn save_failed(&mut self, error: String) {
-        if self.save_error.as_ref() != Some(&error) {
-            self.set_notice(format!("config: {error}"));
-            self.save_error = Some(error);
+        if let Some(job) = self.library.save_job(path, now, token) {
+            self.outbox.push(job);
         }
     }
 
@@ -289,6 +239,9 @@ impl App {
         // Dialog that asked for the result. Listings always come from one.
         let mut requester = Some(done.tag);
         let opened = matches!(done.outcome, IoOutcome::Opened(_));
+        if matches!(done.outcome, IoOutcome::Listed(_)) && self.dialog() != Some(done.tag) {
+            return false;
+        }
         if opened {
             let Some(request) = self
                 .open_request
@@ -297,7 +250,6 @@ impl App {
                 return false;
             };
             requester = request.dialog;
-            self.notice = None;
             changed = true;
         }
         match done.outcome {
@@ -318,7 +270,11 @@ impl App {
                     None => self.dialog().is_some(),
                 };
                 if routed {
-                    self.set_listing(listing.dir, listing.entries);
+                    if opened {
+                        self.route_listing(listing.dir, listing.entries);
+                    } else {
+                        self.set_listing(listing.dir, listing.entries);
+                    }
                     changed = true;
                 }
             }
@@ -327,8 +283,8 @@ impl App {
                     if result.is_ok()
                         && self
                             .notice
-                            .as_deref()
-                            .is_some_and(|notice| Some(notice) == export.status())
+                            .as_ref()
+                            .is_some_and(|notice| matches!(notice.source, Source::Export))
                     {
                         self.notice = None;
                         changed = true;
@@ -336,30 +292,19 @@ impl App {
                     changed |= export.complete(result.as_ref().map(|_| ()));
                 }
                 if let Err(error) = result {
-                    changed |= self.set_notice(error.to_string());
+                    changed |= self.report_notice(Notice {
+                        source: Source::Export,
+                        text: error.to_string(),
+                    });
                 }
             }
             IoOutcome::Updated(result) => {
-                let Some(saving) = self.saving.take_if(|saving| saving.token == done.tag) else {
+                let Some(()) = self.library.complete(done.tag, result, Instant::now()) else {
                     return false;
                 };
-                match result {
-                    Ok(updated) => {
-                        // Edits made after the job was queued stay unsaved for the next save
-                        // and stay visible over the saved lists.
-                        self.unsaved
-                            .retain(|change| !saving.changes.contains(change));
-                        let mut loaded = crate::store::parse(&updated.text);
-                        for change in &self.unsaved {
-                            // An edit the saved lists now reject is left for the next save to report.
-                            let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
-                        }
-                        self.saved(loaded);
-                    }
-                    Err(error) => {
-                        self.save_retry = Some(Instant::now() + SAVE_RETRY);
-                        self.save_failed(error.cause.to_string());
-                    }
+                // A failure or a newly blocked save shows through the persistent fallback.
+                if self.library.notice().is_some() {
+                    self.notice = None;
                 }
                 changed = true;
             }
@@ -367,17 +312,7 @@ impl App {
                 changed |= self.set_notice(error.to_string());
             }
         }
-        if opened {
-            let deferred = self.deferred_notice.take();
-            if self.notice.is_none() {
-                self.notice = deferred;
-            }
-        }
         changed
-    }
-
-    fn loading(&self) -> bool {
-        self.open_request.is_some()
     }
 
     fn next_token(&mut self) -> u64 {
@@ -395,7 +330,12 @@ impl App {
 
     fn open_dialog(&mut self, start: PathBuf) {
         let generation = self.next_token();
-        self.modal = Some(Modal::open_file(start, generation));
+        self.show_modal(Modal::open_file(start, generation));
+    }
+
+    fn show_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+        self.last_drag = None;
     }
 
     /// Queues an image load and shows its file name while loading.
@@ -404,13 +344,14 @@ impl App {
         self.open_request = Some(OpenRequest {
             token,
             dialog: self.dialog(),
+            label: format!(
+                "Loading {}",
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+            ),
         });
-        self.notice = Some(format!(
-            "Loading {}",
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-        ));
+        self.notice = None;
         let job = Job::Open {
             path,
             dir,
@@ -536,29 +477,48 @@ impl App {
         self.export.as_ref().map_or(Ok(()), Export::result)
     }
 
-    /// Routes modal mouse input or pans and recenters the preview.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, geometry: &PreviewGeometry, screen: Rect) {
-        if let Some(modal) = &mut self.modal {
+    /// Whether a left mouse drag has panned the preview.
+    pub fn dragging(&self) -> bool {
+        self.last_drag.is_some_and(|drag| drag.moved)
+    }
+
+    /// Routes mouse input and reports whether the display needs redrawing.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        geometry: &PreviewGeometry,
+        screen: Rect,
+    ) -> bool {
+        let was_dragging = self.dragging();
+        if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
-            let ctx = Ctx {
-                palettes: &self.palettes,
-                templates: &self.templates,
-                settings: &self.settings,
-                show_original: self.show_original,
+            let selection = |modal: &Modal| match modal {
+                Modal::OpenFile(picker) => (picker.list.selected(), picker.typed),
+                Modal::Presets { list, .. } | Modal::Templates { list, .. } => {
+                    (list.selected(), false)
+                }
+                Modal::Editor(editor) => (editor.rows.selected(), false),
             };
+            let before = selection(&modal);
+            let ctx = self.modal_ctx();
             let layout = modal.layout(geometry.area, screen, &ctx);
             let step = modal.handle_mouse(mouse, &layout, ctx);
+            let changed = before != selection(&modal)
+                || step.effect.is_some()
+                || !matches!(step.next, Next::Stay);
+            self.modal = Some(modal);
             self.apply_step(step);
-            return;
+            return was_dragging || changed;
         }
         if self.source_path().is_none() {
             self.last_drag = None;
-            return;
+            return was_dragging;
         }
+        let before = (self.viewport.x, self.viewport.y);
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
         if !geometry.overflows() || !geometry.area.contains(point.into()) {
-            return;
+            return was_dragging;
         }
         let (dx, dy) = geometry.zoom.dots_per_cell(geometry.grid, geometry.area);
         let (sx, sy) = ((dx * 6.0).round() as i64, (dy * 6.0).round() as i64);
@@ -569,20 +529,29 @@ impl App {
                 {
                     self.viewport.center_on_minimap(point, geometry);
                 } else {
+                    let mut drag = Drag {
+                        point,
+                        origin: geometry.origin,
+                        moved: false,
+                    };
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
-                        && let Some(((x, y), origin)) = prev
+                        && let Some(anchor) = prev
                     {
+                        drag = anchor;
+                        let (x, y) = drag.point;
                         let anchored = PreviewGeometry {
-                            origin,
+                            origin: drag.origin,
                             ..*geometry
                         };
+                        let before = (self.viewport.x, self.viewport.y);
                         self.viewport.pan(
                             (f64::from(i32::from(x) - i32::from(mouse.column)) * dx).round() as i64,
                             (f64::from(i32::from(y) - i32::from(mouse.row)) * dy).round() as i64,
                             &anchored,
                         );
+                        drag.moved |= before != (self.viewport.x, self.viewport.y);
                     }
-                    self.last_drag = Some(prev.unwrap_or((point, geometry.origin)));
+                    self.last_drag = Some(drag);
                 }
             }
             MouseEventKind::ScrollUp => self.viewport.pan(0, -sy, geometry),
@@ -592,32 +561,31 @@ impl App {
             MouseEventKind::ScrollRight => self.viewport.pan(sx, 0, geometry),
             _ => {}
         }
+        before != (self.viewport.x, self.viewport.y) || was_dragging != self.dragging()
     }
 
     /// Borrows the preview and saved entries needed by dialogs.
     pub fn modal_ctx(&self) -> Ctx<'_> {
         Ctx {
-            palettes: &self.palettes,
-            templates: &self.templates,
+            palettes: &self.library.palettes,
+            templates: &self.library.templates,
             settings: &self.settings,
             show_original: self.show_original,
         }
     }
 
     fn apply_step(&mut self, step: Step) {
-        if step.effect.is_some() && !self.loading() {
+        if let Some(effect) = step.effect {
             self.notice = None;
-        }
-        if let Some(effect) = step.effect
-            && let Err(error) = self.apply(effect)
-        {
-            self.set_notice(error);
-            return;
+            if let Err(error) = self.apply(effect) {
+                self.set_notice(error);
+                return;
+            }
         }
         match step.next {
             Next::Stay => {}
             Next::Close => self.modal = None,
-            Next::Replace(modal) => self.modal = Some(modal),
+            Next::Replace(modal) => self.show_modal(modal),
         }
     }
 
@@ -626,9 +594,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if !self.loading() {
-            self.notice = None;
-        }
+        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -639,17 +605,9 @@ impl App {
         {
             return;
         }
-        // Borrowing fields one by one lets the modal stay in place while it reads the rest of App.
-        if let Some(modal) = &mut self.modal {
-            let step = modal.handle_key(
-                key,
-                Ctx {
-                    palettes: &self.palettes,
-                    templates: &self.templates,
-                    settings: &self.settings,
-                    show_original: self.show_original,
-                },
-            );
+        if let Some(mut modal) = self.modal.take() {
+            let step = modal.handle_key(key, self.modal_ctx());
+            self.modal = Some(modal);
             self.apply_step(step);
             return;
         }
@@ -660,34 +618,24 @@ impl App {
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
-            self.last_drag = None;
             self.open_dialog(start.clone());
             self.request_list(start);
             return;
         }
         if key.code == KeyCode::Char('P') {
-            self.last_drag = None;
-            self.modal = Some(Modal::presets(&self.settings, &self.palettes));
+            self.show_modal(Modal::presets(&self.settings, &self.library.palettes));
             return;
         }
         if key.code == KeyCode::Char('T') {
-            self.last_drag = None;
-            self.modal = Some(Modal::templates());
+            self.show_modal(Modal::templates());
             return;
         }
         if key.code == KeyCode::Tab {
             self.preview_focus = !self.preview_focus;
             return;
         }
-        if self.source_path().is_none()
-            && (matches!(key.code, KeyCode::Char(' ' | 'm' | '+' | '=' | '-' | '0'))
-                || (self.preview_focus
-                    && pan_delta(key.code, geometry.visible, geometry.pan_step()).is_some()))
-        {
-            return;
-        }
-        if key.code == KeyCode::Char(' ') {
-            self.show_original = !self.show_original;
+        let preview_key = self.preview_key(key.code, geometry);
+        if self.source_path().is_none() && preview_key.is_some() {
             return;
         }
         // Esc leaves preview focus. Only q or Ctrl+C exits.
@@ -695,31 +643,18 @@ impl App {
             self.preview_focus = false;
             return;
         }
-        match key.code {
-            KeyCode::Char('m') => {
-                self.viewport.hide_minimap = !self.viewport.hide_minimap;
-                return;
+        if let Some(preview_key) = preview_key {
+            match preview_key {
+                PreviewKey::ToggleOriginal => self.show_original = !self.show_original,
+                PreviewKey::ToggleMinimap => {
+                    self.viewport.hide_minimap = !self.viewport.hide_minimap;
+                }
+                PreviewKey::Zoom(zoom) => {
+                    self.viewport.set_zoom(zoom, geometry);
+                    self.last_drag = None;
+                }
+                PreviewKey::Pan(dx, dy) => self.viewport.pan(dx, dy, geometry),
             }
-            KeyCode::Char('+' | '=' | '-' | '0') => {
-                let zoom = if key.code == KeyCode::Char('0') {
-                    Zoom::Fit
-                } else {
-                    self.viewport.zoom.step(
-                        key.code != KeyCode::Char('-'),
-                        geometry.grid,
-                        geometry.area,
-                    )
-                };
-                self.viewport.set_zoom(zoom, geometry);
-                self.last_drag = None;
-                return;
-            }
-            _ => {}
-        }
-        if self.preview_focus
-            && let Some((dx, dy)) = pan_delta(key.code, geometry.visible, geometry.pan_step())
-        {
-            self.viewport.pan(dx, dy, geometry);
             return;
         }
         match self.panel.handle_key(key, Setting::ALL.len()) {
@@ -733,12 +668,28 @@ impl App {
             KeyCode::Char('d') => {
                 self.settings = self
                     .settings
-                    .with_default(Setting::ALL[self.panel.selected()], &self.palettes)
+                    .with_default(Setting::ALL[self.panel.selected()], &self.library.palettes)
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
             _ => {}
+        }
+    }
+
+    fn preview_key(&self, code: KeyCode, geometry: &PreviewGeometry) -> Option<PreviewKey> {
+        match code {
+            KeyCode::Char(' ') => Some(PreviewKey::ToggleOriginal),
+            KeyCode::Char('m') => Some(PreviewKey::ToggleMinimap),
+            KeyCode::Char('0') => Some(PreviewKey::Zoom(Zoom::Fit)),
+            KeyCode::Char('+' | '=' | '-') => Some(PreviewKey::Zoom(self.viewport.zoom.step(
+                code != KeyCode::Char('-'),
+                geometry.grid,
+                geometry.area,
+            ))),
+            _ if self.preview_focus => pan_delta(code, geometry.visible, geometry.pan_step())
+                .map(|(dx, dy)| PreviewKey::Pan(dx, dy)),
+            _ => None,
         }
     }
 
@@ -762,32 +713,30 @@ impl App {
             }
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
-                self.commit(Change::UpsertPreset(preset))?;
-                let preset = self.palettes.find(&name).and_then(|i| self.palettes.get(i));
+                self.library.commit(Change::UpsertPreset(preset))?;
+                let preset = self
+                    .library
+                    .palettes
+                    .find(&name)
+                    .and_then(|i| self.library.palettes.get(i));
                 let settings = base.with_preset(preset.unwrap());
                 self.apply(Effect::Preview(settings))?;
             }
-            Effect::RemovePreset(name) => self.commit(Change::RemovePreset(name))?,
+            Effect::RemovePreset(name) => self.library.commit(Change::RemovePreset(name))?,
             Effect::SaveTemplate(name) => {
                 let template = Template::capture(name, &self.settings);
-                self.commit(Change::UpsertTemplate(template))?;
+                self.library.commit(Change::UpsertTemplate(template))?;
             }
-            Effect::RemoveTemplate(name) => self.commit(Change::RemoveTemplate(name))?,
+            Effect::RemoveTemplate(name) => self.library.commit(Change::RemoveTemplate(name))?,
         }
-        Ok(())
-    }
-
-    fn commit(&mut self, change: Change) -> Result<(), String> {
-        change.apply(&mut self.palettes, &mut self.templates)?;
-        self.unsaved.retain(|older| older.key() != change.key());
-        self.unsaved.push(change);
-        self.dirty = true;
         Ok(())
     }
 
     fn adjust(&mut self, direction: i32) {
         let setting = Setting::ALL[self.panel.selected()];
-        let next = self.settings.adjusted(setting, direction, &self.palettes);
+        let next = self
+            .settings
+            .adjusted(setting, direction, &self.library.palettes);
         // Clamped presses preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
             self.apply(Effect::Preview(next)).expect("preview is valid");
@@ -815,30 +764,51 @@ fn pan_delta(code: KeyCode, visible: (u32, u32), step: (u32, u32)) -> Option<(i6
 }
 
 #[cfg(test)]
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        settings::{Palettes, Rotation},
+        settings::{Rotation, Templates},
         ui::Layout,
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    fn opened_photo() -> IoOutcome {
+        IoOutcome::Opened(Ok(Opened::Image {
+            path: "photo.png".into(),
+            image: RgbaImage::new(2, 3),
+        }))
+    }
 
     // Echoes the tag of the newest matching request, as the worker would.
     fn done(app: &App, outcome: IoOutcome) -> Done {
         let tag = match outcome {
             IoOutcome::Opened(_) => app.open_request.as_ref().map_or(0, |r| r.token),
             IoOutcome::Listed(_) => app.dialog().unwrap_or(0),
-            IoOutcome::Exported(_) => 0,
-            IoOutcome::Updated(_) => app.saving.as_ref().map_or(0, |saving| saving.token),
+            _ => app.last_token,
         };
         Done::new(tag, std::time::Duration::ZERO, outcome)
     }
 
     // Drains unsaved edits as a save that succeeded would.
     fn take_changes(app: &mut App) -> Vec<Change> {
-        app.dirty = false;
-        std::mem::take(&mut app.unsaved)
+        let changes = app.library.unsaved();
+        if !changes.is_empty() {
+            let (tag, path, edit) = queued_save(app);
+            let text = edit.apply(None).unwrap();
+            app.complete(save_done(tag, Ok(rthid_io::io::Updated { path, text })));
+        }
+        changes
     }
 
     fn jobs(app: &mut App) -> Vec<Job> {
@@ -890,13 +860,7 @@ mod tests {
         assert!(app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
         assert!(app.notice().is_none());
         app.request_open("photo.png".into(), None);
-        assert!(app.complete(done(
-            &app,
-            IoOutcome::Opened(Ok(Opened::Image {
-                path: "photo.png".into(),
-                image: RgbaImage::new(2, 3),
-            }))
-        )));
+        assert!(app.complete(done(&app, opened_photo())));
         assert!(app.modal.is_none());
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
@@ -990,7 +954,7 @@ mod tests {
                 image: RgbaImage::new(2, 3),
             })),
         )));
-        assert!(!app.loading());
+        assert!(app.open_request.is_none());
         assert_eq!(
             app.source_path(),
             Some(std::path::Path::new("/first/a.png"))
@@ -1202,12 +1166,7 @@ mod tests {
                 }
             }
             app.handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: 2,
-                    row: 3,
-                    modifiers: KeyModifiers::NONE,
-                },
+                mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 3),
                 &app.geometry(test_layout().preview),
                 test_layout().screen,
             );
@@ -1238,7 +1197,9 @@ mod tests {
             matches!(jobs(&mut app).as_slice(), [Job::Export { path, grid }]
             if path == &output && (grid.w, grid.h) == (4, 2))
         );
-        app.settings = app.settings.with_preset(app.palettes.get(1).unwrap());
+        app.settings = app
+            .settings
+            .with_preset(app.library.palettes.get(1).unwrap());
         app.settings.options.tone.brightness = 0.2;
         app.settings.rotation = Rotation::R90;
         app.show_original = false;
@@ -1248,7 +1209,11 @@ mod tests {
         app.viewport.zoom = Zoom::In(2);
         app.viewport.x = 1;
         app.viewport.hide_minimap = true;
-        app.last_drag = Some(((3, 4), (1, 0)));
+        app.last_drag = Some(Drag {
+            point: (3, 4),
+            origin: (1, 0),
+            moved: true,
+        });
         let path = PathBuf::from("replacement.png");
         app.open_image(path.clone(), RgbaImage::new(3, 5));
         assert_eq!(app.source_path(), Some(path.as_path()));
@@ -1283,7 +1248,7 @@ mod tests {
         }
         assert!(app.modal.is_none() && !take_changes(&mut app).is_empty());
         assert_eq!(
-            app.templates.get(0),
+            app.library.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
         );
         app.settings.options.strength = 0.9;
@@ -1322,12 +1287,13 @@ mod tests {
             press(&mut app, code);
         }
         assert_eq!(app.settings.palette_name, "Z");
-        assert!(app.palettes.find("Z").is_some());
+        assert!(app.library.palettes.find("Z").is_some());
         assert!(app.modal.is_none() && !take_changes(&mut app).is_empty() && !app.show_original);
     }
 
     // Takes the queued save job with the tag its result echoes.
-    fn save_job(app: &mut App) -> (u64, PathBuf, Box<dyn rthid_io::io::Edit>) {
+    fn queued_save(app: &mut App) -> (u64, PathBuf, Box<dyn rthid_io::io::Edit>) {
+        app.queue_save(Path::new("config.toml"), Instant::now());
         match app.take_jobs().pop() {
             Some((Job::Update { path, edit, .. }, tag)) => (tag, path, edit),
             _ => panic!("save job expected"),
@@ -1338,135 +1304,242 @@ mod tests {
         Done::new(tag, std::time::Duration::ZERO, IoOutcome::Updated(result))
     }
 
-    #[test]
-    fn unsaved_edits_keep_the_last_change_per_list_and_name() {
-        let mut app = App::empty();
-        let last = Change::UpsertTemplate(Template::capture("Shared".into(), &Settings::default()));
-        for change in [
-            Change::RemovePreset("Shared".into()),
-            Change::RemoveTemplate("Shared".into()),
-            last.clone(),
-            Change::RemovePreset("Other".into()),
-            Change::RemovePreset("Other".into()),
-        ] {
-            app.commit(change).unwrap();
-        }
-        assert_eq!(
-            app.unsaved(),
-            [
-                Change::RemovePreset("Shared".into()),
-                last,
-                Change::RemovePreset("Other".into())
-            ]
-        );
+    fn saved(app: &mut App, text: &str) {
+        app.library
+            .commit(Change::RemoveTemplate("Absent".into()))
+            .unwrap();
+        let (tag, path, _) = queued_save(app);
+        app.complete(save_done(
+            tag,
+            Ok(rthid_io::io::Updated {
+                path,
+                text: text.into(),
+            }),
+        ));
     }
 
-    #[test]
-    fn edits_made_during_a_save_are_saved_after_it_succeeds() {
-        use rthid_io::io::Updated;
-        let config = Path::new("config.toml");
-        let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("First".into())).unwrap();
-        app.queue_save(config, Instant::now());
-        let (tag, path, edit) = save_job(&mut app);
-        app.apply(Effect::SaveTemplate("Second".into())).unwrap();
-        let text = edit.apply(None).unwrap();
-        let first = || Updated {
-            path: path.clone(),
-            text: text.clone(),
-        };
-        assert!(!app.complete(save_done(tag + 1, Ok(first()))));
-        assert!(app.complete(save_done(tag, Ok(first()))));
-        assert_eq!(app.unsaved().len(), 1);
-        assert!(app.templates.find("First").is_some());
-        assert!(app.templates.find("Second").is_some());
-        app.queue_save(config, Instant::now());
-        let (tag, path, edit) = save_job(&mut app);
-        let text = edit.apply(Some(text)).unwrap();
-        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
-        assert!(app.unsaved().is_empty());
-        let names: Vec<_> = app.templates.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["First", "Second"]);
-        app.queue_save(config, Instant::now());
-        assert!(app.take_jobs().is_empty());
-    }
-
-    #[test]
-    fn failed_saves_keep_edits_and_retry_after_the_deadline() {
-        use rthid_io::io::{Cause, IoError, Op, Updated};
-        let config = Path::new("config.toml");
-        let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("Zine".into())).unwrap();
-        let started = Instant::now();
-        app.queue_save(config, started);
-        let (tag, path, _) = save_job(&mut app);
-        let busy = IoError {
-            op: Op::Save,
+    fn save_failed(app: &mut App) {
+        app.library
+            .commit(Change::RemoveTemplate("Absent".into()))
+            .unwrap();
+        let (tag, path, _) = queued_save(app);
+        let error = rthid_io::io::IoError {
+            op: rthid_io::io::Op::Save,
             path,
-            cause: Cause::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "config is busy",
-            )),
+            cause: rthid_io::io::Cause::Io(std::io::Error::other("config is busy")),
         };
-        assert!(app.complete(save_done(tag, Err(busy))));
-        assert_eq!(app.notice(), Some("config: config is busy"));
-        assert_eq!(app.unsaved().len(), 1);
-        let deadline = app.save_retry().unwrap();
-        assert!(deadline >= started + SAVE_RETRY);
-        app.queue_save(config, deadline - Duration::from_millis(1));
-        assert!(app.take_jobs().is_empty());
-        app.queue_save(config, deadline);
-        assert!(app.save_retry().is_none());
-        let (tag, path, edit) = save_job(&mut app);
-        let text = edit.apply(None).unwrap();
-        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
-        assert!(app.unsaved().is_empty());
-        assert!(app.notice().is_none());
-        assert!(app.templates.find("Zine").is_some());
+        app.complete(save_done(tag, Err(error)));
     }
 
     #[test]
-    fn failed_save_reports_each_error_once() {
+    fn notice_regression_validation_resolved_during_loading() {
         let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("First".into())).unwrap();
-        app.apply(Effect::RemoveTemplate("First".into())).unwrap();
-        assert_eq!(
-            take_changes(&mut app),
-            [Change::RemoveTemplate("First".into())]
-        );
-        assert!(take_changes(&mut app).is_empty());
-        app.save_failed("busy".into());
-        assert_eq!(app.notice(), Some("config: busy"));
-        app.set_notice("open: failed".into());
-        app.save_failed("busy".into());
-        assert_eq!(app.notice(), Some("open: failed"));
-        app.saved(Loaded::default());
-        assert_eq!(app.notice(), Some("open: failed"));
-        app.save_failed("denied".into());
-        assert_eq!(app.notice(), Some("config: denied"));
-        app.saved(Loaded::default());
+        app.handle_paste("/photo.png");
+        for code in [KeyCode::Char('P'), KeyCode::Char('n'), KeyCode::Char('s')] {
+            press(&mut app, code);
+        }
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('Z'),
+            KeyCode::Enter,
+            KeyCode::Char('s'),
+        ] {
+            press(&mut app, code);
+        }
+        assert!(app.library.palettes.find("Z").is_some());
+        app.complete(done(&app, opened_photo()));
         assert!(app.notice().is_none());
     }
 
     #[test]
-    fn loading_defers_notices_until_open_finishes() {
+    fn notice_regression_export_resolved_during_loading() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), Some("preview.png".into()));
+        app.request_open("photo.png".into(), None);
+        app.complete(done(
+            &app,
+            IoOutcome::Exported(Err(failure(rthid_io::io::Op::Encode))),
+        ));
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        app.complete(done(&app, opened_photo()));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_listing_resolved_during_loading() {
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('o'));
+        app.request_open("photo.png".into(), None);
+        app.complete(done(
+            &app,
+            IoOutcome::Listed(Err(failure(rthid_io::io::Op::List))),
+        ));
+        app.complete(done(
+            &app,
+            IoOutcome::Listed(Ok(rthid_io::dir::Listing {
+                dir: "/images".into(),
+                entries: vec![],
+            })),
+        ));
+        app.complete(done(&app, opened_photo()));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_save_failure_survives_replacement_and_input() {
+        let mut app = App::empty();
+        app.request_open("photo.png".into(), None);
+        save_failed(&mut app);
+        app.set_notice("validation".into());
+        press(&mut app, KeyCode::Char('x'));
+        app.complete(done(&app, opened_photo()));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        app.set_notice("validation".into());
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, "");
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn notice_regression_stale_listing_error_is_dropped() {
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('o'));
+        let tag = app.dialog().unwrap();
+        press(&mut app, KeyCode::Esc);
+        for reopen in [false, true] {
+            if reopen {
+                press(&mut app, KeyCode::Char('o'));
+            }
+            app.set_notice("retained".into());
+            assert!(!app.complete(Done::new(
+                tag,
+                std::time::Duration::ZERO,
+                IoOutcome::Listed(Err(failure(rthid_io::io::Op::List)))
+            )));
+            assert_eq!(app.notice(), Some("retained"));
+        }
+    }
+
+    #[test]
+    fn modal_pointer_motion_preserves_notice_until_an_effect() {
+        let mut app = App::empty();
+        app.open_dialog(".".into());
+        app.set_notice("open: failed".into());
+        let layout = test_layout();
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Moved,
+                layout.screen.width / 2,
+                layout.screen.height / 2,
+            ),
+            &app.geometry(layout.preview),
+            layout.screen,
+        );
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert_eq!(app.notice(), Some("open: failed"));
+        app.apply_step(Step {
+            next: Next::Stay,
+            effect: Some(Effect::Preview(app.settings.clone())),
+        });
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn persistent_notices_follow_fallback_order_until_their_own_success() {
+        let text = "version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']";
+        let loaded = crate::store::parse(text);
+        let warning = loaded.notice().unwrap();
+        let mut app = App::new(None, Some("preview.png".into()), loaded);
+        // A save warning can be replaced before the next draw.
+        saved(&mut app, text);
+        save_failed(&mut app);
+        let error = failure(rthid_io::io::Op::Encode);
+        let export_error = error.to_string();
+        app.complete(done(&app, IoOutcome::Exported(Err(error))));
+        assert_eq!(app.notice(), Some(export_error.as_str()));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, text);
+        assert_eq!(app.notice(), Some(warning.as_str()));
+        saved(&mut app, "");
+        assert_eq!(app.notice(), Some(export_error.as_str()));
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn export_success_preserves_other_sources_with_equal_text() {
+        let mut app = App::new(None, Some("preview.png".into()), Loaded::default());
+        let error = failure(rthid_io::io::Op::Encode);
+        let text = error.to_string();
+        app.complete(done(&app, IoOutcome::Exported(Err(error))));
+        app.set_notice(text.clone());
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        assert_eq!(app.notice(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn save_notices_preserve_unrelated_errors() {
+        let loaded =
+            crate::store::parse("version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n");
+        let mut app = App::new(None, None, loaded);
+        assert!(app.notice().unwrap().starts_with("config:"));
+        saved(&mut app, "");
+        assert!(app.notice().is_none());
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        app.set_notice("open: failed".into());
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        app.set_notice("open: failed".into());
+        saved(&mut app, "");
+        assert_eq!(app.notice(), Some("open: failed"));
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, "");
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn successful_save_clears_only_config_notices_during_loading() {
+        for config in [false, true] {
+            let mut app = App::empty();
+            app.request_open("photo.png".into(), None);
+            save_failed(&mut app);
+            if !config {
+                app.set_notice("open: failed".into());
+            }
+            saved(&mut app, "");
+            assert_eq!(app.notice(), Some("Loading photo.png"));
+            app.complete(done(&app, opened_photo()));
+            assert_eq!(
+                app.notice(),
+                if config { None } else { Some("open: failed") }
+            );
+        }
+    }
+
+    #[test]
+    fn loading_masks_notices_until_open_finishes() {
         use rthid_io::{dir::Listing, io::Op};
         for notice_kind in 0..3 {
             for result_kind in 0..3 {
                 let mut app = App::empty();
                 app.set_notice("Loading is only text".into());
-                assert!(!app.loading());
+                assert!(app.open_request.is_none());
                 app.request_open("photo.png".into(), None);
-                assert!(app.loading());
+                assert!(app.open_request.is_some());
                 app.set_notice("earlier notice".into());
                 let expected = match notice_kind {
                     0 => {
-                        app.save_failed("config is busy".into());
-                        app.save_failed("config is busy".into());
-                        assert_eq!(app.save_error.as_deref(), Some("config is busy"));
+                        save_failed(&mut app);
+                        save_failed(&mut app);
                         "config: config is busy".to_string()
                     }
                     1 => {
+                        app.open_dialog("/images".into());
                         let error = failure(Op::List);
                         let expected = error.to_string();
                         app.complete(done(&app, IoOutcome::Listed(Err(error))));
@@ -1475,16 +1548,13 @@ mod tests {
                     _ => {
                         let loaded = crate::store::parse("version = 99");
                         let expected = loaded.notice().unwrap();
-                        app.saved(loaded);
+                        saved(&mut app, "version = 99");
                         expected
                     }
                 };
                 assert_eq!(app.notice(), Some("Loading photo.png"));
                 let outcome = match result_kind {
-                    0 => IoOutcome::Opened(Ok(Opened::Image {
-                        path: "photo.png".into(),
-                        image: RgbaImage::new(2, 3),
-                    })),
+                    0 => opened_photo(),
                     1 => IoOutcome::Opened(Ok(Opened::Dir(Listing {
                         dir: "/images".into(),
                         entries: vec![],
@@ -1497,9 +1567,8 @@ mod tests {
                     expected
                 };
                 assert!(app.complete(done(&app, outcome)));
-                assert!(!app.loading());
+                assert!(app.open_request.is_none());
                 assert_eq!(app.notice(), Some(expected.as_str()));
-                assert!(app.deferred_notice.is_none());
             }
         }
     }
@@ -1535,16 +1604,14 @@ mod tests {
                 crate::modal::OnYes::RemoveTemplate("Zine".into()),
             )),
         };
-        let index = app.palettes.find("Selected").unwrap();
-        let loaded = crate::store::parse(
-            "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n",
-        );
-        let notice = loaded.notice();
-        app.saved(loaded);
+        let index = app.library.palettes.find("Selected").unwrap();
+        let text = "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n";
+        let notice = crate::store::parse(text).notice();
+        saved(&mut app, text);
         assert_eq!(app.settings.palette_name, "Selected");
         assert!(app.settings == settings);
-        assert_eq!(app.palettes.find("Selected"), Some(index + 1));
-        assert!(app.templates.find("Zine").is_some());
+        assert_eq!(app.library.palettes.find("Selected"), Some(index + 1));
+        assert!(app.library.templates.find("Zine").is_some());
         assert_eq!(app.notice(), notice.as_deref());
         assert!(app.notice().unwrap().contains("1 entries skipped"));
         let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
@@ -1558,12 +1625,12 @@ mod tests {
             .effect
             .unwrap();
         app.apply(effect).unwrap();
-        assert!(app.palettes.find("Other").is_some());
-        assert!(app.palettes.find("Selected").is_none());
-        assert!(app.templates.find("Other").is_some());
-        assert!(app.templates.find("Zine").is_none());
+        assert!(app.library.palettes.find("Other").is_some());
+        assert!(app.library.palettes.find("Selected").is_none());
+        assert!(app.library.templates.find("Other").is_some());
+        assert!(app.library.templates.find("Zine").is_none());
         assert!(take_changes(&mut app).contains(&Change::RemovePreset("Selected".into())));
-        app.saved(Loaded::default());
+        saved(&mut app, "");
         assert!(app.notice().is_none());
     }
 
@@ -1577,21 +1644,26 @@ mod tests {
             let mut app = App::new(
                 Some((PathBuf::from("test.png"), RgbaImage::new(4, 4))),
                 None,
-                Palettes::builtin(),
-                templates.clone(),
-                Some("config warning".into()),
-                blocked.then(|| "broken file".into()),
+                Loaded {
+                    templates: templates.clone(),
+                    save_blocked: blocked.then(|| "broken file".into()),
+                    ..Loaded::default()
+                },
             );
-            assert_eq!(app.templates, templates);
+            app.set_notice("config warning".into());
+            assert_eq!(app.library.templates, templates);
             assert_eq!(app.notice(), Some("config warning"));
-            assert!(app.unsaved().is_empty());
+            assert!(app.library.unsaved().is_empty());
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &app.geometry(Rect::new(0, 0, 20, 10)),
             );
-            assert!(app.notice().is_none());
+            assert_eq!(
+                app.notice(),
+                blocked.then_some("config: saving disabled: broken file")
+            );
             app.apply(Effect::SaveTemplate("Another".into())).unwrap();
-            assert_eq!(app.unsaved().is_empty(), blocked);
+            assert_eq!(app.library.unsaved().is_empty(), blocked);
             app.queue_save(Path::new("config.toml"), Instant::now());
             assert_eq!(
                 matches!(jobs(&mut app).as_slice(), [Job::Update { .. }]),
@@ -2023,6 +2095,34 @@ mod tests {
     }
 
     #[test]
+    fn directory_completion_opens_modal_and_ends_drag() {
+        let mut app = App::drag_fixture();
+        let layout = test_layout();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 10),
+            (MouseEventKind::Drag(MouseButton::Left), 9),
+        ] {
+            app.mouse_at(
+                kind,
+                column,
+                layout.preview.y + 1,
+                &app.geometry(layout.preview),
+                layout.screen,
+            );
+        }
+        assert!(app.dragging());
+        assert!(app.modal.is_none());
+        app.request_open("/images".into(), None);
+        let outcome = IoOutcome::Opened(Ok(Opened::Dir(rthid_io::dir::Listing {
+            dir: "/images".into(),
+            entries: vec![],
+        })));
+        assert!(app.complete(done(&app, outcome)));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert!(!app.dragging());
+    }
+
+    #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
@@ -2031,12 +2131,7 @@ mod tests {
         let mouse = |app: &mut App, kind, column, row| {
             let version = versions(app);
             app.handle_mouse(
-                MouseEvent {
-                    kind,
-                    column,
-                    row,
-                    modifiers: KeyModifiers::NONE,
-                },
+                mouse_event(kind, column, row),
                 &app.geometry(area),
                 test_layout().screen,
             );
@@ -2060,8 +2155,12 @@ mod tests {
         assert_eq!((app.viewport.x, app.viewport.y), (72, 84));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 10, 10);
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 10);
+        assert!(!app.dragging());
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 13, 12);
+        assert!(app.dragging());
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 13, 12);
+        assert!(!app.dragging());
         mouse(&mut app, MouseEventKind::ScrollUp, 13, 12);
         assert_eq!(app.viewport.y, 68);
         mouse(&mut app, MouseEventKind::ScrollDown, 13, 12);
@@ -2137,12 +2236,7 @@ mod tests {
                 (MouseEventKind::Drag(MouseButton::Left), 7, 8),
             ] {
                 app.handle_mouse(
-                    MouseEvent {
-                        kind,
-                        column,
-                        row,
-                        modifiers: KeyModifiers::NONE,
-                    },
+                    mouse_event(kind, column, row),
                     &app.geometry(area),
                     test_layout().screen,
                 );
@@ -2150,12 +2244,7 @@ mod tests {
             assert_eq!((app.viewport.x, app.viewport.y), dragged, "{zoom:?}");
             for kind in [MouseEventKind::ScrollRight, MouseEventKind::ScrollDown] {
                 app.handle_mouse(
-                    MouseEvent {
-                        kind,
-                        column: 7,
-                        row: 8,
-                        modifiers: KeyModifiers::NONE,
-                    },
+                    mouse_event(kind, 7, 8),
                     &app.geometry(area),
                     test_layout().screen,
                 );

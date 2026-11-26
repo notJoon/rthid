@@ -174,7 +174,8 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let labels = Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.palettes)));
+    let labels =
+        Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.library.palettes)));
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
@@ -402,6 +403,30 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
     }
 }
 
+// Chooses the nearest fixed xterm color to shorten Original preview output during dragging.
+fn rgb_to_ansi256(rgb: [u8; 3]) -> u8 {
+    let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let cube = rgb.map(|v| match v {
+        0..=47 => 0,
+        48..=114 => 1,
+        _ => 2 + (v - 115) / 40,
+    });
+    let sum: i32 = rgb.into_iter().map(i32::from).sum();
+    let gray = ((sum - 24 + 15) / 30).clamp(0, 23) as u8;
+    let mut cube_distance = 0;
+    let mut gray_distance = 0;
+    for channel in 0..3 {
+        cube_distance +=
+            (i32::from(rgb[channel]) - i32::from(levels[usize::from(cube[channel])])).pow(2);
+        gray_distance += (i32::from(rgb[channel]) - i32::from(8 + 10 * gray)).pow(2);
+    }
+    if gray_distance < cube_distance {
+        232 + gray
+    } else {
+        16 + 36 * cube[0] + 6 * cube[1] + cube[2]
+    }
+}
+
 // Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
 // Calls present every frame so a hidden image is cleared.
 fn draw_preview(
@@ -431,13 +456,27 @@ fn draw_preview(
     let approximate = if image_mode {
         false
     } else {
-        cells::render(
+        let approximate = cells::render(
             pixels,
             app.glyphs,
             geometry,
             frame.buffer_mut(),
             &mut renderer.overviews,
-        )
+        );
+        if app.dragging() && matches!(pixels, cells::Pixels::Rgb(..)) {
+            for pos in geometry.target.positions() {
+                if geometry.minimap.is_some_and(|map| map.frame.contains(pos)) {
+                    continue;
+                }
+                let cell = &mut frame.buffer_mut()[pos];
+                for color in [&mut cell.fg, &mut cell.bg] {
+                    if let Color::Rgb(r, g, b) = *color {
+                        *color = Color::Indexed(rgb_to_ansi256([r, g, b]));
+                    }
+                }
+            }
+        }
+        approximate
     };
     let mut report = PreviewReport {
         approximate,
@@ -464,7 +503,7 @@ fn draw_preview(
 
 // PNG errors, config notices and graphics errors replace the normal status line.
 fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport) -> String {
-    if let Some(message) = app.notice().or_else(|| app.export_status()) {
+    if let Some(message) = app.notice() {
         return message.to_owned();
     }
     let Some((sw, sh)) = app.grid_cache.source_size() else {
@@ -517,6 +556,23 @@ mod tests {
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn ansi256_uses_nearest_cube_or_gray() {
+        for (rgb, expected) in [
+            ([0, 0, 0], 16),
+            ([255, 255, 255], 231),
+            ([255, 0, 0], 196),
+            ([0, 255, 0], 46),
+            ([0, 0, 255], 21),
+            ([128, 128, 128], 244),
+            ([95, 135, 175], 67),
+            ([8, 8, 8], 232),
+            ([238, 238, 238], 255),
+        ] {
+            assert_eq!(rgb_to_ansi256(rgb), expected, "{rgb:?}");
+        }
+    }
+
     fn draw_text(
         terminal: &mut Terminal<TestBackend>,
         app: &App,
@@ -532,6 +588,116 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn drag_colors_preserve_minimap_dithered_and_exact_cache() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let area = Rect::new(0, 0, 48, 18);
+        let image = RgbaImage::from_fn(120, 120, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
+        let mut app = App::builtin(image, None);
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        for zoom in [
+            viewport::Zoom::In(1),
+            viewport::Zoom::Out(2),
+            viewport::Zoom::Fit,
+        ] {
+            for original in [true, false] {
+                app.viewport.zoom = viewport::Zoom::In(1);
+                app.show_original = original;
+                app.sync(area);
+                let g = app.geometry(area);
+                for (kind, column) in [
+                    (MouseEventKind::Down(MouseButton::Left), 2),
+                    (MouseEventKind::Drag(MouseButton::Left), 1),
+                ] {
+                    app.mouse_at(kind, column, 10, &g, area);
+                }
+                assert!(app.dragging());
+                app.viewport.zoom = zoom;
+                let g = app.geometry(area);
+                terminal
+                    .draw(|frame| {
+                        draw_preview(frame, &app, &g, &mut renderer);
+                    })
+                    .unwrap();
+                let dragging = terminal.backend().buffer().clone();
+                let cache_version = renderer.overviews.full.version();
+                assert!(app.mouse_at(MouseEventKind::Moved, 1, 10, &g, area));
+                terminal
+                    .draw(|frame| {
+                        draw_preview(frame, &app, &g, &mut renderer);
+                    })
+                    .unwrap();
+                assert_eq!(renderer.overviews.full.version(), cache_version);
+                let released = terminal.backend().buffer();
+                if !original {
+                    assert_eq!(&dragging, released);
+                    continue;
+                }
+                if let Some(map) = g.minimap {
+                    for pos in map.frame.positions() {
+                        assert_eq!(dragging[pos], released[pos]);
+                    }
+                }
+                let mut converted = 0;
+                for pos in g
+                    .target
+                    .positions()
+                    .filter(|&pos| !g.minimap.is_some_and(|map| map.frame.contains(pos)))
+                {
+                    let mut expected = released[pos].clone();
+                    for color in [&mut expected.fg, &mut expected.bg] {
+                        if let Color::Rgb(r, g, b) = *color {
+                            converted += 1;
+                            *color = Color::Indexed(rgb_to_ansi256([r, g, b]));
+                        }
+                    }
+                    assert_eq!(dragging[pos], expected);
+                }
+                assert!(converted > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn original_click_and_drag_end_keep_full_color() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::drag_fixture();
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let layout = layout(terminal.size().unwrap());
+        let g = app.geometry(layout.preview);
+        assert!(g.overflows());
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(
+                kind,
+                g.target.x + u16::from(matches!(kind, MouseEventKind::Down(_))),
+                g.target.y,
+                &g,
+                layout.screen,
+            );
+            draw_text(&mut terminal, &app, &mut renderer);
+            for pos in g.target.positions() {
+                let cell = &terminal.backend().buffer()[pos];
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
+                assert!(match kind {
+                    MouseEventKind::Drag(_) => matches!(cell.bg, Color::Indexed(_)),
+                    _ => matches!(cell.bg, Color::Rgb(..)),
+                });
+            }
+        }
     }
 
     #[test]
@@ -581,7 +747,7 @@ mod tests {
             let mut app = App::builtin(RgbaImage::new(12, 12), None);
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
             draw_text(&mut terminal, &app, &mut renderer);
-            app.modal = Some(Modal::presets(&app.settings, &app.palettes));
+            app.modal = Some(Modal::presets(&app.settings, &app.library.palettes));
             let text = draw_text(&mut terminal, &app, &mut renderer);
             assert!(text.contains("(built-in)") && text.contains("Presets"));
             assert!(!text.contains(&format!(
@@ -650,7 +816,8 @@ mod tests {
                     .contains(terminal.get_cursor_position().unwrap())
             );
             app.modal = Some(Modal::templates());
-            app.templates
+            app.library
+                .templates
                 .upsert(crate::settings::Template::capture(
                     "Z".into(),
                     &Settings::default(),
@@ -664,7 +831,7 @@ mod tests {
                 &Settings::default(),
             );
             template.palette_name = "A palette with a long name".into();
-            app.templates.upsert(template).unwrap();
+            app.library.templates.upsert(template).unwrap();
             assert!(
                 usize::from(
                     app.modal
@@ -845,18 +1012,18 @@ mod tests {
             .unwrap();
         let (displayed, overview) = corner.split_once(" overview=").unwrap();
         for cell in [displayed, overview] {
-            assert!(cell.contains("fg: Rgb(255, 255, 255)"));
+            assert!(cell.contains("fg: Reset"));
             assert!(cell.contains("bg: Rgb(255, 255, 255)"));
         }
-        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), "▀");
+        assert_eq!(frame.buffer[(map.x, map.y)].symbol(), " ");
         let outside = text
             .lines()
             .find(|line| line.starts_with(&format!("{},{} ", map.right() - 1, map.bottom() - 1)))
             .unwrap();
         let (displayed, overview) = outside.split_once(" overview=").unwrap();
-        assert!(displayed.contains("fg: Rgb(127, 127, 127)"));
+        assert!(displayed.contains("fg: Reset"));
         assert!(displayed.contains("bg: Rgb(127, 127, 127)"));
-        assert!(overview.contains("fg: Rgb(255, 255, 255)"));
+        assert!(overview.contains("fg: Reset"));
         assert!(overview.contains("bg: Rgb(255, 255, 255)"));
 
         assert!(
@@ -871,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn draws_settings_and_truecolor_half_blocks() {
+    fn draws_settings_and_truecolor_backgrounds() {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
@@ -901,9 +1068,9 @@ mod tests {
         let cell = buffer
             .content
             .iter()
-            .find(|cell| cell.symbol() == "▀")
+            .find(|cell| cell.symbol() == " " && cell.bg == Color::Rgb(255, 255, 255))
             .unwrap();
-        assert_eq!(cell.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(cell.fg, Color::Reset);
         assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
         // Tiny terminals must not panic.
         for (width, height) in [(1, 1), (20, 5), (60, 12)] {

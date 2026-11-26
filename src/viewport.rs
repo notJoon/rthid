@@ -26,14 +26,115 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
 }
 
 /// Preview scale, ordered from the fitted image to enlarged dots.
+///
+/// A dot is one pixel of the scaled and rotated grid. A terminal cell is about
+/// [`CELL_ASPECT`] times taller than wide, so it splits into a top and a bottom
+/// half cell that are nearly square. The status line prints [`Zoom::scale`] as a
+/// percentage, so 100% means one dot per cell column.
+///
+/// | Zoom     | Status          | Dots per cell, columns x rows ([`Zoom::dots_per_cell`]) |
+/// |----------|-----------------|------------------------------------|
+/// | `Fit`    | `Fit (sextant)` | whatever fits the whole grid       |
+/// | `Out(4)` | `25%`           | 4 x 9                              |
+/// | `Out(3)` | `33%`           | 3 x 6.75                           |
+/// | `Out(2)` | `50%`           | 2 x 4.5                            |
+/// | `In(1)`  | `100%`          | 1 x 2                              |
+/// | `In(2)`  | `200%`          | 1/2 x 1                            |
+/// | `In(3)`  | `300%`          | 1/3 x 2/3                          |
+/// | `In(4)`  | `400%`          | 1/4 x 1/2                          |
+///
+/// # In(k): exact dots
+///
+/// Every cell is `▀` with the top half cell as foreground and the bottom half
+/// cell as background, and a cell whose halves share a color is drawn as a
+/// space on that background. No color is mixed or dropped. A half cell is about
+/// 1.125 times taller than wide, so dots look slightly tall.
+///
+/// At In(1) each dot fills one half cell, so a cell shows two vertically
+/// adjacent dots. Below an odd last row the bottom half keeps the terminal
+/// default color.
+///
+/// ```text
+/// dots       cells
+/// a b c d    ▀▀▀▀    fg a b c d    bg e f g h
+/// e f g h
+/// i j k l    ▀▀▀▀    fg i j k l    bg m n o p
+/// m n o p
+/// ```
+///
+/// At In(k) each dot fills k cell columns and k half rows. With an even k both
+/// halves of every cell come from the same dot, so In(2) and In(4) draw only
+/// spaces.
+///
+/// ```text
+/// In(2)
+/// dots    half cells    cells, all spaces
+/// a b     a a b b       bg a a b b
+/// e f     a a b b
+///         e e f f       bg e e f f
+///         e e f f
+/// ```
+///
+/// With an odd k a dot spans one and a half cells, so every other dot row
+/// boundary falls inside a cell and that cell keeps a `▀`.
+///
+/// ```text
+/// In(3), one column
+/// dots    half rows    cell rows
+/// a       0 a          0  a over a    space, bg a
+///         1 a
+/// e       2 a          1  a over e    ▀, fg a, bg e
+///         3 e
+///         4 e          2  e over e    space, bg e
+///         5 e
+/// ```
+///
+/// # Out(n) and Fit: sampled cells
+///
+/// Many dots feed one cell. At Out(n) a cell covers n dot columns and
+/// n x [`CELL_ASPECT`] dot rows, so the image keeps its shape on screen.
+/// Fractional row counts are rounded at each half cell or subcell boundary, so
+/// at Out(2) and Out(3) neighbouring cells cover slightly different row counts.
+/// Fit uses the same rules with the block that fits the whole grid into
+/// [`PreviewGeometry::target`], and repeats dots when the grid is smaller than
+/// the target.
+///
+/// Original averages every dot in each half cell box (`cells::average_rgb`) and
+/// then draws `▀` or a space like In(k). Dithered keeps exact palette colors. It
+/// takes one dot at the center of each glyph subcell, 2 x 2 for quadrant and
+/// 2 x 3 for sextant (`cells::render_overview_indexed`). Then `cells::reduce_cell`
+/// keeps the most frequent sample as background and the next distinct one as foreground,
+/// snaps any third color to the nearer of the two, and draws the quadrant or
+/// sextant glyph whose filled subcells hold the foreground. Fit reports that
+/// snap as `approximate` in the status line.
+///
+/// ```text
+/// Out(4), one cell covers 4 x 9 dots
+/// row   Original             Quadrant    Sextant
+/// 0     t t t t              . . . .     . . . .
+/// 1     t t t t   top =      . . . .     . A . B
+/// 2     t t t t   mean of t  . A . B     . . . .
+/// 3     t t t t              . . . .     . . . .
+/// 4     b b b b              . . . .     . C . D
+/// 5     b b b b   bottom =   . . . .     . . . .
+/// 6     b b b b   mean of b  . C . D     . . . .
+/// 7     b b b b              . . . .     . E . F
+/// 8     b b b b              . . . .     . . . .
+/// ```
+///
+/// With Original at Fit and a graphics backend, the preview is drawn as a real
+/// image and none of these cells are painted.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Zoom {
-    /// The whole grid fitted to the preview.
+    /// The whole grid fitted to the preview with the cell aspect preserved.
+    /// Labeled `Fit` with the glyph set name.
     #[default]
     Fit,
-    /// Dots per cell column, from two through four.
+    /// Dots per cell column, from two through four, with n x [`CELL_ASPECT`]
+    /// dot rows per cell row. Labeled 50%, 33% and 25%.
     Out(u8),
     /// Cells wide and half cells tall per dot, from one through four.
+    /// Labeled 100% through 400%.
     In(u8),
 }
 

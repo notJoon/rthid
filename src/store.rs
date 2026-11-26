@@ -2,13 +2,162 @@
 
 use crate::settings::{Palettes, Preset, Settings, Template, Templates};
 use rthid_dither::dither::{Mode, Tone};
-use rthid_io::atomic;
+use rthid_io::{
+    atomic,
+    io::{IoError, Job, Updated},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// Longest wait for the config lock during a background save.
+const SAVE_WAIT: Duration = Duration::from_millis(50);
+/// Delay before a failed save is tried again.
+const SAVE_RETRY: Duration = Duration::from_secs(2);
+
+// The edits carried by the newest save job.
+struct Saving {
+    /// Tag the result echoes.
+    token: u64,
+    /// Last edit sequence included in the job.
+    through: u64,
+}
+
+/// Named configuration lists and their pending saves.
+pub struct Library {
+    /// Built in and user palette presets in selection order.
+    pub palettes: Palettes,
+    /// Saved settings with independent palette colors.
+    pub templates: Templates,
+    // Only the last unconfirmed edit for each list and name is retained.
+    unsaved: Vec<(u64, Change)>,
+    last_sequence: u64,
+    // Whether edits arrived since the last save job.
+    dirty: bool,
+    saving: Option<Saving>,
+    save_retry: Option<Instant>,
+    save_blocked: Option<String>,
+    save_error: Option<String>,
+    load_notice: Option<String>,
+}
+
+impl Library {
+    /// Starts with loaded lists and no pending edits.
+    pub fn new(loaded: Loaded) -> Self {
+        let load_notice = loaded.notice();
+        Self {
+            load_notice,
+            palettes: loaded.palettes,
+            templates: loaded.templates,
+            unsaved: Vec::new(),
+            last_sequence: 0,
+            dirty: false,
+            saving: None,
+            save_retry: None,
+            save_blocked: loaded.save_blocked,
+            save_error: None,
+        }
+    }
+
+    /// Unresolved save failure before load warnings and blocked saving for the status line.
+    pub fn notice(&self) -> Option<&str> {
+        self.save_error.as_deref().or(self.load_notice.as_deref())
+    }
+
+    /// Applies a validated edit and retains it until a save confirms it.
+    pub fn commit(&mut self, change: Change) -> Result<(), String> {
+        change.apply(&mut self.palettes, &mut self.templates)?;
+        self.unsaved
+            .retain(|(_, older)| older.key() != change.key());
+        self.last_sequence += 1;
+        self.unsaved.push((self.last_sequence, change));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Edits not yet confirmed saved, empty when loading blocked writes.
+    pub fn unsaved(&self) -> Vec<Change> {
+        if self.save_blocked.is_some() {
+            Vec::new()
+        } else {
+            self.unsaved
+                .iter()
+                .map(|(_, change)| change.clone())
+                .collect()
+        }
+    }
+
+    /// When a failed save is due to be tried again.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.save_retry
+    }
+
+    /// Creates a save when edits arrived or the retry deadline passed.
+    pub fn save_job(&mut self, path: &Path, now: Instant, token: u64) -> Option<(Job, u64)> {
+        if !self.dirty && self.save_retry.is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        self.dirty = false;
+        self.save_retry = None;
+        let changes = self.unsaved();
+        if changes.is_empty() {
+            return None;
+        }
+        let job = Job::Update {
+            path: path.to_path_buf(),
+            wait: SAVE_WAIT,
+            edit: Box::new(Merge(changes)),
+        };
+        self.saving = Some(Saving {
+            token,
+            through: self.last_sequence,
+        });
+        Some((job, token))
+    }
+
+    /// Applies a matching save result and returns None for stale tags.
+    pub fn complete(
+        &mut self,
+        tag: u64,
+        result: Result<Updated, IoError>,
+        now: Instant,
+    ) -> Option<()> {
+        let saving = self.saving.take_if(|saving| saving.token == tag)?;
+        match result {
+            Ok(updated) => {
+                // Later edits remain pending and visible over the saved lists.
+                self.unsaved
+                    .retain(|(sequence, _)| *sequence > saving.through);
+                let mut loaded = parse(&updated.text);
+                for (_, change) in &self.unsaved {
+                    // A rejected edit remains for the next save to report.
+                    let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
+                }
+                self.saved(loaded)
+            }
+            Err(error) => {
+                self.save_retry = Some(now + SAVE_RETRY);
+                self.save_failed(error.cause.to_string())
+            }
+        }
+        Some(())
+    }
+
+    fn saved(&mut self, loaded: Loaded) {
+        self.load_notice = loaded.notice();
+        self.save_error = None;
+        self.palettes = loaded.palettes;
+        self.templates = loaded.templates;
+        self.save_blocked = loaded.save_blocked;
+    }
+
+    fn save_failed(&mut self, error: String) {
+        self.save_error = Some(format!("config: {error}"));
+    }
+}
 
 /// A named edit applied to the latest configuration when saving.
 #[derive(Clone, Debug, PartialEq)]
@@ -418,6 +567,153 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn update(job: Job) -> (PathBuf, Box<dyn rthid_io::io::Edit>) {
+        match job {
+            Job::Update { path, edit, .. } => (path, edit),
+            _ => panic!("save job expected"),
+        }
+    }
+
+    fn template(name: &str) -> Change {
+        Change::UpsertTemplate(Template::capture(name.into(), &Settings::default()))
+    }
+
+    #[test]
+    fn failed_saves_keep_edits_and_retry_after_the_deadline() {
+        use rthid_io::io::{Cause, IoError, Op, Updated};
+        let config = Path::new("config.toml");
+        let mut library = Library::new(Loaded::default());
+        library.commit(template("Zine")).unwrap();
+        let started = Instant::now();
+        let (job, tag) = library.save_job(config, started, 1).unwrap();
+        let (path, _) = update(job);
+        let busy = IoError {
+            op: Op::Save,
+            path,
+            cause: Cause::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "config is busy",
+            )),
+        };
+        assert_eq!(library.complete(tag, Err(busy), started), Some(()));
+        assert_eq!(library.notice(), Some("config: config is busy"));
+        assert_eq!(library.unsaved().len(), 1);
+        let deadline = library.retry_at().unwrap();
+        assert_eq!(deadline, started + SAVE_RETRY);
+        assert!(
+            library
+                .save_job(config, deadline - Duration::from_millis(1), 2)
+                .is_none()
+        );
+        let (job, tag) = library.save_job(config, deadline, 2).unwrap();
+        assert!(library.retry_at().is_none());
+        let (path, edit) = update(job);
+        let text = edit.apply(None).unwrap();
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), Instant::now()),
+            Some(())
+        );
+        assert!(library.unsaved().is_empty());
+        assert!(library.templates.find("Zine").is_some());
+    }
+
+    #[test]
+    fn equal_edit_made_during_a_save_remains_unsaved() {
+        let now = Instant::now();
+        let mut library = Library::new(Loaded::default());
+        let change = template("T");
+        library.commit(change.clone()).unwrap();
+        let (job, tag) = library.save_job(Path::new("config.toml"), now, 1).unwrap();
+        let (path, edit) = update(job);
+        let text = edit.apply(None).unwrap();
+        library.commit(change.clone()).unwrap();
+
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), now),
+            Some(())
+        );
+        assert_eq!(library.unsaved(), [change]);
+    }
+
+    #[test]
+    fn edits_made_during_a_save_are_saved_after_it_succeeds() {
+        use rthid_io::io::Updated;
+        let config = Path::new("config.toml");
+        let mut library = Library::new(Loaded::default());
+        library.commit(template("First")).unwrap();
+        let (job, tag) = library.save_job(config, Instant::now(), 1).unwrap();
+        let (path, edit) = update(job);
+        library.commit(template("Second")).unwrap();
+        let text = edit.apply(None).unwrap();
+        let first = || Updated {
+            path: path.clone(),
+            text: text.clone(),
+        };
+        assert!(
+            library
+                .complete(tag + 1, Ok(first()), Instant::now())
+                .is_none()
+        );
+        assert_eq!(library.complete(tag, Ok(first()), Instant::now()), Some(()));
+        assert_eq!(library.unsaved().len(), 1);
+        assert!(library.templates.find("First").is_some());
+        assert!(library.templates.find("Second").is_some());
+        let (job, tag) = library.save_job(config, Instant::now(), 2).unwrap();
+        let (path, edit) = update(job);
+        let text = edit.apply(Some(text)).unwrap();
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), Instant::now()),
+            Some(())
+        );
+        assert!(library.unsaved().is_empty());
+        let names: Vec<_> = library.templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        assert!(library.save_job(config, Instant::now(), 2).is_none());
+    }
+
+    #[test]
+    fn failed_save_reports_repeated_errors() {
+        let mut library = Library::new(Loaded::default());
+        library.commit(template("First")).unwrap();
+        library
+            .commit(Change::RemoveTemplate("First".into()))
+            .unwrap();
+        assert_eq!(library.unsaved(), [Change::RemoveTemplate("First".into())]);
+        library.save_failed("busy".into());
+        assert_eq!(library.notice(), Some("config: busy"));
+        library.save_failed("busy".into());
+        assert_eq!(library.notice(), Some("config: busy"));
+        library.saved(Loaded::default());
+        assert!(library.notice().is_none());
+        library.save_failed("denied".into());
+        assert_eq!(library.notice(), Some("config: denied"));
+        library.saved(Loaded::default());
+        assert!(library.notice().is_none());
+    }
+
+    #[test]
+    fn unsaved_edits_keep_the_last_change_per_list_and_name() {
+        let mut library = Library::new(Loaded::default());
+        let last = template("Shared");
+        for change in [
+            Change::RemovePreset("Shared".into()),
+            Change::RemoveTemplate("Shared".into()),
+            last.clone(),
+            Change::RemovePreset("Other".into()),
+            Change::RemovePreset("Other".into()),
+        ] {
+            library.commit(change).unwrap();
+        }
+        assert_eq!(
+            library.unsaved(),
+            [
+                Change::RemovePreset("Shared".into()),
+                last,
+                Change::RemovePreset("Other".into())
+            ]
+        );
+    }
+
     #[test]
     fn store_round_trip_preserves_entries_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -470,8 +766,7 @@ mod tests {
     fn empty_and_versionless_files_accept_saves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let change =
-            Change::UpsertTemplate(Template::capture("Saved".into(), &Settings::default()));
+        let change = template("Saved");
         for text in ["", " \n\t", "[[template]]\nname = 'Existing'\n"] {
             fs::write(&path, text).unwrap();
             assert!(load(&path).save_blocked.is_none());
@@ -490,10 +785,7 @@ mod tests {
         use rthid_io::io::Edit;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let changes = vec![Change::UpsertTemplate(Template::capture(
-            "Zine".into(),
-            &Settings::default(),
-        ))];
+        let changes = vec![template("Zine")];
         let existing = "[[template]]\nname = 'Existing'\n";
         let text = Merge(changes.clone()).apply(Some(existing.into())).unwrap();
         fs::write(&path, existing).unwrap();
@@ -573,15 +865,7 @@ mod tests {
         let original = "version = 1\nunknown = { enabled = true }\n[[palette]]\nname = 'Bad'\ncolors = 42\n[[palette]]\nname = 'Good'\ncolors = ['#fff']\n[[template]]\nname = 'Broken'\nmode = 'future'\n";
         fs::write(&path, original).unwrap();
         let before: toml::Table = toml::from_str(original).unwrap();
-        let loaded = save(
-            &path,
-            Duration::from_secs(1),
-            &[Change::UpsertTemplate(Template::capture(
-                "New".into(),
-                &Settings::default(),
-            ))],
-        )
-        .unwrap();
+        let loaded = save(&path, Duration::from_secs(1), &[template("New")]).unwrap();
         assert_eq!(loaded.warnings.len(), 2);
         let after: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["unknown"], before["unknown"]);
@@ -590,10 +874,7 @@ mod tests {
         save(
             &path,
             Duration::from_secs(1),
-            &[
-                Change::RemovePreset("Bad".into()),
-                Change::UpsertTemplate(Template::capture("Broken".into(), &Settings::default())),
-            ],
+            &[Change::RemovePreset("Bad".into()), template("Broken")],
         )
         .unwrap();
         assert!(load(&path).warnings.is_empty());
@@ -603,7 +884,7 @@ mod tests {
     fn save_rechecks_current_file_and_recovers_after_repair() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let change = Change::UpsertTemplate(Template::capture("Zine".into(), &Settings::default()));
+        let change = template("Zine");
         save(&path, Duration::from_secs(1), &[]).unwrap();
         for text in ["version = [", "version = 2\n"] {
             fs::write(&path, text).unwrap();

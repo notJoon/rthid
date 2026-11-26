@@ -3,6 +3,32 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - Unreleased
+
+### Changed
+
+- Faster panning of a zoomed image: Original cells use 256 colors while the
+  preview is dragged and return to full color on release, and cells whose two
+  halves share a color are drawn as a background space
+- Each frame is written in one buffered pass and wrapped in a synchronized
+  update, so supporting terminals paint whole frames
+- Frames send only the foreground or background color that changed and skip
+  the foreground of plain spaces, which cuts output at 100% zoom by about a
+  quarter
+
+### Fixed
+
+- Saving the same preset or template value again while an earlier save was
+  still running could drop the newer edit, and quitting right after it left
+  another instance's value in the config file
+- A config save stalled before the file lock could overwrite the value written
+  on quit once shutdown stopped waiting for it
+- Errors resolved while an image was loading, such as an invalid preset name
+  that was then corrected, no longer reappear after the image opens
+- Config save failures stay on the status line until a save succeeds instead
+  of disappearing behind another message or a key press
+- Listing errors from an open dialog that was already closed are ignored
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

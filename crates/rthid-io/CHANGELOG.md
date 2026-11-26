@@ -3,6 +3,15 @@
 All notable changes to rthid-io are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - Unreleased
+
+### Fixed
+
+- A config save that reached the file lock after shutdown gave up waiting for
+  the IO worker could overwrite the newer value written on quit. A detached
+  worker now leaves the file alone, and saves that finish within the shutdown
+  wait still write as before
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

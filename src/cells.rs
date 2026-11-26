@@ -9,7 +9,7 @@ use crate::{
 };
 use image::RgbaImage;
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     style::Color,
     widgets::{Block, Clear, Widget},
 };
@@ -168,6 +168,17 @@ pub fn render(
     approximate
 }
 
+// Solid backgrounds avoid redundant foreground color output.
+fn write_cell(cell: &mut Cell, glyph: char, fg: Color, bg: Color) {
+    let (glyph, fg) = if glyph == ' ' || fg == bg {
+        (' ', Color::Reset)
+    } else {
+        (glyph, fg)
+    };
+    cell.set_char(glyph).set_fg(fg).set_bg(bg);
+}
+
+/// Paints In(k) dot by dot, as drawn in the In(k) diagrams on [`Zoom`].
 fn render_exact(pixels: Pixels<'_>, geometry: &PreviewGeometry, k: u8, buffer: &mut Buffer) {
     let (w, _) = geometry.grid;
     let area = geometry.target;
@@ -178,17 +189,20 @@ fn render_exact(pixels: Pixels<'_>, geometry: &PreviewGeometry, k: u8, buffer: &
     let color = |x, half_y| {
         let (x, y) = (x / k, half_y / k);
         if x < vw && y < vh {
-            Color::from(pixels.rgb(((oy + y) * w + ox + x) as usize))
+            let rgb = pixels.rgb(((oy + y) * w + ox + x) as usize);
+            Color::from(rgb)
         } else {
             Color::Reset
         }
     };
     for y in 0..area.height {
         for x in 0..area.width {
-            buffer[(area.x + x, area.y + y)]
-                .set_symbol("▀")
-                .set_fg(color(u32::from(x), u32::from(y) * 2))
-                .set_bg(color(u32::from(x), u32::from(y) * 2 + 1));
+            write_cell(
+                &mut buffer[(area.x + x, area.y + y)],
+                '▀',
+                color(u32::from(x), u32::from(y) * 2),
+                color(u32::from(x), u32::from(y) * 2 + 1),
+            );
         }
     }
 }
@@ -224,7 +238,8 @@ fn draw_minimap(
     }
 }
 
-// Samples the visible region into its target cells.
+/// Samples the visible region into its target cells at Fit and Out(n), as drawn in
+/// the sampled cell diagram on [`Zoom`].
 fn render_overview(
     pixels: Pixels<'_>,
     glyphs: Glyphs,
@@ -243,8 +258,8 @@ fn render_overview(
     }
 }
 
-// Draws averaged half blocks. Colors rebuild only when the grid version or target
-// size changes.
+/// Draws averaged half blocks for Original, see the Original column on [`Zoom`].
+/// Colors rebuild only when the grid version, visible region, zoom or target size changes.
 fn render_overview_rgb(
     pixels: &RgbaImage,
     version: u64,
@@ -268,16 +283,19 @@ fn render_overview_rgb(
     for cy in 0..target.height {
         for cx in 0..target.width {
             let index = usize::from(cy) * 2 * cw + usize::from(cx);
-            buffer[(target.x + cx, target.y + cy)]
-                .set_symbol("▀")
-                .set_fg(colors[index])
-                .set_bg(colors[index + cw]);
+            write_cell(
+                &mut buffer[(target.x + cx, target.y + cy)],
+                '▀',
+                colors[index],
+                colors[index + cw],
+            );
         }
     }
 }
 
-// Samples one dot at each subcell center without averaging and draws one glyph per
-// cell. Returns whether any cell was approximated.
+/// Samples one dot at each subcell center without averaging and draws one glyph per
+/// cell, see the Quadrant and Sextant columns on [`Zoom`]. Returns whether any cell
+/// was approximated.
 fn render_overview_indexed(
     indices: &[u8],
     palette: &[PaletteColor],
@@ -319,20 +337,18 @@ fn render_overview_indexed(
             let (mask, fg, bg, reduced) = reduce_cell(samples, palette);
             approximate |= reduced;
             let glyph = glyphs.glyph(mask);
-            buffer[(target.x + cx, target.y + cy)]
-                .set_char(glyph)
-                .set_fg(color(fg))
-                .set_bg(color(bg));
+            let cell = &mut buffer[(target.x + cx, target.y + cy)];
+            write_cell(cell, glyph, color(fg), color(bg));
         }
     }
     approximate
 }
 
-// Reduces a cell to two colors. The most frequent sample becomes the background and
-// the next ranked distinct one the foreground, with count ties going to the lower
-// palette index. Other samples map to the nearer of the two, ties to the background.
-// Returns the foreground mask, foreground, background, and whether any sample
-// changed its RGB color.
+/// Reduces a cell to two colors. The most frequent sample becomes the background and
+/// the next ranked distinct one the foreground, with count ties going to the lower
+/// palette index. Other samples map to the nearer of the two, ties to the background.
+/// Returns the foreground mask, foreground, background, and whether any sample
+/// changed its RGB color.
 fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) {
     let mut approximate = false;
     let mut counts = [0u8; 256];
@@ -368,8 +384,8 @@ fn reduce_cell(samples: &[u8], palette: &[PaletteColor]) -> (u32, u8, u8, bool) 
     (mask, fg, bg, approximate)
 }
 
-// Averages the dots under each half cell. Returns two color rows per cell row, in
-// row major order.
+/// Averages the dots under each half cell, see the Original column on [`Zoom`].
+/// Returns two color rows per cell row, in row major order.
 fn average_rgb(pixels: &RgbaImage, geometry: &PreviewGeometry) -> Vec<Color> {
     let (cw, ch) = (geometry.target.width, geometry.target.height);
     let (w, h) = geometry.visible;
@@ -400,7 +416,8 @@ fn average_rgb(pixels: &RgbaImage, geometry: &PreviewGeometry) -> Vec<Color> {
                 sum[2] += u64::from(b);
             }
         }
-        Color::from(sum.map(|total| (total / ((x1 - x0) * (y1 - y0))) as u8))
+        let rgb = sum.map(|total| (total / ((x1 - x0) * (y1 - y0))) as u8);
+        Color::from(rgb)
     };
     (0..u32::from(ch) * 2)
         .flat_map(|row| (0..cw).map(move |col| average(col, row)))
@@ -415,6 +432,39 @@ mod tests {
     use ratatui::layout::Constraint;
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
     use rthid_dither::dither::make_palette;
+
+    fn render_with_new_caches(
+        pixels: Pixels<'_>,
+        glyphs: Glyphs,
+        geometry: &PreviewGeometry,
+        buffer: &mut Buffer,
+    ) -> bool {
+        render(
+            pixels,
+            glyphs,
+            geometry,
+            buffer,
+            &mut OverviewCaches::default(),
+        )
+    }
+
+    #[test]
+    fn solid_cells_reset_foreground_for_every_glyph() {
+        for glyph in [' ', '▀', '▌', '█', '\u{1fb00}'] {
+            for fg in [Color::Red, Color::Blue] {
+                let mut cell = Cell::default();
+                write_cell(&mut cell, glyph, fg, Color::Blue);
+                if glyph == ' ' || fg == Color::Blue {
+                    assert_eq!(cell.symbol(), " ");
+                    assert_eq!(cell.fg, Color::Reset);
+                } else {
+                    assert_eq!(cell.symbol(), glyph.to_string());
+                    assert_eq!(cell.fg, fg);
+                }
+                assert_eq!(cell.bg, Color::Blue);
+            }
+        }
+    }
 
     #[test]
     fn cell_reduction_preserves_ties_masks_and_color_approximation() {
@@ -477,12 +527,11 @@ mod tests {
         let area = Rect::new(2, 3, 60, 30);
         let mut buffer = Buffer::empty(area);
         viewport.zoom = Zoom::Fit;
-        render(
+        render_with_new_caches(
             indexed(&indices, &palette),
             Glyphs::Quadrant,
             &crate::viewport::geometry(&viewport, (w, h), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         );
         let is_block = |cell: &ratatui::buffer::Cell| {
             cell.symbol()
@@ -540,12 +589,11 @@ mod tests {
             viewport.x = x;
             viewport.y = y;
             let viewport_rect = viewport.viewport_rect(w, h, viewport.visible(w, h, area), map);
-            render(
+            render_with_new_caches(
                 indexed(&indices, &palette),
                 Glyphs::default(),
                 &crate::viewport::geometry(&viewport, (w, h), area),
                 &mut current,
-                &mut OverviewCaches::default(),
             );
             for pos in frame.positions() {
                 let original = &baseline[pos];
@@ -562,6 +610,7 @@ mod tests {
                         Color::Rgb(170, 187, 204) => Color::Rgb(85, 93, 102),
                         Color::Rgb(238, 102, 68) => Color::Rgb(119, 51, 34),
                         Color::Rgb(255, 255, 255) => Color::Rgb(127, 127, 127),
+                        Color::Reset => Color::Reset,
                         _ => panic!("unexpected overview color: {color:?}"),
                     };
                     expected.set_fg(dim(original.fg)).set_bg(dim(original.bg));
@@ -624,12 +673,11 @@ mod tests {
         ] {
             let mut buffer = Buffer::empty(area);
             assert_eq!(
-                render(
+                render_with_new_caches(
                     indexed(&indices, &palette),
                     glyphs,
                     &geometry(&Viewport::default(), size, area),
                     &mut buffer,
-                    &mut OverviewCaches::default(),
                 ),
                 approximate,
                 "{glyphs:?} {size:?}"
@@ -712,22 +760,11 @@ mod tests {
             viewport.pan(i64::MAX, i64::MAX, &before);
             let after = geometry(&viewport, (16, 16), area);
             for source in [indexed(&indices, &palette), Pixels::Rgb(&pixels, 1)] {
-                render(
-                    source,
-                    Glyphs::default(),
-                    &before,
-                    &mut buffer,
-                    &mut OverviewCaches::default(),
-                );
+                render_with_new_caches(source, Glyphs::default(), &before, &mut buffer);
                 assert_eq!(buffer[partial].bg, Color::Rgb(255, 0, 0));
-                render(
-                    source,
-                    Glyphs::default(),
-                    &after,
-                    &mut buffer,
-                    &mut OverviewCaches::default(),
-                );
-                assert_eq!(buffer[full].fg, Color::Rgb(255, 0, 0));
+                render_with_new_caches(source, Glyphs::default(), &after, &mut buffer);
+                assert_eq!(buffer[full].symbol(), " ");
+                assert_eq!(buffer[full].fg, Color::Reset);
                 assert_eq!(buffer[full].bg, Color::Rgb(255, 0, 0));
             }
         }
@@ -738,7 +775,7 @@ mod tests {
         let pixels = RgbaImage::from_raw(1, 2, vec![25, 26, 128, 0, 231, 47, 93, 128]).unwrap();
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&pixels, 1),
             Glyphs::default(),
             &crate::viewport::geometry(
@@ -750,7 +787,6 @@ mod tests {
                 area
             ),
             &mut buffer,
-            &mut OverviewCaches::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(25, 26, 128));
@@ -765,20 +801,19 @@ mod tests {
         for (width, expected) in [(2, vec![0, 255]), (1, vec![127])] {
             let area = Rect::new(2, 3, width, 3);
             let mut buffer = Buffer::empty(area);
-            assert!(!render(
+            assert!(!render_with_new_caches(
                 Pixels::Rgb(&rgb(4, 4, &pixels), 1),
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
                 &mut buffer,
-                &mut OverviewCaches::default()
             ));
             let (cw, ch) = fit_aspect(4, 4, area, CELL_ASPECT);
             let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
             assert_eq!((cw, ch), (width, 1));
             for (x, value) in expected.into_iter().enumerate() {
                 let cell = &buffer[(target.x + x as u16, target.y)];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::Rgb(value, value, value));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::Rgb(value, value, value));
             }
             assert!(
@@ -794,12 +829,11 @@ mod tests {
         let pixels = [[0, 20, 100], [100, 40, 200], [200, 60, 0], [254, 80, 100]];
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&rgb(1, 4, &pixels), 1),
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
             &mut buffer,
-            &mut OverviewCaches::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(50, 30, 150));
@@ -811,12 +845,11 @@ mod tests {
         let pixels = [[25, 26, 128], [231, 47, 93]];
         let area = Rect::new(0, 0, 3, 3);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             Pixels::Rgb(&rgb(1, 2, &pixels), 1),
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut buffer,
-            &mut OverviewCaches::default()
         ));
         let (cw, ch) = fit_aspect(1, 2, area, CELL_ASPECT);
         let target = area.centered(Constraint::Length(cw), Constraint::Length(ch));
@@ -825,8 +858,8 @@ mod tests {
             for x in 0..cw {
                 let cell = &buffer[(target.x + x, target.y + y)];
                 let [r, g, b] = pixels[y as usize];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::Rgb(r, g, b));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::Rgb(r, g, b));
             }
         }
@@ -837,7 +870,7 @@ mod tests {
         let palette = make_palette(&["#000", "#333", "#fff"]).unwrap();
         let area = Rect::new(0, 0, 1, 2);
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             indexed(&[0, 1, 2], &palette),
             Glyphs::default(),
             &crate::viewport::geometry(
@@ -849,7 +882,6 @@ mod tests {
                 area
             ),
             &mut buffer,
-            &mut OverviewCaches::default()
         ));
         assert_eq!(buffer[(0, 0)].symbol(), "▀");
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0, 0, 0));
@@ -866,12 +898,11 @@ mod tests {
             zoom: Zoom::In(1),
             ..Viewport::default()
         };
-        render(
+        render_with_new_caches(
             indexed(&vec![0; 120 * 120], &palette),
             Glyphs::default(),
             &crate::viewport::geometry(&viewport, (120, 120), area),
             &mut buffer,
-            &mut OverviewCaches::default(),
         );
         // The square grid fits 9x4 cells inside the 14x4 border of a 16x6 frame at x 32.
         assert_eq!(buffer[(32, 0)].symbol(), "┌");
@@ -879,7 +910,7 @@ mod tests {
         assert_eq!(buffer[(33, 2)].symbol(), " ");
         assert_eq!(buffer[(33, 2)].bg, Color::Reset);
         let (_, map) = viewport.minimap(120, 120, area).unwrap();
-        assert_eq!(buffer[(map.x, map.y)].fg, Color::Rgb(0, 0, 0));
+        assert_eq!(buffer[(map.x, map.y)].fg, Color::Reset);
     }
     #[test]
     fn rgb_overview_and_minimap_keep_separate_memos() {
@@ -905,6 +936,36 @@ mod tests {
         }
     }
     #[test]
+    fn enlarged_solid_cells_use_spaces_and_distinct_halves_keep_half_blocks() {
+        let area = Rect::new(2, 3, 2, 2);
+        let palette = make_palette(&["#f00", "#00f"]).unwrap();
+        let pixels = rgb(1, 2, &[palette[0].rgb, palette[1].rgb]);
+        for zoom in [Zoom::In(2), Zoom::In(1)] {
+            let viewport = Viewport {
+                zoom,
+                hide_minimap: true,
+                ..Viewport::default()
+            };
+            let g = geometry(&viewport, (1, 2), area);
+            for source in [indexed(&[0, 1], &palette), Pixels::Rgb(&pixels, 1)] {
+                let mut buffer = Buffer::empty(area);
+                render_with_new_caches(source, Glyphs::Quadrant, &g, &mut buffer);
+                for pos in g.target.positions() {
+                    let cell = &buffer[pos];
+                    if zoom == Zoom::In(2) {
+                        assert_eq!(cell.symbol(), " ");
+                        assert_eq!(cell.fg, Color::Reset);
+                    } else {
+                        assert_eq!(cell.symbol(), "▀");
+                        assert_eq!(cell.fg, Color::from(palette[0].rgb));
+                        assert_eq!(cell.bg, Color::from(palette[1].rgb));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn in_two_draws_each_dot_as_two_columns_and_two_halves() {
         let area = Rect::new(2, 3, 4, 2);
         let pixels = rgb(2, 2, &[[255, 0, 0], [0, 255, 0], [0, 0, 255], [255; 3]]);
@@ -919,12 +980,11 @@ mod tests {
             .collect();
         for pixels in [Pixels::Rgb(&pixels, 1), indexed(&indices, &palette)] {
             let mut buffer = Buffer::empty(area);
-            assert!(!render(
+            assert!(!render_with_new_caches(
                 pixels,
                 Glyphs::default(),
                 &geometry(&viewport, (2, 2), area),
                 &mut buffer,
-                &mut OverviewCaches::default()
             ));
             for (x, y, rgb) in [
                 (2, 3, [255, 0, 0]),
@@ -937,8 +997,8 @@ mod tests {
                 (5, 4, [255; 3]),
             ] {
                 let cell = &buffer[(x, y)];
-                assert_eq!(cell.symbol(), "▀");
-                assert_eq!(cell.fg, Color::from(rgb));
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::Reset);
                 assert_eq!(cell.bg, Color::from(rgb));
             }
         }
@@ -967,10 +1027,10 @@ mod tests {
                     Glyphs::default(),
                     &g,
                     &mut buffer,
-                    &mut caches
+                    &mut caches,
                 ));
                 for pos in area.positions() {
-                    assert_eq!(buffer[pos].fg, Color::Rgb(expected, expected, expected));
+                    assert_eq!(buffer[pos].fg, Color::Reset);
                     assert_eq!(buffer[pos].bg, Color::Rgb(expected, expected, expected));
                 }
             }
@@ -989,12 +1049,11 @@ mod tests {
         let g = geometry(&viewport, (20, 20), area);
         assert_eq!(g.visible, (4, 13));
         let mut buffer = Buffer::empty(area);
-        assert!(!render(
+        assert!(!render_with_new_caches(
             indexed(&indices, &palette),
             Glyphs::Quadrant,
             &g,
             &mut buffer,
-            &mut OverviewCaches::default()
         ));
         for x in 0..2 {
             let cell = &buffer[(x, 2)];

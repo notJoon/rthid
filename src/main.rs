@@ -53,38 +53,17 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, MouseEventKind,
-    },
+    event::{self, EnableBracketedPaste, EnableMouseCapture, Event},
     execute,
 };
 use rthid_io::{
     image::{check_not_source, load_image},
     io::{Done, IO, Outcome},
 };
+use rthid_term::{BracketedPaste, BufferedTerminal, MouseCapture, run_terminal, synchronized_draw};
 
 use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
-
-/// Disables mouse capture on drop, so it is released even when the terminal session fails.
-struct MouseCapture;
-
-impl Drop for MouseCapture {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
-}
-
-/// Disables bracketed paste even when the terminal session fails.
-struct BracketedPaste;
-
-impl Drop for BracketedPaste {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-    }
-}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -140,11 +119,6 @@ fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
     log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
 }
 
-// Pointer motion alone changes nothing on screen.
-fn needs_redraw(event: &Event) -> bool {
-    !matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
-}
-
 fn main() -> std::io::Result<()> {
     let Args {
         image: path,
@@ -192,22 +166,14 @@ fn main() -> std::io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let notice = loaded.notice();
-    let mut app = App::new(
-        source,
-        preview_png.clone(),
-        loaded.palettes,
-        loaded.templates,
-        notice,
-        loaded.save_blocked,
-    );
+    let mut app = App::new(source, preview_png.clone(), loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let mouse_capture = MouseCapture;
     let bracketed_paste = BracketedPaste;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
-    let mut terminal_result = ratatui::run(|terminal| {
+    let mut terminal_result = run_terminal(|terminal| {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
         let previous = std::panic::take_hook();
@@ -224,16 +190,23 @@ fn main() -> std::io::Result<()> {
                 previous(info);
             }
         }));
+        // Detection queries stdout directly, before any frame output is buffered.
         let mut renderer = ui::Renderer::new(graphics::detect(graphics, term_program.as_deref()));
-        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-        event_loop(
-            terminal,
-            &mut app,
-            &mut renderer,
-            debug_log.as_mut(),
-            config_path.as_deref(),
-            &mut io,
+        execute!(
+            terminal.backend_mut(),
+            EnableMouseCapture,
+            EnableBracketedPaste
         )
+        .and_then(|()| {
+            event_loop(
+                terminal,
+                &mut app,
+                &mut renderer,
+                debug_log.as_mut(),
+                config_path.as_deref(),
+                &mut io,
+            )
+        })
     });
     drop(bracketed_paste);
     drop(mouse_capture);
@@ -250,7 +223,7 @@ fn main() -> std::io::Result<()> {
     // Edits whose background save did not finish are saved here.
     terminal_result = terminal_result.and(save_on_quit(
         config_path.as_deref(),
-        app.unsaved(),
+        &app.library.unsaved(),
         &mut debug_log.as_mut(),
     ));
     if debug_log.is_none()
@@ -280,7 +253,7 @@ fn save_on_quit(
 // Syncs and draws when something changed, then waits for input and applies
 // every queued event before the next draw. Runs until the app requests quit.
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut BufferedTerminal,
     app: &mut App,
     renderer: &mut Renderer,
     mut debug_log: Option<&mut File>,
@@ -300,12 +273,15 @@ fn event_loop(
             if rebuilt {
                 log_timing(&mut debug_log, "sync", started.elapsed(), None)?;
             }
-            let frame = terminal.draw(|frame| {
-                ui::draw(frame, app, &layout, renderer);
+            synchronized_draw(terminal, |terminal| {
+                let frame = terminal.draw(|frame| {
+                    ui::draw(frame, app, &layout, renderer);
+                })?;
+                if let Some(log) = &mut debug_log {
+                    ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
+                }
+                Ok(())
             })?;
-            if let Some(log) = &mut debug_log {
-                ui::log_minimap(app, log, &frame, &app.geometry(layout.preview))?;
-            }
         }
         for (job, tag) in app.take_jobs() {
             io.submit(job, tag);
@@ -314,7 +290,8 @@ fn event_loop(
         // TODO: The 30 ms tick only polls for worker results. Have the worker wake the event loop
         //       when a job finishes instead.
         let timeout = [
-            app.save_retry()
+            app.library
+                .retry_at()
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
             io.busy().then_some(Duration::from_millis(30)),
         ]
@@ -328,19 +305,20 @@ fn event_loop(
                 if let Some(log) = &mut debug_log {
                     writeln!(log, "event {event:?}")?;
                 }
-                redraw |= needs_redraw(&event);
-                match event {
-                    Event::Key(key) => app.handle_key(key, &app.geometry(layout.preview)),
+                match &event {
+                    Event::Key(key) => app.handle_key(*key, &app.geometry(layout.preview)),
                     Event::Mouse(mouse) => {
-                        app.handle_mouse(mouse, &app.geometry(layout.preview), layout.screen)
+                        redraw |=
+                            app.handle_mouse(*mouse, &app.geometry(layout.preview), layout.screen);
                     }
-                    Event::Paste(text) => app.handle_paste(&text),
+                    Event::Paste(text) => app.handle_paste(text),
                     Event::Resize(width, height) => {
-                        layout = ui::layout(ratatui::layout::Size::new(width, height));
+                        layout = ui::layout(ratatui::layout::Size::new(*width, *height));
                         app.clamp_viewport(layout.preview);
                     }
                     _ => {}
                 }
+                redraw |= !matches!(event, Event::Mouse(_));
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -475,24 +453,30 @@ mod tests {
     }
 
     #[test]
-    fn pointer_motion_alone_does_not_request_redraw() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-        let mouse = |kind| {
-            Event::Mouse(MouseEvent {
-                kind,
-                column: 1,
-                row: 2,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        let moved = mouse(MouseEventKind::Moved);
-        assert!(!needs_redraw(&moved));
-        for event in [
-            mouse(MouseEventKind::ScrollDown),
-            Event::Resize(80, 24),
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+    fn pointer_motion_after_drag_requests_redraw() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::drag_fixture();
+        let layout = ui::layout(ratatui::layout::Size::new(100, 24));
+        for (kind, column, dragging, redraw) in [
+            (MouseEventKind::Down(MouseButton::Left), 10, false, false),
+            (MouseEventKind::Drag(MouseButton::Left), 9, true, true),
+            (MouseEventKind::Drag(MouseButton::Left), 9, true, false),
+            (MouseEventKind::Moved, 9, false, true),
+            (MouseEventKind::Moved, 10, false, false),
+            (MouseEventKind::Up(MouseButton::Left), 10, false, false),
+            (MouseEventKind::ScrollUp, 10, false, false),
+            (MouseEventKind::ScrollDown, 10, false, true),
+            (MouseEventKind::ScrollRight, 10, false, true),
         ] {
-            assert!(needs_redraw(&event));
+            let changed = app.mouse_at(
+                kind,
+                column,
+                layout.preview.y + 1,
+                &app.geometry(layout.preview),
+                layout.screen,
+            );
+            assert_eq!(app.dragging(), dragging);
+            assert_eq!(changed, redraw);
         }
     }
 }

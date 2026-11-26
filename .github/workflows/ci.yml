@@ -28,6 +28,7 @@ jobs:
     # Decides whether the library jobs have anything new to test.
     runs-on: ubuntu-latest
     outputs:
+      term: ${{ steps.filter.outputs.term }}
       widgets: ${{ steps.filter.outputs.widgets }}
       dither: ${{ steps.filter.outputs.dither }}
       io: ${{ steps.filter.outputs.io }}
@@ -51,6 +52,9 @@ jobs:
               - *shared
               - 'crates/rthid-io/**'
               - 'crates/rthid-dither/**'
+            term:
+              - *shared
+              - 'crates/rthid-term/**'
             widgets:
               - *shared
               - 'crates/rthid-widgets/**'
@@ -68,6 +72,20 @@ jobs:
       # rust-cache keys entries by job, so this cache is separate from the check job's.
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:widgets
+
+  term:
+    # Unit tests and rustdoc warnings for rthid-term, in parallel with check.
+    # The crate is platform independent, so one runner is enough.
+    # A skipped job counts as passing for required checks.
+    needs: changes
+    if: needs.changes.outputs.term == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      # rust-cache keys entries by job, so this cache is separate from the check job's.
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci:term
 
   dither:
     # Unit tests, golden tests and rustdoc warnings for rthid-dither.
