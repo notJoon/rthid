@@ -1,6 +1,6 @@
 //! User palettes and independent settings templates in a versioned TOML file.
 
-use crate::settings::{Palettes, Preset, Settings, Template, Templates};
+use crate::settings::{Dither, Palettes, Preset, Settings, Template, Templates};
 use rthid_dither::dither::{Mode, Tone};
 use rthid_io::{
     atomic,
@@ -273,6 +273,56 @@ impl From<FileMode> for Mode {
     }
 }
 
+/// Algorithm names stored in templates, kept apart from the app and library enums
+/// so renaming a Rust variant cannot change the file format. An unknown name fails
+/// only its own template entry, which is reported and kept raw on save rather than
+/// read as some default algorithm.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FileDither {
+    Atkinson,
+    FloydSteinberg,
+    // The panel shows the short label Jarvis, but files store the full algorithm name.
+    #[serde(rename = "jarvis-judice-ninke")]
+    Jarvis,
+    Stucki,
+    SierraLite,
+    Bayer2,
+    Bayer4,
+    Bayer8,
+    Noise,
+}
+impl From<Dither> for FileDither {
+    fn from(value: Dither) -> Self {
+        match value {
+            Dither::Atkinson => Self::Atkinson,
+            Dither::FloydSteinberg => Self::FloydSteinberg,
+            Dither::Jarvis => Self::Jarvis,
+            Dither::Stucki => Self::Stucki,
+            Dither::SierraLite => Self::SierraLite,
+            Dither::Bayer2 => Self::Bayer2,
+            Dither::Bayer4 => Self::Bayer4,
+            Dither::Bayer8 => Self::Bayer8,
+            Dither::Noise => Self::Noise,
+        }
+    }
+}
+impl From<FileDither> for Dither {
+    fn from(value: FileDither) -> Self {
+        match value {
+            FileDither::Atkinson => Self::Atkinson,
+            FileDither::FloydSteinberg => Self::FloydSteinberg,
+            FileDither::Jarvis => Self::Jarvis,
+            FileDither::Stucki => Self::Stucki,
+            FileDither::SierraLite => Self::SierraLite,
+            FileDither::Bayer2 => Self::Bayer2,
+            FileDither::Bayer4 => Self::Bayer4,
+            FileDither::Bayer8 => Self::Bayer8,
+            FileDither::Noise => Self::Noise,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FileStore {
     version: u32,
@@ -284,6 +334,8 @@ struct FilePreset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<FileMode>,
 }
+/// Missing fields take default settings, so older files without an algorithm or
+/// seed load as Atkinson with seed 0.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct FileTemplate {
@@ -291,6 +343,9 @@ struct FileTemplate {
     palette: String,
     colors: Vec<String>,
     mode: FileMode,
+    algorithm: FileDither,
+    // Read as u64 to match the library range, then clamped to the app's u32 seed.
+    seed: u64,
     strength: f64,
     serpentine: bool,
     scale: i32,
@@ -308,6 +363,8 @@ impl From<Template> for FileTemplate {
             palette: t.palette_name,
             colors: t.palette_hex,
             mode: t.mode.into(),
+            algorithm: t.dither.into(),
+            seed: u64::from(t.seed),
             strength: t.strength,
             serpentine: t.serpentine,
             scale: t.scale,
@@ -322,6 +379,9 @@ impl From<FileTemplate> for Template {
             palette_name: t.palette,
             palette_hex: t.colors,
             mode: t.mode.into(),
+            dither: t.algorithm.into(),
+            // Larger file seeds saturate at the app boundary instead of wrapping.
+            seed: t.seed.min(u64::from(u32::MAX)) as u32,
             strength: t.strength,
             serpentine: t.serpentine,
             scale: t.scale,
@@ -576,6 +636,51 @@ mod tests {
 
     fn template(name: &str) -> Change {
         Change::UpsertTemplate(Template::capture(name.into(), &Settings::default()))
+    }
+
+    #[test]
+    fn algorithm_names_match_the_file_format() {
+        let names = [
+            "atkinson",
+            "floyd-steinberg",
+            "jarvis-judice-ninke",
+            "stucki",
+            "sierra-lite",
+            "bayer2",
+            "bayer4",
+            "bayer8",
+            "noise",
+        ];
+        for (dither, name) in Dither::ALL.into_iter().zip(names) {
+            let value = toml::Value::try_from(FileDither::from(dither)).unwrap();
+            assert_eq!(value.as_str(), Some(name));
+        }
+    }
+
+    #[test]
+    fn file_seed_is_clamped_at_the_domain_boundary() {
+        let template = Template::from(FileTemplate {
+            seed: u64::MAX,
+            ..FileTemplate::default()
+        });
+        assert_eq!(template.seed, u32::MAX);
+    }
+
+    #[test]
+    fn template_algorithms_default_and_round_trip() {
+        let old = parse("version = 1\n[[template]]\nname = 'Old'\n");
+        let old = old.templates.get(0).unwrap();
+        assert_eq!(old.dither, Dither::Atkinson);
+        assert_eq!(old.seed, 0);
+        let settings = Settings {
+            dither: Dither::Bayer4,
+            seed: 7,
+            ..Settings::default()
+        };
+        let template = Template::capture("Pattern".into(), &settings);
+        let (text, loaded) = merge(None, &[Change::UpsertTemplate(template.clone())]).unwrap();
+        assert!(text.contains("algorithm = \"bayer4\""));
+        assert_eq!(loaded.templates.get(0), Some(&template));
     }
 
     #[test]
@@ -862,8 +967,16 @@ mod tests {
     fn unrelated_saves_preserve_raw_entries_and_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let original = "version = 1\nunknown = { enabled = true }\n[[palette]]\nname = 'Bad'\ncolors = 42\n[[palette]]\nname = 'Good'\ncolors = ['#fff']\n[[template]]\nname = 'Broken'\nmode = 'future'\n";
+        let original = "version = 1\nunknown = { enabled = true }\n[[palette]]\nname = 'Bad'\ncolors = 42\n[[palette]]\nname = 'Good'\ncolors = ['#fff']\n[[template]]\nname = 'Broken'\nalgorithm = 'future'\n";
         fs::write(&path, original).unwrap();
+        let skipped = load(&path);
+        assert!(skipped.templates.is_empty());
+        assert!(
+            skipped
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("future"))
+        );
         let before: toml::Table = toml::from_str(original).unwrap();
         let loaded = save(&path, Duration::from_secs(1), &[template("New")]).unwrap();
         assert_eq!(loaded.warnings.len(), 2);

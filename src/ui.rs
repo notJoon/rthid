@@ -174,8 +174,14 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let labels =
-        Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.library.palettes)));
+    let labels = Setting::ALL.map(|setting| {
+        let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
+        if setting.is_active(&app.settings) {
+            label
+        } else {
+            label.style(Style::default().fg(Color::DarkGray))
+        }
+    });
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
@@ -1147,7 +1153,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
-        for _ in 0..6 {
+        for _ in 0..8 {
             app.handle_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                 &app.geometry(layout(terminal.size().unwrap()).preview),
@@ -1158,16 +1164,16 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(6));
-        assert_eq!(app.panel.offset(), 4);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(8));
+        assert_eq!(app.panel.offset(), 6);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(5));
-        assert_eq!(app.panel.offset(), 4);
-        for label in ["Serpentine", "Brightness", "Contrast"] {
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(7));
+        assert_eq!(app.panel.offset(), 6);
+        for label in ["Seed", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
     }
