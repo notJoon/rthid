@@ -18,6 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The hidden cursor stays on the status line between frames, so terminals that
+  mark the cursor row, like iTerm2 with its cursor guide, no longer show that
+  mark jumping around the preview
 - Cells next to a one-column inline image, such as a very tall image at Fit,
   are redrawn instead of keeping the previous image
 - Resizing the window in iTerm2 no longer leaves copies of the rthid screen in

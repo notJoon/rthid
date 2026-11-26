@@ -43,6 +43,15 @@ impl<W: Write> ElidingBackend<W> {
         self.inner.writer_mut()
     }
 
+    /// Moves the hidden cursor to the start of the last of `rows` rows.
+    ///
+    /// Otherwise it stays on whichever cell a frame wrote last, and terminals that mark the
+    /// cursor row even while the cursor is hidden, like iTerm2's cursor guide, show that mark
+    /// jumping around between frames.
+    fn park_cursor(&mut self, rows: u16) -> io::Result<()> {
+        execute!(self.inner, MoveTo(0, rows.saturating_sub(1)))
+    }
+
     /// Erases `rows` screen rows with one erase-line each and keeps the cursor where it was.
     ///
     /// Terminals disagree on what an erase-display (`ESC[2J`) does beyond blanking cells, such as
@@ -140,8 +149,16 @@ impl<W: Write> Backend for ElidingBackend<W> {
         self.inner.append_lines(n)
     }
 
+    /// Hides the cursor and moves it to the start of the last row. Ratatui calls this after
+    /// every frame that does not show a cursor, so terminals that mark the cursor row, like
+    /// iTerm2's cursor guide, keep that mark in one place. Without a terminal size the cursor
+    /// stays put, since parking only affects how the hidden cursor looks.
     fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
+        self.inner.hide_cursor()?;
+        match self.inner.size() {
+            Ok(size) => self.park_cursor(size.height),
+            Err(_) => Ok(()),
+        }
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
@@ -455,6 +472,14 @@ mod tests {
             .draw(Buffer::empty(frame.area).diff(&frame).into_iter())
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hidden_cursor_parks_at_the_start_of_the_last_row() {
+        let mut backend = ElidingBackend::new(Vec::new());
+        backend.park_cursor(24).unwrap();
+        backend.park_cursor(0).unwrap();
+        assert_eq!(backend.writer(), b"\x1b[24;1H\x1b[1;1H");
     }
 
     #[test]

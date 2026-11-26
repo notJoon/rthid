@@ -18,6 +18,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   changed and skips the foreground of plain spaces
 - `ElidingBackend::writer` and `writer_mut` for access to the output writer, and
   `Debug` when the writer supports it
+- `ElidingBackend` parks the hidden cursor at the start of the last row after
+  each frame instead of leaving it on the last cell the frame wrote
 - `ElidingBackend` moves the cursor explicitly after a cell whose symbol holds
   escape sequences, such as an inline image, instead of assuming where the
   terminal left it
