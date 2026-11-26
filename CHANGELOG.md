@@ -18,6 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Original at Fit is visible again in iTerm2, which answered the Kitty graphics
+  query but drew nothing for its placeholder cells, so the preview went blank
+  at Fit and after zooming back out; iTerm2 now uses its own image protocol
 - Saving the same preset or template value again while an earlier save was
   still running could drop the newer edit, and quitting right after it left
   another instance's value in the config file

@@ -154,6 +154,8 @@ zoom regardless of keyboard focus.
 
 `--graphics auto|off`: detect Kitty, iTerm2, or Sixel on startup (`auto`, the default).
 Detection waits about 200 ms and is skipped on Apple Terminal.
+iTerm2 always uses its own image protocol, because its Kitty support leaves the
+placeholder cells rthid draws blank.
 If detection fails or no graphics protocol is available, Original uses half blocks.
 `off` skips the terminal query and always uses half blocks. Dithered stays cell-rendered.
 

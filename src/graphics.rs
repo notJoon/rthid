@@ -68,13 +68,24 @@ const KITTY_IMAGE_ID: u32 = 0x727468;
 /// Queries the terminal for an image protocol, blocking for up to 200 ms.
 ///
 /// Returns None when graphics are off, the terminal is Apple Terminal, the query
-/// fails, or only half blocks are available.
+/// fails, or only half blocks are available. iTerm2 always gets the iTerm2 protocol.
 pub fn detect(mode: Mode, term_program: Option<&str>) -> Option<Graphics> {
     if mode == Mode::Off || term_program == Some("Apple_Terminal") {
         return None;
     }
+    // iTerm2 draws nothing for a Kitty virtual placement sent without c= and r=,
+    // which is how ratatui-image sends it. Excluding Kitty, and Sixel, which iTerm2
+    // also reports, lets ratatui-image fall back to the iTerm2 protocol.
+    // LC_TERMINAL stays set inside tmux, where TERM_PROGRAM becomes tmux.
+    let iterm2 = term_program == Some("iTerm.app")
+        || std::env::var("LC_TERMINAL").is_ok_and(|t| t == "iTerm2");
     let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
         timeout: Duration::from_millis(200),
+        blacklist_protocols: if iterm2 {
+            vec![ProtocolType::Kitty, ProtocolType::Sixel]
+        } else {
+            Vec::new()
+        },
         ..QueryStdioOptions::default()
     })
     .ok()
