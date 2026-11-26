@@ -374,7 +374,7 @@ impl Template {
         }
     }
 
-    /// Restores saved settings while retaining the current rotation, zoom and pan.
+    /// Restores saved settings while retaining the current rotation, flip, zoom and pan.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
         let next = Settings {
@@ -390,6 +390,7 @@ impl Template {
             pan_x: settings.pan_x,
             pan_y: settings.pan_y,
             rotation: settings.rotation,
+            flip: settings.flip,
             palette_name: self.palette_name.clone(),
             palette_hex: self.palette_hex.clone(),
             palette,
@@ -724,7 +725,7 @@ impl Setting {
 }
 
 /// Everything that affects the grid or the dither. d resets the selected row and
-/// D resets everything, including rotation.
+/// D resets everything, including rotation and flip.
 // TODO: Hold the palette as one Preset and derive the palette from it. Name, hex list and
 // built palette are three copies that every setter must keep in sync.
 #[derive(Clone, PartialEq)]
@@ -745,6 +746,8 @@ pub struct Settings {
     pub pan_y: i32,
     /// Source rotation inside the card.
     pub rotation: Rotation,
+    /// Mirrors left and right on the card after rotation.
+    pub flip: bool,
     /// Selected preset name, also retained for palettes stored in templates.
     pub palette_name: String,
     /// Hex colors preserved in the user's order.
@@ -781,6 +784,7 @@ impl Default for Settings {
             pan_x: 0,
             pan_y: 0,
             rotation: Rotation::R0,
+            flip: false,
             palette_name: String::new(),
             palette_hex: Vec::new(),
             dither: Dither::default(),
@@ -1313,6 +1317,7 @@ mod tests {
         let mut template = Template::capture("Zine".into(), &settings);
         let current = Settings {
             rotation: Rotation::R270,
+            flip: true,
             zoom: 135,
             pan_x: -25,
             pan_y: 45,
@@ -1323,6 +1328,7 @@ mod tests {
             restored
                 == Settings {
                     rotation: current.rotation,
+                    flip: current.flip,
                     zoom: current.zoom,
                     pan_x: current.pan_x,
                     pan_y: current.pan_y,

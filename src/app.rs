@@ -179,6 +179,7 @@ impl App {
         self.viewport = Viewport::default();
         self.last_drag = None;
         self.settings.rotation = Rotation::R0;
+        self.settings.flip = false;
         self.settings.zoom = 100;
         self.settings.pan_x = 0;
         self.settings.pan_y = 0;
@@ -683,6 +684,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('f') => self.settings.flip = !self.settings.flip,
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
@@ -1250,6 +1252,7 @@ mod tests {
         app.settings.zoom = 150;
         app.settings.pan_x = 25;
         app.settings.pan_y = -40;
+        app.settings.flip = true;
         app.show_original = false;
         app.refresh();
         let settings = app.settings.clone();
@@ -1270,6 +1273,7 @@ mod tests {
         assert!(!app.viewport.hide_minimap);
         assert!(app.last_drag.is_none() && app.show_original);
         assert_eq!(app.settings.rotation, Rotation::R0);
+        assert!(!app.settings.flip);
         assert_eq!(
             (app.settings.zoom, app.settings.pan_x, app.settings.pan_y),
             (100, 0, 0)
@@ -1303,11 +1307,13 @@ mod tests {
             Some(&Template::capture("Z".into(), &saved))
         );
         app.settings.strength = 0.9;
+        app.settings.flip = true;
         app.settings.rotation = Rotation::R90;
         for code in [KeyCode::Char('T'), KeyCode::Enter] {
             press(&mut app, code);
         }
         assert_eq!(app.settings.strength, 0.5);
+        assert!(app.settings.flip);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
     }
@@ -2070,12 +2076,14 @@ mod tests {
     #[test]
     fn reset_restores_selected_or_all_defaults() {
         let mut app = app_at(Setting::Card);
+        press(&mut app, KeyCode::Char('f'));
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Char('r'));
         select(&mut app, Setting::Mode);
         press(&mut app, KeyCode::Right);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert!(matches!(app.settings.mode, Mode::Tone));
+        assert!(app.settings.flip);
         assert_eq!(
             (app.settings.card, app.settings.rotation),
             (crate::settings::CARDS[1], Rotation::R90)
@@ -2088,6 +2096,7 @@ mod tests {
             (p.card, p.rotation),
             (crate::settings::CARDS[0], Rotation::R0)
         );
+        assert!(!p.flip);
         assert_eq!(p.palette_name, "Black/white");
         assert_eq!(p.palette.len(), 2);
         assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 250 * 450);
@@ -2185,6 +2194,33 @@ mod tests {
         assert_eq!(versions(&app), version);
         app.handle_key(ctrl('c'), &app.geometry(test_layout().preview));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn flip_toggles_in_both_focuses_and_layers_and_rebuilds_once() {
+        for focus in [false, true] {
+            for original in [false, true] {
+                let mut app = App::builtin(RgbaImage::new(16, 12), None);
+                app.settings = Settings::for_pixels(16, 12);
+                app.preview_focus = focus;
+                app.show_original = original;
+                app.refresh();
+                assert!(!app.settings.flip);
+                for expected in [true, false] {
+                    let before = versions(&app);
+                    assert!(press(&mut app, KeyCode::Char('f')));
+                    assert_eq!(app.settings.flip, expected);
+                    assert_eq!(app.show_original, original);
+                    let after = (before.0 + 1, before.1 + u64::from(!original));
+                    assert_eq!(versions(&app), after);
+                    app.refresh();
+                    assert_eq!(versions(&app), after);
+                }
+                press(&mut app, KeyCode::Char('o'));
+                press(&mut app, KeyCode::Char('f'));
+                assert!(!app.settings.flip);
+            }
+        }
     }
 
     #[test]

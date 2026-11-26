@@ -62,7 +62,10 @@ impl GridCache {
             let mut grid =
                 RgbaImage::from_pixel(placement.width, placement.height, image::Rgba([255; 4]));
             if placement.aw > 0 {
-                let rotated = placement.rotation.apply(source.clone());
+                let mut rotated = placement.rotation.apply(source.clone());
+                if placement.flip {
+                    imageops::flip_horizontal_in_place(&mut rotated);
+                }
                 let left = (-placement.x).max(0) as u32;
                 let top = (-placement.y).max(0) as u32;
                 let right =
@@ -243,6 +246,42 @@ mod tests {
             source: Some(source),
             grid: Memo::default(),
             dithered: Memo::default(),
+        }
+    }
+
+    #[test]
+    fn flip_mirrors_rotated_pixels_before_cover_and_pan() {
+        use crate::settings::Rotation;
+
+        let source = RgbaImage::from_fn(16, 12, |x, y| Rgba([x as u8, y as u8, 0, 255]));
+        for rotation in [Rotation::R0, Rotation::R90] {
+            for cropped in [false, true] {
+                let (width, height) = match (rotation, cropped) {
+                    (_, true) => (8, 8),
+                    (Rotation::R0, false) => (16, 12),
+                    _ => (12, 16),
+                };
+                let settings = Settings {
+                    rotation,
+                    flip: true,
+                    zoom: if cropped { 150 } else { 100 },
+                    pan_x: if cropped { 100 } else { 0 },
+                    pan_y: if cropped { -100 } else { 0 },
+                    ..Settings::for_pixels(width, height)
+                };
+                let mut cache = cache(source.clone());
+                cache.refresh(&settings, false);
+                let grid = cache.grid().unwrap();
+                for y in 0..height {
+                    for x in 0..width {
+                        let (sx, sy) = match rotation {
+                            Rotation::R0 => (width - 1 - x, y),
+                            _ => (y, x + if cropped { 4 } else { 0 }),
+                        };
+                        assert_eq!(grid.get_pixel(x, y), source.get_pixel(sx, sy));
+                    }
+                }
+            }
         }
     }
 

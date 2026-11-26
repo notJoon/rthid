@@ -31,6 +31,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("m", "map"),
     ("mouse", "drag/wheel/map"),
     ("r/R", "rotate"),
+    ("f", "flip"),
     ("d/D", "reset"),
     ("Esc", "back"),
     ("q", "quit"),
@@ -46,6 +47,7 @@ const PANEL_HINTS: &[(&str, &str)] = &[
     ("Up/Down k/j", "select"),
     ("Left/Right h/l", "change"),
     ("r/R", "rotate"),
+    ("f", "flip"),
     ("d/D", "reset"),
     ("q", "quit"),
 ];
@@ -556,7 +558,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
-            "{displayed} | {mode} | Card {}x{} mm{} | Dots {gw}x{gh} | Dot {:.2} mm | Rot {}°{}",
+            "{displayed} | {mode} | Card {}x{} mm{} | Dots {gw}x{gh} | Dot {:.2} mm | Rot {}°{}{}",
             app.settings.card.w_mm,
             app.settings.card.h_mm,
             if app.settings.bleed > 0 {
@@ -566,6 +568,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             },
             f64::from(app.settings.dot) / 100.0,
             app.settings.rotation.degrees(),
+            if app.settings.flip { " Flip" } else { "" },
             if placement.aw == 0 {
                 " | no image area"
             } else {
@@ -1205,11 +1208,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
         );
     }
 
@@ -1388,9 +1391,15 @@ mod tests {
     fn print_status_includes_bleed_and_empty_area_and_truncates() {
         let mut app = App::builtin(RgbaImage::new(8, 8), None);
         app.settings.bleed = 3;
+        app.settings.rotation = crate::settings::Rotation::R90;
+        app.settings.flip = true;
         let geometry = app.geometry(Rect::new(0, 0, 100, 20));
         let text = status(&app, &geometry, PreviewReport::default());
-        assert!(text.contains("Card 50x90 mm (+3 mm bleed) | Dots 280x480 | Dot 0.20 mm | Rot 0°"));
+        assert!(
+            text.contains(
+                "Card 50x90 mm (+3 mm bleed) | Dots 280x480 | Dot 0.20 mm | Rot 90° Flip"
+            )
+        );
         app.settings = crate::settings::Settings {
             margin: 100,
             ..crate::settings::Settings::for_pixels(8, 8)
@@ -1400,6 +1409,7 @@ mod tests {
         let text = status(&app, &geometry, PreviewReport::default());
         assert!(text.contains("no image area"));
         assert!(!text.contains("bleed"));
+        assert!(!text.contains("Flip"));
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(20, 7)).unwrap();
         let _ = draw_text(&mut terminal, &app, &mut renderer);

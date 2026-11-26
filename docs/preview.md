@@ -23,8 +23,8 @@ The preview starts with Original at Fit.
   terminal's cell pixel size. Otherwise Original uses truecolor half blocks,
   averaged at Fit and reduced zoom levels. Press `Space` to toggle the layer.
   Dithering is deferred while Original is shown unless a companion PNG is enabled.
-  Changing a dither parameter reveals Dithered. Print controls, rotation, and resets keep
-  the selected layer. PNG exports always use the dithered result.
+  Changing a dither parameter reveals Dithered. Print controls, rotation, flip,
+  and resets keep the selected layer. PNG exports always use the dithered result.
 - **Fit**: shows the whole grid with terminal cell aspect correction. For Dithered,
   `Fit (sextant)` or `Fit (quadrant)` names the sampling glyphs. `approximate`
   means samples needed color reduction. Sampling may omit detail without this label.
@@ -64,9 +64,10 @@ as paper. If either remaining image axis is at most two dots, the whole grid is
 paper and the status shows `no image area`.
 
 The source covers the image area at Zoom 1.00x. Smaller values can expose paper.
-Rotation turns the source inside the fixed card. Positive Pan X moves toward
-right edge alignment and positive Pan Y toward bottom edge alignment. Negative
-values align the opposite edges. Paper always uses the brightest palette color
+Rotation turns the source inside the fixed card. `f` mirrors left and right after
+rotation, before cover placement. Pan directions stay relative to the card.
+Positive Pan X moves toward right edge alignment and positive Pan Y toward
+bottom edge alignment. Negative values align the opposite edges. Paper always uses the brightest palette color
 in Dithered, regardless of tone settings. Original uses white RGB for paper.
 
 These composition controls change the output. The preview zoom keys and preview
@@ -74,6 +75,7 @@ panning only navigate the result. `d` restores the selected control and `D`
 restores all settings, including composition.
 
 The status includes `Card 50x90 mm | Dots 250x450 | Dot 0.20 mm | Rot 0°`.
+When flipped, the rotation reads, for example, `Rot 90° Flip`.
 With bleed it shows, for example, `Card 50x90 mm (+3 mm bleed)`.
 The layer and preview navigation information remain before these fields.
 Long status lines are clipped to the terminal width.
@@ -90,7 +92,8 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `Space` | Toggle original / dithered; compute a pending result if needed |
 | Any | `Esc` | Return focus to parameters |
 | Any | `r` / `R` | Rotate 90° clockwise / counterclockwise |
-| Any | `d` / `D` | Reset selected parameter / all parameters and rotation |
+| Any, outside modals | `f` | Flip left and right on the card |
+| Any | `d` / `D` | Reset selected parameter / all parameters and composition |
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
 | Parameters, Seed row with Noise | `Enter` | Draw a new noise pattern |
@@ -123,8 +126,8 @@ it and click it again to open it. The wheel moves the selection.
 You can also drag and drop an image outside a dialog when your terminal sends
 bracketed paste. Quoted paths, escaped spaces and local file URIs are accepted.
 Only the first path is opened. Pasting into a dialog inserts text in its active
-field. Opening an image keeps processing settings, resets rotation, image zoom, image pan and preview navigation,
-and shows Original at Fit. A failed open keeps the current image.
+field. Opening an image keeps processing settings, resets rotation, flip, image
+zoom, image pan and preview navigation, and shows Original at Fit. A failed open keeps the current image.
 
 ## Presets and templates
 
@@ -134,8 +137,9 @@ editor, `Enter` edits a field, `a` adds a color, `x` removes a color, and `s` sa
 `Esc` cancels an edit or closes the dialog.
 
 `T` opens templates: arrows or `j`/`k` select, `Enter` restores settings and
-shows Dithered while keeping rotation, image zoom and image pan, `n` saves current settings under a name
-of up to 32 characters, and `x` asks to delete. Names must be nonempty and
+shows Dithered while keeping rotation, flip, image zoom and image pan. These
+composition values are not stored in templates. `n` saves current settings under
+a name of up to 32 characters, and `x` asks to delete. Names must be nonempty and
 cannot match a built-in preset. Reusing a template name asks to overwrite with
 `y`; any other key returns to the name prompt. `Esc` returns from naming to
 the list or closes the list. Click to select a preset, template, or editor row,

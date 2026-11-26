@@ -31,6 +31,8 @@ pub(crate) struct Placement {
     pub pan_y: i32,
     /// Source orientation inside the card.
     pub rotation: Rotation,
+    /// Mirrors the rotated source along the card width.
+    pub flip: bool,
 }
 
 // Ties go toward positive infinity, including negative image offsets.
@@ -66,6 +68,7 @@ impl Placement {
             x: 0,
             y: 0,
             rotation: settings.rotation,
+            flip: settings.flip,
             zoom: settings.zoom,
             pan_x: settings.pan_x,
             pan_y: settings.pan_y,

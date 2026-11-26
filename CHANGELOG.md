@@ -5,6 +5,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.1] - Unreleased
 
+### Added
+
+- `f` mirrors left and right on the card after rotation, keeping pan directions
+  and the current layer. The status shows `Flip` beside rotation. Templates keep
+  the current flip, while opening an image or pressing `D` resets it
+
 ### Changed
 
 - Scale is replaced by card, dot, margin, bleed, zoom and pan controls. Rotation
