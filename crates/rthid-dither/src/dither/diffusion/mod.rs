@@ -80,7 +80,6 @@ struct Weights {
 }
 
 /// Quantizes prepared channels and spreads error to later pixels.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn diffuse(
     work: &mut [Vec<f32>],
     w: usize,
@@ -89,8 +88,8 @@ pub(super) fn diffuse(
     levels: f64,
     colors: &[[f64; 3]],
     settings: &Diffusion,
-    out: &mut [u8],
-) {
+) -> Vec<u8> {
+    let mut out = vec![0; w * h];
     let weights = settings.kernel.weights();
     for y in 0..h {
         let reverse = settings.serpentine && y % 2 == 1;
@@ -100,7 +99,7 @@ pub(super) fn diffuse(
             let (q, target) = match mode {
                 Mode::Tone => {
                     let v = f64::from(work[0][i]);
-                    let q = tone_level(v, levels);
+                    let q = tone_level(v, levels, 0.5);
                     (q, [q as f64 / levels; 3])
                 }
                 Mode::Color => {
@@ -132,11 +131,12 @@ pub(super) fn diffuse(
             }
         }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Algorithm, Options, dither, make_palette};
+    use super::super::{Algorithm, Options, dither};
     use super::*;
 
     const KERNELS: [Kernel; 5] = [
@@ -194,8 +194,7 @@ mod tests {
                     mode,
                     algorithm: Algorithm::Diffusion(Diffusion {
                         kernel,
-                        serpentine: true,
-                        strength: 1.0,
+                        ..Diffusion::default()
                     }),
                     ..Options::default()
                 };
@@ -203,7 +202,7 @@ mod tests {
                 options.algorithm = Algorithm::Diffusion(Diffusion {
                     kernel,
                     serpentine: false,
-                    strength: 1.0,
+                    ..Diffusion::default()
                 });
                 let reverse = dither(&mirrored, w, 2, &options);
                 assert_eq!(
@@ -211,41 +210,6 @@ mod tests {
                     reverse[w..].iter().rev().copied().collect::<Vec<_>>(),
                     "{kernel:?} {mode:?}"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn kernels_return_valid_indices_for_small_images() {
-        let colors = ["#000", "#345", "#789", "#abc", "#fff"];
-        for kernel in KERNELS {
-            for mode in [Mode::Tone, Mode::Color] {
-                for (w, h) in [(1, 1), (7, 1), (1, 7), (0, 0), (0, 3)] {
-                    let rgba: Vec<_> = (0..w * h)
-                        .flat_map(|i| [((i * 53 + 71) % 256) as u8, 137, 211, 255])
-                        .collect();
-                    for count in 1..=5 {
-                        let options = Options {
-                            palette: make_palette(&colors[..count]).unwrap(),
-                            mode,
-                            algorithm: Algorithm::Diffusion(Diffusion {
-                                kernel,
-                                serpentine: true,
-                                strength: 1.0,
-                            }),
-                            ..Options::default()
-                        };
-                        let indices = dither(&rgba, w, h, &options);
-                        assert_eq!(indices.len(), w * h);
-                        assert!(
-                            indices.iter().all(|&index| usize::from(index) < count),
-                            "{kernel:?} {mode:?} {w}x{h} palette {count}"
-                        );
-                        if count == 1 {
-                            assert_eq!(indices, vec![0; w * h]);
-                        }
-                    }
-                }
             }
         }
     }

@@ -1,12 +1,17 @@
 //! Reproducible noise thresholds from SplitMix64.
 
 /// Maps the indexed generator output to a threshold in [0, 1).
-pub(in crate::dither) fn splitmix64(seed: u64, i: u64) -> f64 {
+fn splitmix64(seed: u64, i: u64) -> f64 {
     let mut z = seed.wrapping_add(i.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
     (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Prepares thresholds indexed by pixel position.
+pub(in crate::dither) fn threshold(seed: u64, w: usize) -> impl Fn(usize, usize) -> f64 {
+    move |x, y| splitmix64(seed, (y * w + x) as u64)
 }
 
 #[cfg(test)]

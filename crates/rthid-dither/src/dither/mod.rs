@@ -84,24 +84,6 @@ impl Default for Algorithm {
     }
 }
 
-impl Algorithm {
-    /// Returns error diffusion settings, or None for algorithms that do not diffuse error.
-    pub fn diffusion(&self) -> Option<&Diffusion> {
-        match self {
-            Self::Diffusion(d) => Some(d),
-            Self::Bayer(_) | Self::Noise { .. } => None,
-        }
-    }
-
-    /// Returns mutable error diffusion settings, or None for algorithms that do not diffuse error.
-    pub fn diffusion_mut(&mut self) -> Option<&mut Diffusion> {
-        match self {
-            Self::Diffusion(d) => Some(d),
-            Self::Bayer(_) | Self::Noise { .. } => None,
-        }
-    }
-}
-
 /// Palette and processing settings for dithering. Defaults to a black and white
 /// palette, Tone mode, `Algorithm::default()` and default tone.
 #[derive(Debug, Clone, PartialEq)]
@@ -257,8 +239,8 @@ fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
     n
 }
 
-fn tone_level(v: f64, levels: f64) -> usize {
-    (v * levels + 0.5).floor().clamp(0.0, levels) as usize
+fn tone_level(v: f64, levels: f64, offset: f64) -> usize {
+    (v * levels + offset).floor().clamp(0.0, levels) as usize
 }
 
 fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
@@ -297,7 +279,6 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
             .collect(),
     };
     let mut channels = to_channels(rgba, w, h, &options.tone);
-    let mut out = vec![0; n];
     let levels = (palette.len() - 1) as f64;
     // Tone mode quantizes luminance alone.
     let work = match options.mode {
@@ -313,7 +294,7 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     };
     match options.algorithm {
         Algorithm::Diffusion(d) => {
-            diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d, &mut out)
+            diffusion::diffuse(work, w, h, options.mode, levels, &colors, &d)
         }
         Algorithm::Bayer(size) => threshold::threshold(
             work,
@@ -323,7 +304,6 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
             levels,
             &colors,
             threshold::bayer::threshold(size),
-            &mut out,
         ),
         Algorithm::Noise { seed } => threshold::threshold(
             work,
@@ -332,11 +312,9 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
             options.mode,
             levels,
             &colors,
-            |x, y| threshold::noise::splitmix64(seed, (y * w + x) as u64),
-            &mut out,
+            threshold::noise::threshold(seed, w),
         ),
     }
-    out
 }
 
 /// Expands a `gw` by `gh` index grid into opaque `ow` by `oh` RGBA pixels by
@@ -382,6 +360,56 @@ pub fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn algorithms_return_valid_indices_for_small_images() {
+        let colors = ["#000", "#345", "#789", "#abc", "#fff"];
+        for algorithm in [
+            Kernel::Atkinson,
+            Kernel::FloydSteinberg,
+            Kernel::JarvisJudiceNinke,
+            Kernel::Stucki,
+            Kernel::SierraLite,
+        ]
+        .map(|kernel| {
+            Algorithm::Diffusion(Diffusion {
+                kernel,
+                ..Diffusion::default()
+            })
+        })
+        .into_iter()
+        .chain([
+            Algorithm::Bayer(BayerSize::Two),
+            Algorithm::Bayer(BayerSize::Four),
+            Algorithm::Bayer(BayerSize::Eight),
+            Algorithm::Noise { seed: 0 },
+        ]) {
+            for mode in [Mode::Tone, Mode::Color] {
+                for (w, h) in [(1, 1), (7, 1), (1, 7), (0, 0), (0, 3)] {
+                    let rgba: Vec<_> = (0..w * h)
+                        .flat_map(|i| [((i * 53 + 71) % 256) as u8, 137, 211, 255])
+                        .collect();
+                    for count in 1..=5 {
+                        let options = Options {
+                            palette: make_palette(&colors[..count]).unwrap(),
+                            mode,
+                            algorithm,
+                            ..Options::default()
+                        };
+                        let indices = dither(&rgba, w, h, &options);
+                        assert_eq!(indices.len(), w * h);
+                        assert!(
+                            indices.iter().all(|&index| usize::from(index) < count),
+                            "{algorithm:?} {mode:?} {w}x{h} palette {count}"
+                        );
+                        if count == 1 {
+                            assert_eq!(indices, vec![0; w * h]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_hex_colors() {
@@ -438,7 +466,10 @@ mod tests {
     fn rejects_invalid_numeric_options_even_for_one_color() {
         let setters: [fn(&mut Options, f64); 7] = [
             |options, value| {
-                options.algorithm.diffusion_mut().unwrap().strength = value;
+                options.algorithm = Algorithm::Diffusion(Diffusion {
+                    strength: value,
+                    ..Diffusion::default()
+                });
             },
             |options, value| options.tone.brightness = value,
             |options, value| options.tone.contrast = value,
@@ -470,24 +501,39 @@ mod tests {
     #[test]
     #[should_panic(expected = "algorithm strength must be within 0..=1, got -0.1")]
     fn rejects_negative_strength() {
-        let mut options = Options::default();
-        options.algorithm.diffusion_mut().unwrap().strength = -0.1;
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: -0.1,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
         dither(&[0; 4], 1, 1, &options);
     }
 
     #[test]
     #[should_panic(expected = "algorithm strength must be within 0..=1, got 1.1")]
     fn rejects_strength_above_one() {
-        let mut options = Options::default();
-        options.algorithm.diffusion_mut().unwrap().strength = 1.1;
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: 1.1,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
         dither(&[0; 4], 1, 1, &options);
     }
 
     #[test]
     #[should_panic(expected = "algorithm strength must be finite, got NaN")]
     fn rejects_nan_strength() {
-        let mut options = Options::default();
-        options.algorithm.diffusion_mut().unwrap().strength = f64::NAN;
+        let options = Options {
+            algorithm: Algorithm::Diffusion(Diffusion {
+                strength: f64::NAN,
+                ..Diffusion::default()
+            }),
+            ..Options::default()
+        };
         dither(&[0; 4], 1, 1, &options);
     }
 
@@ -578,7 +624,8 @@ mod tests {
         }
     }
 
-    fn gradient() -> Vec<u8> {
+    /// Shared pixels for quantization checks.
+    pub(crate) fn gradient() -> Vec<u8> {
         (0..128)
             .flat_map(|i| {
                 let (x, y) = (i % 16, i / 16);

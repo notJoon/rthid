@@ -3,10 +3,9 @@
 pub(super) mod bayer;
 pub(super) mod noise;
 
-use super::{Mode, nearest};
+use super::{Mode, nearest, tone_level};
 
 /// Quantizes prepared channels in rows from left to right.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn threshold(
     work: &[Vec<f32>],
     w: usize,
@@ -15,8 +14,8 @@ pub(super) fn threshold(
     levels: f64,
     colors: &[[f64; 3]],
     threshold: impl Fn(usize, usize) -> f64,
-    out: &mut [u8],
-) {
+) -> Vec<u8> {
+    let mut out = vec![0; w * h];
     let spread = 1.6 / f64::max(1.0, levels);
     for y in 0..h {
         for x in 0..w {
@@ -25,7 +24,7 @@ pub(super) fn threshold(
             let q = match mode {
                 Mode::Tone => {
                     let v = f64::from(work[0][i]);
-                    (v * levels + t).floor().clamp(0.0, levels) as usize
+                    tone_level(v, levels, t)
                 }
                 Mode::Color => {
                     let d = (t - 0.5) * spread;
@@ -35,11 +34,12 @@ pub(super) fn threshold(
             out[i] = q as u8;
         }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Algorithm, BayerSize, Options, dither, make_palette};
+    use super::super::{Algorithm, BayerSize, Options, dither, tests::gradient};
     use super::*;
 
     const ALGORITHMS: [Algorithm; 4] = [
@@ -50,40 +50,8 @@ mod tests {
     ];
 
     #[test]
-    fn thresholds_return_valid_indices_for_small_images() {
-        let colors = ["#000", "#345", "#789", "#abc", "#fff"];
-        for mut algorithm in ALGORITHMS {
-            assert!(algorithm.diffusion().is_none());
-            assert!(algorithm.diffusion_mut().is_none());
-            for mode in [Mode::Tone, Mode::Color] {
-                for (w, h) in [(1, 1), (7, 1), (1, 7), (0, 0), (0, 3)] {
-                    let rgba: Vec<_> = (0..w * h)
-                        .flat_map(|i| [((i * 53 + 71) % 256) as u8, 137, 211, 255])
-                        .collect();
-                    for count in 1..=5 {
-                        let options = Options {
-                            palette: make_palette(&colors[..count]).unwrap(),
-                            mode,
-                            algorithm,
-                            ..Options::default()
-                        };
-                        let indices = dither(&rgba, w, h, &options);
-                        assert_eq!(indices.len(), w * h);
-                        assert!(
-                            indices.iter().all(|&index| usize::from(index) < count),
-                            "{algorithm:?} {mode:?} {w}x{h} palette {count}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn thresholds_repeat_and_noise_changes_with_seed() {
-        let rgba: Vec<_> = (0..256)
-            .flat_map(|i| [i as u8, i as u8, i as u8, 255])
-            .collect();
+        let rgba = gradient();
         for mode in [Mode::Tone, Mode::Color] {
             for algorithm in ALGORITHMS {
                 let mut options = Options {
@@ -91,11 +59,11 @@ mod tests {
                     algorithm,
                     ..Options::default()
                 };
-                let indices = dither(&rgba, 16, 16, &options);
-                assert_eq!(indices, dither(&rgba, 16, 16, &options));
+                let indices = dither(&rgba, 16, 8, &options);
+                assert_eq!(indices, dither(&rgba, 16, 8, &options));
                 if matches!(algorithm, Algorithm::Noise { .. }) {
                     options.algorithm = Algorithm::Noise { seed: 1 };
-                    assert_ne!(indices, dither(&rgba, 16, 16, &options));
+                    assert_ne!(indices, dither(&rgba, 16, 8, &options));
                 }
             }
         }

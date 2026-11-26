@@ -1141,7 +1141,7 @@ mod tests {
         let palettes = Palettes::builtin();
         let templates = Templates::default();
         let mut original = Settings::default();
-        original.options.tone.brightness = 0.2;
+        original.tone.brightness = 0.2;
         let mut modal = Modal::presets(&original, &palettes);
         let step = modal.handle_key(
             key(KeyCode::Char('n')),

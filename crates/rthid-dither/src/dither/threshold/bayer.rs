@@ -36,7 +36,9 @@ fn matrix(size: BayerSize) -> ([[u8; 8]; 8], usize) {
 /// Prepares a matrix once for all pixels in an image.
 pub(in crate::dither) fn threshold(size: BayerSize) -> impl Fn(usize, usize) -> f64 {
     let (matrix, n) = matrix(size);
-    move |x, y| (f64::from(matrix[y % n][x % n]) + 0.5) / (n * n) as f64
+    let thresholds: [[f64; 8]; 8] =
+        matrix.map(|row| row.map(|m| (f64::from(m) + 0.5) / (n * n) as f64));
+    move |x, y| thresholds[y % n][x % n]
 }
 
 #[cfg(test)]

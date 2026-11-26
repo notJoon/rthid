@@ -274,24 +274,17 @@ impl From<FileMode> for Mode {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum FileDither {
-    #[serde(rename = "atkinson")]
     Atkinson,
-    #[serde(rename = "floyd-steinberg")]
     FloydSteinberg,
     #[serde(rename = "jarvis-judice-ninke")]
     Jarvis,
-    #[serde(rename = "stucki")]
     Stucki,
-    #[serde(rename = "sierra-lite")]
     SierraLite,
-    #[serde(rename = "bayer2")]
     Bayer2,
-    #[serde(rename = "bayer4")]
     Bayer4,
-    #[serde(rename = "bayer8")]
     Bayer8,
-    #[serde(rename = "noise")]
     Noise,
 }
 impl From<Dither> for FileDither {
@@ -363,7 +356,7 @@ impl From<Template> for FileTemplate {
             colors: t.palette_hex,
             mode: t.mode.into(),
             algorithm: t.dither.into(),
-            seed: t.seed,
+            seed: u64::from(t.seed),
             strength: t.strength,
             serpentine: t.serpentine,
             scale: t.scale,
@@ -379,7 +372,7 @@ impl From<FileTemplate> for Template {
             palette_hex: t.colors,
             mode: t.mode.into(),
             dither: t.algorithm.into(),
-            seed: t.seed,
+            seed: t.seed.min(u64::from(u32::MAX)) as u32,
             strength: t.strength,
             serpentine: t.serpentine,
             scale: t.scale,
@@ -637,6 +630,34 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_names_match_the_file_format() {
+        let names = [
+            "atkinson",
+            "floyd-steinberg",
+            "jarvis-judice-ninke",
+            "stucki",
+            "sierra-lite",
+            "bayer2",
+            "bayer4",
+            "bayer8",
+            "noise",
+        ];
+        for (dither, name) in Dither::ALL.into_iter().zip(names) {
+            let value = toml::Value::try_from(FileDither::from(dither)).unwrap();
+            assert_eq!(value.as_str(), Some(name));
+        }
+    }
+
+    #[test]
+    fn file_seed_is_clamped_at_the_domain_boundary() {
+        let template = Template::from(FileTemplate {
+            seed: u64::MAX,
+            ..FileTemplate::default()
+        });
+        assert_eq!(template.seed, u32::MAX);
+    }
+
+    #[test]
     fn template_algorithms_default_and_round_trip() {
         let old = parse("version = 1\n[[template]]\nname = 'Old'\n");
         let old = old.templates.get(0).unwrap();
@@ -644,9 +665,9 @@ mod tests {
         assert_eq!(old.seed, 0);
         let settings = Settings {
             dither: Dither::Bayer4,
+            seed: 7,
             ..Settings::default()
-        }
-        .with_seed(7);
+        };
         let template = Template::capture("Pattern".into(), &settings);
         let (text, loaded) = merge(None, &[Change::UpsertTemplate(template.clone())]).unwrap();
         assert!(text.contains("algorithm = \"bayer4\""));

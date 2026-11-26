@@ -85,13 +85,14 @@ impl GridCache {
         let grid = self.grid.get().expect("processed grid");
         let (w, h) = grid.dimensions();
         let version = self.grid_version();
+        let options = settings.options();
         self.dithered.update_by(
-            |key| key.grid == version && key.options == settings.options,
+            |key| key.grid == version && key.options == options,
             || DitherKey {
                 grid: version,
-                options: settings.options.clone(),
+                options: options.clone(),
             },
-            || dither::dither(grid.as_raw(), w as usize, h as usize, &settings.options),
+            || dither::dither(grid.as_raw(), w as usize, h as usize, &options),
         )
     }
 
