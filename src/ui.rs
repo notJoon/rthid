@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn original_release_frame_restores_full_color() {
+    fn original_click_and_drag_end_keep_full_color() {
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         app.viewport.zoom = viewport::Zoom::In(1);
@@ -550,11 +550,15 @@ mod tests {
         for kind in [
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
         ] {
             app.handle_mouse(
                 MouseEvent {
                     kind,
-                    column: g.target.x,
+                    column: g.target.x + u16::from(matches!(kind, MouseEventKind::Down(_))),
                     row: g.target.y,
                     modifiers: KeyModifiers::NONE,
                 },
@@ -567,7 +571,7 @@ mod tests {
                 assert_eq!(cell.symbol(), " ");
                 assert_eq!(cell.fg, Color::Reset);
                 assert!(match kind {
-                    MouseEventKind::Down(_) => matches!(cell.bg, Color::Indexed(_)),
+                    MouseEventKind::Drag(_) => matches!(cell.bg, Color::Indexed(_)),
                     _ => matches!(cell.bg, Color::Rgb(..)),
                 });
             }

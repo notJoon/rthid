@@ -45,6 +45,13 @@ struct OpenRequest {
     dialog: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct Drag {
+    point: (u16, u16),
+    origin: (u32, u32),
+    moved: bool,
+}
+
 /// All interactive state: settings, focus, preview viewport, grid caches and
 /// the optional companion PNG.
 pub struct App {
@@ -78,7 +85,7 @@ pub struct App {
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
-    last_drag: Option<((u16, u16), (u32, u32))>,
+    last_drag: Option<Drag>,
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Built-in and user palette presets in selection order.
@@ -395,7 +402,12 @@ impl App {
 
     fn open_dialog(&mut self, start: PathBuf) {
         let generation = self.next_token();
-        self.modal = Some(Modal::open_file(start, generation));
+        self.show_modal(Modal::open_file(start, generation));
+    }
+
+    fn show_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+        self.last_drag = None;
     }
 
     /// Queues an image load and shows its file name while loading.
@@ -536,9 +548,9 @@ impl App {
         self.export.as_ref().map_or(Ok(()), Export::result)
     }
 
-    /// Whether a left mouse drag is active on the preview.
+    /// Whether a left mouse drag has panned the preview.
     pub fn dragging(&self) -> bool {
-        self.last_drag.is_some()
+        self.last_drag.is_some_and(|drag| drag.moved)
     }
 
     /// Routes modal mouse input or pans and recenters the preview.
@@ -574,20 +586,29 @@ impl App {
                 {
                     self.viewport.center_on_minimap(point, geometry);
                 } else {
+                    let mut drag = Drag {
+                        point,
+                        origin: geometry.origin,
+                        moved: false,
+                    };
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
-                        && let Some(((x, y), origin)) = prev
+                        && let Some(anchor) = prev
                     {
+                        drag = anchor;
+                        let (x, y) = drag.point;
                         let anchored = PreviewGeometry {
-                            origin,
+                            origin: drag.origin,
                             ..*geometry
                         };
+                        let before = (self.viewport.x, self.viewport.y);
                         self.viewport.pan(
                             (f64::from(i32::from(x) - i32::from(mouse.column)) * dx).round() as i64,
                             (f64::from(i32::from(y) - i32::from(mouse.row)) * dy).round() as i64,
                             &anchored,
                         );
+                        drag.moved |= before != (self.viewport.x, self.viewport.y);
                     }
-                    self.last_drag = Some(prev.unwrap_or((point, geometry.origin)));
+                    self.last_drag = Some(drag);
                 }
             }
             MouseEventKind::ScrollUp => self.viewport.pan(0, -sy, geometry),
@@ -622,7 +643,7 @@ impl App {
         match step.next {
             Next::Stay => {}
             Next::Close => self.modal = None,
-            Next::Replace(modal) => self.modal = Some(modal),
+            Next::Replace(modal) => self.show_modal(modal),
         }
     }
 
@@ -665,19 +686,16 @@ impl App {
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
-            self.last_drag = None;
             self.open_dialog(start.clone());
             self.request_list(start);
             return;
         }
         if key.code == KeyCode::Char('P') {
-            self.last_drag = None;
-            self.modal = Some(Modal::presets(&self.settings, &self.palettes));
+            self.show_modal(Modal::presets(&self.settings, &self.palettes));
             return;
         }
         if key.code == KeyCode::Char('T') {
-            self.last_drag = None;
-            self.modal = Some(Modal::templates());
+            self.show_modal(Modal::templates());
             return;
         }
         if key.code == KeyCode::Tab {
@@ -1253,7 +1271,11 @@ mod tests {
         app.viewport.zoom = Zoom::In(2);
         app.viewport.x = 1;
         app.viewport.hide_minimap = true;
-        app.last_drag = Some(((3, 4), (1, 0)));
+        app.last_drag = Some(Drag {
+            point: (3, 4),
+            origin: (1, 0),
+            moved: true,
+        });
         let path = PathBuf::from("replacement.png");
         app.open_image(path.clone(), RgbaImage::new(3, 5));
         assert_eq!(app.source_path(), Some(path.as_path()));
@@ -2028,6 +2050,39 @@ mod tests {
     }
 
     #[test]
+    fn directory_completion_opens_modal_and_ends_drag() {
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = Zoom::In(1);
+        app.viewport.hide_minimap = true;
+        let layout = test_layout();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 10),
+            (MouseEventKind::Drag(MouseButton::Left), 9),
+        ] {
+            app.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row: layout.preview.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &app.geometry(layout.preview),
+                layout.screen,
+            );
+        }
+        assert!(app.dragging());
+        assert!(app.modal.is_none());
+        app.request_open("/images".into(), None);
+        let outcome = IoOutcome::Opened(Ok(Opened::Dir(rthid_io::dir::Listing {
+            dir: "/images".into(),
+            entries: vec![],
+        })));
+        assert!(app.complete(done(&app, outcome)));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert!(!app.dragging());
+    }
+
+    #[test]
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         let area = Rect::new(2, 3, 48, 18);
@@ -2065,8 +2120,9 @@ mod tests {
         assert_eq!((app.viewport.x, app.viewport.y), (72, 84));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 10, 10);
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 10);
-        assert!(app.dragging());
+        assert!(!app.dragging());
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 13, 12);
+        assert!(app.dragging());
         assert_eq!((app.viewport.x, app.viewport.y), (69, 80));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 13, 12);
         assert!(!app.dragging());
