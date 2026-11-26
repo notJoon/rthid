@@ -16,27 +16,20 @@ Put this in `src/main.rs` and run `cargo run`. No image decoder or terminal is
 needed. Input is row major RGBA bytes and output is one palette index per pixel:
 
 ```rust
-use rthid_dither::dither::{Options, dither, rasterize};
+use rthid_dither::dither::{Options, dither};
 
 fn main() {
     let rgba = [0, 0, 0, 255, 255, 255, 255, 255];
     let options = Options::default();
     let indices = dither(&rgba, 2, 1, &options);
     assert_eq!(indices, [0, 1]);
-
-    let output = rasterize(&indices, (2, 1), (2, 1), |index| {
-        options.palette[usize::from(index)].rgb
-    });
-    assert_eq!(output, rgba);
 }
 ```
 
 Defaults use a black and white palette, Tone mode, serpentine Atkinson error
 diffusion at strength 1, and no tone adjustment.
 
-`rasterize` is a convenience helper for previews and examples. It expands
-indices to opaque RGBA pixels using nearest neighbor sampling. Grid and output
-sizes are `(width, height)` tuples and may differ.
+Use [rthid-render](../rthid-render) to rasterize indices and encode PNG output.
 
 ## Choosing an algorithm
 
@@ -141,8 +134,7 @@ fn main() -> Result<(), PaletteError> {
 ```
 
 `PaletteColor::rgb` is the source of color data, so edits are reflected on the
-next call. Keep palettes darkest first when using Tone mode. The `rasterize`
-color callback can map indices differently without changing dithering.
+next call. Keep palettes darkest first when using Tone mode.
 `PaletteColor` supports `Copy`, `Eq`, and `Hash`. `Mode` supports `Eq` and `Hash`.
 For normalized channels, use `rgb.map(|v| f64::from(v) / 255.0)` in place of the
 removed `PaletteColor::f` field.
@@ -165,12 +157,6 @@ whatever the algorithm, because every Tone path maps luma steps to indices
 darkest first. Equal luma is allowed and `make_palette` output always satisfies
 this ordering. Color mode accepts any palette order. Image size overflow also
 panics.
-
-`rasterize` returns an empty vector when either output dimension is zero,
-including with a 0x0 grid. It panics on an empty grid with nonempty output,
-mismatched index lengths, grid size overflow, or output byte count overflow.
-Its callback must handle every index in the grid. It is called for sampled
-indices and any panic inside it propagates.
 
 ## Not provided
 

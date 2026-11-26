@@ -1,10 +1,8 @@
 //! Companion PNG destination and latest write error.
 
 use rthid_dither::dither::PaletteColor;
-use rthid_io::{
-    io::{Cause, IoError, Job, Op},
-    png::Grid,
-};
+use rthid_io::io::{Cause, IoError, Job, Op};
+use rthid_render::{Grid, preview_scale};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -46,7 +44,9 @@ impl Export {
             })?;
         Ok(Job::Export {
             path: self.path.clone(),
-            grid,
+            write: Box::new(move |file| {
+                rthid_render::write_png(file, &grid, preview_scale(grid.w, grid.h))
+            }),
         })
     }
 

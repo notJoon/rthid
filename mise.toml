@@ -52,6 +52,15 @@ run = [
   "cargo doc -p rthid-dither --no-deps",
 ]
 
+[tasks."ci:render"]
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = [
+  "cargo fmt -p rthid-render --check",
+  "cargo clippy -p rthid-render --all-targets -- -D warnings",
+  "cargo test -p rthid-render",
+  "cargo doc -p rthid-render --no-deps",
+]
+
 [tasks."ci:io"]
 env = { RUSTDOCFLAGS = "-D warnings" }
 run = [

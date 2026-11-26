@@ -842,6 +842,19 @@ mod tests {
         app.take_jobs().into_iter().map(|(job, _)| job).collect()
     }
 
+    fn encoded_export(job: Job) -> (PathBuf, image::RgbaImage) {
+        let Job::Export { path, write } = job else {
+            panic!("expected export");
+        };
+        let mut file = tempfile::tempfile().unwrap();
+        write(&mut file).unwrap();
+        use std::io::{Read, Seek};
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        (path, image::load_from_memory(&bytes).unwrap().to_rgba8())
+    }
+
     fn failure(op: rthid_io::io::Op) -> rthid_io::io::IoError {
         rthid_io::io::IoError {
             op,
@@ -1024,11 +1037,18 @@ mod tests {
         let path = PathBuf::from("preview.png");
         let mut app = App::builtin(RgbaImage::new(4, 2), Some(path.clone()));
         app.request_open("photo.png".into(), Some("/images".into()));
-        let queued = jobs(&mut app);
+        let mut queued = jobs(&mut app);
+        let (output, image) = encoded_export(queued.remove(0));
+        assert_eq!(output, path);
+        assert_eq!(image.dimensions(), (16, 8));
         assert!(
-            matches!(queued.as_slice(), [Job::Export { path: output, grid }, Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
-            if output == &path && protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images")
-                && (grid.w, grid.h) == (4, 2) && grid.indices.len() == 8 && grid.palette == app.settings.palette)
+            image
+                .pixels()
+                .all(|pixel| pixel.0[..3] == app.settings.palette[0].rgb)
+        );
+        assert!(
+            matches!(queued.as_slice(), [Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
+            if protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images"))
         );
         app.complete(done(&app, IoOutcome::Opened(Err(failure(Op::Decode)))));
         assert!(app.complete(done(&app, IoOutcome::Exported(Err(failure(Op::Encode))))));
@@ -1220,10 +1240,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("preview.png");
         let mut app = App::builtin(RgbaImage::new(4, 2), Some(output.clone()));
-        assert!(
-            matches!(jobs(&mut app).as_slice(), [Job::Export { path, grid }]
-            if path == &output && (grid.w, grid.h) == (4, 2))
-        );
+        let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
+        assert_eq!(path, output);
+        assert_eq!(image.dimensions(), (16, 8));
         app.settings = app
             .settings
             .with_preset(app.library.palettes.get(1).unwrap());
@@ -1254,10 +1273,9 @@ mod tests {
         assert_eq!(app.settings.palette_name, settings.palette_name);
         assert_eq!(app.grid_size(), (3, 5));
         assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
-        assert!(
-            matches!(jobs(&mut app).last(), Some(Job::Export { path, grid })
-            if path == &output && (grid.w, grid.h) == (3, 5))
-        );
+        let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
+        assert_eq!(path, output);
+        assert_eq!(image.dimensions(), (12, 20));
     }
 
     #[test]
@@ -2394,10 +2412,9 @@ mod tests {
         assert_eq!(app.grid_cache.grid.version(), 1);
         jobs(&mut app);
         app.finish();
-        assert!(
-            matches!(jobs(&mut app).as_slice(), [Job::Export { path: output, grid }]
-            if output == &path && (grid.w, grid.h) == (2, 4))
-        );
+        let (output, image) = encoded_export(jobs(&mut app).pop().unwrap());
+        assert_eq!(output, path);
+        assert_eq!(image.dimensions(), (8, 16));
         assert!(jobs(&mut app).is_empty());
     }
 }

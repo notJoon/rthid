@@ -52,30 +52,24 @@ its parent directory must already exist.
 | `io` | Latest-only background jobs, typed results, and bounded shutdown |
 | `paste` | Paths carried by terminal paste events |
 | `path` | Home directory expansion for entered paths |
-| `png` | Synchronous atomic PNG export of a palette-indexed grid |
 
 ## Background export
 
-For this PNG example, also add the palette crate to your app's dependencies:
-
-```toml
-rthid-dither = { path = "../rthid/crates/rthid-dither" }
-```
-
-Submit a grid, then inspect its result when shutting down. No terminal, input
-image or polling loop is required:
+Submit an owned encoder, then inspect its result when shutting down:
 
 ```rust
-use std::io;
-use rthid_dither::dither::make_palette;
-use rthid_io::{io::{IO, Job, Outcome}, png::Grid};
+use std::io::Write;
+use rthid_io::io::{IO, Job, Outcome};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
     let path = scratch.path().join("preview.png");
-    let grid = Grid::new(vec![0], 1, 1, make_palette(&["#000"]).map_err(io::Error::other)?)?;
+    let bytes = b"exported bytes".to_vec();
     let mut worker = IO::new(None)?;
-    worker.submit(Job::Export { path: path.clone(), grid }, 7);
+    worker.submit(Job::Export {
+        path: path.clone(),
+        write: Box::new(move |file| file.write_all(&bytes)),
+    }, 7);
     let results = worker.finish();
     assert_eq!(results.len(), 1);
     let done = results.into_iter().next().unwrap();
@@ -124,7 +118,7 @@ already started running may still finish; a shutdown timeout is not cancellation
 
 ## File and preview policies
 
-- `atomic::replace` and PNG export overwrite the resolved destination while
+- `atomic::replace` and Export jobs overwrite the resolved destination while
   keeping symlinks intact. Saving splits hard links and may replace read-only
   files when the parent allows it. The `.rthid-*.tmp` namespace is reserved: on
   first use of a resolved parent per process, stale matching regular files older
@@ -141,10 +135,8 @@ already started running may still finish; a shutdown timeout is not cancellation
 
 See the crate docs (`cargo doc -p rthid-io --open`) for the API.
 
-`Grid::new(indices, w, h, palette)` validates sizes, palette indices and dimensions
-at `preview_scale(w, h)` before submission. Its fields remain public, so
-`png::write_atomic` repeats these checks at the requested scale. Invalid grid
-errors identify the failed check, and write errors include the destination path.
+For PNG output, build a grid with [rthid-render](../rthid-render) and pass an
+encoder closure to `Job::Export`. IO replaces the destination only on success.
 `atomic::read_regular` and `atomic::update` report paths with generic file wording.
 Lock timeouts retain `WouldBlock`, and file type failures retain `InvalidInput`.
 

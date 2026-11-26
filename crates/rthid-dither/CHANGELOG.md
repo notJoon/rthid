@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- Move rasterization: `rthid_dither::dither::rasterize` -> `rthid_render::rasterize`
+
 - Move `serpentine` and `strength` from `Options` into the `Diffusion` payload of
   `Algorithm::Diffusion`. Atkinson stays the default with unchanged output.
 
