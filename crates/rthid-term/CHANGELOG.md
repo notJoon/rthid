@@ -20,6 +20,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Debug` when the writer supports it
 - `ElidingBackend` parks the hidden cursor at the start of the last row after
   each frame instead of leaving it on the last cell the frame wrote
+- `ElidingBackend` clears the whole screen one line at a time instead of with
+  erase-display, which some terminals, like iTerm2, copy into the shell's
+  scrollback
 - `SessionOptions` and `run_terminal_with_options` for session-owned mouse capture
   and bracketed paste, with current and future fields defaulting to off
 - Copyable quick-start and input-mode examples, compiled as documentation tests
