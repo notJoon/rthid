@@ -22,7 +22,7 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::{
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct OpenRequest {
@@ -664,7 +664,23 @@ impl App {
         }
         match self.panel.handle_key(key, Setting::ALL.len()) {
             Outcome::Ignored => {}
-            Outcome::Consumed | Outcome::Submit(_) | Outcome::Cancel => return,
+            Outcome::Submit(_) => {
+                let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
+                if setting == Setting::Seed && setting.is_active(&self.settings) {
+                    let nanos = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let mut seed = (nanos ^ (nanos >> 32) ^ u128::from(self.settings.seed)) as u32;
+                    if u64::from(seed) == self.settings.seed {
+                        seed = seed.wrapping_add(1);
+                    }
+                    self.apply(Effect::Preview(self.settings.with_seed(u64::from(seed))))
+                        .expect("preview is valid");
+                }
+                return;
+            }
+            Outcome::Consumed | Outcome::Cancel => return,
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -783,19 +799,11 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 mod tests {
     use super::*;
     use crate::{
-        settings::{Rotation, Templates},
+        settings::{Dither, Rotation, Templates},
         ui::Layout,
     };
     use ratatui::layout::Rect;
-    use rthid_dither::dither::{Diffusion, Mode};
-
-    fn diffusion(settings: &Settings) -> &Diffusion {
-        settings.options.algorithm.diffusion().unwrap()
-    }
-
-    fn diffusion_mut(settings: &mut Settings) -> &mut Diffusion {
-        settings.options.algorithm.diffusion_mut().unwrap()
-    }
+    use rthid_dither::dither::Mode;
 
     fn opened_photo() -> IoOutcome {
         IoOutcome::Opened(Ok(Opened::Image {
@@ -1054,9 +1062,8 @@ mod tests {
         app.show_original = false;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
-        {
-            diffusion_mut(&mut app.settings).strength = 0.5;
-        }
+        app.settings.strength = 0.5;
+        app.settings = app.settings.with_seed(app.settings.seed);
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         assert!(!App::empty().sync(preview));
@@ -1252,9 +1259,8 @@ mod tests {
     #[test]
     fn template_manager_saves_and_applies_settings() {
         let mut app = app_at(Setting::Strength);
-        {
-            diffusion_mut(&mut app.settings).strength = 0.5;
-        }
+        app.settings.strength = 0.5;
+        app.settings = app.settings.with_seed(app.settings.seed);
         let saved = app.settings.clone();
         for code in [
             KeyCode::Char('T'),
@@ -1269,14 +1275,13 @@ mod tests {
             app.library.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
         );
-        {
-            diffusion_mut(&mut app.settings).strength = 0.9;
-        }
+        app.settings.strength = 0.9;
+        app.settings = app.settings.with_seed(app.settings.seed);
         app.settings.rotation = Rotation::R90;
         for code in [KeyCode::Char('T'), KeyCode::Enter] {
             press(&mut app, code);
         }
-        let strength = diffusion(&app.settings).strength;
+        let strength = app.settings.strength;
         assert_eq!(strength, 0.5);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
@@ -1795,9 +1800,8 @@ mod tests {
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 1);
-        {
-            diffusion_mut(&mut app.settings).strength = 0.5;
-        }
+        app.settings.strength = 0.5;
+        app.settings = app.settings.with_seed(app.settings.seed);
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 2);
@@ -1925,11 +1929,84 @@ mod tests {
     }
 
     #[test]
+    fn algorithms_cycle_in_panel_order_and_back() {
+        let mut app = app_at(Setting::Dither);
+        for expected in Dither::ALL.into_iter().cycle().skip(1).take(9) {
+            assert!(press(&mut app, KeyCode::Right));
+            assert_eq!(app.settings.dither, expected);
+        }
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(app.settings.dither, Dither::Noise);
+    }
+
+    #[test]
+    fn bayer_ignores_diffusion_rows_and_retains_their_values() {
+        let mut app = app_at(Setting::Strength);
+        press(&mut app, KeyCode::Left);
+        app.settings.serpentine = false;
+        app.settings.dither = Dither::Bayer4;
+        app.settings = app.settings.with_seed(42);
+        app.sync(test_layout().preview);
+        app.show_original = true;
+        for setting in [Setting::Strength, Setting::Serpentine] {
+            app.panel
+                .select(Setting::ALL.iter().position(|&row| row == setting).unwrap());
+            for key in [
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Char('d'),
+            ] {
+                let before = app.settings.clone();
+                assert!(!press(&mut app, key));
+                assert!(app.settings == before);
+                assert!(app.show_original);
+            }
+        }
+        app.panel.select(
+            Setting::ALL
+                .iter()
+                .position(|&row| row == Setting::Dither)
+                .unwrap(),
+        );
+        app.show_original = false;
+        assert!(press(&mut app, KeyCode::Char('d')));
+        assert_eq!(app.settings.dither, Dither::Atkinson);
+        assert_eq!(app.settings.strength, 0.9);
+        assert!(!app.settings.serpentine);
+        assert_eq!(app.settings.seed, 42);
+    }
+
+    #[test]
+    fn seed_steps_and_enter_only_change_noise() {
+        let mut app = app_at(Setting::Seed);
+        let before = app.settings.clone();
+        assert!(!press(&mut app, KeyCode::Enter));
+        assert!(app.settings == before);
+        assert!(app.show_original);
+        app.settings.dither = Dither::Noise;
+        app.settings = app.settings.with_seed(0);
+        assert!(!press(&mut app, KeyCode::Left));
+        assert_eq!(app.settings.seed, 0);
+        assert!(app.show_original);
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(app.settings.seed, 1);
+        let seed = app.settings.seed;
+        app.show_original = true;
+        assert!(press(&mut app, KeyCode::Enter));
+        assert_ne!(app.settings.seed, seed);
+        assert!(app.settings.seed <= u64::from(u32::MAX));
+        assert!(!app.show_original);
+        assert!(press(&mut app, KeyCode::Char('d')));
+        assert_eq!(app.settings.seed, 0);
+    }
+
+    #[test]
     fn numeric_settings_clamp_without_redither() {
         type Getter = fn(&Settings) -> f64;
         let cases: [(Setting, Getter); 8] = [
             (Setting::Scale, |p| f64::from(p.scale)),
-            (Setting::Strength, |p| diffusion(p).strength),
+            (Setting::Strength, |p| p.strength),
             (Setting::Brightness, |p| p.options.tone.brightness),
             (Setting::Contrast, |p| p.options.tone.contrast),
             (Setting::Gamma, |p| p.options.tone.gamma),
@@ -1960,7 +2037,7 @@ mod tests {
         assert!(matches!(app.settings.options.mode, Mode::Color));
         let mut app = app_at(Setting::Serpentine);
         press(&mut app, KeyCode::Right);
-        let serpentine = diffusion(&app.settings).serpentine;
+        let serpentine = app.settings.serpentine;
         assert!(!serpentine);
         let mut app = app_at(Setting::Palette);
         // Wrapping back lands on the last built-in, which also switches to its Color mode.
@@ -1998,12 +2075,34 @@ mod tests {
 
     #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
-        for setting in Setting::ALL {
+        for (setting, dither) in Setting::ALL
+            .into_iter()
+            .map(|setting| (setting, Dither::Atkinson))
+            .chain([(Setting::Seed, Dither::Noise)])
+        {
             let mut app = App::builtin(RgbaImage::new(20, 10), None);
             app.panel = ListPicker::new(Setting::ALL.iter().position(|&p| p == setting).unwrap());
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
-            let change = if matches!(setting, Setting::Black | Setting::Sharpen) {
+            app.settings.dither = dither;
+            app.settings = app.settings.with_seed(0);
+            app.sync(test_layout().preview);
+            if !setting.is_active(&app.settings) {
+                let before = app.settings.clone();
+                app.show_original = true;
+                for key in [
+                    KeyCode::Left,
+                    KeyCode::Right,
+                    KeyCode::Enter,
+                    KeyCode::Char('d'),
+                ] {
+                    assert!(!press(&mut app, key));
+                    assert!(app.settings == before);
+                    assert!(app.show_original);
+                }
+                continue;
+            }
+            let change = if matches!(setting, Setting::Black | Setting::Sharpen | Setting::Seed) {
                 KeyCode::Right
             } else {
                 KeyCode::Left

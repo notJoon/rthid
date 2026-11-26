@@ -56,6 +56,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `d` / `D` | Reset selected parameter / all parameters and rotation |
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
+| Parameters, Seed row with Noise | `Enter` | Draw a new noise pattern |
 | Parameters | `←` / `→`, `h` / `l` | Change value |
 | Any | `+` / `=` / `-` | Zoom in / in / out |
 | Any | `0` | Return to Fit |
@@ -125,8 +126,16 @@ name = "Zine"
 palette = "Paper"
 colors = ["#123456", "#fff"]
 mode = "color"
+algorithm = "bayer4"
+seed = 0
 strength = 0.8
 ```
+
+Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
+`stucki`, `sierra-lite`, `bayer2`, `bayer4`, `bayer8`, `noise`.
+
+Strength and Serpentine apply to diffusion algorithms. Seed applies to Noise.
+Unused rows stay visible and dimmed, and their values survive algorithm changes.
 
 Templates keep their own colors, so later preset edits or removal do not alter them.
 

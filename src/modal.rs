@@ -448,10 +448,11 @@ pub(crate) fn template_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
             .iter()
             .map(|template| {
                 Line::raw(format!(
-                    "{} | {} | {}",
+                    "{} | {} | {} | {}",
                     template.name,
                     template.palette_name,
-                    crate::settings::mode_label(template.mode)
+                    crate::settings::mode_label(template.mode),
+                    template.dither.label()
                 ))
             })
             .collect()

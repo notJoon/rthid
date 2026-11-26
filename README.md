@@ -33,5 +33,10 @@ name = "Zine"
 palette = "Paper"
 colors = ["#123456", "#fff"]
 mode = "color"
+algorithm = "bayer4"
+seed = 0
 strength = 0.8
 ```
+
+Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
+`stucki`, `sierra-lite`, `bayer2`, `bayer4`, `bayer8`, `noise`.
