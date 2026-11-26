@@ -253,7 +253,11 @@ impl FilePicker {
                 );
             }
             Outcome::Submit(()) => {
-                if let Some(entry) = self.entries.get(self.list.selected()) {
+                if let Some(entry) = self
+                    .list
+                    .selected(self.entries.len())
+                    .and_then(|i| self.entries.get(i))
+                {
                     let path = self.dir.join(&entry.file_name);
                     return Step::effect(
                         Next::Stay,
@@ -299,8 +303,9 @@ impl Editor {
 
     /// Whether the active hex edit can be committed.
     pub fn invalid_hex(&self) -> bool {
-        self.rows.selected() > 0
-            && self.rows.selected() <= self.draft.colors.len()
+        self.rows
+            .selected(self.draft.colors.len() + 2)
+            .is_some_and(|row| row > 0 && row <= self.draft.colors.len())
             && self
                 .input
                 .as_ref()
@@ -310,7 +315,7 @@ impl Editor {
     /// Color for a draft row, including any uncommitted hex edit.
     pub fn swatch_rgb(&self, row: usize) -> Option<[u8; 3]> {
         let color = self.draft.colors.get(row.checked_sub(1)?)?;
-        let text = if row == self.rows.selected() {
+        let text = if Some(row) == self.rows.selected(self.draft.colors.len() + 2) {
             self.input.as_ref().map_or(color.as_str(), TextInput::text)
         } else {
             color
@@ -325,7 +330,7 @@ impl Editor {
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Step {
-        let row = self.rows.selected();
+        let row = self.rows.selected(self.draft.colors.len() + 2).unwrap();
         if let Some(input) = &mut self.input {
             match input.handle_key(key) {
                 Outcome::Cancel => {
@@ -402,7 +407,7 @@ impl Editor {
     }
 
     fn open_input(&mut self) {
-        let row = self.rows.selected();
+        let row = self.rows.selected(self.draft.colors.len() + 2).unwrap();
         let text = if row == 0 {
             &self.draft.name
         } else {
@@ -511,7 +516,7 @@ impl Modal {
                             format!("{row}: ")
                         };
                         let text = if let Some(input) = &editor.input
-                            && editor.rows.selected() == row
+                            && editor.rows.selected(editor.draft.colors.len() + 2) == Some(row)
                         {
                             input.text()
                         } else if row == 0 {
@@ -567,7 +572,7 @@ impl Modal {
             ),
             Self::Editor(editor) => {
                 let field = editor.input.as_ref().and_then(|_| {
-                    let selected = editor.rows.selected().min(editor.draft.colors.len() + 1);
+                    let selected = editor.rows.selected(editor.draft.colors.len() + 2)?;
                     let offset = editor.rows.offset().min(selected).max(
                         selected
                             .saturating_add(1)
@@ -754,7 +759,13 @@ impl Modal {
                                 builtin: false,
                             }
                         } else {
-                            let mut preset = ctx.palettes.get(list.selected()).unwrap().clone();
+                            let Some(preset) = list
+                                .selected(ctx.palettes.len())
+                                .and_then(|i| ctx.palettes.get(i))
+                            else {
+                                return Step::stay();
+                            };
+                            let mut preset = preset.clone();
                             if preset.builtin {
                                 preset.name.push_str(" copy");
                             }
@@ -769,14 +780,18 @@ impl Modal {
                         );
                     }
                     KeyCode::Char('x') => {
-                        if ctx.palettes.get(list.selected()).unwrap().builtin {
+                        let Some(preset) = list
+                            .selected(ctx.palettes.len())
+                            .and_then(|i| ctx.palettes.get(i))
+                        else {
+                            return Step::stay();
+                        };
+                        if preset.builtin {
                             return Step::notice("built-in presets cannot be removed".into());
                         }
                         *confirm = Some((
                             Confirm::new("Delete preset?"),
-                            OnYes::RemovePreset(
-                                ctx.palettes.get(list.selected()).unwrap().name.clone(),
-                            ),
+                            OnYes::RemovePreset(preset.name.clone()),
                         ));
                     }
                     _ => {}
@@ -826,12 +841,16 @@ impl Modal {
                             KeyCode::Char('n') => {
                                 *prompt = Some(TextInput::new("", MAX_NAME_CHARS))
                             }
-                            KeyCode::Char('x') if !ctx.templates.is_empty() => {
+                            KeyCode::Char('x') => {
+                                let Some(template) = list
+                                    .selected(ctx.templates.len())
+                                    .and_then(|i| ctx.templates.get(i))
+                                else {
+                                    return Step::stay();
+                                };
                                 *confirm = Some((
                                     Confirm::new("Delete template?"),
-                                    OnYes::RemoveTemplate(
-                                        ctx.templates.get(list.selected()).unwrap().name.clone(),
-                                    ),
+                                    OnYes::RemoveTemplate(template.name.clone()),
                                 ));
                             }
                             _ => {}
@@ -905,13 +924,17 @@ mod tests {
                 .effect
                 .is_none()
         );
-        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 1 && !p.typed));
+        assert!(
+            matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(1) && !p.typed)
+        );
         let step = modal.handle_mouse(click(1), &layout, context());
         assert!(
             matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
         );
         modal.handle_mouse(mouse(MouseEventKind::ScrollUp, area, 0), &layout, context());
-        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 0));
+        assert!(
+            matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(0))
+        );
         assert!(
             matches!(modal.handle_mouse(click(0), &layout, context()).effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
         );
@@ -920,7 +943,9 @@ mod tests {
             &layout,
             context(),
         );
-        assert!(matches!(&modal, Modal::OpenFile(p) if p.list.selected() == 1));
+        assert!(
+            matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(1))
+        );
         let outside = mouse(MouseEventKind::Down(MouseButton::Left), layout.dialog, 0);
         assert!(
             modal
@@ -1007,7 +1032,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.list.selected(picker.entries.len()), Some(1));
         assert_eq!(picker.input.text(), "/images/");
         let context = || ctx(&palettes, &templates, &settings);
         let step = modal.handle_key(key(KeyCode::Enter), context());
@@ -1025,7 +1050,7 @@ mod tests {
         let Modal::OpenFile(picker) = &modal else {
             unreachable!()
         };
-        assert_eq!(picker.list.selected(), 1);
+        assert_eq!(picker.list.selected(picker.entries.len()), Some(1));
         assert_eq!(picker.input.text(), "/images/j");
         let Modal::OpenFile(picker) = &mut modal else {
             unreachable!()
@@ -1052,9 +1077,9 @@ mod tests {
                 dir: true,
             }],
         );
-        assert_eq!(picker.list.selected(), 0);
+        assert_eq!(picker.list.selected(picker.entries.len()), Some(0));
         picker.set_listing(PathBuf::from("/empty"), vec![]);
-        assert_eq!(picker.list.selected(), 0);
+        assert_eq!(picker.list.selected(picker.entries.len()), None);
         assert_eq!(picker.list.offset(), 0);
         assert!(!picker.typed);
         let step = modal.handle_key(key(KeyCode::Enter), context());
@@ -1197,7 +1222,7 @@ mod tests {
             ctx(&palettes, &templates, &original),
         );
         assert!(
-            matches!(&modal, Modal::Editor(e) if e.rows.selected() == 1 && e.draft.colors.len() == 2 && e.input.as_ref().is_some_and(|i| i.text() == "#123456"))
+            matches!(&modal, Modal::Editor(e) if e.rows.selected(e.draft.colors.len() + 2) == Some(1) && e.draft.colors.len() == 2 && e.input.as_ref().is_some_and(|i| i.text() == "#123456"))
         );
         let step = press(&mut modal, KeyCode::Enter, &palettes, &templates, &original);
         assert!(matches!(step.effect, Some(Effect::Preview(s)) if s.palette_hex[0] == "#123456"));
@@ -1295,7 +1320,7 @@ mod tests {
             &settings,
         );
         assert!(
-            matches!(&modal, Modal::Presets { list, confirm: None } if list.selected() == index)
+            matches!(&modal, Modal::Presets { list, confirm: None } if list.selected(palettes.len()) == Some(index))
         );
         press(
             &mut modal,
@@ -1353,7 +1378,7 @@ mod tests {
         ));
         press(&mut modal, KeyCode::Esc, &palettes, &templates, &settings);
         assert!(
-            matches!(&modal, Modal::Templates { list, prompt: Some(input), confirm: None } if input.text() == "Zine" && list.selected() == 1)
+            matches!(&modal, Modal::Templates { list, prompt: Some(input), confirm: None } if input.text() == "Zine" && list.selected(templates.len()) == Some(1))
         );
         press(
             &mut modal,
@@ -1392,7 +1417,7 @@ mod tests {
         );
         press(&mut modal, KeyCode::Esc, &palettes, &templates, &settings);
         assert!(
-            matches!(&modal, Modal::Templates { list, prompt: None, confirm: None } if list.selected() == 1)
+            matches!(&modal, Modal::Templates { list, prompt: None, confirm: None } if list.selected(templates.len()) == Some(1))
         );
         press(
             &mut modal,

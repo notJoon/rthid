@@ -72,6 +72,6 @@ mod tests {
             picker.handle_key(release(KeyCode::Down), 3),
             Outcome::Ignored
         );
-        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.selected(3), Some(0));
     }
 }

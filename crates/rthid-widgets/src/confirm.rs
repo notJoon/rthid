@@ -1,10 +1,10 @@
 //! Confirmation input with a message for the caller to display.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{Outcome, outcome::is_release};
 
-/// Yes or no question that treats every key except a lowercase y as a no.
+/// Yes or no question that treats every key except an unmodified lowercase y as a no.
 ///
 /// Defaulting to cancel keeps destructive actions safe from stray keys. The
 /// component holds the message so the caller can show it, for example as a
@@ -55,11 +55,11 @@ impl Confirm {
         &self.message
     }
 
-    /// Returns `Submit(())` for a lowercase y and `Cancel` for any other key,
+    /// Returns `Submit(())` for an unmodified lowercase y and `Cancel` for any other key,
     /// including an uppercase Y, Enter and Esc.
     ///
-    /// Modifiers are not checked. A key release returns `Ignored` so the
-    /// question survives the release of the key that opened it. Otherwise the
+    /// Modified keys, including Ctrl+y and Alt+y, cancel. A key release returns
+    /// `Ignored` so the question survives the release of the key that opened it. Otherwise the
     /// result is never `Ignored` or `Consumed`, so the caller should close the
     /// question after any key.
     ///
@@ -78,7 +78,7 @@ impl Confirm {
     pub fn handle_key(&self, key: KeyEvent) -> Outcome<()> {
         if is_release(&key) {
             Outcome::Ignored
-        } else if key.code == KeyCode::Char('y') {
+        } else if key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::NONE {
             Outcome::Submit(())
         } else {
             Outcome::Cancel
@@ -122,6 +122,17 @@ mod tests {
             assert_eq!(
                 confirm.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
                 expected
+            );
+        }
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                confirm.handle_key(KeyEvent::new(KeyCode::Char('y'), modifier)),
+                Outcome::Cancel
             );
         }
     }

@@ -329,7 +329,7 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
                     format!("{row}: ")
                 };
                 let text = if let Some(input) = &editor.input
-                    && editor.rows.selected() == row
+                    && editor.rows.selected(editor.draft.colors.len() + 2) == Some(row)
                 {
                     editing = Some(Editing {
                         input,
@@ -1158,14 +1158,14 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(), 6);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(6));
         assert_eq!(app.panel.offset(), 4);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(), 5);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(5));
         assert_eq!(app.panel.offset(), 4);
         for label in ["Serpentine", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
