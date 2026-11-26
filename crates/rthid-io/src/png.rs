@@ -23,29 +23,68 @@ pub struct Grid {
     pub palette: Vec<PaletteColor>,
 }
 
+impl Grid {
+    /// Validates owned pixels for export at [`preview_scale`]. Fields remain mutable,
+    /// so [`write_atomic`] validates again before writing.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a size mismatch, an index outside the palette,
+    /// or dimensions that cannot be exported at the preview scale.
+    pub fn new(indices: Vec<u8>, w: u32, h: u32, palette: Vec<PaletteColor>) -> io::Result<Self> {
+        let grid = Self {
+            indices,
+            w,
+            h,
+            palette,
+        };
+        grid.validate(preview_scale(w, h))?;
+        Ok(grid)
+    }
+
+    fn validate(&self, scale: u32) -> io::Result<(u32, u32)> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if (self.w as usize).checked_mul(self.h as usize) != Some(self.indices.len()) {
+            return Err(invalid("PNG grid size mismatch"));
+        }
+        if self
+            .indices
+            .iter()
+            .any(|&i| usize::from(i) >= self.palette.len())
+        {
+            return Err(invalid("PNG grid index out of palette"));
+        }
+        let scaled = |n: u32| {
+            n.checked_mul(scale)
+                .filter(|&v| v > 0)
+                .ok_or_else(|| invalid("invalid PNG scale or scaled dimensions"))
+        };
+        let ow = scaled(self.w)?;
+        let oh = scaled(self.h)?;
+        (ow as usize)
+            .checked_mul(oh as usize)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(|| invalid("invalid PNG scale or scaled dimensions"))?;
+        Ok((ow, oh))
+    }
+}
+
 /// Writes the grid with each dot as a `scale` px solid square. Encodes to a temporary
 /// file beside `path` and renames it over the destination only after encoding succeeds.
+///
+/// # Errors
+/// Returns `InvalidInput` with the path and failed grid check for invalid sizes,
+/// palette indices or scale. Also returns file replacement and PNG encoding errors.
 pub fn write_atomic(path: &Path, grid: &Grid, scale: u32) -> io::Result<()> {
+    let (ow, oh) = grid
+        .validate(scale)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
     let &Grid {
         ref indices,
         w,
         h,
         ref palette,
     } = grid;
-    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid PNG grid or scale");
-    let scaled = |n: u32| n.checked_mul(scale).filter(|&v| v > 0).ok_or_else(invalid);
-    let ow = scaled(w)?;
-    let oh = scaled(h)?;
-    (ow as usize)
-        .checked_mul(oh as usize)
-        .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n <= isize::MAX as usize)
-        .ok_or_else(invalid)?;
-    if (w as usize).checked_mul(h as usize) != Some(indices.len())
-        || indices.iter().any(|&i| usize::from(i) >= palette.len())
-    {
-        return Err(invalid());
-    }
     let pixels = dither::rasterize(
         indices,
         (w as usize, h as usize),
@@ -71,6 +110,51 @@ mod tests {
             h,
             palette: make_palette(colors).unwrap(),
         }
+    }
+
+    #[test]
+    fn constructor_and_writer_report_the_failed_grid_check() {
+        let path = Path::new("preview.png");
+        for (indices, w, h, expected) in [
+            (vec![], 1, 1, "PNG grid size mismatch"),
+            (vec![1], 1, 1, "PNG grid index out of palette"),
+            (vec![], 0, 1, "invalid PNG scale or scaled dimensions"),
+            (vec![], u32::MAX, u32::MAX, "PNG grid size mismatch"),
+        ] {
+            let palette = make_palette(&["#000"]).unwrap();
+            let error = Grid::new(indices.clone(), w, h, palette.clone())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), expected);
+            let error = write_atomic(
+                path,
+                &Grid {
+                    indices,
+                    w,
+                    h,
+                    palette,
+                },
+                preview_scale(w, h),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), format!("preview.png: {expected}"));
+        }
+        let mut valid = Grid::new(vec![0], 1, 1, make_palette(&["#000"]).unwrap()).unwrap();
+        for scale in [0, u32::MAX] {
+            let error = write_atomic(path, &valid, scale).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "preview.png: invalid PNG scale or scaled dimensions"
+            );
+        }
+        valid.indices.clear();
+        assert_eq!(
+            write_atomic(path, &valid, 1).unwrap_err().to_string(),
+            "preview.png: PNG grid size mismatch"
+        );
     }
 
     #[test]

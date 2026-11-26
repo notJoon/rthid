@@ -36,6 +36,9 @@ pub(crate) enum Kind {
 /// Replacement text computed from the current file contents while its lock is held.
 pub trait Edit: Send {
     /// Returns the new text for the current contents, which are `None` when the file is missing.
+    ///
+    /// # Errors
+    /// Returns an error if the edit cannot produce replacement text.
     fn apply(&self, text: Option<String>) -> io::Result<String>;
 }
 
@@ -254,8 +257,8 @@ pub enum Cause {
     Io(io::Error),
     /// Image decoding failed.
     Decode(image::ImageError),
-    /// The companion PNG resolves to the source image.
-    IsSource,
+    /// The companion PNG resolves to this source path, which must not be overwritten.
+    IsSource(PathBuf),
     /// A job panicked, with its message when available.
     Panicked(String),
     /// The worker stopped before executing the job.
@@ -269,9 +272,13 @@ impl fmt::Display for Cause {
         match self {
             Self::Io(error) => error.fmt(f),
             Self::Decode(error) => error.fmt(f),
-            Self::IsSource => f.write_str("--preview-png must not point at the source image"),
+            Self::IsSource(path) => write!(
+                f,
+                "{} is the source image and cannot be overwritten",
+                path.display()
+            ),
             Self::Panicked(message) => write!(f, "IO job panicked: {message}"),
-            Self::Stopped => f.write_str("IO worker stopped"),
+            Self::Stopped => f.write_str("skipped because the IO worker shut down"),
             Self::TimedOut => f.write_str("operation did not finish before quitting"),
         }
     }
@@ -279,8 +286,11 @@ impl fmt::Display for Cause {
 
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if matches!(self.cause, Cause::IsSource) {
+        if matches!(self.cause, Cause::IsSource(_)) {
             return write!(f, "open: {}", self.cause);
+        }
+        if matches!(self.cause, Cause::Stopped) {
+            return write!(f, "{}: {}: {}", self.op, self.path.display(), self.cause);
         }
         match self.op {
             Op::Decode => write!(
@@ -328,13 +338,14 @@ impl Pending {
     }
 }
 
-/// Stable worker name used to isolate caught panics from terminal panic hooks.
+/// Thread name for process panic hooks that need to recognize the IO worker.
 pub const WORKER_NAME: &str = "rthid-io";
 
 /// Longest wait for the worker when the queue shuts down.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
-/// Text of a panic payload, for reporting worker panics.
+/// Panic payload text for a process panic hook that recognizes the IO worker.
+/// Returns "unknown panic" for payloads other than `String` or `&str`.
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<String>()
@@ -378,6 +389,9 @@ const KINDS: [Kind; 4] = [Kind::Open, Kind::List, Kind::Export, Kind::Update];
 
 impl IO {
     /// Starts the worker. `home` expands `~` in Open paths without reading the environment.
+    ///
+    /// # Errors
+    /// Returns an error if the worker thread cannot be started.
     pub fn new(home: Option<PathBuf>) -> io::Result<Self> {
         let jobs = Arc::new(Queue {
             slots: Mutex::new([None, None, None, None]),
@@ -482,10 +496,12 @@ impl IO {
     /// Skips queued reads and updates and waits up to five seconds for the newest export.
     /// Returns available results and detaches a worker still running at the deadline.
     ///
-    /// A running operation may finish during the wait. Skipped jobs return [`Cause::Stopped`];
-    /// jobs still pending at the deadline return [`Cause::TimedOut`]. A timeout does not cancel
-    /// an operation already running. Inspect matching Update results, then synchronously save
-    /// remaining unsaved changes with [`crate::atomic::update`]; `finish` does not flush every save.
+    /// Queued jobs may be skipped at shutdown. Collect reads with [`Self::poll`] before
+    /// calling `finish`. A running operation may finish during the wait. Skipped jobs return
+    /// [`Cause::Stopped`]. Jobs still pending at the deadline return [`Cause::TimedOut`].
+    /// A timeout does not cancel an operation already running. Inspect matching Update results,
+    /// then synchronously save remaining unsaved changes with [`crate::atomic::update`].
+    /// `finish` does not flush every save.
     pub fn finish(self) -> Vec<Done> {
         self.finish_timeout(SHUTDOWN_WAIT)
     }
@@ -629,7 +645,10 @@ fn execute(
                 return listing(path).map(|listing| Outcome::Opened(Ok(Opened::Dir(listing))));
             }
             crate::image::check_not_source(path, protect.as_deref())?;
-            let image = crate::image::load_image(path).map_err(Cause::Decode)?;
+            let image = crate::image::load_image(path).map_err(|error| match error {
+                image::ImageError::IoError(error) => Cause::Io(error),
+                error => Cause::Decode(error),
+            })?;
             Ok(Outcome::Opened(Ok(Opened::Image {
                 path: path.clone(),
                 image,
@@ -925,7 +944,7 @@ mod tests {
         assert!(matches!(
             wait(&mut worker).outcome,
             Outcome::Opened(Err(IoError {
-                cause: Cause::IsSource,
+                cause: Cause::IsSource(_),
                 ..
             }))
         ));
@@ -1084,6 +1103,21 @@ mod tests {
     }
 
     #[test]
+    fn stopped_jobs_are_reported_as_skipped() {
+        for op in [Op::Decode, Op::List, Op::Encode, Op::Save] {
+            let error = IoError {
+                op,
+                path: "photo.png".into(),
+                cause: Cause::Stopped,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("{op}: photo.png: skipped because the IO worker shut down")
+            );
+        }
+    }
+
+    #[test]
     fn notices_preserve_existing_text_and_decode_errors_remain_typed() {
         for (op, expected) in [
             (Op::Decode, "open: Could not load photo.png: failed"),
@@ -1102,11 +1136,11 @@ mod tests {
         let error = IoError {
             op: Op::Decode,
             path: "photo.png".into(),
-            cause: Cause::IsSource,
+            cause: Cause::IsSource("photo.png".into()),
         };
         assert_eq!(
             error.to_string(),
-            "open: --preview-png must not point at the source image"
+            "open: photo.png is the source image and cannot be overwritten"
         );
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
@@ -1114,8 +1148,25 @@ mod tests {
         worker.enqueue(open(path.clone()), 0);
         let done = wait(&mut worker);
         assert_eq!(done.path(), path);
+        let Outcome::Opened(Err(ref error)) = done.outcome else {
+            panic!("expected missing source error");
+        };
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("open: Could not load {}: ", path.display()))
+        );
         assert!(matches!(
             done.outcome,
+            Outcome::Opened(Err(IoError {
+                cause: Cause::Io(ref error),
+                ..
+            })) if error.kind() == io::ErrorKind::NotFound
+        ));
+        std::fs::write(&path, b"invalid PNG").unwrap();
+        worker.enqueue(open(path), 0);
+        assert!(matches!(
+            wait(&mut worker).outcome,
             Outcome::Opened(Err(IoError {
                 cause: Cause::Decode(_),
                 ..

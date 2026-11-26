@@ -73,12 +73,7 @@ use rthid_io::{io::{IO, Job, Outcome}, png::Grid};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
     let path = scratch.path().join("preview.png");
-    let grid = Grid {
-        indices: vec![0],
-        w: 1,
-        h: 1,
-        palette: make_palette(&["#000"]).map_err(io::Error::other)?,
-    };
+    let grid = Grid::new(vec![0], 1, 1, make_palette(&["#000"]).map_err(io::Error::other)?)?;
     let mut worker = IO::new(None)?;
     worker.submit(Job::Export { path: path.clone(), grid }, 7);
     let results = worker.finish();
@@ -112,6 +107,9 @@ synchronous functions when every operation must run, such as saving independent
 files. An Update edit must contain all changes not yet confirmed saved; submitting
 individual incremental edits can lose earlier ones that were replaced in the queue.
 
+Collect reads with `poll` before calling `finish`. Stopped jobs are reported as
+skipped because the IO worker shut down, rather than as file failures.
+
 `finish` skips queued reads and updates and waits up to five seconds for running
 work and the latest queued export. It returns results, including stopped or timed
 out jobs, and detaches a worker still running at the deadline. It does not cancel
@@ -142,3 +140,16 @@ already started running may still finish; a shutdown timeout is not cancellation
   file extensions, sorts directories first, and adds `..` when there is a parent.
 
 See the crate docs (`cargo doc -p rthid-io --open`) for the API.
+
+`Grid::new(indices, w, h, palette)` validates sizes, palette indices and dimensions
+at `preview_scale(w, h)` before submission. Its fields remain public, so
+`png::write_atomic` repeats these checks at the requested scale. Invalid grid
+errors identify the failed check, and write errors include the destination path.
+`atomic::read_regular` and `atomic::update` report paths with generic file wording.
+Lock timeouts retain `WouldBlock`, and file type failures retain `InvalidInput`.
+
+Open jobs report filesystem failures as `Cause::Io`, including errors from the
+image decoder, so callers can use `kind()` just as for export failures. Real
+decode errors remain `Cause::Decode`. `Cause::IsSource(path)` carries the protected
+source path and has no CLI flag wording. `WORKER_NAME` and `panic_message` are
+intended for process panic hooks that need to recognize and report IO worker panics.

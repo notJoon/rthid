@@ -133,8 +133,12 @@ fn main() -> std::io::Result<()> {
         CliGraphics::Off => Graphics::Off,
     };
     if let Some(path) = &path {
-        check_not_source(path, preview_png.as_deref())
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause.to_string()))?;
+        check_not_source(path, preview_png.as_deref()).map_err(|cause| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--preview-png: {cause}"),
+            )
+        })?;
     }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
