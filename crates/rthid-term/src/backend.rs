@@ -51,7 +51,11 @@ impl<W: Write> ElidingBackend<W> {
     fn erase_rows(&mut self, rows: u16) -> io::Result<()> {
         queue!(self.inner, SavePosition)?;
         for row in 0..rows {
-            queue!(self.inner, MoveTo(0, row), Clear(TerminalClear::CurrentLine))?;
+            queue!(
+                self.inner,
+                MoveTo(0, row),
+                Clear(TerminalClear::CurrentLine)
+            )?;
         }
         execute!(self.inner, RestorePosition)
     }
@@ -154,7 +158,8 @@ impl<W: Write> Backend for ElidingBackend<W> {
         self.clear_region(ClearType::All)
     }
 
-    /// Clears the whole screen one row at a time, see [`ElidingBackend::erase_rows`].
+    /// Clears the whole screen with one erase-line per row instead of erase-display, which some
+    /// terminals, like iTerm2, copy into the shell's scrollback. Other clear types go to crossterm.
     fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
         if clear_type != ClearType::All {
             return self.inner.clear_region(clear_type);
