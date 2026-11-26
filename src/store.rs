@@ -1142,7 +1142,13 @@ mod tests {
         );
         let t = loaded.templates.get(0).unwrap();
         assert_eq!(t.card, crate::settings::CARDS[0].id);
-        assert_eq!((t.dot, t.margin, t.bleed), (24, 16, 3));
+        assert_eq!((t.dot, t.margin, t.bleed), (24, 15, 3));
+        for (mm, margin) in [("1.26", 15), ("1.24", 10), ("1.25", 15)] {
+            let loaded = parse(&format!(
+                "version = 1\n[[template]]\nname = 'Snap'\nmargin_mm = {mm}\n"
+            ));
+            assert_eq!(loaded.templates.get(0).unwrap().margin, margin, "{mm}");
+        }
         let loaded = parse(
             "version = 1\n[[template]]\nname = 'Clamped'\ndot_mm = -10.0\nmargin_mm = 100\nbleed_mm = 99\n",
         );

@@ -187,7 +187,7 @@ Templates keep their own colors, card, dot size, margin and bleed, so later
 preset edits or removal do not alter them. Card ids are `business-portrait`,
 `business-landscape`, `euro-business`, `trading`, `square` and `postcard`.
 Unknown ids use the default card. Numeric print values round to their stored
-units and clamp to the control bounds. Old `scale` fields are ignored and missing
+units, the margin snaps to its 0.5 mm step, and all clamp to the control bounds. Old `scale` fields are ignored and missing
 print fields use defaults. The config version remains 1.
 
 ## Mouse

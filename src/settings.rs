@@ -445,7 +445,9 @@ impl Templates {
         }
         build_palette(&template.palette_hex)?;
         template.dot = Setting::Dot.clamp(f64::from(template.dot)).round() as i32;
-        template.margin = Setting::Margin.clamp(f64::from(template.margin)).round() as i32;
+        // Margin steps by 0.5 mm (5 stored units), so snap off-grid values onto that grid.
+        template.margin =
+            Setting::Margin.clamp((f64::from(template.margin) / 5.0).round() * 5.0) as i32;
         template.bleed = Setting::Bleed.clamp(f64::from(template.bleed)).round() as i32;
         template.strength = Setting::Strength.clamp(template.strength);
         template.tone.brightness = Setting::Brightness.clamp(template.tone.brightness);
