@@ -21,6 +21,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `ElidingBackend` moves the cursor explicitly after a cell whose symbol holds
   escape sequences, such as an inline image, instead of assuming where the
   terminal left it
+- `ElidingBackend` clears the whole screen one line at a time instead of with
+  erase-display, which some terminals, like iTerm2, copy into the shell's
+  scrollback
 - `SessionOptions` and `run_terminal_with_options` for session-owned mouse capture
   and bracketed paste, with current and future fields defaulting to off
 - Copyable quick-start and input-mode examples, compiled as documentation tests
