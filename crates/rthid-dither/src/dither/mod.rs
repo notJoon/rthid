@@ -42,7 +42,7 @@ pub use threshold::bayer::BayerSize;
 ///
 /// The bytes are the only stored form. Color mode derives normalized values once
 /// per call, so there is no second copy for callers to keep in sync.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaletteColor {
     /// Bytes used to paint the preview and the PNG.
     pub rgb: [u8; 3],
@@ -140,8 +140,9 @@ impl Default for Algorithm {
 /// [`BayerSize`] on its own defaults to Four.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
-    /// Colors sorted darkest first, as built by `make_palette`. Output indices
-    /// point into it, and Tone mode relies on the order.
+    /// Colors referenced by output indices. Tone mode requires nondecreasing
+    /// luma, with ties allowed, as built by `make_palette`. Color mode accepts
+    /// any order.
     pub palette: Vec<PaletteColor>,
     /// Color model used to quantize.
     pub mode: Mode,
@@ -179,15 +180,49 @@ fn hex_to_rgb(hex: &str) -> Result<[u8; 3], &'static str> {
     }))
 }
 
+/// Invalid palette input, preserving the count or color that failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteError {
+    /// The palette must contain 1 to 256 colors.
+    Count {
+        /// Number of colors supplied.
+        len: usize,
+    },
+    /// A color was not valid hex.
+    Parse {
+        /// Zero based position in the input.
+        index: usize,
+        /// Original input text.
+        value: String,
+    },
+}
+
+impl std::fmt::Display for PaletteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Count { .. } => write!(f, "palette must have 1 to 256 colors"),
+            Self::Parse { index, value } => write!(
+                f,
+                "color {} ({value:?}): expected a 3- or 6-digit hex color",
+                index + 1
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PaletteError {}
+
 /// Parses 1 to 256 hex colors (`#rgb` or `#rrggbb`, `#` optional) and sorts them
 /// darkest first by luma, so the last, lightest color acts as paper.
-/// Invalid colors return an error with their input text and position counted from 1.
+/// Returns [`PaletteError`] for invalid counts or colors. Invalid colors retain
+/// their input text and zero based position, displayed as a 1 based position.
 ///
 /// Dither indices refer to this sorted order, not the input order. Callers who
-/// edit `rgb` afterwards are responsible for keeping the order for Tone mode.
-pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, String> {
+/// edit `rgb` afterwards must keep nondecreasing luma for Tone mode, which
+/// [`dither`] checks.
+pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, PaletteError> {
     if hexes.is_empty() || hexes.len() > 256 {
-        return Err("palette must have 1 to 256 colors".into());
+        return Err(PaletteError::Count { len: hexes.len() });
     }
     let mut palette = hexes
         .iter()
@@ -195,7 +230,10 @@ pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, String> {
         .map(|(index, hex)| {
             hex_to_rgb(hex)
                 .map(|rgb| PaletteColor { rgb })
-                .map_err(|error| format!("color {} ({hex:?}): {error}", index + 1))
+                .map_err(|_| PaletteError::Parse {
+                    index,
+                    value: (*hex).into(),
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let lum = |p: &PaletteColor| luma(p.rgb.map(f64::from)) / 255.0;
@@ -259,12 +297,24 @@ fn validate(rgba: &[u8], w: usize, h: usize, options: &Options) -> usize {
         palette.len()
     );
     let n = w.checked_mul(h).expect("image size overflow");
-    let expected = n.checked_mul(4).expect("RGBA size overflow");
+    let bytes = n.checked_mul(4).expect("image size overflow");
     assert!(
-        rgba.len() == expected,
-        "rgba.len() is {}, expected w * h * 4 = {expected} for {w}x{h}",
+        rgba.len() == bytes,
+        "rgba has {} bytes, expected {w}x{h}x4 = {bytes}",
         rgba.len()
     );
+    // Tone mode maps luma steps to indices darkest first, whatever the algorithm,
+    // so every Tone path relies on this order.
+    if options.mode == Mode::Tone {
+        for (index, pair) in palette.windows(2).enumerate() {
+            assert!(
+                luma(pair[0].rgb.map(f64::from)) / 255.0
+                    <= luma(pair[1].rgb.map(f64::from)) / 255.0,
+                "Tone palette is out of order at index {}",
+                index + 1
+            );
+        }
+    }
     match options.algorithm {
         Algorithm::Diffusion(d) => {
             assert!(
@@ -325,8 +375,11 @@ fn nearest(px: [f64; 3], colors: &[[f64; 3]]) -> usize {
 /// is ignored.
 ///
 /// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
-/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
-/// is not positive or algorithm strength is outside 0..=1. Panics report the
+/// not exactly `w` by `h` pixels, if the image byte count overflows, if any
+/// numeric option is not finite, or if gamma is not positive or algorithm
+/// strength is outside 0..=1. Tone mode also panics at the first palette index
+/// whose luma is lower than the previous color's luma, with every algorithm.
+/// Palette indices are zero based and equal luma is allowed. Panics report the
 /// caller's location. An empty image that meets these contracts returns an empty
 /// vector.
 #[track_caller]
@@ -387,34 +440,40 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     }
 }
 
-/// Expands a `gw` by `gh` index grid into opaque `ow` by `oh` RGBA pixels by
-/// nearest neighbor sampling, coloring each index with `color_of`.
+/// Convenience helper to turn indices into opaque RGBA for previews and examples.
+/// Both `grid` and `out` are `(width, height)`. Uses nearest neighbor sampling.
+/// Returns an empty vector if either output dimension is zero.
 ///
-/// Panics if the grid is empty or `idx` does not hold `gw` by `gh` indices, with
-/// the location of the caller.
+/// Panics if the grid is empty with nonempty output, if the grid size overflows
+/// or does not match `idx.len()`, or if the output byte count overflows. Panics
+/// report the caller's location. `color_of` must accept every index in `idx`. It
+/// is called for sampled indices and any panic inside it propagates.
 #[track_caller]
 pub fn rasterize(
     idx: &[u8],
-    gw: usize,
-    gh: usize,
-    ow: usize,
-    oh: usize,
+    grid: (usize, usize),
+    out: (usize, usize),
     color_of: impl Fn(u8) -> [u8; 3],
 ) -> Vec<u8> {
+    let (gw, gh) = grid;
+    let (ow, oh) = out;
+    let n = gw.checked_mul(gh).expect("grid size overflow");
     assert!(
-        gw > 0 && gh > 0,
-        "source dimensions must be positive, got {gw}x{gh}"
-    );
-    let expected = gw.checked_mul(gh).expect("source size overflow");
-    assert!(
-        idx.len() == expected,
-        "idx.len() is {}, expected gw * gh = {expected} for {gw}x{gh}",
+        idx.len() == n,
+        "idx has {} indices, expected {gw}x{gh} = {n}",
         idx.len()
     );
     let size = ow
         .checked_mul(oh)
         .and_then(|n| n.checked_mul(4))
         .expect("output size overflow");
+    if size == 0 {
+        return Vec::new();
+    }
+    assert!(
+        gw > 0 && gh > 0,
+        "source dimensions must be positive, got {gw}x{gh}"
+    );
     let mut rgba = vec![0; size];
     for y in 0..oh {
         let row = y * gh / oh * gw;
@@ -503,16 +562,68 @@ mod tests {
 
     #[test]
     fn palette_errors_identify_the_invalid_color() {
+        let error = make_palette(&["#000", "badhex", "#fff"]).unwrap_err();
         assert_eq!(
-            make_palette(&["#000", "badhex", "#fff"]).unwrap_err(),
+            error,
+            PaletteError::Parse {
+                index: 1,
+                value: "badhex".into(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
             "color 2 (\"badhex\"): expected a 3- or 6-digit hex color"
         );
         for hexes in [vec![], vec!["#000"; 257]] {
-            assert_eq!(
-                make_palette(&hexes).unwrap_err(),
-                "palette must have 1 to 256 colors"
-            );
+            let error = make_palette(&hexes).unwrap_err();
+            assert_eq!(error, PaletteError::Count { len: hexes.len() });
+            assert_eq!(error.to_string(), "palette must have 1 to 256 colors");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "Tone palette is out of order at index 2")]
+    fn tone_rejects_the_first_out_of_order_color() {
+        let mut options = Options::default();
+        options.palette.push(PaletteColor { rgb: [128; 3] });
+        options.palette.push(PaletteColor { rgb: [0; 3] });
+        dither(&[0; 4], 1, 1, &options);
+    }
+
+    #[test]
+    fn tone_order_check_covers_every_algorithm() {
+        for algorithm in [
+            Algorithm::default(),
+            Algorithm::Bayer(BayerSize::Two),
+            Algorithm::Noise { seed: 0 },
+        ] {
+            let options = Options {
+                palette: vec![PaletteColor { rgb: [255; 3] }, PaletteColor { rgb: [0; 3] }],
+                algorithm,
+                ..Options::default()
+            };
+            assert!(std::panic::catch_unwind(|| dither(&[0; 4], 1, 1, &options)).is_err());
+            let color = Options {
+                mode: Mode::Color,
+                ..options
+            };
+            assert_eq!(dither(&[0; 4], 1, 1, &color).len(), 1);
+        }
+    }
+
+    #[test]
+    fn tone_accepts_sorted_colors_and_luma_ties() {
+        let options = Options {
+            palette: make_palette(&["#fff", "#0f0", "#00f", "#000", "#f00", "#f00"]).unwrap(),
+            ..Options::default()
+        };
+        assert_eq!(dither(&[0; 4], 1, 1, &options), [0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rgba has 3 bytes, expected 1x1x4 = 4")]
+    fn rgba_mismatch_reports_actual_and_expected_size() {
+        dither(&[0; 3], 1, 1, &Options::default());
     }
 
     #[test]
@@ -528,7 +639,8 @@ mod tests {
         let indices = dither(&white, 1, 1, &options);
         assert_eq!(indices, [0]);
         assert_eq!(
-            rasterize(&indices, 1, 1, 1, 1, |i| options.palette[i as usize].rgb),
+            rasterize(&indices, (1, 1), (1, 1), |i| options.palette[i as usize]
+                .rgb),
             white
         );
     }
@@ -623,12 +735,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "rgba.len() is 3, expected w * h * 4 = 4 for 1x1")]
-    fn reports_rgba_length() {
-        dither(&[0; 3], 1, 1, &Options::default());
-    }
-
-    #[test]
     #[should_panic(expected = "tone.gamma must be positive, got 0")]
     fn reports_nonpositive_gamma() {
         let mut options = Options::default();
@@ -642,12 +748,6 @@ mod tests {
         let mut options = Options::default();
         options.tone.brightness = f64::INFINITY;
         dither(&[0; 4], 1, 1, &options);
-    }
-
-    #[test]
-    #[should_panic(expected = "idx.len() is 5, expected gw * gh = 6 for 3x2")]
-    fn reports_index_length() {
-        rasterize(&[0; 5], 3, 2, 3, 2, |_| [0; 3]);
     }
 
     #[test]
@@ -758,7 +858,7 @@ mod tests {
 
     #[test]
     fn rasterize_scales_nearest_neighbor() {
-        let result = rasterize(&[0, 1], 2, 1, 4, 2, |i| {
+        let result = rasterize(&[0, 1], (2, 1), (4, 2), |i| {
             if i == 0 {
                 [10, 20, 30]
             } else {
@@ -769,6 +869,40 @@ mod tests {
             10, 20, 30, 255, 10, 20, 30, 255, 200, 210, 220, 255, 200, 210, 220, 255,
         ];
         assert_eq!(result, row.repeat(2));
+    }
+
+    #[test]
+    fn rasterize_empty_output_accepts_empty_grids() {
+        for grid in [(0, 0), (0, 1), (1, 0)] {
+            for out in [(0, 0), (0, 2), (2, 0)] {
+                assert!(rasterize(&[], grid, out, |_| panic!("empty output")).is_empty());
+            }
+            assert!(std::panic::catch_unwind(|| rasterize(&[], grid, (1, 1), |_| [0; 3])).is_err());
+        }
+        assert!(rasterize(&[0], (1, 1), (0, 2), |_| panic!("empty output")).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "idx has 1 indices, expected 2x3 = 6")]
+    fn index_mismatch_reports_actual_and_expected_size() {
+        rasterize(&[0], (2, 3), (1, 1), |_| [0; 3]);
+    }
+
+    #[test]
+    fn rasterize_rejects_size_overflow() {
+        for (grid, out) in [
+            ((usize::MAX, 2), (1, 1)),
+            ((1, 1), (usize::MAX, 2)),
+            ((1, 1), (usize::MAX / 4 + 1, 1)),
+        ] {
+            assert!(std::panic::catch_unwind(|| rasterize(&[0], grid, out, |_| [0; 3])).is_err());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported index 7")]
+    fn rasterize_propagates_callback_panics() {
+        rasterize(&[7], (1, 1), (1, 1), |i| panic!("unsupported index {i}"));
     }
     const TONE_GOLDEN: [u8; 128] = [
         0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2,

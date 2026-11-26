@@ -48,10 +48,8 @@ pub fn write_atomic(path: &Path, grid: &Grid, scale: u32) -> io::Result<()> {
     }
     let pixels = dither::rasterize(
         indices,
-        w as usize,
-        h as usize,
-        ow as usize,
-        oh as usize,
+        (w as usize, h as usize),
+        (ow as usize, oh as usize),
         |i| palette[usize::from(i)].rgb,
     );
     crate::atomic::replace(path, |file| {

@@ -24,7 +24,7 @@ fn main() {
     let indices = dither(&rgba, 2, 1, &options);
     assert_eq!(indices, [0, 1]);
 
-    let output = rasterize(&indices, 2, 1, 2, 1, |index| {
+    let output = rasterize(&indices, (2, 1), (2, 1), |index| {
         options.palette[usize::from(index)].rgb
     });
     assert_eq!(output, rgba);
@@ -34,8 +34,9 @@ fn main() {
 Defaults use a black and white palette, Tone mode, serpentine Atkinson error
 diffusion at strength 1, and no tone adjustment.
 
-`rasterize` expands the indices to opaque RGBA pixels with nearest neighbor
-sampling. Its output width and height may differ from the input grid.
+`rasterize` is a convenience helper for previews and examples. It expands
+indices to opaque RGBA pixels using nearest neighbor sampling. Grid and output
+sizes are `(width, height)` tuples and may differ.
 
 ## Choosing an algorithm
 
@@ -120,8 +121,9 @@ indices refer to this sorted palette:
 
 ```rust
 use rthid_dither::dither::{Algorithm, Diffusion, Kernel, Mode, Options, Tone, dither, make_palette};
+use rthid_dither::PaletteError;
 
-fn main() -> Result<(), String> {
+fn main() -> Result<(), PaletteError> {
     let options = Options {
         palette: make_palette(&["#172438", "#c45238", "#f3e8c8"])?,
         mode: Mode::Color,
@@ -141,20 +143,34 @@ fn main() -> Result<(), String> {
 `PaletteColor::rgb` is the source of color data, so edits are reflected on the
 next call. Keep palettes darkest first when using Tone mode. The `rasterize`
 color callback can map indices differently without changing dithering.
+`PaletteColor` supports `Copy`, `Eq`, and `Hash`. `Mode` supports `Eq` and `Hash`.
+For normalized channels, use `rgb.map(|v| f64::from(v) / 255.0)` in place of the
+removed `PaletteColor::f` field.
 
 ## Input requirements and errors
 
-`make_palette` returns a `String` error for invalid lengths or colors. Color
-errors include the input text and its one based position.
+`make_palette` returns `PaletteError::Count { len }` for invalid lengths or
+`PaletteError::Parse { index, value }` for invalid colors. The error is exported
+from the crate root and the `dither` module and implements `std::error::Error`.
+`index` is zero based. Display text retains the input text and its one based
+position, so use `error.to_string()` when a string is needed.
 
 `dither` panics on mismatched RGBA dimensions or palettes outside 1 to 256 colors.
 All numeric options must be finite, gamma must be positive, and diffusion strength
 must be within `0.0..=1.0`. These checks also apply to single color palettes.
 Other finite adjustments are accepted without imposing UI specific ranges.
 Panic messages report the caller's location.
+Tone mode panics at the first palette index with lower luma than its predecessor,
+whatever the algorithm, because every Tone path maps luma steps to indices
+darkest first. Equal luma is allowed and `make_palette` output always satisfies
+this ordering. Color mode accepts any palette order. Image size overflow also
+panics.
 
-`rasterize` panics on an empty or mismatched source grid or overflowing output
-dimensions. Its callback must handle every index in the grid.
+`rasterize` returns an empty vector when either output dimension is zero,
+including with a 0x0 grid. It panics on an empty grid with nonempty output,
+mismatched index lengths, grid size overflow, or output byte count overflow.
+Its callback must handle every index in the grid. It is called for sampled
+indices and any panic inside it propagates.
 
 ## Not provided
 
