@@ -1,6 +1,23 @@
-//! Integer placement of a rotated source inside a physical card.
+//! Physical PNG sizing and integer placement inside a physical card.
 
 use crate::settings::{Rotation, Settings};
+
+/// Rounds each card axis including bleed to pixels, independently of the dot grid.
+/// Returns `InvalidInput` when a dimension is zero or overflows `u32`.
+pub(crate) fn png_size(settings: &Settings, dpi: u32) -> std::io::Result<(u32, u32)> {
+    let axis = |mm: u32| {
+        let mm = f64::from(mm) + 2.0 * f64::from(settings.bleed);
+        let pixels = (mm / 25.4 * f64::from(dpi)).round();
+        if !(1.0..=f64::from(u32::MAX)).contains(&pixels) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PNG dimension must be positive and fit in u32",
+            ));
+        }
+        Ok(pixels as u32)
+    };
+    Ok((axis(settings.card.w_mm)?, axis(settings.card.h_mm)?))
+}
 
 /// Placement also serves as the complete geometry cache key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +126,52 @@ impl Placement {
 mod tests {
     use super::*;
     use crate::settings::{CARDS, Card};
+
+    #[test]
+    fn png_presets_round_each_axis_at_print_resolutions() {
+        for (card, expected) in CARDS.into_iter().zip([
+            [(591, 1063), (1181, 2126), (2362, 4252)],
+            [(1063, 591), (2126, 1181), (4252, 2362)],
+            [(650, 1004), (1299, 2008), (2598, 4016)],
+            [(744, 1039), (1488, 2079), (2976, 4157)],
+            [(768, 768), (1535, 1535), (3071, 3071)],
+            [(1181, 1748), (2362, 3496), (4724, 6992)],
+        ]) {
+            let mut settings = Settings {
+                card,
+                ..Settings::default()
+            };
+            for (dpi, expected) in [300, 600, 1200].into_iter().zip(expected) {
+                assert_eq!(png_size(&settings, dpi).unwrap(), expected);
+                settings.dot = 8;
+                settings.rotation = Rotation::R90;
+                assert_eq!(png_size(&settings, dpi).unwrap(), expected);
+            }
+        }
+        let mut settings = Settings {
+            bleed: 3,
+            ..Settings::default()
+        };
+        assert_eq!(png_size(&settings, 600).unwrap(), (1323, 2268));
+        settings.card.w_mm = 127;
+        settings.bleed = 0;
+        assert_eq!(png_size(&settings, 1).unwrap().0, 5);
+        assert_eq!(png_size(&settings, 3).unwrap().0, 15);
+    }
+
+    #[test]
+    fn png_size_rejects_zero_and_overflow_before_casting() {
+        let mut settings = Settings::default();
+        assert!(png_size(&settings, 0).is_err());
+        settings.card.w_mm = 0;
+        assert!(png_size(&settings, 600).is_err());
+        settings.card.w_mm = u32::MAX;
+        settings.bleed = i32::MAX;
+        assert!(png_size(&settings, 4800).is_err());
+        settings.card = CARDS[0];
+        settings.bleed = i32::MIN;
+        assert!(png_size(&settings, 600).is_err());
+    }
 
     #[test]
     fn presets_and_axes_round_independently() {

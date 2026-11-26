@@ -27,11 +27,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   use rthid_io::{atomic::replace, io::Job};
 
   let grid = Grid::new(indices, w, h, palette)?;
-  replace(&path, |file| write_png(file, &grid, preview_size(grid.w, grid.h)))?;
+  replace(&path, |file| write_png(file, &grid, preview_size(grid.w, grid.h), None))?;
   let job = Job::Export {
       path,
       write: Box::new(move |file| {
-          write_png(file, &grid, preview_size(grid.w, grid.h))
+          write_png(file, &grid, preview_size(grid.w, grid.h), None)
       }),
   };
   ```

@@ -73,6 +73,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
+    /// Optional physical PNG resolution selected at startup.
+    pub dpi: Option<u32>,
     /// Preview zoom, minimap and dot origin.
     pub viewport: Viewport,
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
@@ -98,10 +100,12 @@ impl App {
     pub fn new(
         source: Option<(PathBuf, RgbaImage)>,
         preview_png: Option<PathBuf>,
+        dpi: Option<u32>,
         loaded: Loaded,
     ) -> Self {
         let mut app = Self {
             export: preview_png.map(Export::new),
+            dpi,
             source_path: None,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
@@ -135,6 +139,7 @@ impl App {
         Self::new(
             Some((PathBuf::from("test.png"), source)),
             preview_png,
+            None,
             Loaded::default(),
         )
     }
@@ -164,7 +169,7 @@ impl App {
     /// Builds an app without an image for tests.
     #[cfg(test)]
     pub fn empty() -> Self {
-        Self::new(None, None, Loaded::default())
+        Self::new(None, None, None, Loaded::default())
     }
 
     /// Path of the loaded source, if any.
@@ -432,12 +437,26 @@ impl App {
             && let Some(export) = &mut self.export
         {
             let (w, h) = self.grid_cache.grid().expect("processed grid").dimensions();
-            let job = export.job(
-                self.grid_cache.dithered().expect("dithered grid"),
-                w,
-                h,
-                &self.settings.palette,
-            );
+            let size = match self.dpi {
+                Some(dpi) => crate::print::png_size(&self.settings, dpi),
+                None => Ok(rthid_render::preview_size(w, h)),
+            };
+            let job = size
+                .map_err(|error| rthid_io::io::IoError {
+                    op: rthid_io::io::Op::Encode,
+                    path: export.path().to_owned(),
+                    cause: rthid_io::io::Cause::Io(error),
+                })
+                .and_then(|size| {
+                    export.job(
+                        self.grid_cache.dithered().expect("dithered grid"),
+                        w,
+                        h,
+                        &self.settings.palette,
+                        size,
+                        self.dpi,
+                    )
+                });
             match job {
                 Ok(job) => self.outbox.push((job, 0)),
                 Err(error) => {
@@ -841,6 +860,49 @@ mod tests {
 
     fn jobs(app: &mut App) -> Vec<Job> {
         app.take_jobs().into_iter().map(|(job, _)| job).collect()
+    }
+
+    #[test]
+    fn export_size_snapshots_use_preview_or_physical_dimensions() {
+        for (dpi, expected) in [(None, (1000, 1800)), (Some(600), (1181, 2126))] {
+            let mut app = App::new(
+                Some(("test.png".into(), RgbaImage::new(4, 4))),
+                Some("preview.png".into()),
+                dpi,
+                Loaded::default(),
+            );
+            let job = jobs(&mut app).pop().unwrap();
+            app.settings.bleed = 3;
+            assert_eq!(encoded_export(job).1.dimensions(), expected);
+            app.refresh();
+            let expected = if dpi.is_some() {
+                (1323, 2268)
+            } else {
+                (1120, 1920)
+            };
+            assert_eq!(
+                encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_png_is_reported_before_submission() {
+        let mut app = App::new(
+            None,
+            Some("preview.png".into()),
+            Some(4800),
+            Loaded::default(),
+        );
+        app.settings.card = crate::settings::CARDS[5];
+        app.open_image("test.png".into(), RgbaImage::new(4, 4));
+        assert!(jobs(&mut app).is_empty());
+        assert_eq!(
+            app.export_status(),
+            Some("PNG preview.png: output size 18898x27969 exceeds 268435456 pixels")
+        );
+        assert!(app.export_result().is_err());
     }
 
     fn encoded_export(job: Job) -> (PathBuf, image::RgbaImage) {
@@ -1511,7 +1573,7 @@ mod tests {
         let text = "version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']";
         let loaded = crate::store::parse(text);
         let warning = loaded.notice().unwrap();
-        let mut app = App::new(None, Some("preview.png".into()), loaded);
+        let mut app = App::new(None, Some("preview.png".into()), None, loaded);
         // A save warning can be replaced before the next draw.
         saved(&mut app, text);
         save_failed(&mut app);
@@ -1531,7 +1593,7 @@ mod tests {
 
     #[test]
     fn export_success_preserves_other_sources_with_equal_text() {
-        let mut app = App::new(None, Some("preview.png".into()), Loaded::default());
+        let mut app = App::new(None, Some("preview.png".into()), None, Loaded::default());
         let error = failure(rthid_io::io::Op::Encode);
         let text = error.to_string();
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
@@ -1544,7 +1606,7 @@ mod tests {
     fn save_notices_preserve_unrelated_errors() {
         let loaded =
             crate::store::parse("version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n");
-        let mut app = App::new(None, None, loaded);
+        let mut app = App::new(None, None, None, loaded);
         assert!(app.notice().unwrap().starts_with("config:"));
         saved(&mut app, "");
         assert!(app.notice().is_none());
@@ -1703,6 +1765,7 @@ mod tests {
                 .unwrap();
             let mut app = App::new(
                 Some((PathBuf::from("test.png"), RgbaImage::new(4, 4))),
+                None,
                 None,
                 Loaded {
                     templates: templates.clone(),

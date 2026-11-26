@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```text
-rthid [image] [--preview-png path] [--glyphs sextant|quadrant] [--graphics auto|off] [--config path]
+rthid [image] [--preview-png path] [--dpi N] [--glyphs sextant|quadrant] [--graphics auto|off] [--config path]
 ```
 
 Use `rthid --help` for option details and `rthid --version` for the version.
@@ -215,16 +215,32 @@ is `Apple_Terminal`, otherwise `sextant`. An explicit value overrides the defaul
 
 `--preview-png path`: save a PNG on startup and after each re-dither, replacing
 any existing file at `path`. The destination directory must exist; the path
-must differ from the source image. Each dot becomes a solid square at an
-integer scale of 1–4, keeping the long side within 2048 px unless the grid
-itself is larger. Write errors appear in the status line; the next re-dither
-retries. Quit waits for the final export and reports failures with a nonzero
-exit status. No viewer is opened.
+must differ from the source image. Write errors appear in the status line and
+another re-dither retries. Quit waits for the final export and reports failures
+with a nonzero exit status. No viewer is opened.
 
-Example:
+## PNG sizing
+
+Without `--dpi`, each dot becomes a solid square at an integer scale of 1 to 4,
+keeping the long side within 2048 pixels unless the grid itself is larger.
+The PNG contains no resolution metadata and retains the existing encoder bytes.
+
+`--dpi N` accepts integers from 1 to 4800. Each PNG axis is
+`round((card mm + 2 * bleed mm) / 25.4 * N)`. Dot size does not change these
+pixel dimensions. Nearest sampling keeps dot boundaries, including when pixels
+per dot are not integers. The PNG records resolution in pixels per metre on both
+axes, rounded from `N / 0.0254`.
+
+At 600 DPI, the default 50x90 mm card produces 1181x2126 pixels. With 3 mm bleed
+it produces 1323x2268 pixels. The status includes `PNG 1181x2126 @600dpi` when DPI
+is set. Output sides must be positive and at most `i32::MAX`, and output area
+must not exceed 268435456 pixels. Invalid sizes appear as export errors before
+any job is submitted. The source image still shrinks to 1024 pixels on its long
+side when loaded.
 
 ```sh
 rthid photo.png --preview-png /tmp/preview.png
+rthid photo.png --preview-png /tmp/print.png --dpi 600
 ```
 
 ## Environment

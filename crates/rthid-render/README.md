@@ -21,7 +21,7 @@ use rthid_render::{Grid, preview_size, write_png};
 fn main() -> std::io::Result<()> {
     let grid = Grid::new(vec![0, 1], 2, 1, Options::default().palette)?;
     let mut bytes = Vec::new();
-    write_png(&mut bytes, &grid, preview_size(grid.w, grid.h))?;
+    write_png(&mut bytes, &grid, preview_size(grid.w, grid.h), None)?;
     assert!(bytes.starts_with(b"\x89PNG"));
     Ok(())
 }
@@ -31,7 +31,7 @@ fn main() -> std::io::Result<()> {
 
 ```rust
 use rthid_dither::dither::{Options, dither};
-use rthid_render::{Grid, preview_size, write_png};
+use rthid_render::{Grid, write_png};
 use std::{fs::File, io::BufWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_png(
         BufWriter::new(File::create(path)?),
         &grid,
-        preview_size(grid.w, grid.h),
+        (1181, 2126),
+        Some(600),
     )?;
     Ok(())
 }
@@ -55,6 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 size. Fields remain public, so `write_png` validates again before writing.
 `write_png` samples dots with nearest neighbor sampling at the requested size in
 pixels, including sizes with a fractional number of pixels per dot.
+Pass `Some(dpi)` to record resolution in pixels per metre on both axes, rounded
+from `dpi / 0.0254`. Pass `None` to omit resolution metadata and keep the default
+encoder bytes. The caller chooses pixel dimensions independently of this metadata.
+`check_output_size` validates dimensions before submitting an output job.
 `preview_size` uses an integer dot size from 1 to 4 pixels for previews.
 
 Invalid grids and output sizes return `InvalidInput` before allocation or writing.

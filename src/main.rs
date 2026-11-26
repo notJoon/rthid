@@ -72,6 +72,9 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
+    /// Size the PNG from card and bleed at N DPI (1 to 4800), with resolution metadata.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=4800))]
+    dpi: Option<u32>,
     /// Load user presets and templates from this TOML file.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -132,6 +135,7 @@ fn run() -> io::Result<()> {
     let Args {
         image: path,
         preview_png,
+        dpi,
         config,
         glyphs,
         graphics,
@@ -179,7 +183,7 @@ fn run() -> io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut app = App::new(source, preview_png.clone(), loaded);
+    let mut app = App::new(source, preview_png.clone(), dpi, loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
@@ -406,6 +410,7 @@ mod tests {
         let args = Args::try_parse_from(["rthid"]).unwrap();
         assert_eq!(args.image, None);
         assert_eq!(args.preview_png, None);
+        assert_eq!(args.dpi, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
         assert!(matches!(args.graphics, CliGraphics::Auto));
@@ -442,6 +447,19 @@ mod tests {
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
+    }
+
+    #[test]
+    fn cli_validates_dpi_range() {
+        for dpi in ["1", "600", "4800"] {
+            assert_eq!(
+                Args::try_parse_from(["rthid", "--dpi", dpi]).unwrap().dpi,
+                Some(dpi.parse().unwrap())
+            );
+        }
+        for dpi in ["0", "4801", "-1", "1.5", "abc", "4294967296"] {
+            assert!(Args::try_parse_from(["rthid", "--dpi", dpi]).is_err());
+        }
     }
 
     #[test]

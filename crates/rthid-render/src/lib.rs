@@ -1,7 +1,6 @@
 //! Rasterization and PNG encoding of owned palette index grids.
 #![doc = include_str!("../README.md")]
 
-use image::ImageEncoder;
 use rthid_dither::dither::PaletteColor;
 use std::io;
 
@@ -133,7 +132,7 @@ impl<W: io::Write> io::Write for PngWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.inner.write(bytes).map_err(|error| {
             let stand_in = io::Error::new(error.kind(), error.to_string());
-            self.error = Some(error);
+            self.error.get_or_insert(error);
             stand_in
         })
     }
@@ -141,23 +140,18 @@ impl<W: io::Write> io::Write for PngWriter<W> {
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush().map_err(|error| {
             let stand_in = io::Error::new(error.kind(), error.to_string());
-            self.error = Some(error);
+            self.error.get_or_insert(error);
             stand_in
         })
     }
 }
 
-/// Encodes dots as opaque RGBA PNG at `size` in pixels with nearest neighbor sampling.
-/// Nothing is written when validation fails. A writer error may leave partial
-/// output. The writer is flushed on success.
+/// Validates output dimensions before allocation or job submission.
 ///
 /// # Errors
-/// Returns `InvalidInput` for invalid grid dimensions or palette indices,
-/// zero output sides, sides above `i32::MAX`, or an area above [`MAX_OUTPUT_PIXELS`].
-/// Writer errors are returned unchanged, including flush errors. Other encoder
-/// errors are wrapped with `io::Error::other`.
-pub fn write_png(writer: impl io::Write, grid: &Grid, size: (u32, u32)) -> io::Result<()> {
-    grid.validate()?;
+/// Returns `InvalidInput` for zero sides, sides above `i32::MAX`,
+/// or an area above [`MAX_OUTPUT_PIXELS`].
+pub fn check_output_size(size: (u32, u32)) -> io::Result<()> {
     let (width, height) = size;
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
     if width == 0 || height == 0 {
@@ -175,6 +169,29 @@ pub fn write_png(writer: impl io::Write, grid: &Grid, size: (u32, u32)) -> io::R
             "output size {width}x{height} exceeds {MAX_OUTPUT_PIXELS} pixels"
         )));
     }
+    Ok(())
+}
+
+/// Encodes dots as opaque RGBA PNG at `size` in pixels with nearest neighbor sampling.
+/// Nothing is written when validation fails. A writer error may leave partial
+/// output. The writer is flushed on success.
+/// `Some(dpi)` records resolution in pixels per metre on both axes.
+/// `None` omits resolution metadata and preserves the default encoder bytes.
+///
+/// # Errors
+/// Returns `InvalidInput` for invalid grid dimensions or palette indices,
+/// zero output sides, sides above `i32::MAX`, or an area above [`MAX_OUTPUT_PIXELS`].
+/// Writer errors are returned unchanged, including flush errors. Other encoder
+/// errors are wrapped with `io::Error::other`.
+pub fn write_png(
+    writer: impl io::Write,
+    grid: &Grid,
+    size: (u32, u32),
+    dpi: Option<u32>,
+) -> io::Result<()> {
+    grid.validate()?;
+    check_output_size(size)?;
+    let (width, height) = size;
     let pixels = rasterize(
         &grid.indices,
         (grid.w as usize, grid.h as usize),
@@ -185,20 +202,36 @@ pub fn write_png(writer: impl io::Write, grid: &Grid, size: (u32, u32)) -> io::R
         inner: writer,
         error: None,
     };
-    image::codecs::png::PngEncoder::new(&mut writer)
-        .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|error| {
-            writer.error.take().unwrap_or_else(|| match error {
-                image::ImageError::IoError(error) => error,
-                error => io::Error::other(error),
-            })
-        })?;
-    writer.inner.flush()
+    let result = (|| {
+        let mut encoder = png::Encoder::new(&mut writer, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::Filter::Adaptive);
+        encoder.set_pixel_dims(dpi.map(|dpi| {
+            let pixels_per_metre = (f64::from(dpi) / 0.0254).round() as u32;
+            png::PixelDimensions {
+                xppu: pixels_per_metre,
+                yppu: pixels_per_metre,
+                unit: png::Unit::Meter,
+            }
+        }));
+        let mut png = encoder.write_header()?;
+        png.write_image_data(&pixels)?;
+        png.finish()
+    })();
+    result.map_err(|error| {
+        writer
+            .error
+            .take()
+            .unwrap_or_else(|| io::Error::other(error))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
     use rthid_dither::dither::make_palette;
 
     fn grid(indices: &[u8], w: u32, h: u32, colors: &[&str]) -> Grid {
@@ -301,6 +334,7 @@ mod tests {
                     palette,
                 },
                 (1, 1),
+                None,
             )
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -310,7 +344,7 @@ mod tests {
         let mut valid = Grid::new(vec![0], 1, 1, make_palette(&["#000"]).unwrap()).unwrap();
         valid.indices.clear();
         assert_eq!(
-            write_png(Vec::new(), &valid, (1, 1))
+            write_png(Vec::new(), &valid, (1, 1), None)
                 .unwrap_err()
                 .to_string(),
             "grid has 0 indices, expected 1x1 = 1"
@@ -337,7 +371,7 @@ mod tests {
             ),
         ] {
             let mut bytes = Vec::new();
-            let error = write_png(&mut bytes, &grid, size).unwrap_err();
+            let error = write_png(&mut bytes, &grid, size, None).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(error.to_string(), expected);
             assert!(bytes.is_empty());
@@ -400,7 +434,7 @@ mod tests {
                 fail_write,
                 fail_flush,
             };
-            let result = write_png(&mut writer, &grid, (1, 1));
+            let result = write_png(&mut writer, &grid, (1, 1), None);
             assert!(writer.writes > 0);
             assert_eq!(writer.flushes, usize::from(!fail_write));
             if fail_write || fail_flush {
@@ -424,7 +458,7 @@ mod tests {
             fail_write: false,
             fail_flush: false,
         };
-        assert!(write_png(&mut writer, &grid, (0, 1)).is_err());
+        assert!(write_png(&mut writer, &grid, (0, 1), None).is_err());
         assert_eq!((writer.writes, writer.flushes), (0, 0));
     }
 
@@ -453,7 +487,7 @@ mod tests {
         }
 
         let mut writer = PartialWriter { bytes: Vec::new() };
-        let error = write_png(&mut writer, &grid(&[0], 1, 1, &["#000"]), (1, 1)).unwrap_err();
+        let error = write_png(&mut writer, &grid(&[0], 1, 1, &["#000"]), (1, 1), None).unwrap_err();
         assert_eq!(writer.bytes.len(), 16);
         assert!(writer.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
@@ -464,7 +498,7 @@ mod tests {
     fn integer_output_gives_solid_squares_and_unchanged_png_bytes() {
         let grid = grid(&[0, 1], 2, 1, &["#000", "#fff"]);
         let mut bytes = Vec::new();
-        write_png(&mut bytes, &grid, preview_size(grid.w, grid.h)).unwrap();
+        write_png(&mut bytes, &grid, preview_size(grid.w, grid.h), None).unwrap();
         let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
         assert_eq!(image.dimensions(), (8, 4));
         for (x, _, pixel) in image.enumerate_pixels() {
@@ -479,9 +513,59 @@ mod tests {
     }
 
     #[test]
+    fn resolution_metadata_is_optional_and_none_preserves_encoder_bytes() {
+        for (grid, size) in [
+            (grid(&[0], 1, 1, &["#123"]), (1, 1)),
+            (grid(&[0, 1], 2, 1, &["#000", "#fff"]), (3, 7)),
+            (
+                grid(&[0, 1, 2, 2, 1, 0], 3, 2, &["#123", "#456", "#abc"]),
+                (257, 129),
+            ),
+        ] {
+            for dpi in [None, Some(600)] {
+                let mut bytes = Vec::new();
+                write_png(&mut bytes, &grid, size, dpi).unwrap();
+                let reader = png::Decoder::new(io::Cursor::new(&bytes))
+                    .read_info()
+                    .unwrap();
+                assert_eq!(
+                    reader
+                        .info()
+                        .pixel_dims
+                        .map(|dims| (dims.xppu, dims.yppu, dims.unit)),
+                    dpi.map(|_| (23622, 23622, png::Unit::Meter))
+                );
+                if dpi.is_none() {
+                    let pixels = rasterize(
+                        &grid.indices,
+                        (grid.w as usize, grid.h as usize),
+                        (size.0 as usize, size.1 as usize),
+                        |i| grid.palette[usize::from(i)].rgb,
+                    );
+                    let mut expected = Vec::new();
+                    image::codecs::png::PngEncoder::new_with_quality(
+                        &mut expected,
+                        image::codecs::png::CompressionType::Fast,
+                        image::codecs::png::FilterType::Adaptive,
+                    )
+                    .write_image(&pixels, size.0, size.1, image::ExtendedColorType::Rgba8)
+                    .unwrap();
+                    assert_eq!(bytes, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn output_size_allows_fractional_dot_sizes() {
         let mut bytes = Vec::new();
-        write_png(&mut bytes, &grid(&[0, 1], 2, 1, &["#000", "#fff"]), (3, 1)).unwrap();
+        write_png(
+            &mut bytes,
+            &grid(&[0, 1], 2, 1, &["#000", "#fff"]),
+            (3, 1),
+            None,
+        )
+        .unwrap();
         let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
         assert_eq!(image.dimensions(), (3, 1));
         assert_eq!(

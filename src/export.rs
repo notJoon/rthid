@@ -2,7 +2,7 @@
 
 use rthid_dither::dither::PaletteColor;
 use rthid_io::io::{Cause, IoError, Job, Op};
-use rthid_render::{Grid, preview_size};
+use rthid_render::{Grid, check_output_size};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -28,25 +28,26 @@ impl Export {
     /// Copies the current grid into an owned export job.
     ///
     /// # Errors
-    /// Returns an export error if the grid dimensions or palette indices are invalid.
+    /// Returns an export error if the grid, palette indices or output size are invalid.
     pub fn job(
         &self,
         indices: &[u8],
         w: u32,
         h: u32,
         palette: &[PaletteColor],
+        size: (u32, u32),
+        dpi: Option<u32>,
     ) -> Result<Job, IoError> {
-        let grid =
-            Grid::new(indices.to_vec(), w, h, palette.to_vec()).map_err(|error| IoError {
-                op: Op::Encode,
-                path: self.path.clone(),
-                cause: Cause::Io(error),
-            })?;
+        let invalid = |error| IoError {
+            op: Op::Encode,
+            path: self.path.clone(),
+            cause: Cause::Io(error),
+        };
+        check_output_size(size).map_err(invalid)?;
+        let grid = Grid::new(indices.to_vec(), w, h, palette.to_vec()).map_err(invalid)?;
         Ok(Job::Export {
             path: self.path.clone(),
-            write: Box::new(move |file| {
-                rthid_render::write_png(file, &grid, preview_size(grid.w, grid.h))
-            }),
+            write: Box::new(move |file| rthid_render::write_png(file, &grid, size, dpi)),
         })
     }
 
@@ -79,7 +80,7 @@ mod tests {
     #[test]
     fn invalid_grid_fails_before_submission() {
         let mut export = Export::new("preview.png".into());
-        let error = export.job(&[], 1, 1, &[]).err().unwrap();
+        let error = export.job(&[], 1, 1, &[], (1, 1), None).err().unwrap();
         assert!(
             matches!(&error.cause, Cause::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
         );

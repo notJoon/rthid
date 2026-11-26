@@ -558,7 +558,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
-            "{displayed} | {mode} | Card {}x{} mm{} | Dots {gw}x{gh} | Dot {:.2} mm | Rot {}°{}{}",
+            "{displayed} | {mode} | Card {}x{} mm{} | Dots {gw}x{gh} | Dot {:.2} mm | Rot {}°{}{}{}",
             app.settings.card.w_mm,
             app.settings.card.h_mm,
             if app.settings.bleed > 0 {
@@ -574,6 +574,11 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             } else {
                 ""
             },
+            app.dpi
+                .and_then(|dpi| crate::print::png_size(&app.settings, dpi).ok().map(|(w, h)| {
+                    format!(" | PNG {w}x{h} @{dpi}dpi")
+                }))
+                .unwrap_or_default(),
         )
     })
 }
@@ -1399,6 +1404,11 @@ mod tests {
             text.contains(
                 "Card 50x90 mm (+3 mm bleed) | Dots 280x480 | Dot 0.20 mm | Rot 90° Flip"
             )
+        );
+        assert!(!text.contains("PNG"));
+        app.dpi = Some(600);
+        assert!(
+            status(&app, &geometry, PreviewReport::default()).contains("PNG 1323x2268 @600dpi")
         );
         app.settings = crate::settings::Settings {
             margin: 100,
