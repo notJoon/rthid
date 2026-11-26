@@ -203,7 +203,7 @@ impl App {
     }
 
     /// Edits not yet confirmed saved, empty when configuration loading blocked writes.
-    pub fn unsaved(&self) -> &[Change] {
+    pub fn unsaved(&self) -> Vec<Change> {
         self.library.unsaved()
     }
 
@@ -791,7 +791,7 @@ mod tests {
 
     // Drains unsaved edits as a save that succeeded would.
     fn take_changes(app: &mut App) -> Vec<Change> {
-        let changes = app.unsaved().to_vec();
+        let changes = app.unsaved();
         if !changes.is_empty() {
             app.queue_save(Path::new("config.toml"), Instant::now());
             let (tag, path, edit) = save_job(app);

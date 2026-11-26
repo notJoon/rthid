@@ -229,7 +229,7 @@ fn main() -> std::io::Result<()> {
     // Edits whose background save did not finish are saved here.
     terminal_result = terminal_result.and(save_on_quit(
         config_path.as_deref(),
-        app.unsaved(),
+        &app.unsaved(),
         &mut debug_log.as_mut(),
     ));
     if debug_log.is_none()

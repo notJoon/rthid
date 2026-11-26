@@ -22,8 +22,8 @@ const SAVE_RETRY: Duration = Duration::from_secs(2);
 struct Saving {
     /// Tag the result echoes.
     token: u64,
-    /// Edits included in the job.
-    changes: Vec<Change>,
+    /// Sequence numbers of edits included in the job.
+    sequences: Vec<u64>,
 }
 
 /// Named configuration lists and their pending saves.
@@ -33,7 +33,8 @@ pub struct Library {
     /// Saved settings with independent palette colors.
     pub templates: Templates,
     // Only the last unconfirmed edit for each list and name is retained.
-    unsaved: Vec<Change>,
+    unsaved: Vec<(u64, Change)>,
+    last_sequence: u64,
     // Whether edits arrived since the last save job.
     dirty: bool,
     saving: Option<Saving>,
@@ -61,6 +62,7 @@ impl Library {
             palettes: loaded.palettes,
             templates: loaded.templates,
             unsaved: Vec::new(),
+            last_sequence: 0,
             dirty: false,
             saving: None,
             save_retry: None,
@@ -73,18 +75,23 @@ impl Library {
     /// Applies a validated edit and retains it until a save confirms it.
     pub fn commit(&mut self, change: Change) -> Result<(), String> {
         change.apply(&mut self.palettes, &mut self.templates)?;
-        self.unsaved.retain(|older| older.key() != change.key());
-        self.unsaved.push(change);
+        self.unsaved
+            .retain(|(_, older)| older.key() != change.key());
+        self.last_sequence += 1;
+        self.unsaved.push((self.last_sequence, change));
         self.dirty = true;
         Ok(())
     }
 
     /// Edits not yet confirmed saved, empty when loading blocked writes.
-    pub fn unsaved(&self) -> &[Change] {
+    pub fn unsaved(&self) -> Vec<Change> {
         if self.save_blocked.is_some() {
-            &[]
+            Vec::new()
         } else {
-            &self.unsaved
+            self.unsaved
+                .iter()
+                .map(|(_, change)| change.clone())
+                .collect()
         }
     }
 
@@ -100,18 +107,19 @@ impl Library {
         }
         self.dirty = false;
         self.save_retry = None;
-        if self.unsaved().is_empty() {
+        let changes = self.unsaved();
+        if changes.is_empty() {
             return None;
         }
         self.last_token += 1;
         let token = self.last_token;
-        let changes = self.unsaved.clone();
+        let sequences = self.unsaved.iter().map(|(sequence, _)| *sequence).collect();
         let job = Job::Update {
             path: path.to_path_buf(),
             wait: SAVE_WAIT,
-            edit: Box::new(Merge(changes.clone())),
+            edit: Box::new(Merge(changes)),
         };
-        self.saving = Some(Saving { token, changes });
+        self.saving = Some(Saving { token, sequences });
         Some((job, token))
     }
 
@@ -127,9 +135,9 @@ impl Library {
             Ok(updated) => {
                 // Later edits remain pending and visible over the saved lists.
                 self.unsaved
-                    .retain(|change| !saving.changes.contains(change));
+                    .retain(|(sequence, _)| !saving.sequences.contains(sequence));
                 let mut loaded = parse(&updated.text);
-                for change in &self.unsaved {
+                for (_, change) in &self.unsaved {
                     // A rejected edit remains for the next save to report.
                     let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
                 }
@@ -620,6 +628,26 @@ mod tests {
         );
         assert!(library.unsaved().is_empty());
         assert!(library.templates.find("Zine").is_some());
+    }
+
+    #[test]
+    fn equal_edit_made_during_a_save_remains_unsaved() {
+        let now = Instant::now();
+        let mut library = Library::new(Loaded::default());
+        let change = Change::UpsertTemplate(Template::capture("T".into(), &Settings::default()));
+        library.commit(change.clone()).unwrap();
+        let (job, tag) = library.save_job(Path::new("config.toml"), now).unwrap();
+        let Job::Update { path, edit, .. } = job else {
+            panic!("save job expected")
+        };
+        let text = edit.apply(None).unwrap();
+        library.commit(change.clone()).unwrap();
+
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), now),
+            Some(SaveNotice::ClearConfig)
+        );
+        assert_eq!(library.unsaved(), [change]);
     }
 
     #[test]
