@@ -447,13 +447,22 @@ pub(crate) fn template_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         ctx.templates
             .iter()
             .map(|template| {
-                Line::raw(format!(
-                    "{} | {} | {} | {}",
+                let mut row = format!(
+                    "{} | {} | {} | {} | {} {:.2} mm",
                     template.name,
                     template.palette_name,
                     crate::settings::mode_label(template.mode),
-                    template.dither.label()
-                ))
+                    template.dither.label(),
+                    crate::settings::Card::from_id(template.card).label,
+                    f64::from(template.dot) / 100.0
+                );
+                if template.margin != 0 {
+                    row += &format!(" +{:.1} mm margin", f64::from(template.margin) / 10.0);
+                }
+                if template.bleed != 0 {
+                    row += &format!(" +{} mm bleed", template.bleed);
+                }
+                Line::raw(row)
             })
             .collect()
     }

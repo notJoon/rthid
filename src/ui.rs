@@ -858,7 +858,15 @@ mod tests {
                 ))
                 .unwrap();
             assert!(
-                draw_text(&mut terminal, &app, &mut renderer).contains("Z | Black/white | tone")
+                draw_text(&mut terminal, &app, &mut renderer)
+                    .contains("Z | Black/white | tone | Atkinson | Business 50x90 0.20 mm")
+            );
+            let mut print = crate::settings::Template::capture("P".into(), &Settings::default());
+            (print.card, print.dot, print.margin, print.bleed) = ("postcard", 12, 15, 3);
+            app.library.templates.upsert(print).unwrap();
+            assert!(
+                template_rows(&app.modal_ctx()).iter().any(|row| row.to_string()
+                    == "P | Black/white | tone | Atkinson | Postcard 100x148 0.12 mm +1.5 mm margin +3 mm bleed")
             );
             let mut template = crate::settings::Template::capture(
                 "A template with a long name".into(),
