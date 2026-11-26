@@ -172,15 +172,7 @@ fn main() -> std::io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let notice = loaded.notice();
-    let mut app = App::new(
-        source,
-        preview_png.clone(),
-        loaded.palettes,
-        loaded.templates,
-        notice,
-        loaded.save_blocked,
-    );
+    let mut app = App::new(source, preview_png.clone(), loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;

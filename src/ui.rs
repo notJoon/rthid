@@ -175,7 +175,8 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let labels = Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.palettes)));
+    let labels =
+        Setting::ALL.map(|setting| Line::raw(setting.label(&app.settings, &app.library.palettes)));
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
@@ -625,7 +626,7 @@ mod tests {
             let mut app = App::builtin(RgbaImage::new(12, 12), None);
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
             draw_text(&mut terminal, &app, &mut renderer);
-            app.modal = Some(Modal::presets(&app.settings, &app.palettes));
+            app.modal = Some(Modal::presets(&app.settings, &app.library.palettes));
             let text = draw_text(&mut terminal, &app, &mut renderer);
             assert!(text.contains("(built-in)") && text.contains("Presets"));
             assert!(!text.contains(&format!(
@@ -694,7 +695,8 @@ mod tests {
                     .contains(terminal.get_cursor_position().unwrap())
             );
             app.modal = Some(Modal::templates());
-            app.templates
+            app.library
+                .templates
                 .upsert(crate::settings::Template::capture(
                     "Z".into(),
                     &Settings::default(),
@@ -708,7 +710,7 @@ mod tests {
                 &Settings::default(),
             );
             template.palette_name = "A palette with a long name".into();
-            app.templates.upsert(template).unwrap();
+            app.library.templates.upsert(template).unwrap();
             assert!(
                 usize::from(
                     app.modal

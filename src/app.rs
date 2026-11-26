@@ -6,8 +6,8 @@ use crate::{
     grid::GridCache,
     memo::Memo,
     modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
-    settings::{Palettes, Rotation, Setting, Settings, Template, Templates},
-    store::{Change, Loaded, Merge},
+    settings::{Rotation, Setting, Settings, Template},
+    store::{Change, Library, Loaded, SaveNotice},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
 use image::RgbaImage;
@@ -22,21 +22,8 @@ use rthid_io::{
 use rthid_widgets::{ListPicker, Outcome};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
-
-/// Longest wait for the config lock during a background save.
-const SAVE_WAIT: Duration = Duration::from_millis(50);
-/// Delay before a failed save is tried again.
-const SAVE_RETRY: Duration = Duration::from_secs(2);
-
-// The edits carried by the newest save job.
-struct Saving {
-    /// Tag the result echoes.
-    token: u64,
-    /// Edits included in the job.
-    changes: Vec<Change>,
-}
 
 struct OpenRequest {
     /// Tag the result echoes, unique to this request.
@@ -62,23 +49,13 @@ pub struct App {
     //       status line. Notices would then never need deferring, and this field and every
     //       `loading()` guard could go.
     deferred_notice: Option<String>,
-    save_blocked: Option<String>,
     outbox: Vec<(Job, u64)>,
-    // Edits not yet confirmed saved, with only the last one for each list and name.
-    unsaved: Vec<Change>,
-    // Whether edits arrived since the last save job.
-    dirty: bool,
-    saving: Option<Saving>,
-    save_retry: Option<Instant>,
     open_request: Option<OpenRequest>,
     // Last value handed out as a dialog generation or Open token.
     // Zero tags requests without a dialog.
     last_token: u64,
-    save_error: Option<String>,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
-    /// Saved settings with independent palette colors.
-    pub templates: Templates,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
     /// Preview zoom, minimap and dot origin.
@@ -88,8 +65,8 @@ pub struct App {
     last_drag: Option<Drag>,
     /// Image processing caches.
     pub grid_cache: GridCache,
-    /// Built-in and user palette presets in selection order.
-    pub palettes: Palettes,
+    /// Named configuration lists and their pending saves.
+    pub library: Library,
     /// Current image settings.
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
@@ -106,11 +83,9 @@ impl App {
     pub fn new(
         source: Option<(PathBuf, RgbaImage)>,
         preview_png: Option<PathBuf>,
-        palettes: Palettes,
-        templates: Templates,
-        notice: Option<String>,
-        save_blocked: Option<String>,
+        loaded: Loaded,
     ) -> Self {
+        let notice = loaded.notice();
         let mut app = Self {
             export: preview_png.map(Export::new),
             source_path: None,
@@ -123,19 +98,12 @@ impl App {
                 grid: Memo::default(),
                 dithered: Memo::default(),
             },
-            palettes,
-            templates,
+            library: Library::new(loaded),
             notice: None,
             deferred_notice: None,
-            save_blocked,
             outbox: Vec::new(),
-            unsaved: Vec::new(),
-            dirty: false,
-            saving: None,
-            save_retry: None,
             open_request: None,
             last_token: 0,
-            save_error: None,
             modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
@@ -155,24 +123,14 @@ impl App {
         Self::new(
             Some((PathBuf::from("test.png"), source)),
             preview_png,
-            Palettes::builtin(),
-            Templates::default(),
-            None,
-            None,
+            Loaded::default(),
         )
     }
 
     /// Builds an app without an image for tests.
     #[cfg(test)]
     pub fn empty() -> Self {
-        Self::new(
-            None,
-            None,
-            Palettes::builtin(),
-            Templates::default(),
-            None,
-            None,
-        )
+        Self::new(None, None, Loaded::default())
     }
 
     /// Path of the loaded source, if any.
@@ -219,69 +177,37 @@ impl App {
 
     /// Edits not yet confirmed saved, empty when configuration loading blocked writes.
     pub fn unsaved(&self) -> &[Change] {
-        if self.save_blocked.is_some() {
-            &[]
-        } else {
-            &self.unsaved
-        }
+        self.library.unsaved()
     }
 
     /// When a failed save is due to be tried again.
     pub fn save_retry(&self) -> Option<Instant> {
-        self.save_retry
+        self.library.retry_at()
     }
 
-    /// Queues a background save of every unsaved edit to `path` when edits arrived since the
-    /// last save or the retry deadline passed by `now`.
+    /// Queues a save when edits arrived or the retry deadline passed.
     pub fn queue_save(&mut self, path: &Path, now: Instant) {
-        if !self.dirty && self.save_retry.is_none_or(|deadline| now < deadline) {
-            return;
+        if let Some(job) = self.library.save_job(path, now) {
+            self.outbox.push(job);
         }
-        self.dirty = false;
-        self.save_retry = None;
-        if self.unsaved().is_empty() {
-            return;
-        }
-        let token = self.next_token();
-        let changes = self.unsaved.clone();
-        let job = Job::Update {
-            path: path.to_path_buf(),
-            wait: SAVE_WAIT,
-            edit: Box::new(Merge(changes.clone())),
-        };
-        self.outbox.push((job, token));
-        self.saving = Some(Saving { token, changes });
     }
 
-    /// Replaces saved lists while retaining the current palette selection by name.
-    fn saved(&mut self, loaded: Loaded) {
-        let notice = loaded.notice();
-        if let Some(notice) = notice {
-            self.set_notice(notice);
-        } else {
-            let notice = if self.loading() {
-                &mut self.deferred_notice
-            } else {
-                &mut self.notice
-            };
-            // TODO: Notice ownership is decided by comparing text here and in the Exported arm of
-            //       `complete`. Give config, export and open errors their own slots, or tag the notice
-            //       with its source, so each source clears only its own message and `save_error` goes.
-            if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
-                *notice = None;
+    fn save_notice(&mut self, notice: SaveNotice) {
+        match notice {
+            SaveNotice::Show(notice) => {
+                self.set_notice(notice);
             }
-        }
-        self.save_error = None;
-        self.palettes = loaded.palettes;
-        self.templates = loaded.templates;
-        self.save_blocked = loaded.save_blocked;
-    }
-
-    /// Reports the save error once per distinct message.
-    fn save_failed(&mut self, error: String) {
-        if self.save_error.as_ref() != Some(&error) {
-            self.set_notice(format!("config: {error}"));
-            self.save_error = Some(error);
+            SaveNotice::ClearConfig => {
+                let notice = if self.loading() {
+                    &mut self.deferred_notice
+                } else {
+                    &mut self.notice
+                };
+                if notice.as_deref().is_some_and(|n| n.starts_with("config:")) {
+                    *notice = None;
+                }
+            }
+            SaveNotice::Unchanged => {}
         }
     }
 
@@ -347,27 +273,10 @@ impl App {
                 }
             }
             IoOutcome::Updated(result) => {
-                let Some(saving) = self.saving.take_if(|saving| saving.token == done.tag) else {
+                let Some(notice) = self.library.complete(done.tag, result, Instant::now()) else {
                     return false;
                 };
-                match result {
-                    Ok(updated) => {
-                        // Edits made after the job was queued stay unsaved for the next save
-                        // and stay visible over the saved lists.
-                        self.unsaved
-                            .retain(|change| !saving.changes.contains(change));
-                        let mut loaded = crate::store::parse(&updated.text);
-                        for change in &self.unsaved {
-                            // An edit the saved lists now reject is left for the next save to report.
-                            let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
-                        }
-                        self.saved(loaded);
-                    }
-                    Err(error) => {
-                        self.save_retry = Some(Instant::now() + SAVE_RETRY);
-                        self.save_failed(error.cause.to_string());
-                    }
-                }
+                self.save_notice(notice);
                 changed = true;
             }
             IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
@@ -619,8 +528,8 @@ impl App {
     /// Borrows the preview and saved entries needed by dialogs.
     pub fn modal_ctx(&self) -> Ctx<'_> {
         Ctx {
-            palettes: &self.palettes,
-            templates: &self.templates,
+            palettes: &self.library.palettes,
+            templates: &self.library.templates,
             settings: &self.settings,
             show_original: self.show_original,
         }
@@ -679,7 +588,7 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('P') {
-            self.show_modal(Modal::presets(&self.settings, &self.palettes));
+            self.show_modal(Modal::presets(&self.settings, &self.library.palettes));
             return;
         }
         if key.code == KeyCode::Char('T') {
@@ -744,7 +653,7 @@ impl App {
             KeyCode::Char('d') => {
                 self.settings = self
                     .settings
-                    .with_default(Setting::ALL[self.panel.selected()], &self.palettes)
+                    .with_default(Setting::ALL[self.panel.selected()], &self.library.palettes)
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -774,7 +683,11 @@ impl App {
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
                 self.commit(Change::UpsertPreset(preset))?;
-                let preset = self.palettes.find(&name).and_then(|i| self.palettes.get(i));
+                let preset = self
+                    .library
+                    .palettes
+                    .find(&name)
+                    .and_then(|i| self.library.palettes.get(i));
                 let settings = base.with_preset(preset.unwrap());
                 self.apply(Effect::Preview(settings))?;
             }
@@ -789,16 +702,14 @@ impl App {
     }
 
     fn commit(&mut self, change: Change) -> Result<(), String> {
-        change.apply(&mut self.palettes, &mut self.templates)?;
-        self.unsaved.retain(|older| older.key() != change.key());
-        self.unsaved.push(change);
-        self.dirty = true;
-        Ok(())
+        self.library.commit(change)
     }
 
     fn adjust(&mut self, direction: i32) {
         let setting = Setting::ALL[self.panel.selected()];
-        let next = self.settings.adjusted(setting, direction, &self.palettes);
+        let next = self
+            .settings
+            .adjusted(setting, direction, &self.library.palettes);
         // Clamped presses preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
             self.apply(Effect::Preview(next)).expect("preview is valid");
@@ -829,7 +740,7 @@ fn pan_delta(code: KeyCode, visible: (u32, u32), step: (u32, u32)) -> Option<(i6
 mod tests {
     use super::*;
     use crate::{
-        settings::{Palettes, Rotation},
+        settings::{Rotation, Templates},
         ui::Layout,
     };
     use ratatui::layout::Rect;
@@ -841,15 +752,21 @@ mod tests {
             IoOutcome::Opened(_) => app.open_request.as_ref().map_or(0, |r| r.token),
             IoOutcome::Listed(_) => app.dialog().unwrap_or(0),
             IoOutcome::Exported(_) => 0,
-            IoOutcome::Updated(_) => app.saving.as_ref().map_or(0, |saving| saving.token),
+            IoOutcome::Updated(_) => panic!("use the queued save tag"),
         };
         Done::new(tag, std::time::Duration::ZERO, outcome)
     }
 
     // Drains unsaved edits as a save that succeeded would.
     fn take_changes(app: &mut App) -> Vec<Change> {
-        app.dirty = false;
-        std::mem::take(&mut app.unsaved)
+        let changes = app.unsaved().to_vec();
+        if !changes.is_empty() {
+            app.queue_save(Path::new("config.toml"), Instant::now());
+            let (tag, path, edit) = save_job(app);
+            let text = edit.apply(None).unwrap();
+            app.complete(save_done(tag, Ok(rthid_io::io::Updated { path, text })));
+        }
+        changes
     }
 
     fn jobs(app: &mut App) -> Vec<Job> {
@@ -1249,7 +1166,9 @@ mod tests {
             matches!(jobs(&mut app).as_slice(), [Job::Export { path, grid }]
             if path == &output && (grid.w, grid.h) == (4, 2))
         );
-        app.settings = app.settings.with_preset(app.palettes.get(1).unwrap());
+        app.settings = app
+            .settings
+            .with_preset(app.library.palettes.get(1).unwrap());
         app.settings.options.tone.brightness = 0.2;
         app.settings.rotation = Rotation::R90;
         app.show_original = false;
@@ -1298,7 +1217,7 @@ mod tests {
         }
         assert!(app.modal.is_none() && !take_changes(&mut app).is_empty());
         assert_eq!(
-            app.templates.get(0),
+            app.library.templates.get(0),
             Some(&Template::capture("Z".into(), &saved))
         );
         app.settings.options.strength = 0.9;
@@ -1337,7 +1256,7 @@ mod tests {
             press(&mut app, code);
         }
         assert_eq!(app.settings.palette_name, "Z");
-        assert!(app.palettes.find("Z").is_some());
+        assert!(app.library.palettes.find("Z").is_some());
         assert!(app.modal.is_none() && !take_changes(&mut app).is_empty() && !app.show_original);
     }
 
@@ -1353,113 +1272,44 @@ mod tests {
         Done::new(tag, std::time::Duration::ZERO, IoOutcome::Updated(result))
     }
 
-    #[test]
-    fn unsaved_edits_keep_the_last_change_per_list_and_name() {
-        let mut app = App::empty();
-        let last = Change::UpsertTemplate(Template::capture("Shared".into(), &Settings::default()));
-        for change in [
-            Change::RemovePreset("Shared".into()),
-            Change::RemoveTemplate("Shared".into()),
-            last.clone(),
-            Change::RemovePreset("Other".into()),
-            Change::RemovePreset("Other".into()),
-        ] {
-            app.commit(change).unwrap();
-        }
-        assert_eq!(
-            app.unsaved(),
-            [
-                Change::RemovePreset("Shared".into()),
-                last,
-                Change::RemovePreset("Other".into())
-            ]
-        );
+    fn saved(app: &mut App, text: &str) {
+        app.commit(Change::RemoveTemplate("Absent".into())).unwrap();
+        app.queue_save(Path::new("config.toml"), Instant::now());
+        let (tag, path, _) = save_job(app);
+        app.complete(save_done(
+            tag,
+            Ok(rthid_io::io::Updated {
+                path,
+                text: text.into(),
+            }),
+        ));
     }
 
-    #[test]
-    fn edits_made_during_a_save_are_saved_after_it_succeeds() {
-        use rthid_io::io::Updated;
-        let config = Path::new("config.toml");
-        let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("First".into())).unwrap();
-        app.queue_save(config, Instant::now());
-        let (tag, path, edit) = save_job(&mut app);
-        app.apply(Effect::SaveTemplate("Second".into())).unwrap();
-        let text = edit.apply(None).unwrap();
-        let first = || Updated {
-            path: path.clone(),
-            text: text.clone(),
-        };
-        assert!(!app.complete(save_done(tag + 1, Ok(first()))));
-        assert!(app.complete(save_done(tag, Ok(first()))));
-        assert_eq!(app.unsaved().len(), 1);
-        assert!(app.templates.find("First").is_some());
-        assert!(app.templates.find("Second").is_some());
-        app.queue_save(config, Instant::now());
-        let (tag, path, edit) = save_job(&mut app);
-        let text = edit.apply(Some(text)).unwrap();
-        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
-        assert!(app.unsaved().is_empty());
-        let names: Vec<_> = app.templates.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["First", "Second"]);
-        app.queue_save(config, Instant::now());
-        assert!(app.take_jobs().is_empty());
-    }
-
-    #[test]
-    fn failed_saves_keep_edits_and_retry_after_the_deadline() {
-        use rthid_io::io::{Cause, IoError, Op, Updated};
-        let config = Path::new("config.toml");
-        let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("Zine".into())).unwrap();
-        let started = Instant::now();
-        app.queue_save(config, started);
-        let (tag, path, _) = save_job(&mut app);
-        let busy = IoError {
-            op: Op::Save,
+    fn save_failed(app: &mut App) {
+        app.commit(Change::RemoveTemplate("Absent".into())).unwrap();
+        app.queue_save(Path::new("config.toml"), Instant::now());
+        let (tag, path, _) = save_job(app);
+        let error = rthid_io::io::IoError {
+            op: rthid_io::io::Op::Save,
             path,
-            cause: Cause::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "config is busy",
-            )),
+            cause: rthid_io::io::Cause::Io(std::io::Error::other("config is busy")),
         };
-        assert!(app.complete(save_done(tag, Err(busy))));
-        assert_eq!(app.notice(), Some("config: config is busy"));
-        assert_eq!(app.unsaved().len(), 1);
-        let deadline = app.save_retry().unwrap();
-        assert!(deadline >= started + SAVE_RETRY);
-        app.queue_save(config, deadline - Duration::from_millis(1));
-        assert!(app.take_jobs().is_empty());
-        app.queue_save(config, deadline);
-        assert!(app.save_retry().is_none());
-        let (tag, path, edit) = save_job(&mut app);
-        let text = edit.apply(None).unwrap();
-        assert!(app.complete(save_done(tag, Ok(Updated { path, text }))));
-        assert!(app.unsaved().is_empty());
-        assert!(app.notice().is_none());
-        assert!(app.templates.find("Zine").is_some());
+        app.complete(save_done(tag, Err(error)));
     }
 
     #[test]
-    fn failed_save_reports_each_error_once() {
+    fn save_notices_preserve_unrelated_errors() {
         let mut app = App::empty();
-        app.apply(Effect::SaveTemplate("First".into())).unwrap();
-        app.apply(Effect::RemoveTemplate("First".into())).unwrap();
-        assert_eq!(
-            take_changes(&mut app),
-            [Change::RemoveTemplate("First".into())]
-        );
-        assert!(take_changes(&mut app).is_empty());
-        app.save_failed("busy".into());
-        assert_eq!(app.notice(), Some("config: busy"));
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
         app.set_notice("open: failed".into());
-        app.save_failed("busy".into());
+        save_failed(&mut app);
         assert_eq!(app.notice(), Some("open: failed"));
-        app.saved(Loaded::default());
+        saved(&mut app, "");
         assert_eq!(app.notice(), Some("open: failed"));
-        app.save_failed("denied".into());
-        assert_eq!(app.notice(), Some("config: denied"));
-        app.saved(Loaded::default());
+        save_failed(&mut app);
+        assert_eq!(app.notice(), Some("config: config is busy"));
+        saved(&mut app, "");
         assert!(app.notice().is_none());
     }
 
@@ -1476,9 +1326,8 @@ mod tests {
                 app.set_notice("earlier notice".into());
                 let expected = match notice_kind {
                     0 => {
-                        app.save_failed("config is busy".into());
-                        app.save_failed("config is busy".into());
-                        assert_eq!(app.save_error.as_deref(), Some("config is busy"));
+                        save_failed(&mut app);
+                        save_failed(&mut app);
                         "config: config is busy".to_string()
                     }
                     1 => {
@@ -1490,7 +1339,7 @@ mod tests {
                     _ => {
                         let loaded = crate::store::parse("version = 99");
                         let expected = loaded.notice().unwrap();
-                        app.saved(loaded);
+                        saved(&mut app, "version = 99");
                         expected
                     }
                 };
@@ -1550,16 +1399,14 @@ mod tests {
                 crate::modal::OnYes::RemoveTemplate("Zine".into()),
             )),
         };
-        let index = app.palettes.find("Selected").unwrap();
-        let loaded = crate::store::parse(
-            "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n",
-        );
-        let notice = loaded.notice();
-        app.saved(loaded);
+        let index = app.library.palettes.find("Selected").unwrap();
+        let text = "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n";
+        let notice = crate::store::parse(text).notice();
+        saved(&mut app, text);
         assert_eq!(app.settings.palette_name, "Selected");
         assert!(app.settings == settings);
-        assert_eq!(app.palettes.find("Selected"), Some(index + 1));
-        assert!(app.templates.find("Zine").is_some());
+        assert_eq!(app.library.palettes.find("Selected"), Some(index + 1));
+        assert!(app.library.templates.find("Zine").is_some());
         assert_eq!(app.notice(), notice.as_deref());
         assert!(app.notice().unwrap().contains("1 entries skipped"));
         let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
@@ -1573,12 +1420,12 @@ mod tests {
             .effect
             .unwrap();
         app.apply(effect).unwrap();
-        assert!(app.palettes.find("Other").is_some());
-        assert!(app.palettes.find("Selected").is_none());
-        assert!(app.templates.find("Other").is_some());
-        assert!(app.templates.find("Zine").is_none());
+        assert!(app.library.palettes.find("Other").is_some());
+        assert!(app.library.palettes.find("Selected").is_none());
+        assert!(app.library.templates.find("Other").is_some());
+        assert!(app.library.templates.find("Zine").is_none());
         assert!(take_changes(&mut app).contains(&Change::RemovePreset("Selected".into())));
-        app.saved(Loaded::default());
+        saved(&mut app, "");
         assert!(app.notice().is_none());
     }
 
@@ -1592,12 +1439,14 @@ mod tests {
             let mut app = App::new(
                 Some((PathBuf::from("test.png"), RgbaImage::new(4, 4))),
                 None,
-                Palettes::builtin(),
-                templates.clone(),
-                Some("config warning".into()),
-                blocked.then(|| "broken file".into()),
+                Loaded {
+                    templates: templates.clone(),
+                    save_blocked: blocked.then(|| "broken file".into()),
+                    ..Loaded::default()
+                },
             );
-            assert_eq!(app.templates, templates);
+            app.set_notice("config warning".into());
+            assert_eq!(app.library.templates, templates);
             assert_eq!(app.notice(), Some("config warning"));
             assert!(app.unsaved().is_empty());
             app.handle_key(

@@ -2,13 +2,167 @@
 
 use crate::settings::{Palettes, Preset, Settings, Template, Templates};
 use rthid_dither::dither::{Mode, Tone};
-use rthid_io::atomic;
+use rthid_io::{
+    atomic,
+    io::{IoError, Job, Updated},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// Longest wait for the config lock during a background save.
+const SAVE_WAIT: Duration = Duration::from_millis(50);
+/// Delay before a failed save is tried again.
+const SAVE_RETRY: Duration = Duration::from_secs(2);
+
+// The edits carried by the newest save job.
+struct Saving {
+    /// Tag the result echoes.
+    token: u64,
+    /// Edits included in the job.
+    changes: Vec<Change>,
+}
+
+/// Named configuration lists and their pending saves.
+pub struct Library {
+    /// Built in and user palette presets in selection order.
+    pub palettes: Palettes,
+    /// Saved settings with independent palette colors.
+    pub templates: Templates,
+    // Only the last unconfirmed edit for each list and name is retained.
+    unsaved: Vec<Change>,
+    // Whether edits arrived since the last save job.
+    dirty: bool,
+    saving: Option<Saving>,
+    save_retry: Option<Instant>,
+    save_blocked: Option<String>,
+    save_error: Option<String>,
+    last_token: u64,
+}
+
+/// Status line effect of a completed configuration save.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SaveNotice {
+    /// Displays a configuration diagnostic.
+    Show(String),
+    /// Clears a diagnostic owned by configuration persistence.
+    ClearConfig,
+    /// Preserves the current diagnostic for a repeated error.
+    Unchanged,
+}
+
+impl Library {
+    /// Starts with loaded lists and no pending edits.
+    pub fn new(loaded: Loaded) -> Self {
+        Self {
+            palettes: loaded.palettes,
+            templates: loaded.templates,
+            unsaved: Vec::new(),
+            dirty: false,
+            saving: None,
+            save_retry: None,
+            save_blocked: loaded.save_blocked,
+            save_error: None,
+            last_token: 0,
+        }
+    }
+
+    /// Applies a validated edit and retains it until a save confirms it.
+    pub fn commit(&mut self, change: Change) -> Result<(), String> {
+        change.apply(&mut self.palettes, &mut self.templates)?;
+        self.unsaved.retain(|older| older.key() != change.key());
+        self.unsaved.push(change);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Edits not yet confirmed saved, empty when loading blocked writes.
+    pub fn unsaved(&self) -> &[Change] {
+        if self.save_blocked.is_some() {
+            &[]
+        } else {
+            &self.unsaved
+        }
+    }
+
+    /// When a failed save is due to be tried again.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.save_retry
+    }
+
+    /// Creates a save when edits arrived or the retry deadline passed.
+    pub fn save_job(&mut self, path: &Path, now: Instant) -> Option<(Job, u64)> {
+        if !self.dirty && self.save_retry.is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        self.dirty = false;
+        self.save_retry = None;
+        if self.unsaved().is_empty() {
+            return None;
+        }
+        self.last_token += 1;
+        let token = self.last_token;
+        let changes = self.unsaved.clone();
+        let job = Job::Update {
+            path: path.to_path_buf(),
+            wait: SAVE_WAIT,
+            edit: Box::new(Merge(changes.clone())),
+        };
+        self.saving = Some(Saving { token, changes });
+        Some((job, token))
+    }
+
+    /// Applies the latest save result, ignoring stale tags.
+    pub fn complete(
+        &mut self,
+        tag: u64,
+        result: Result<Updated, IoError>,
+        now: Instant,
+    ) -> Option<SaveNotice> {
+        let saving = self.saving.take_if(|saving| saving.token == tag)?;
+        Some(match result {
+            Ok(updated) => {
+                // Later edits remain pending and visible over the saved lists.
+                self.unsaved
+                    .retain(|change| !saving.changes.contains(change));
+                let mut loaded = parse(&updated.text);
+                for change in &self.unsaved {
+                    // A rejected edit remains for the next save to report.
+                    let _ = change.apply(&mut loaded.palettes, &mut loaded.templates);
+                }
+                self.saved(loaded)
+            }
+            Err(error) => {
+                self.save_retry = Some(now + SAVE_RETRY);
+                self.save_failed(error.cause.to_string())
+            }
+        })
+    }
+
+    fn saved(&mut self, loaded: Loaded) -> SaveNotice {
+        let notice = loaded
+            .notice()
+            .map_or(SaveNotice::ClearConfig, SaveNotice::Show);
+        self.save_error = None;
+        self.palettes = loaded.palettes;
+        self.templates = loaded.templates;
+        self.save_blocked = loaded.save_blocked;
+        notice
+    }
+
+    fn save_failed(&mut self, error: String) -> SaveNotice {
+        if self.save_error.as_ref() == Some(&error) {
+            SaveNotice::Unchanged
+        } else {
+            let notice = SaveNotice::Show(format!("config: {error}"));
+            self.save_error = Some(error);
+            notice
+        }
+    }
+}
 
 /// A named edit applied to the latest configuration when saving.
 #[derive(Clone, Debug, PartialEq)]
@@ -417,6 +571,158 @@ fn path_from_env(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn failed_saves_keep_edits_and_retry_after_the_deadline() {
+        use rthid_io::io::{Cause, IoError, Op, Updated};
+        let config = Path::new("config.toml");
+        let mut library = Library::new(Loaded::default());
+        library
+            .commit(Change::UpsertTemplate(Template::capture(
+                "Zine".into(),
+                &Settings::default(),
+            )))
+            .unwrap();
+        let started = Instant::now();
+        let (job, tag) = library.save_job(config, started).unwrap();
+        let Job::Update { path, .. } = job else {
+            panic!("save job expected")
+        };
+        let busy = IoError {
+            op: Op::Save,
+            path,
+            cause: Cause::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "config is busy",
+            )),
+        };
+        assert_eq!(
+            library.complete(tag, Err(busy), started),
+            Some(SaveNotice::Show("config: config is busy".into()))
+        );
+        assert_eq!(library.unsaved().len(), 1);
+        let deadline = library.retry_at().unwrap();
+        assert_eq!(deadline, started + SAVE_RETRY);
+        assert!(
+            library
+                .save_job(config, deadline - Duration::from_millis(1))
+                .is_none()
+        );
+        let (job, tag) = library.save_job(config, deadline).unwrap();
+        assert!(library.retry_at().is_none());
+        let Job::Update { path, edit, .. } = job else {
+            panic!("save job expected")
+        };
+        let text = edit.apply(None).unwrap();
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), Instant::now()),
+            Some(SaveNotice::ClearConfig)
+        );
+        assert!(library.unsaved().is_empty());
+        assert!(library.templates.find("Zine").is_some());
+    }
+
+    #[test]
+    fn edits_made_during_a_save_are_saved_after_it_succeeds() {
+        use rthid_io::io::Updated;
+        let config = Path::new("config.toml");
+        let mut library = Library::new(Loaded::default());
+        library
+            .commit(Change::UpsertTemplate(Template::capture(
+                "First".into(),
+                &Settings::default(),
+            )))
+            .unwrap();
+        let (job, tag) = library.save_job(config, Instant::now()).unwrap();
+        let Job::Update { path, edit, .. } = job else {
+            panic!("save job expected")
+        };
+        library
+            .commit(Change::UpsertTemplate(Template::capture(
+                "Second".into(),
+                &Settings::default(),
+            )))
+            .unwrap();
+        let text = edit.apply(None).unwrap();
+        let first = || Updated {
+            path: path.clone(),
+            text: text.clone(),
+        };
+        assert!(
+            library
+                .complete(tag + 1, Ok(first()), Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            library.complete(tag, Ok(first()), Instant::now()),
+            Some(SaveNotice::ClearConfig)
+        );
+        assert_eq!(library.unsaved().len(), 1);
+        assert!(library.templates.find("First").is_some());
+        assert!(library.templates.find("Second").is_some());
+        let (job, tag) = library.save_job(config, Instant::now()).unwrap();
+        let Job::Update { path, edit, .. } = job else {
+            panic!("save job expected")
+        };
+        let text = edit.apply(Some(text)).unwrap();
+        assert_eq!(
+            library.complete(tag, Ok(Updated { path, text }), Instant::now()),
+            Some(SaveNotice::ClearConfig)
+        );
+        assert!(library.unsaved().is_empty());
+        let names: Vec<_> = library.templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        assert!(library.save_job(config, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn failed_save_reports_each_error_once() {
+        let mut library = Library::new(Loaded::default());
+        library
+            .commit(Change::UpsertTemplate(Template::capture(
+                "First".into(),
+                &Settings::default(),
+            )))
+            .unwrap();
+        library
+            .commit(Change::RemoveTemplate("First".into()))
+            .unwrap();
+        assert_eq!(library.unsaved(), [Change::RemoveTemplate("First".into())]);
+        assert_eq!(
+            library.save_failed("busy".into()),
+            SaveNotice::Show("config: busy".into())
+        );
+        assert_eq!(library.save_failed("busy".into()), SaveNotice::Unchanged);
+        assert_eq!(library.saved(Loaded::default()), SaveNotice::ClearConfig);
+        assert_eq!(
+            library.save_failed("denied".into()),
+            SaveNotice::Show("config: denied".into())
+        );
+        assert_eq!(library.saved(Loaded::default()), SaveNotice::ClearConfig);
+    }
+
+    #[test]
+    fn unsaved_edits_keep_the_last_change_per_list_and_name() {
+        let mut library = Library::new(Loaded::default());
+        let last = Change::UpsertTemplate(Template::capture("Shared".into(), &Settings::default()));
+        for change in [
+            Change::RemovePreset("Shared".into()),
+            Change::RemoveTemplate("Shared".into()),
+            last.clone(),
+            Change::RemovePreset("Other".into()),
+            Change::RemovePreset("Other".into()),
+        ] {
+            library.commit(change).unwrap();
+        }
+        assert_eq!(
+            library.unsaved(),
+            [
+                Change::RemovePreset("Shared".into()),
+                last,
+                Change::RemovePreset("Other".into())
+            ]
+        );
+    }
 
     #[test]
     fn store_round_trip_preserves_entries_and_defaults() {
