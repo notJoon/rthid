@@ -96,6 +96,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn decoding_rejects_dimensions_above_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.bmp");
+        let mut header = [0u8; 54];
+        header[..2].copy_from_slice(b"BM");
+        header[2..6].copy_from_slice(&54u32.to_le_bytes());
+        header[10..14].copy_from_slice(&54u32.to_le_bytes());
+        header[14..18].copy_from_slice(&40u32.to_le_bytes());
+        header[18..22].copy_from_slice(&16385u32.to_le_bytes());
+        header[22..26].copy_from_slice(&1u32.to_le_bytes());
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[28..30].copy_from_slice(&24u16.to_le_bytes());
+        std::fs::write(&huge, header).unwrap();
+        assert!(matches!(
+            load_image(&huge),
+            Err(image::ImageError::Limits(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn decoding_rejects_non_regular_sources() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("socket");

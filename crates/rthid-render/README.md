@@ -32,7 +32,6 @@ Fields remain public, so `write_png` validates again at the requested scale.
 Invalid grids and scales return `InvalidInput`. Encoder errors preserve their
 original cause. `preview_scale` selects an integer dot size from 1 to 4.
 
-Pass an owned grid in a `Send` closure to `rthid_io::io::Job::Export` for atomic
-file replacement. The renderer accepts any standard writer and owns no paths.
+The renderer encodes to any `std::io::Write` and owns no paths.
 
 See the crate docs (`cargo doc -p rthid-render --open`) for the API.

@@ -1,4 +1,4 @@
-//! Shared file replacement for PNG exports and configuration.
+//! Atomic file replacement for exports and configuration.
 //!
 //! Saving splits hard links and replaces read only destinations when the parent permits it.
 //! A config bind mounted as a single file cannot be replaced and fails to save.
@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn filesystem_boundaries_preserve_links_and_refuse_unsafe_inputs() {
-        use std::{fs, os::unix::fs::symlink, process::Command};
+    fn replacements_through_symlinks_keep_the_link() {
+        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("actual.jpg");
         let alias = dir.path().join("link.png");
@@ -199,29 +199,13 @@ mod tests {
         replace(&alias, |file| file.write_all(bytes)).unwrap();
         assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
         assert_eq!(fs::read(&target).unwrap(), bytes);
-        assert!(
-            replace(&dir.path().join("missing/out.png"), |file| file
-                .write_all(bytes))
-            .is_err()
-        );
-        assert!(!dir.path().join("missing").exists());
+    }
 
-        let huge = dir.path().join("huge.bmp");
-        let mut header = [0u8; 54];
-        header[..2].copy_from_slice(b"BM");
-        header[2..6].copy_from_slice(&54u32.to_le_bytes());
-        header[10..14].copy_from_slice(&54u32.to_le_bytes());
-        header[14..18].copy_from_slice(&40u32.to_le_bytes());
-        header[18..22].copy_from_slice(&16385u32.to_le_bytes());
-        header[22..26].copy_from_slice(&1u32.to_le_bytes());
-        header[26..28].copy_from_slice(&1u16.to_le_bytes());
-        header[28..30].copy_from_slice(&24u16.to_le_bytes());
-        fs::write(&huge, header).unwrap();
-        assert!(matches!(
-            crate::image::load_image(&huge),
-            Err(image::ImageError::Limits(_))
-        ));
-
+    #[test]
+    #[cfg(unix)]
+    fn updates_reject_a_fifo() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("config");
         assert!(
             Command::new("mkfifo")
@@ -235,45 +219,6 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("not a regular file"));
-
-        // APFS refuses invalid UTF-8 file names.
-        #[cfg(not(target_os = "macos"))]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let raw = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
-            let raw_path = dir.path().join(&raw);
-            image::RgbaImage::new(1, 1).save(&raw_path).unwrap();
-            let crate::dir::Listing { dir: base, entries } =
-                crate::dir::list_dir(dir.path()).unwrap();
-            let entry = entries.iter().find(|entry| entry.file_name == raw).unwrap();
-            assert_eq!(
-                crate::image::load_image(&base.join(&entry.file_name))
-                    .unwrap()
-                    .dimensions(),
-                (1, 1)
-            );
-        }
-    }
-
-    #[test]
-    fn atomic_export_replaces_and_preserves_destination_on_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path();
-        let path = dir.join("preview.png");
-        fs::write(&path, b"old").unwrap();
-        replace(&path, |file| file.write_all(b"new")).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new");
-        let error = replace(&path, |file| {
-            file.write_all(b"partial")?;
-            Err(io::Error::other("encoder failed"))
-        })
-        .unwrap_err();
-        assert_eq!(error.to_string(), "encoder failed");
-        assert_eq!(fs::read(&path).unwrap(), b"new");
-        assert!(replace(dir, |file| file.write_all(b"bytes")).is_err());
-        assert_eq!(fs::read_dir(dir).unwrap().count(), 1);
-        replace(&path, |file| file.write_all(b"last")).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"last");
     }
 
     #[test]
@@ -474,15 +419,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/file");
         assert!(replace(&path, |file| file.write_all(b"original")).is_err());
+        assert!(!path.parent().unwrap().exists());
         fs::create_dir(path.parent().unwrap()).unwrap();
         replace(&path, |file| file.write_all(b"original")).unwrap();
-        assert!(
-            replace(&path, |file| {
-                file.write_all(b"partial")?;
-                Err(io::Error::other("failed"))
-            })
-            .is_err()
-        );
+        let error = replace(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "failed");
         assert!(std::panic::catch_unwind(|| replace(&path, |_| panic!("write panic"))).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);

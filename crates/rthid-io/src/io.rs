@@ -28,7 +28,7 @@ pub(crate) enum Kind {
     Open,
     /// List a directory.
     List,
-    /// Write an export. Coalesces across paths because the companion path is fixed for a run.
+    /// Write an export. Coalesces across paths because the export destination is fixed for a run.
     Export,
     /// Replace a text file under its lock. Coalesces across paths, so each edit carries every
     /// unsaved change.
@@ -54,7 +54,7 @@ pub enum Job {
         path: PathBuf,
         /// Base directory for relative paths.
         dir: Option<PathBuf>,
-        /// Companion PNG path that must never be opened as the source.
+        /// Protected export destination that must never be opened as the source.
         protect: Option<PathBuf>,
     },
     /// List the given directory.
@@ -225,7 +225,7 @@ pub enum Op {
     Decode,
     /// List a directory.
     List,
-    /// Encode a PNG.
+    /// Run an export encoder.
     Encode,
     /// Replace a text file.
     Save,
@@ -260,7 +260,7 @@ pub enum Cause {
     Io(io::Error),
     /// Image decoding failed.
     Decode(image::ImageError),
-    /// The companion PNG resolves to this source path, which must not be overwritten.
+    /// The protected export destination resolves to this source path, which must not be overwritten.
     IsSource(PathBuf),
     /// A job panicked, with its message when available.
     Panicked(String),
@@ -755,7 +755,6 @@ mod tests {
             Outcome::Exported(Err(IoError { cause: Cause::Io(error), .. }))
                 if error.to_string() == "encoder failed"));
         assert_eq!(std::fs::read(path).unwrap(), b"old");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         assert!(worker.finish().is_empty());
     }
 

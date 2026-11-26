@@ -58,7 +58,7 @@ pub fn preview_scale(w: u32, h: u32) -> u32 {
     2048u32.checked_div(w.max(h)).unwrap_or(1).clamp(1, 4)
 }
 
-/// Owned grid submitted for background PNG encoding.
+/// Owned palette indexed grid for output rendering.
 pub struct Grid {
     /// One palette index per dot, row major.
     pub indices: Vec<u8>,
@@ -206,19 +206,12 @@ mod tests {
             (vec![], u32::MAX, u32::MAX, "PNG grid size mismatch"),
         ] {
             let palette = make_palette(&["#000"]).unwrap();
-            let error = Grid::new(indices.clone(), w, h, palette.clone())
-                .err()
-                .unwrap();
+            let error = Grid::new(indices.clone(), w, h, palette).err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(error.to_string(), expected);
             let error = write_png(
                 Vec::new(),
-                &Grid {
-                    indices,
-                    w,
-                    h,
-                    palette,
-                },
+                &grid(&indices, w, h, &["#000"]),
                 preview_scale(w, h),
             )
             .unwrap_err();

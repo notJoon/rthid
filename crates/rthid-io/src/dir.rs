@@ -82,6 +82,25 @@ pub fn list_dir(dir: &Path) -> io::Result<Listing> {
 mod tests {
     use super::*;
 
+    // APFS refuses invalid UTF-8 file names.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn invalid_utf8_file_names_are_listed_and_decoded() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = std::ffi::OsString::from_vec(b"photo-\xff.png".to_vec());
+        let raw_path = dir.path().join(&raw);
+        image::RgbaImage::new(1, 1).save(&raw_path).unwrap();
+        let Listing { dir: base, entries } = list_dir(dir.path()).unwrap();
+        let entry = entries.iter().find(|entry| entry.file_name == raw).unwrap();
+        assert_eq!(
+            crate::image::load_image(&base.join(&entry.file_name))
+                .unwrap()
+                .dimensions(),
+            (1, 1)
+        );
+    }
+
     #[test]
     fn directory_listing_filters_and_sorts() {
         let temp = tempfile::tempdir().unwrap();
