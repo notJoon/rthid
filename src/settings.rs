@@ -16,7 +16,7 @@ pub fn build_palette(hexes: &[impl AsRef<str>]) -> Result<Vec<PaletteColor>, Str
     if hexes.iter().any(|hex| hex.as_ref().chars().count() > 7) {
         return Err("hex colors must have at most 7 characters".into());
     }
-    dither::make_palette(&hexes.iter().map(AsRef::as_ref).collect::<Vec<_>>()).map_err(String::from)
+    dither::make_palette(&hexes.iter().map(AsRef::as_ref).collect::<Vec<_>>())
 }
 
 /// Compact color model label for saved settings and palette editing.

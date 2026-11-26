@@ -5,29 +5,28 @@
 //! of the error spreads and highlights and shadows stay clean. Tone mode diffuses
 //! luminance only. Color mode diffuses RGB and picks the nearest palette color.
 
-/// A palette color in byte and normalized channels.
+/// A palette color in byte channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteColor {
     /// Bytes used to paint the preview and the PNG.
     pub rgb: [u8; 3],
-    /// The same channels scaled to 0..=1, compared against pixels in Color mode.
-    pub f: [f64; 3],
 }
 
 /// Per channel adjustments applied before dithering, in the order sharpen,
 /// contrast, brightness, gamma, then black and white points. The defaults leave
-/// pixels unchanged.
+/// pixels unchanged. All values must be finite and gamma must be positive.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tone {
     /// Offset added after contrast, with the result clipped to 0..=1.
     pub brightness: f64,
     /// Scales the distance from middle gray by `1 + contrast`, so 0 keeps it.
     pub contrast: f64,
-    /// Channels are raised to the power `1 / gamma`, so values above 1 brighten midtones.
+    /// Positive gamma; channels are raised to `1 / gamma`, so values above 1 brighten midtones.
     pub gamma: f64,
     /// Level mapped to 0 after gamma. Darker values clip to black.
     pub black: f64,
-    /// Level mapped to 1 after gamma. Lighter values clip to white.
+    /// Level mapped to 1 after gamma. Lighter values clip to white. The black-to-white
+    /// span is floored at 0.02.
     pub white: f64,
     /// Unsharp mask strength against a 3x3 box blur. 0 disables it.
     pub sharpen: f64,
@@ -71,7 +70,7 @@ pub struct Options {
     /// diffusing in one direction.
     pub serpentine: bool,
     /// Scales the diffused error. 1 is full Atkinson and 0 is plain nearest
-    /// color quantization.
+    /// color quantization. Must be finite.
     pub strength: f64,
     /// Adjustments applied before quantization.
     pub tone: Tone,
@@ -108,18 +107,18 @@ fn hex_to_rgb(hex: &str) -> Result<[u8; 3], &'static str> {
 
 /// Parses 1 to 256 hex colors (`#rgb` or `#rrggbb`, `#` optional) and sorts them
 /// darkest first by luma, so the last, lightest color acts as paper.
-pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, &'static str> {
+/// Invalid colors return an error with their input text and 1-based position.
+pub fn make_palette(hexes: &[&str]) -> Result<Vec<PaletteColor>, String> {
     if hexes.is_empty() || hexes.len() > 256 {
-        return Err("palette must have 1 to 256 colors");
+        return Err("palette must have 1 to 256 colors".into());
     }
     let mut palette = hexes
         .iter()
-        .map(|hex| {
-            let rgb = hex_to_rgb(hex)?;
-            Ok(PaletteColor {
-                rgb,
-                f: rgb.map(|v| f64::from(v) / 255.0),
-            })
+        .enumerate()
+        .map(|(index, hex)| {
+            hex_to_rgb(hex)
+                .map(|rgb| PaletteColor { rgb })
+                .map_err(|error| format!("color {} ({hex:?}): {error}", index + 1))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let lum = |p: &PaletteColor| luma(p.rgb.map(f64::from)) / 255.0;
@@ -174,7 +173,8 @@ fn box_blur3(channel: &[f32], w: usize, h: usize) -> Vec<f32> {
 /// is ignored.
 ///
 /// Panics if the palette is empty or has more than 256 colors, or if `rgba` is
-/// not exactly `w` by `h` pixels.
+/// not exactly `w` by `h` pixels, if any numeric option is non-finite, or if gamma
+/// is not positive.
 pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     let palette = &options.palette;
     assert!(
@@ -183,10 +183,29 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
     );
     let n = w.checked_mul(h).expect("image size overflow");
     assert_eq!(Some(rgba.len()), n.checked_mul(4), "RGBA length mismatch");
+    for (name, value) in [
+        ("strength", options.strength),
+        ("brightness", options.tone.brightness),
+        ("contrast", options.tone.contrast),
+        ("gamma", options.tone.gamma),
+        ("black", options.tone.black),
+        ("white", options.tone.white),
+        ("sharpen", options.tone.sharpen),
+    ] {
+        assert!(value.is_finite(), "{name} must be finite");
+    }
+    assert!(options.tone.gamma > 0.0, "gamma must be positive");
     // One color needs no work, and tone mode would divide by zero levels.
     if palette.len() == 1 {
         return vec![0; n];
     }
+    let colors: Vec<_> = match options.mode {
+        Mode::Tone => Vec::new(),
+        Mode::Color => palette
+            .iter()
+            .map(|color| color.rgb.map(|value| f64::from(value) / 255.0))
+            .collect(),
+    };
     let mut channels = to_channels(rgba, w, h, &options.tone);
     let mut out = vec![0; n];
     let levels = (palette.len() - 1) as f64;
@@ -218,15 +237,15 @@ pub fn dither(rgba: &[u8], w: usize, h: usize, options: &Options) -> Vec<u8> {
                     let px: [f64; 3] = std::array::from_fn(|c| f64::from(work[c][i]));
                     let mut nearest = 0;
                     let mut best_distance = f64::INFINITY;
-                    for (j, color) in palette.iter().enumerate() {
-                        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color.f[c]);
+                    for (j, color) in colors.iter().enumerate() {
+                        let [dr, dg, db] = std::array::from_fn(|c| px[c] - color[c]);
                         let distance = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
                         if distance < best_distance {
                             best_distance = distance;
                             nearest = j;
                         }
                     }
-                    (nearest, palette[nearest].f)
+                    (nearest, colors[nearest])
                 }
             };
             out[i] = q as u8;
@@ -302,7 +321,69 @@ mod tests {
             palette.iter().map(|p| p.rgb).collect::<Vec<_>>(),
             [[0, 0, 0], [0, 0, 255], [255, 0, 0], [0, 255, 0], [255; 3]]
         );
-        assert_eq!(palette[4].f, [1.0; 3]);
+    }
+
+    #[test]
+    fn palette_errors_identify_the_invalid_color() {
+        assert_eq!(
+            make_palette(&["#000", "badhex", "#fff"]).unwrap_err(),
+            "color 2 (\"badhex\"): expected a 3- or 6-digit hex color"
+        );
+        for hexes in [vec![], vec!["#000"; 257]] {
+            assert_eq!(
+                make_palette(&hexes).unwrap_err(),
+                "palette must have 1 to 256 colors"
+            );
+        }
+    }
+
+    #[test]
+    fn color_mode_uses_edited_rgb_values() {
+        let mut options = Options {
+            mode: Mode::Color,
+            ..Options::default()
+        };
+        let white = [255; 4];
+        assert_eq!(dither(&white, 1, 1, &options), [1]);
+        options.palette[0].rgb = [255; 3];
+        options.palette[1].rgb = [0; 3];
+        let indices = dither(&white, 1, 1, &options);
+        assert_eq!(indices, [0]);
+        assert_eq!(
+            rasterize(&indices, 1, 1, 1, 1, |i| options.palette[i as usize].rgb),
+            white
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_options_even_for_one_color() {
+        let setters: [fn(&mut Options, f64); 7] = [
+            |options, value| options.strength = value,
+            |options, value| options.tone.brightness = value,
+            |options, value| options.tone.contrast = value,
+            |options, value| options.tone.gamma = value,
+            |options, value| options.tone.black = value,
+            |options, value| options.tone.white = value,
+            |options, value| options.tone.sharpen = value,
+        ];
+        for colors in [&["#000"][..], &["#000", "#fff"][..]] {
+            let options = Options {
+                palette: make_palette(colors).unwrap(),
+                ..Options::default()
+            };
+            for set in setters {
+                for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                    let mut invalid = options.clone();
+                    set(&mut invalid, value);
+                    assert!(std::panic::catch_unwind(|| dither(&[0; 4], 1, 1, &invalid)).is_err());
+                }
+            }
+            for gamma in [0.0, -1.0] {
+                let mut invalid = options.clone();
+                invalid.tone.gamma = gamma;
+                assert!(std::panic::catch_unwind(|| dither(&[0; 4], 1, 1, &invalid)).is_err());
+            }
+        }
     }
 
     #[test]
