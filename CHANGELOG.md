@@ -14,7 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `f` mirrors left and right on the card after rotation, keeping pan directions
   and the current layer. The status shows `Flip` beside rotation. Templates keep
-  the current flip, while opening an image or pressing `D` resets it
+  the current flip, while opening an image resets it
 
 - A Mass layer shows a flat four tone study of the undithered card grid, so
   large dark and light shapes can be judged without the dither pattern. `a`
@@ -47,6 +47,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Frames send only the foreground or background color that changed and skip
   the foreground of plain spaces, which cuts output at 100% zoom by about a
   quarter
+
+### Removed
+
+- `D` no longer resets all parameters and composition. `d` still resets the
+  selected parameter
 
 ### Fixed
 

@@ -25,6 +25,47 @@ pub fn build_palette(hexes: &[impl AsRef<str>]) -> Result<Vec<PaletteColor>, Str
         .map_err(|error| error.to_string())
 }
 
+/// A named palette with source colors and their validated dither colors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Palette {
+    name: String,
+    hex: Vec<String>,
+    colors: Vec<PaletteColor>,
+}
+
+impl Palette {
+    /// Validates colors and keeps their original and dither-ready forms together.
+    pub fn new(name: String, hex: Vec<String>) -> Result<Self, String> {
+        let colors = build_palette(&hex)?;
+        Ok(Self { name, hex, colors })
+    }
+
+    /// Palette label retained for saved templates and preset selection.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Hex colors in their original order.
+    pub fn hex(&self) -> &[String] {
+        &self.hex
+    }
+
+    /// Colors sorted by brightness for quantization.
+    pub fn colors(&self) -> &[PaletteColor] {
+        &self.colors
+    }
+
+    /// Builds unnamed colors for tests that do not need a preset label.
+    #[cfg(test)]
+    pub(crate) fn custom(hex: &[&str]) -> Self {
+        Self::new(
+            String::new(),
+            hex.iter().map(|color| (*color).into()).collect(),
+        )
+        .unwrap()
+    }
+}
+
 /// Compact color model label for saved settings and palette editing.
 pub fn mode_label(mode: Mode) -> &'static str {
     match mode {
@@ -377,8 +418,8 @@ impl Template {
     pub fn capture(name: String, settings: &Settings) -> Self {
         Self {
             name,
-            palette_name: settings.palette_name.clone(),
-            palette_hex: settings.palette_hex.clone(),
+            palette_name: settings.palette.name().into(),
+            palette_hex: settings.palette.hex().to_vec(),
             mode: settings.mode,
             dither: settings.dither,
             seed: settings.seed,
@@ -394,8 +435,7 @@ impl Template {
 
     /// Restores saved settings while retaining the current rotation, flip, zoom and pan.
     pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
-        let palette = build_palette(&self.palette_hex)?;
-        let next = Settings {
+        Ok(Settings {
             dither: self.dither,
             strength: self.strength,
             serpentine: self.serpentine,
@@ -404,18 +444,11 @@ impl Template {
             dot: self.dot,
             margin: self.margin,
             bleed: self.bleed,
-            zoom: settings.zoom,
-            pan_x: settings.pan_x,
-            pan_y: settings.pan_y,
-            rotation: settings.rotation,
-            flip: settings.flip,
-            palette_name: self.palette_name.clone(),
-            palette_hex: self.palette_hex.clone(),
-            palette,
+            palette: Palette::new(self.palette_name.clone(), self.palette_hex.clone())?,
             mode: self.mode,
             tone: self.tone,
-        };
-        Ok(next)
+            ..settings.clone()
+        })
     }
 }
 
@@ -637,7 +670,7 @@ impl Setting {
                 let matches = palettes.iter().any(|preset| settings.uses(preset));
                 format!(
                     "Palette: {}{}",
-                    settings.palette_name,
+                    settings.palette.name(),
                     if matches { "" } else { "*" }
                 )
             }
@@ -752,10 +785,7 @@ impl Setting {
     }
 }
 
-/// Everything that affects the grid or the dither. d resets the selected row and
-/// D resets everything, including rotation and flip.
-// TODO: Hold the palette as one Preset and derive the palette from it. Name, hex list and
-// built palette are three copies that every setter must keep in sync.
+/// Everything that affects the grid or the dither. d resets the selected row.
 #[derive(Clone, PartialEq)]
 pub struct Settings {
     /// Physical card before bleed.
@@ -776,10 +806,8 @@ pub struct Settings {
     pub rotation: Rotation,
     /// Mirrors left and right on the card after rotation.
     pub flip: bool,
-    /// Selected preset name, also retained for palettes stored in templates.
-    pub palette_name: String,
-    /// Hex colors preserved in the user's order.
-    pub palette_hex: Vec<String>,
+    /// Selected palette label, source colors and validated dither colors.
+    pub palette: Palette,
     /// Selected quantization algorithm.
     ///
     /// Strength, serpentine and seed are kept as plain values next to it and are
@@ -793,8 +821,6 @@ pub struct Settings {
     /// Seed retained for noise patterns. The panel edits a u32 range while the
     /// library accepts any u64.
     pub seed: u32,
-    /// Colors sorted by brightness for quantization.
-    pub palette: Vec<PaletteColor>,
     /// Color model used for quantization.
     pub mode: Mode,
     /// Adjustments before quantization.
@@ -803,6 +829,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let preset = &Palettes::builtin().presets[0];
         Self {
             card: CARDS[0],
             dot: 20,
@@ -813,17 +840,15 @@ impl Default for Settings {
             pan_y: 0,
             rotation: Rotation::R0,
             flip: false,
-            palette_name: String::new(),
-            palette_hex: Vec::new(),
+            palette: Palette::new(preset.name.clone(), preset.colors.clone())
+                .expect("built-in palette"),
             dither: Dither::default(),
             strength: 1.0,
             serpentine: true,
             seed: 0,
-            palette: Options::default().palette,
-            mode: Mode::default(),
+            mode: preset.mode.unwrap_or_default(),
             tone: Tone::default(),
         }
-        .with_preset(&Palettes::builtin().presets[0])
     }
 }
 
@@ -916,7 +941,7 @@ impl Settings {
     /// left out, which also keeps them out of the dither cache key.
     pub fn options(&self) -> Options {
         Options {
-            palette: self.palette.clone(),
+            palette: self.palette.colors().to_vec(),
             mode: self.mode,
             tone: self.tone,
             algorithm: self
@@ -943,14 +968,11 @@ impl Settings {
 
     /// Whether the selected name and colors still match this preset.
     pub fn uses(&self, preset: &Preset) -> bool {
-        self.palette_name == preset.name && self.palette_hex == preset.colors
+        self.palette.name() == preset.name && self.palette.hex() == preset.colors
     }
 
     fn set_palette(&mut self, preset: &Preset) -> Result<(), String> {
-        let palette = build_palette(&preset.colors)?;
-        self.palette_name.clone_from(&preset.name);
-        self.palette_hex.clone_from(&preset.colors);
-        self.palette = palette;
+        self.palette = Palette::new(preset.name.clone(), preset.colors.clone())?;
         if let Some(mode) = preset.mode {
             self.mode = mode;
         }
@@ -962,6 +984,15 @@ impl Settings {
         let mut next = self.clone();
         let _ = next.set_palette(preset);
         next
+    }
+
+    /// Restores source composition without changing print or dither settings.
+    pub fn reset_composition(&mut self) {
+        self.rotation = Rotation::R0;
+        self.flip = false;
+        self.zoom = 100;
+        self.pan_x = 0;
+        self.pan_y = 0;
     }
 
     /// Returns settings with one parameter restored to its default.
@@ -1021,7 +1052,7 @@ impl Settings {
                     }
                 }
                 Setting::Palette => {
-                    let current = palettes.find(&self.palette_name).unwrap_or(0);
+                    let current = palettes.find(self.palette.name()).unwrap_or(0);
                     let i = wrap(current, dir, palettes.len());
                     next = next.with_preset(&palettes.presets[i]);
                 }
@@ -1283,8 +1314,8 @@ mod tests {
         };
         let settings = Settings::default().with_preset(&preset);
         assert_eq!(settings.mode, Mode::Color);
-        assert_eq!(settings.palette_hex, preset.colors);
-        assert_eq!(settings.palette[0].rgb, [0; 3]);
+        assert_eq!(settings.palette.hex(), preset.colors);
+        assert_eq!(settings.palette.colors()[0].rgb, [0; 3]);
         assert_eq!(
             Setting::Palette.label(&settings, &palettes),
             "Palette: Paper*"
@@ -1305,19 +1336,21 @@ mod tests {
         let builtin = settings.with_preset(palettes.get(0).unwrap());
         assert_eq!(builtin.mode, Mode::Color);
         let unknown = Settings {
-            palette_name: "Template".into(),
+            palette: Palette::new("Template".into(), settings.palette.hex().to_vec()).unwrap(),
             ..settings
         };
         assert_eq!(
             unknown
                 .adjusted(Setting::Palette, 1, &palettes)
-                .palette_name,
+                .palette
+                .name(),
             "4-gray"
         );
         assert_eq!(
             unknown
                 .adjusted(Setting::Palette, -1, &palettes)
-                .palette_name,
+                .palette
+                .name(),
             "Paper"
         );
     }

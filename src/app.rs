@@ -4,9 +4,8 @@ use crate::{
     cells::{Glyphs, Layer, Pixels},
     export::Export,
     grid::GridCache,
-    memo::Memo,
-    modal::{Ctx, Effect, Modal, Next, PATH_MAX_CHARS, Step},
-    settings::{Rotation, Setting, Settings, Template},
+    modal::{Ctx, Effect, Modal, Next, Step},
+    settings::{Setting, Settings, Template},
     store::{Change, Library, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
 };
@@ -125,12 +124,7 @@ impl App {
             preview_focus: false,
             last_drag: None,
             minimap_visible: false,
-            grid_cache: GridCache {
-                source: None,
-                grid: Memo::default(),
-                dithered: Memo::default(),
-                mass: Memo::default(),
-            },
+            grid_cache: GridCache::default(),
             library: Library::new(loaded),
             notice: None,
             outbox: Vec::new(),
@@ -212,11 +206,7 @@ impl App {
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
-        self.settings.rotation = Rotation::R0;
-        self.settings.flip = false;
-        self.settings.zoom = 100;
-        self.settings.pan_x = 0;
-        self.settings.pan_y = 0;
+        self.settings.reset_composition();
         self.layer = Layer::Original;
         self.mass_return = Layer::Original;
         self.refresh(false);
@@ -416,20 +406,7 @@ impl App {
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(modal) = &mut self.modal {
-            if let Modal::OpenFile(picker) = modal
-                && let Some(path) = rthid_io::paste::dropped_path(text)
-            {
-                picker.input =
-                    rthid_widgets::TextInput::new(path.to_string_lossy(), PATH_MAX_CHARS);
-                picker.typed = true;
-                return;
-            }
-            if let Some(input) = modal.text_input_mut() {
-                input.insert_str(text);
-                if let Modal::OpenFile(picker) = modal {
-                    picker.typed = true;
-                }
-            }
+            modal.paste(text);
         } else if let Some(path) = rthid_io::paste::dropped_path(text) {
             self.request_open(path, None);
         }
@@ -477,9 +454,9 @@ impl App {
 
     fn refresh(&mut self, inset_mass: bool) {
         let need_dither = self.layer == Layer::Dithered || self.has_export();
-        let tones = self
-            .mass_tones
-            .unwrap_or_else(|| mass::tones_from_palette(&self.settings.palette, &self.mass));
+        let tones = self.mass_tones.unwrap_or_else(|| {
+            mass::tones_from_palette(self.settings.palette.colors(), &self.mass)
+        });
         let changed = self.grid_cache.refresh(
             &self.settings,
             need_dither,
@@ -492,26 +469,15 @@ impl App {
             && let Some(export) = &mut self.export
         {
             let (w, h) = self.grid_cache.grid().expect("processed grid").dimensions();
-            let job = export.size(w, h, &self.settings, source).and_then(|size| {
-                if !changed && export.png_size == Some(size) {
-                    return Ok(None);
-                }
-                export
-                    .job(
-                        self.grid_cache.dithered().expect("dithered grid"),
-                        w,
-                        h,
-                        &self.settings,
-                        size,
-                    )
-                    .map(Some)
-            });
-            match job {
-                Ok(Some(job)) => self.outbox.push((job, 0)),
-                Ok(None) => {}
-                Err(error) => {
-                    export.complete(Err(&error));
-                }
+            if let Some(job) = export.sync(
+                self.grid_cache.dithered().expect("dithered grid"),
+                w,
+                h,
+                &self.settings,
+                source,
+                changed,
+            ) {
+                self.outbox.push((job, 0));
             }
         }
     }
@@ -544,7 +510,7 @@ impl App {
             },
             Layer::Dithered => Pixels::Indexed {
                 indices: self.grid_cache.dithered().expect("dithered grid"),
-                palette: &self.settings.palette,
+                palette: self.settings.palette.colors(),
             },
             Layer::Mass => Pixels::Rgb {
                 image: self.grid_cache.mass().expect("mass grid"),
@@ -819,7 +785,6 @@ impl App {
                 );
                 let _ = self.set_settings(next, self.layer);
             }
-            KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
             _ => {}
@@ -852,12 +817,7 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
-                let layer = if self.layer == Layer::Mass {
-                    Layer::Mass
-                } else {
-                    Layer::Dithered
-                };
-                self.set_settings(settings, layer)?;
+                self.set_settings(settings, self.edit_layer())?;
             }
             Effect::Restore { settings, layer } => {
                 self.set_settings(settings, layer)?;
@@ -898,15 +858,22 @@ impl App {
         Ok(())
     }
 
+    fn edit_layer(&self) -> Layer {
+        if self.layer == Layer::Mass {
+            Layer::Mass
+        } else {
+            Layer::Dithered
+        }
+    }
+
     // Enter and arrow keys share the preview rule and preserve it for rejected edits.
     // The mass study stays selected because palette edits recolor its tones.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        let layer =
-            if next != self.settings && setting.shows_dithered() && self.layer != Layer::Mass {
-                Layer::Dithered
-            } else {
-                self.layer
-            };
+        let layer = if next != self.settings && setting.shows_dithered() {
+            self.edit_layer()
+        } else {
+            self.layer
+        };
         let _ = self.set_settings(next, layer);
     }
 }
@@ -942,6 +909,7 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 mod tests {
     use super::*;
     use crate::{
+        modal::PATH_MAX_CHARS,
         settings::{BUSINESS_CARD, Dither, Rotation, Templates},
         ui::Layout,
     };
@@ -1283,7 +1251,7 @@ mod tests {
         assert!(
             image
                 .pixels()
-                .all(|pixel| pixel.0[..3] == app.settings.palette[0].rgb)
+                .all(|pixel| pixel.0[..3] == app.settings.palette.colors()[0].rgb)
         );
         assert!(
             matches!(queued.as_slice(), [Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
@@ -1522,8 +1490,7 @@ mod tests {
             (100, 0, 0)
         );
         assert_eq!(app.settings.options(), settings.options());
-        assert_eq!(app.settings.palette_hex, settings.palette_hex);
-        assert_eq!(app.settings.palette_name, settings.palette_name);
+        assert_eq!(app.settings.palette, settings.palette);
         assert_eq!(app.grid_size(), (250, 450));
         assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
         let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
@@ -1579,7 +1546,7 @@ mod tests {
             &app.geometry(test_layout().preview),
         );
         assert!(
-            matches!(&app.modal, Some(Modal::Editor(editor)) if editor.draft.colors == app.settings.palette_hex && editor.rows.selected(editor.draft.colors.len() + 2) == Some(1) && editor.input.is_none())
+            matches!(&app.modal, Some(Modal::Editor(editor)) if editor.draft.colors == app.settings.palette.hex() && editor.rows.selected(editor.draft.colors.len() + 2) == Some(1) && editor.input.is_none())
         );
         press(&mut app, KeyCode::Up);
         for code in [
@@ -1590,7 +1557,7 @@ mod tests {
         ] {
             press(&mut app, code);
         }
-        assert_eq!(app.settings.palette_name, "Z");
+        assert_eq!(app.settings.palette.name(), "Z");
         assert!(app.library.palettes.find("Z").is_some());
         assert!(
             app.modal.is_none()
@@ -1919,7 +1886,7 @@ mod tests {
         let text = "version = 1\n[[palette]]\nname = 'Other'\ncolors = ['#fff']\n[[palette]]\nname = 'Selected'\ncolors = ['#123456']\n[[template]]\nname = 'Other'\n[[template]]\nname = 'Zine'\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n";
         let notice = crate::store::parse(text).notice();
         saved(&mut app, text);
-        assert_eq!(app.settings.palette_name, "Selected");
+        assert_eq!(app.settings.palette.name(), "Selected");
         assert!(app.settings == settings);
         assert_eq!(app.library.palettes.find("Selected"), Some(index + 1));
         assert!(app.library.templates.find("Zine").is_some());
@@ -2167,7 +2134,7 @@ mod tests {
         app.panel = ListPicker::new(0);
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.layer, Layer::Original);
-        for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
+        for code in [KeyCode::Char('r'), KeyCode::Char('d')] {
             assert!(press(&mut app, code));
             assert_eq!(app.layer, Layer::Original);
         }
@@ -2508,7 +2475,7 @@ mod tests {
         assert_eq!(app.notice(), Some("grid exceeds four million dots"));
         press(&mut app, KeyCode::Down);
         assert_eq!(app.notice(), Some("grid exceeds four million dots"));
-        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('d'));
         assert!(app.grid_cache.placement(&app.settings).is_some());
         assert!(app.notice().is_none());
     }
@@ -2521,12 +2488,7 @@ mod tests {
         let area = test_layout().preview;
         app.sync(area);
         let version = app.grid_cache.mass_version();
-        app.settings.palette = vec![
-            PaletteColor { rgb: [10, 20, 30] },
-            PaletteColor {
-                rgb: [210, 220, 230],
-            },
-        ];
+        app.settings.palette = crate::settings::Palette::custom(&["#0a141e", "#d2dce6"]);
         assert!(app.sync(area));
         assert_eq!(app.grid_cache.mass_version(), version + 1);
         assert_eq!(
@@ -2679,16 +2641,16 @@ mod tests {
         let mut app = app_at(Setting::Palette);
         // Wrapping back lands on the last built-in, which also switches to its Color mode.
         press(&mut app, KeyCode::Left);
-        assert_eq!(app.settings.palette_name, "Pratt");
-        assert_eq!(app.settings.palette.len(), 5);
+        assert_eq!(app.settings.palette.name(), "Pratt");
+        assert_eq!(app.settings.palette.colors().len(), 5);
         assert_eq!(app.settings.mode, Mode::Color);
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.settings.palette_name, "Black/white");
-        assert_eq!(app.settings.palette.len(), 2);
+        assert_eq!(app.settings.palette.name(), "Black/white");
+        assert_eq!(app.settings.palette.colors().len(), 2);
     }
 
     #[test]
-    fn reset_restores_selected_or_all_defaults() {
+    fn reset_restores_selected_default() {
         let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Char('f'));
         press(&mut app, KeyCode::Right);
@@ -2702,18 +2664,6 @@ mod tests {
             (app.settings.card, app.settings.rotation),
             (BUSINESS_CARD, Rotation::R90)
         );
-        select(&mut app, Setting::Palette);
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Char('D'));
-        let p = &app.settings;
-        assert_eq!(
-            (p.card, p.rotation),
-            (crate::settings::CARDS[0], Rotation::R0)
-        );
-        assert!(!p.flip);
-        assert_eq!(p.palette_name, "Black/white");
-        assert_eq!(p.palette.len(), 2);
-        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 4 * 4);
     }
 
     #[test]
@@ -2726,7 +2676,6 @@ mod tests {
             let mut app = App::builtin(RgbaImage::new(20, 10), None);
             select(&mut app, setting);
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
-            assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
             app.settings.dither = dither;
             app.settings.seed = 0;
             app.sync(test_layout().preview);
@@ -2761,19 +2710,10 @@ mod tests {
             assert_eq!(press(&mut app, change), rebuilds, "{setting:?}");
             assert_eq!(press(&mut app, KeyCode::Char('d')), rebuilds, "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
-            assert_eq!(press(&mut app, change), rebuilds, "{setting:?}");
-            assert_eq!(press(&mut app, KeyCode::Char('D')), rebuilds, "{setting:?}");
-            assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
         }
         let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Char('r'));
         assert!(!press(&mut app, KeyCode::Char('d')));
-        assert!(press(&mut app, KeyCode::Char('D')));
-        app.settings.tone.gamma = 2.0;
-        app.layer = Layer::Dithered;
-        app.sync(test_layout().preview);
-        assert!(press(&mut app, KeyCode::Char('D')));
-        assert_eq!(app.settings.tone.gamma, 1.0);
         app.handle_key(
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &app.geometry(test_layout().preview),

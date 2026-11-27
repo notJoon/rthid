@@ -14,7 +14,7 @@ pub struct Export {
     dpi: Option<u32>,
     error: Option<String>,
     /// PNG size of the last submitted job.
-    pub(crate) png_size: Option<(u32, u32)>,
+    png_size: Option<(u32, u32)>,
 }
 
 impl Export {
@@ -39,7 +39,7 @@ impl Export {
     }
 
     /// Resolves and validates the companion PNG size before submission.
-    pub(crate) fn size(
+    fn size(
         &self,
         w: u32,
         h: u32,
@@ -66,7 +66,7 @@ impl Export {
     ///
     /// # Errors
     /// Returns an export error if the grid or palette indices are invalid.
-    pub fn job(
+    fn job(
         &mut self,
         indices: &[u8],
         w: u32,
@@ -74,13 +74,35 @@ impl Export {
         settings: &Settings,
         size: (u32, u32),
     ) -> Result<Job, IoError> {
-        let grid = Grid::new(indices.to_vec(), w, h, settings.palette.clone())
+        let grid = Grid::new(indices.to_vec(), w, h, settings.palette.colors().to_vec())
             .map_err(|error| self.invalid(error))?;
         self.png_size = Some(size);
         let dpi = self.dpi;
         Ok(Job::Export {
             path: self.path.clone(),
             write: Box::new(move |file| rthid_render::write_png(file, &grid, size, dpi)),
+        })
+    }
+
+    /// Returns a new export job when its pixels or output size changed.
+    pub fn sync(
+        &mut self,
+        indices: &[u8],
+        w: u32,
+        h: u32,
+        settings: &Settings,
+        source: (u32, u32),
+        changed: bool,
+    ) -> Option<Job> {
+        let result = self.size(w, h, settings, source).and_then(|size| {
+            if !changed && self.png_size == Some(size) {
+                return Ok(None);
+            }
+            self.job(indices, w, h, settings, size).map(Some)
+        });
+        result.unwrap_or_else(|error| {
+            self.complete(Err(&error));
+            None
         })
     }
 

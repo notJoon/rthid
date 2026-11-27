@@ -35,7 +35,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("mouse", "drag/wheel/map"),
     ("r/R", "rotate"),
     ("f", "flip"),
-    ("d/D", "reset"),
+    ("d", "reset"),
     ("Esc", "back"),
     ("q", "quit"),
 ];
@@ -53,7 +53,7 @@ const PANEL_HINTS: &[(&str, &str)] = &[
     ("Left/Right h/l", "change"),
     ("r/R", "rotate"),
     ("f", "flip"),
-    ("d/D", "reset"),
+    ("d", "reset"),
     ("q", "quit"),
 ];
 
@@ -1229,11 +1229,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: mass map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: mass map | mouse: drag/wheel/map | r/R: rotate | f: flip | d: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: mass map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: mass map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d: reset | q: quit"
         );
     }
 
