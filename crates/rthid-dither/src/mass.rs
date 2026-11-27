@@ -1,4 +1,9 @@
-//! Flat graphic masses from a blurred ink field with nested foreground masks.
+//! Turns a source image into a flat four tone composition study that shows where the
+//! visual weight sits.
+//!
+//! This is a rough guide to visual mass built from blurred ink density, not segmentation.
+//! It does not find objects or edges. Each tone is a cleaned mask nested inside the tone
+//! below it, so a cell's index counts how many masks contain it.
 //!
 //! ```
 //! use rthid_dither::dither::PaletteColor;
@@ -21,6 +26,9 @@ use image::{ImageBuffer, Luma, imageops::FilterType};
 use crate::dither::PaletteColor;
 
 /// Maximum analysis width all distance parameters are specified at.
+///
+/// Blur and closing distances are tuned at this width and scale with the real grid width.
+/// Area limits are fractions of the grid area instead.
 const ANALYSIS_WIDTH: u32 = 450;
 
 /// Fixed monochrome tones: background, base, shadow, accent, independent of invert.
@@ -37,7 +45,8 @@ pub const MONO: [PaletteColor; 4] = [
     PaletteColor { rgb: [17, 17, 17] },
 ];
 
-/// Fixed warm tones for style comparison, independent of invert.
+/// Fixed warm tones in background, base, shadow, accent order, from light paper to dark
+/// umber. Invert does not affect them.
 pub const WARM: [PaletteColor; 4] = [
     PaletteColor {
         rgb: [255, 255, 255],
@@ -51,10 +60,12 @@ pub const WARM: [PaletteColor; 4] = [
 
 /// Four tones sampled from a palette as a gradient from its lightest to its darkest color.
 ///
-/// A local copy is stably sorted by luma ascending. Tones sit at 0, 1/3, 2/3 and 1 of the
-/// gradient, so four colors keep their values and two colors get two blended steps.
-/// `options.invert` reverses the direction for light ink on dark backgrounds. Fewer than
-/// two colors fall back to the fixed [`MONO`] tones regardless of invert.
+/// Input order does not matter and the input is never changed. Colors with equal luma keep
+/// their input order. Tones sit at 0, 1/3, 2/3 and 1 of the gradient, so four colors keep
+/// their values and two colors get two blended steps. Blends are per channel on the stored
+/// sRGB values. Only the invert option is read. It reverses the direction for light ink on
+/// dark backgrounds. Fewer than two colors fall back to the fixed [`MONO`] tones regardless
+/// of invert.
 pub fn tones_from_palette(palette: &[PaletteColor], options: &MassOptions) -> [PaletteColor; 4] {
     if palette.len() < 2 {
         return MONO;
@@ -86,13 +97,21 @@ fn luma(rgb: &[u8; 3]) -> f32 {
 }
 
 /// Controls smoothing and the three cumulative ink masks.
+///
+/// Any value can be built. The study function validates the fields and returns an error
+/// for out of range values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MassOptions {
-    /// Gaussian sigma at 450 pixels, scaled by the actual analysis width. Zero disables blur.
+    /// Blur radius in pixels of a 450 pixel wide analysis grid. Narrower grids get a
+    /// proportionally smaller blur, so smoothing stays the same fraction of the image
+    /// width. Zero disables blur.
     pub sigma: f32,
-    /// Strictly increasing base, shadow and accent thresholds in (0, 1]. Higher covers less area.
+    /// Strictly increasing base, shadow and accent thresholds in (0, 1]. A cell joins a
+    /// tier when its blurred ink density is at least the threshold, so higher covers less
+    /// area. A density of 1 means the darkest visible pixel at full opacity.
     pub thresholds: [f32; 3],
-    /// Treat light pixels as ink for light on dark images.
+    /// Treat light pixels as ink for light on dark images. Also keeps palette tones darkest
+    /// first, so the background takes the darkest color.
     pub invert: bool,
 }
 
@@ -106,9 +125,10 @@ impl Default for MassOptions {
     }
 }
 
-/// Four tone grid at analysis size, from the lightest background (0) to accent (3).
+/// Grid of tone indices at analysis size, from background (0) to accent (3).
 ///
-/// Tone order is opposite to dither palette order.
+/// Index k means the cell lies inside the first k nested masks. Without invert, index 0 is
+/// the lightest tone, which is the reverse of the darkest first dither palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MassStudy {
     /// One tone index per cell in row major order.
@@ -125,7 +145,8 @@ impl MassStudy {
         self.w
     }
 
-    /// Number of analysis rows, preserving the source aspect ratio.
+    /// Number of analysis rows, preserving the source aspect ratio. Rounded to the nearest
+    /// row with ties going to even, and never less than one.
     pub fn h(&self) -> usize {
         self.h
     }
@@ -135,9 +156,11 @@ impl MassStudy {
         &self.indices
     }
 
-    /// Opaque RGBA at any output size with nearest neighbor sampling.
+    /// Opaque RGBA at any output size.
     ///
-    /// Panics on output size overflow.
+    /// Each output pixel takes the cell under its top left corner, which is exact for
+    /// integer scale factors. Tone index i is drawn with entry i of the tones. A zero width
+    /// or height returns an empty buffer. Panics on output size overflow.
     #[track_caller]
     pub fn rgba(&self, out_w: usize, out_h: usize, tones: &[PaletteColor; 4]) -> Vec<u8> {
         let len = out_w
@@ -196,17 +219,22 @@ impl fmt::Display for MassError {
 
 impl std::error::Error for MassError {}
 
-/// Computes a mass study from the undithered RGBA source image.
+/// Takes row major RGBA with straight alpha and returns four nested tone masks.
 ///
-/// The returned grid is at most 450 columns wide with the source aspect ratio preserved.
-/// [`MassStudy::rgba`] resamples it to any output size.
+/// Ink is averaged down to the analysis grid, blurred, cut at the three thresholds, then
+/// each tier is closed, trimmed to its largest regions and has its small enclosed holes
+/// filled. The returned grid is at most 450 columns wide with the source aspect ratio
+/// preserved. [`MassStudy::rgba`] resamples it to any output size.
 ///
 /// Ink is relative to the image's own darkest and lightest pixels with nonzero
 /// alpha, so two color images map to 0 and 1 and continuous tone images use
 /// their full range before alpha scales coverage. Uniform or fully transparent
 /// images have zero ink because they contain no visible luma contrast.
 ///
-/// Panics on mismatched RGBA dimensions or image size overflow.
+/// Panics when the buffer length does not match the dimensions, which is checked before
+/// the empty size check, so an empty size with a non empty buffer panics instead of
+/// returning an error. Also panics when the pixel count overflows or a dimension exceeds
+/// `u32::MAX`.
 #[track_caller]
 pub fn mass_study(
     rgba: &[u8],
@@ -242,8 +270,13 @@ pub fn mass_study(
         }
         previous = threshold;
     }
+    // Images are only shrunk, never enlarged. Ties go to even so results do not depend on
+    // float noise, and very wide images still keep one row.
     let aw = w.min(ANALYSIS_WIDTH as usize);
     let ah = ((h as f64 * aw as f64 / w as f64).round_ties_even() as usize).max(1);
+    // Ink is measured against the darkest and lightest visible pixels so every image uses
+    // the full density range. Transparent pixels add no ink and do not affect the range.
+    // Alpha then thins partly transparent ink.
     let mut ink = Vec::with_capacity(n);
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
@@ -273,6 +306,8 @@ pub fn mass_study(
         ink,
     )
     .expect("validated image dimensions");
+    // Averaging on the way down turns thin dark lines into lower density instead of
+    // dropping them.
     let mut density = image::imageops::resize(
         &source,
         aw as u32,
@@ -281,6 +316,7 @@ pub fn mass_study(
         FilterType::Triangle,
     )
     .into_raw();
+    // Scale the blur to the grid width so it covers the same share of the image at any size.
     blur(
         &mut density,
         aw,
@@ -288,6 +324,7 @@ pub fn mass_study(
         options.sigma as f64 * aw as f64 / ANALYSIS_WIDTH as f64,
     );
     let masks = masks(&density, aw, ah, &options.thresholds);
+    // The masks are nested, so counting the ones that contain a cell gives its tone index.
     let mut indices = vec![0; aw * ah];
     for mask in masks {
         for (index, foreground) in indices.iter_mut().zip(mask) {
@@ -301,6 +338,8 @@ pub fn mass_study(
     })
 }
 
+// Mirrors an out of range position back inside without repeating the edge cell, so minus
+// one maps to one. Works for any distance, including kernels wider than the image.
 fn reflect(position: i64, len: usize) -> usize {
     if len == 1 {
         return 0;
@@ -310,6 +349,8 @@ fn reflect(position: i64, len: usize) -> usize {
     p.min(period - p) as usize
 }
 
+// Separable Gaussian cut off at four sigma. The weights sum to one, so a uniform field keeps
+// its value. Results are clamped because rounding can push density slightly past one.
 fn blur(density: &mut [f32], w: usize, h: usize, sigma: f64) {
     if sigma == 0.0 {
         return;
@@ -344,6 +385,9 @@ fn blur(density: &mut [f32], w: usize, h: usize, sigma: f64) {
     }
 }
 
+// Closing radius is three pixels at 450 columns, so grids of 75 columns or fewer skip
+// closing. Base, shadow and accent keep at most 3, 6 and 5 regions. Accent allows regions
+// half as small so small dark accents survive. Holes up to 0.3 percent of the area are filled.
 fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<bool>> {
     let radius = (3.0 * w as f64 / ANALYSIS_WIDTH as f64).round_ties_even() as isize;
     let mut result: Vec<Vec<bool>> = Vec::new();
@@ -352,6 +396,8 @@ fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<
         for &value in density {
             raw.push(value >= thresholds[i]);
         }
+        // The minimum area rounds up and the hole limit rounds down, so both limits err
+        // toward keeping the image as drawn.
         let mut mask = clean_mask(
             &raw,
             w,
@@ -361,6 +407,9 @@ fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<
             [3, 6, 5][i],
             (0.003 * (w * h) as f64).floor() as usize,
         );
+        // Each tier is cleaned on its own threshold before it is clipped to the tier below.
+        // The region cap counts regions of the tier itself. Clipping only removes cells,
+        // which keeps the tiers nested.
         if let Some(parent) = result.last() {
             for (cell, &p) in mask.iter_mut().zip(parent) {
                 *cell &= p;
@@ -371,11 +420,14 @@ fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<
     result
 }
 
+// Grows or shrinks the mask by a disk of the given radius. Edge cells are repeated outward
+// so masses touching the border are not eaten away by shrinking.
 fn morphology(mask: &[bool], w: usize, h: usize, radius: isize, dilate: bool) -> Vec<bool> {
     let mut out = vec![!dilate; mask.len()];
     for y in 0..h {
         for x in 0..w {
             'disk: for dy in -radius..=radius {
+                // Half width of the disk on this row, so the shape is round and not square.
                 let extent = ((radius * radius - dy * dy) as f64)
                     .sqrt()
                     .round_ties_even() as isize;
@@ -393,6 +445,9 @@ fn morphology(mask: &[bool], w: usize, h: usize, radius: isize, dilate: bool) ->
     out
 }
 
+// Connected regions in scan order. The flag picks eight neighbor or four neighbor links.
+// Each region's first cell is its topmost, then leftmost cell, which gives a stable key
+// for ordering.
 fn components(
     mask: &[bool],
     w: usize,
@@ -431,6 +486,9 @@ fn components(
     result
 }
 
+// Closes small gaps, keeps the largest regions that meet the minimum area up to the cap,
+// then fills small background holes that do not touch the border. Dropped islands inside a
+// kept region become part of its hole and can be filled.
 fn clean_mask(
     mask: &[bool],
     w: usize,
@@ -442,6 +500,8 @@ fn clean_mask(
 ) -> Vec<bool> {
     let closed = morphology(&morphology(mask, w, h, radius, true), w, h, radius, false);
     let mut regions = components(&closed, w, h, true, true);
+    // Larger regions win. Equal areas go to the region that starts first in row major
+    // order, so the result is the same on every run.
     regions.sort_by_key(|cells| (std::cmp::Reverse(cells.len()), cells[0]));
     let mut out = vec![false; mask.len()];
     for cells in regions
@@ -453,7 +513,10 @@ fn clean_mask(
             out[p] = true;
         }
     }
+    // Holes use four neighbor links while regions use eight. A diagonal gap then never counts
+    // as both a region link and a way out of a hole.
     for hole in components(&out, w, h, false, false) {
+        // Background that reaches the border is outside space, not a hole.
         if hole.len() <= max_hole
             && !hole
                 .iter()
