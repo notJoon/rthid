@@ -43,7 +43,9 @@ inherits = "release"
 debug = "line-tables-only"
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 tempfile.workspace = true
+vt100 = "0.18.1"
 
 # The binary does not inherit workspace lints yet, so missing_docs applies to the library crates only.
 [lints]

@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- End-to-end terminal QA covers image loading, zoom, mouse input, resize cleanup,
+  and terminal mode restoration through a pseudo terminal
+
 - Local CPU benchmarks and a profiling build profile, with CodSpeed simulation in CI
 - `--mass-svg PATH` exports a self-contained mass-study analysis sheet with embedded preview, vector tone layers, fitted ellipses and settings
 
