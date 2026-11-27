@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A CPU benchmark for full-frame `ElidingBackend` output
 - Terminal session that enters raw mode and the alternate screen, restores them
   on exit and on panic, and never lets buffered output land after a panic
   restore

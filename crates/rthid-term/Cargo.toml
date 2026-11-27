@@ -10,5 +10,12 @@ publish = false
 #       keep the writer outside `CrosstermBackend`.
 ratatui = { workspace = true, features = ["unstable-backend-writer"] }
 
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "cpu"
+harness = false
+
 [lints]
 workspace = true

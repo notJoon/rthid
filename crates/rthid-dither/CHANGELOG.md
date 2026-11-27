@@ -36,6 +36,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- CPU benchmarks for every dither algorithm and the mass-study pipeline
 - Public rounded-path commands and accepted accent ellipse geometry for mass-study renderers
 - `MassStudy::rounded_rings` and `mass::RoundedRing` simplify and round traced mass-study rings
 - `MassStudy::rings`, `mass::Ring` and `mass::rasterize` trace mass-study tiers and

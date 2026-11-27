@@ -7,6 +7,7 @@ edition = "2024"
 members = ["crates/rthid-render", "crates/rthid-dither", "crates/rthid-io", "crates/rthid-term", "crates/rthid-widgets"]
 
 [workspace.dependencies]
+divan = { package = "codspeed-divan-compat", version = "6.1.0" }
 image = "0.25.10"
 tempfile = "3.27.0"
 libc = "0.2.191"
@@ -35,6 +36,11 @@ opt-level = 1
 # Optimize dependencies in dev builds so image decoding stays fast
 [profile.dev.package."*"]
 opt-level = 3
+
+# Keep symbols for samply and Instruments without disabling release optimizations.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
 
 [dev-dependencies]
 tempfile.workspace = true

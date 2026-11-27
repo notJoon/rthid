@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A CPU benchmark for PNG encoding
 - Self-contained deterministic SVG mass-study analysis sheets with embedded PNG previews
 - Optional DPI records PNG resolution metadata in pixels per metre on both axes
 - `check_output_size` exposes output validation before job submission
