@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::cells::Layer;
+
 use crate::settings::{
     MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
 };
@@ -76,7 +78,7 @@ pub struct Ctx<'a> {
     /// Current preview settings.
     pub settings: &'a Settings,
     /// Preview selection to restore when editing is cancelled.
-    pub show_original: bool,
+    pub layer: Layer,
 }
 
 /// A modal transition and its optional application change.
@@ -136,7 +138,7 @@ pub enum Effect {
         /// Captured processing settings.
         settings: Settings,
         /// Captured preview selection.
-        show_original: bool,
+        layer: Layer,
     },
     /// Persist and select the draft using the captured base settings.
     SavePreset {
@@ -284,7 +286,7 @@ pub struct Editor {
     /// Uncommitted name or hex text.
     pub input: Option<TextInput>,
     original: Settings,
-    show_original: bool,
+    layer: Layer,
 }
 
 impl Editor {
@@ -297,7 +299,7 @@ impl Editor {
             rows,
             input: None,
             original: ctx.settings.clone(),
-            show_original: ctx.show_original,
+            layer: ctx.layer,
         }
     }
 
@@ -363,7 +365,7 @@ impl Editor {
                     Next::Close,
                     Effect::Restore {
                         settings: self.original.clone(),
-                        show_original: self.show_original,
+                        layer: self.layer,
                     },
                 );
             }
@@ -1137,7 +1139,7 @@ mod tests {
             palettes,
             templates,
             settings,
-            show_original: true,
+            layer: Layer::Original,
         }
     }
 
@@ -1251,7 +1253,7 @@ mod tests {
         let step = press(&mut modal, KeyCode::Esc, &palettes, &templates, &original);
         assert!(matches!(step.next, Next::Close));
         assert!(
-            matches!(step.effect, Some(Effect::Restore { settings, show_original: true }) if settings == original)
+            matches!(step.effect, Some(Effect::Restore { settings, layer: Layer::Original }) if settings == original)
         );
     }
 

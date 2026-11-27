@@ -15,10 +15,11 @@ use ratatui::{
 };
 use rthid_dither::dither::PaletteColor;
 
-/// Grid version, visible region, zoom and target size for averaged RGB cells.
+/// Layer, build version, visible region, zoom and target size for averaged RGB cells.
 #[derive(PartialEq)]
 pub struct OverviewKey {
     grid: u64,
+    layer: Layer,
     cols: u16,
     rows: u16,
     origin: (u32, u32),
@@ -40,7 +41,30 @@ pub struct OverviewCaches {
     pub inset: OverviewCache,
 }
 
-/// Borrowed pixels of the Original or Dithered layer.
+/// Which pixels the preview shows.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
+    /// Composed card pixels.
+    #[default]
+    Original,
+    /// Palette colors from dithering.
+    Dithered,
+    /// Four tones from the source mass study.
+    Mass,
+}
+
+impl Layer {
+    /// Label used in preview status text.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Dithered => "Dithered",
+            Self::Mass => "Mass",
+        }
+    }
+}
+
+/// Borrowed pixels of the selected preview layer.
 #[derive(Clone, Copy)]
 pub enum Pixels<'a> {
     /// Dithered layer as palette indices and their colors.
@@ -50,17 +74,22 @@ pub enum Pixels<'a> {
         /// Colors referenced by the indices.
         palette: &'a [PaletteColor],
     },
-    /// Original layer as the composed card grid and its build version.
-    /// The version keys the RGB overview caches.
-    // TODO: Name the fields { image, version }.
-    Rgb(&'a RgbaImage, u64),
+    /// Original or Mass pixels with their overview cache identity.
+    Rgb {
+        /// Colors at grid dimensions.
+        image: &'a RgbaImage,
+        /// Build count of the source cache.
+        version: u64,
+        /// Distinguishes caches with equal build counts.
+        layer: Layer,
+    },
 }
 
 impl Pixels<'_> {
     fn rgb(self, i: usize) -> [u8; 3] {
         match self {
             Self::Indexed { indices, palette } => palette[usize::from(indices[i])].rgb,
-            Self::Rgb(pixels, _) => pixels.as_raw()[i * 4..i * 4 + 3].try_into().unwrap(),
+            Self::Rgb { image, .. } => image.as_raw()[i * 4..i * 4 + 3].try_into().unwrap(),
         }
     }
 }
@@ -248,8 +277,12 @@ fn render_overview(
     cache: &mut OverviewCache,
 ) -> bool {
     match pixels {
-        Pixels::Rgb(pixels, version) => {
-            render_overview_rgb(pixels, version, geometry, buffer, cache);
+        Pixels::Rgb {
+            image,
+            version,
+            layer,
+        } => {
+            render_overview_rgb(image, version, layer, geometry, buffer, cache);
             false
         }
         Pixels::Indexed { indices, palette } => {
@@ -258,11 +291,12 @@ fn render_overview(
     }
 }
 
-/// Draws averaged half blocks for Original, see the Original column on [`Zoom`].
-/// Colors rebuild only when the grid version, visible region, zoom or target size changes.
+/// Draws averaged half blocks for RGB layers, see the Original column on [`Zoom`].
+/// Colors rebuild when the layer, build version or preview geometry changes.
 fn render_overview_rgb(
     pixels: &RgbaImage,
     version: u64,
+    layer: Layer,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
@@ -271,6 +305,7 @@ fn render_overview_rgb(
     let colors = cache.get_or_build(
         OverviewKey {
             grid: version,
+            layer,
             cols: target.width,
             rows: target.height,
             origin: geometry.origin,
@@ -697,7 +732,11 @@ mod tests {
         let mut cache = OverviewCaches::default();
         for (version, expected) in [(1, 1), (1, 1), (2, 2)] {
             render(
-                Pixels::Rgb(&pixels, version),
+                Pixels::Rgb {
+                    image: &pixels,
+                    version,
+                    layer: Layer::Original,
+                },
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
                 &mut buffer,
@@ -707,7 +746,11 @@ mod tests {
         }
         let area = Rect::new(0, 0, 2, 2);
         render(
-            Pixels::Rgb(&pixels, 2),
+            Pixels::Rgb {
+                image: &pixels,
+                version: 2,
+                layer: Layer::Original,
+            },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
@@ -717,7 +760,11 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let updated = rgb(1, 2, &[[0; 3], [255; 3]]);
         render(
-            Pixels::Rgb(&updated, 3),
+            Pixels::Rgb {
+                image: &updated,
+                version: 3,
+                layer: Layer::Original,
+            },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
@@ -728,6 +775,43 @@ mod tests {
             cache.full.get().unwrap(),
             &[Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]
         );
+    }
+
+    #[test]
+    fn rgb_overview_distinguishes_layers_with_equal_versions() {
+        let original = rgb(8, 8, &[[0; 3]; 64]);
+        let mass = rgb(8, 8, &[[255; 3]; 64]);
+        let area = Rect::new(0, 0, 2, 2);
+        let geometry = geometry(&Viewport::default(), (8, 8), area);
+        let mut caches = OverviewCaches::default();
+        let mut buffer = Buffer::empty(area);
+        for cache in [&mut caches.full, &mut caches.inset] {
+            render_overview(
+                Pixels::Rgb {
+                    image: &original,
+                    version: 1,
+                    layer: Layer::Original,
+                },
+                Glyphs::default(),
+                &geometry,
+                &mut buffer,
+                cache,
+            );
+            let before = buffer.clone();
+            render_overview(
+                Pixels::Rgb {
+                    image: &mass,
+                    version: 1,
+                    layer: Layer::Mass,
+                },
+                Glyphs::default(),
+                &geometry,
+                &mut buffer,
+                cache,
+            );
+            assert_ne!(buffer, before);
+            assert_eq!(cache.version(), 2);
+        }
     }
 
     #[test]
@@ -759,7 +843,14 @@ mod tests {
             let before = geometry(&viewport, (16, 16), area);
             viewport.pan(i64::MAX, i64::MAX, &before);
             let after = geometry(&viewport, (16, 16), area);
-            for source in [indexed(&indices, &palette), Pixels::Rgb(&pixels, 1)] {
+            for source in [
+                indexed(&indices, &palette),
+                Pixels::Rgb {
+                    image: &pixels,
+                    version: 1,
+                    layer: Layer::Original,
+                },
+            ] {
                 render_with_new_caches(source, Glyphs::default(), &before, &mut buffer);
                 assert_eq!(buffer[partial].bg, Color::Rgb(255, 0, 0));
                 render_with_new_caches(source, Glyphs::default(), &after, &mut buffer);
@@ -776,7 +867,11 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
         assert!(!render_with_new_caches(
-            Pixels::Rgb(&pixels, 1),
+            Pixels::Rgb {
+                image: &pixels,
+                version: 1,
+                layer: Layer::Original
+            },
             Glyphs::default(),
             &crate::viewport::geometry(
                 &Viewport {
@@ -802,7 +897,11 @@ mod tests {
             let area = Rect::new(2, 3, width, 3);
             let mut buffer = Buffer::empty(area);
             assert!(!render_with_new_caches(
-                Pixels::Rgb(&rgb(4, 4, &pixels), 1),
+                Pixels::Rgb {
+                    image: &rgb(4, 4, &pixels),
+                    version: 1,
+                    layer: Layer::Original
+                },
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
                 &mut buffer,
@@ -830,7 +929,11 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
         assert!(!render_with_new_caches(
-            Pixels::Rgb(&rgb(1, 4, &pixels), 1),
+            Pixels::Rgb {
+                image: &rgb(1, 4, &pixels),
+                version: 1,
+                layer: Layer::Original
+            },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
             &mut buffer,
@@ -846,7 +949,11 @@ mod tests {
         let area = Rect::new(0, 0, 3, 3);
         let mut buffer = Buffer::empty(area);
         assert!(!render_with_new_caches(
-            Pixels::Rgb(&rgb(1, 2, &pixels), 1),
+            Pixels::Rgb {
+                image: &rgb(1, 2, &pixels),
+                version: 1,
+                layer: Layer::Original
+            },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut buffer,
@@ -924,7 +1031,11 @@ mod tests {
                     ..Viewport::default()
                 };
                 render(
-                    Pixels::Rgb(&pixels, version),
+                    Pixels::Rgb {
+                        image: &pixels,
+                        version,
+                        layer: Layer::Original,
+                    },
                     Glyphs::default(),
                     &geometry(&viewport, pixels.dimensions(), area),
                     &mut Buffer::empty(area),
@@ -947,7 +1058,14 @@ mod tests {
                 ..Viewport::default()
             };
             let g = geometry(&viewport, (1, 2), area);
-            for source in [indexed(&[0, 1], &palette), Pixels::Rgb(&pixels, 1)] {
+            for source in [
+                indexed(&[0, 1], &palette),
+                Pixels::Rgb {
+                    image: &pixels,
+                    version: 1,
+                    layer: Layer::Original,
+                },
+            ] {
                 let mut buffer = Buffer::empty(area);
                 render_with_new_caches(source, Glyphs::Quadrant, &g, &mut buffer);
                 for pos in g.target.positions() {
@@ -978,7 +1096,14 @@ mod tests {
             .pixels()
             .map(|p| palette.iter().position(|c| c.rgb == p.0[..3]).unwrap() as u8)
             .collect();
-        for pixels in [Pixels::Rgb(&pixels, 1), indexed(&indices, &palette)] {
+        for pixels in [
+            Pixels::Rgb {
+                image: &pixels,
+                version: 1,
+                layer: Layer::Original,
+            },
+            indexed(&indices, &palette),
+        ] {
             let mut buffer = Buffer::empty(area);
             assert!(!render_with_new_caches(
                 pixels,
@@ -1020,7 +1145,14 @@ mod tests {
             viewport.y = 5;
             let g = geometry(&viewport, (12, 20), area);
             assert_eq!(g.visible, (4, 9));
-            for pixels in [Pixels::Rgb(&pixels, 1), indexed(&indices, &palette)] {
+            for pixels in [
+                Pixels::Rgb {
+                    image: &pixels,
+                    version: 1,
+                    layer: Layer::Original,
+                },
+                indexed(&indices, &palette),
+            ] {
                 let mut buffer = Buffer::empty(area);
                 assert!(!render(
                     pixels,

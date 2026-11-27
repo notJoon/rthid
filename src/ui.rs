@@ -5,7 +5,8 @@
 //! graphics while the panel retains its own scroll offset.
 
 use crate::{
-    cells, graphics,
+    cells::{self, Layer},
+    graphics,
     modal::{Modal, preset_rows, template_rows},
     viewport,
 };
@@ -24,6 +25,7 @@ const MODAL_HINTS: &[(&str, &str)] = &[("o", "open"), ("P", "presets"), ("T", "t
 const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("Tab", "focus"),
     ("Space", "original/dithered"),
+    ("a", "mass study"),
     ("+/-", "zoom"),
     ("0", "fit"),
     ("hjkl/arrows", "pan"),
@@ -40,6 +42,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
 const PANEL_HINTS: &[(&str, &str)] = &[
     ("Tab", "focus"),
     ("Space", "original/dithered"),
+    ("a", "mass study"),
     ("+/-", "zoom"),
     ("0", "fit"),
     ("m", "map"),
@@ -464,7 +467,7 @@ fn draw_preview(
     };
     let image_mode = app.modal.is_none()
         && renderer.graphics.is_some()
-        && app.show_original
+        && app.layer == Layer::Original
         && geometry.zoom == viewport::Zoom::Fit
         && !geometry.area.is_empty();
     let approximate = if image_mode {
@@ -477,7 +480,7 @@ fn draw_preview(
             frame.buffer_mut(),
             &mut renderer.overviews,
         );
-        if app.dragging() && matches!(pixels, cells::Pixels::Rgb(..)) {
+        if app.dragging() && matches!(pixels, cells::Pixels::Rgb { .. }) {
             for pos in geometry.target.positions() {
                 if geometry.minimap.is_some_and(|map| map.frame.contains(pos)) {
                     continue;
@@ -554,10 +557,8 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     let displayed = if let Some(name) = report.graphics_name {
         format!("Original ({name})")
-    } else if app.show_original {
-        "Original".into()
     } else {
-        "Dithered".into()
+        app.layer.name().into()
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
@@ -645,7 +646,11 @@ mod tests {
         ] {
             for original in [true, false] {
                 app.viewport.zoom = viewport::Zoom::In(1);
-                app.show_original = original;
+                app.layer = if original {
+                    Layer::Original
+                } else {
+                    Layer::Dithered
+                };
                 app.sync(area);
                 let g = app.geometry(area);
                 for (kind, column) in [
@@ -1131,7 +1136,7 @@ mod tests {
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         app.settings.card = BUSINESS_CARD;
         app.sync(Rect::new(0, 0, 180, 30));
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
@@ -1225,11 +1230,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
         );
     }
 
@@ -1270,7 +1275,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(8, 12), None);
         app.settings = crate::settings::Settings::for_pixels(8, 12);
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
@@ -1284,6 +1289,10 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!(text.contains("100% x 1-8 y 1-12"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
+        app.layer = Layer::Mass;
+        app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(text.contains("Mass | 100%"));
     }
     #[test]
     fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
@@ -1316,7 +1325,11 @@ mod tests {
                         crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
                     })
                     .unwrap();
-                app.show_original = exact;
+                app.layer = if exact {
+                    Layer::Original
+                } else {
+                    Layer::Dithered
+                };
                 app.viewport.zoom = if exact {
                     viewport::Zoom::In(1)
                 } else {
@@ -1373,8 +1386,8 @@ mod tests {
             let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
             let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
             let mut app = App::builtin(RgbaImage::new(400, 400), None);
-            for original in [true, false] {
-                app.show_original = original;
+            for layer in [Layer::Original, Layer::Dithered, Layer::Mass] {
+                app.layer = layer;
                 app.sync(layout(terminal.size().unwrap()).preview);
                 for zoom in [
                     viewport::Zoom::Fit,
@@ -1393,9 +1406,9 @@ mod tests {
                             let report = draw_preview(frame, &app, &g, &mut renderer);
                             assert_eq!(
                                 report.graphics_name.is_some(),
-                                original && zoom == viewport::Zoom::Fit
+                                layer == Layer::Original && zoom == viewport::Zoom::Fit
                             );
-                            if !original {
+                            if layer != Layer::Original {
                                 assert!(report.graphics_name.is_none());
                             }
                         })
