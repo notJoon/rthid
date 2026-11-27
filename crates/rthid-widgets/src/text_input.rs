@@ -9,7 +9,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::{Outcome, outcome::is_release};
+use crate::{Hint, Outcome, outcome::is_release};
 
 /// Single line text field with a cursor and a length limit.
 ///
@@ -37,6 +37,22 @@ pub struct TextInput {
 }
 
 impl TextInput {
+    /// Enter submits the current text.
+    ///
+    /// ```
+    /// use rthid_widgets::{TextInput, hint_line};
+    ///
+    /// let line = hint_line(&[TextInput::SUBMIT, TextInput::CANCEL], None, 80);
+    /// assert_eq!(line.to_string(), "Enter: submit | Esc: cancel");
+    /// ```
+    pub const SUBMIT: Hint = Hint::new("Enter", "submit");
+
+    /// Esc cancels editing.
+    pub const CANCEL: Hint = Hint::new("Esc", "cancel");
+
+    /// Left, Right, Home and End move the cursor.
+    pub const CURSOR: Hint = Hint::new("Left/Right/Home/End", "cursor");
+
     /// Creates a field holding at most `max` printable characters of `text`,
     /// with the cursor after the last character. Control characters are removed
     /// before applying the limit, as with [`Self::insert_str`].

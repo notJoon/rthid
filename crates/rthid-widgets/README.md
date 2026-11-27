@@ -69,6 +69,8 @@ open. Validate values on `Submit` before closing the component. An invalid value
 | `ListPicker` | Cursor over a list the caller owns, with scroll kept across frames |
 | `Confirm` | A yes or no question answered by y or any other key |
 | `Dialog` | Centered popup area with a cleared background and a border |
+| `Hint` | One key and what it does now |
+| `hint_line` | Fits an ordered prefix of key hints into a display width |
 | `key_hints` | Formats `key: action` help text |
 
 ## List selection
@@ -100,5 +102,9 @@ padding column on each side.
 
 `TextInput` filters control characters from initial and pasted text. `Confirm`
 approves only an unmodified lowercase `y`; other pressed keys cancel.
+
+Widgets expose `Hint` constants for the keys they handle. Prefer `hint_line` for
+help lines that must fit a width. `key_hints` joins grouped key and action pairs
+without a width limit.
 
 See the crate docs (`cargo doc -p rthid-widgets --open`) for the API and examples.
