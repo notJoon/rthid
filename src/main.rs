@@ -4,7 +4,7 @@
 //! the grid and, when Dithered or a companion PNG needs it, dithers the grid
 //! into palette indices. `app::App` holds `settings::Settings` and the
 //! `viewport::Viewport`. `ui::draw` turns them into a frame through `cells` (cell glyphs) or `graphics`
-//! (terminal images), and `Export` writes the dithered grid to the companion PNG.
+//! (terminal images), and the exporters write companion PNG and SVG files.
 //!
 //! Glossary:
 //! - Grid: the composed card image. Its pixels are also called dots.
@@ -19,12 +19,13 @@
 //! - Approximate: some sampled cell used more than two palette colors, so
 //!   the extra samples took the nearer kept color.
 //! - Companion PNG: the optional `--preview-png` file, rewritten after each new dither.
+//! - Mass SVG: the optional `--mass-svg` analysis sheet, rewritten after each mass build.
 
 /// Interactive state and input handling.
 mod app;
 /// Cell rendering for Fit, zoom levels and the minimap.
 mod cells;
-/// Companion PNG writer and its status.
+/// Companion PNG and mass-study SVG writers and their status.
 mod export;
 /// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for Original at Fit.
 mod graphics;
@@ -72,6 +73,9 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
+    /// Save the mass study analysis sheet to an SVG file.
+    #[arg(long, value_name = "PATH")]
+    mass_svg: Option<PathBuf>,
     /// Size the PNG at N DPI (1 to 4800), requiring --preview-png.
     #[arg(long, value_name = "N", requires = "preview_png", value_parser = clap::value_parser!(u32).range(1..=4800))]
     dpi: Option<u32>,
@@ -145,10 +149,23 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::path::absolute(a), std::path::absolute(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 fn run() -> io::Result<()> {
     let Args {
         image: path,
         preview_png,
+        mass_svg,
         dpi,
         config,
         glyphs,
@@ -165,12 +182,22 @@ fn run() -> io::Result<()> {
         CliGraphics::Off => Graphics::Off,
     };
     if let Some(path) = &path {
-        check_not_source(path, preview_png.as_deref()).map_err(|cause| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("--preview-png: {cause}"),
-            )
+        let protected: Vec<&Path> = preview_png
+            .iter()
+            .chain(&mass_svg)
+            .map(PathBuf::as_path)
+            .collect();
+        check_not_source(path, &protected).map_err(|cause| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("export path: {cause}"))
         })?;
+    }
+    if let (Some(png), Some(svg)) = (&preview_png, &mass_svg)
+        && same_path(png, svg)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--preview-png and --mass-svg must use different paths",
+        ));
     }
     let mut debug_log = std::env::var_os("RTHID_DEBUG_LOG")
         .map(|path| {
@@ -199,7 +226,7 @@ fn run() -> io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut app = App::new(source, preview_png.clone(), dpi, loaded);
+    let mut app = App::new(source, preview_png.clone(), mass_svg.clone(), dpi, loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     app.mass_tones = match mass_tones {
@@ -431,6 +458,7 @@ mod tests {
         let args = Args::try_parse_from(["rthid"]).unwrap();
         assert_eq!(args.image, None);
         assert_eq!(args.preview_png, None);
+        assert_eq!(args.mass_svg, None);
         assert_eq!(args.dpi, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
@@ -460,6 +488,8 @@ mod tests {
             "--mass-invert",
             "--preview-png",
             "dots.png",
+            "--mass-svg",
+            "mass.svg",
             "--config",
             "presets.toml",
         ])
@@ -467,6 +497,7 @@ mod tests {
         assert_eq!(args.image, Some(PathBuf::from("photo.png")));
         assert_eq!(args.config, Some(PathBuf::from("presets.toml")));
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
+        assert_eq!(args.mass_svg, Some(PathBuf::from("mass.svg")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
         assert_eq!(args.mass_tones, CliMassTones::Warm);
@@ -476,6 +507,7 @@ mod tests {
             ["--glyphs", "unknown"],
             ["--mass-tones", "unknown"],
             ["--preview-png", ""],
+            ["--mass-svg", ""],
             ["--config", ""],
             ["a", "b"],
         ] {
@@ -502,6 +534,17 @@ mod tests {
                 Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi]).is_err()
             );
         }
+    }
+
+    #[test]
+    fn export_paths_reject_equal_and_existing_aliases() {
+        assert!(same_path(Path::new("out.svg"), Path::new("out.svg")));
+        assert!(same_path(Path::new("out.dat"), Path::new("./out.dat")));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.svg");
+        std::fs::write(&path, []).unwrap();
+        assert!(same_path(&path, &dir.path().join(".").join("out.svg")));
+        assert!(!same_path(&path, &dir.path().join("preview.png")));
     }
 
     #[test]

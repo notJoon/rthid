@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `--mass-svg PATH` exports a self-contained mass-study analysis sheet with embedded preview, vector tone layers, fitted ellipses and settings
 - `--dpi 1..4800` sizes companion PNGs from the card including bleed and records
   resolution metadata. It requires `--preview-png`. The status shows PNG dimensions
   and DPI. Oversized outputs are rejected before submission. Omitting DPI preserves
