@@ -155,10 +155,18 @@ fn same_path(a: &Path, b: &Path) -> bool {
             (std::path::absolute(a), std::path::absolute(b)),
             (Ok(a), Ok(b)) if a == b
         )
-        || matches!(
-            (a.canonicalize(), b.canonicalize()),
-            (Ok(a), Ok(b)) if a == b
-        )
+        || matches!((resolve(a), resolve(b)), (Some(a), Some(b)) if a == b)
+}
+
+// Canonical path, or canonical parent plus file name when the file does not exist yet.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().or_else(|| {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Some(parent.canonicalize().ok()?.join(path.file_name()?))
+    })
 }
 
 fn run() -> io::Result<()> {
@@ -545,6 +553,10 @@ mod tests {
         std::fs::write(&path, []).unwrap();
         assert!(same_path(&path, &dir.path().join(".").join("out.svg")));
         assert!(!same_path(&path, &dir.path().join("preview.png")));
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let missing = dir.path().join("missing.dat");
+        assert!(same_path(&missing, &dir.path().join("sub/../missing.dat")));
+        assert!(!same_path(&missing, &dir.path().join("sub/missing.dat")));
     }
 
     #[test]

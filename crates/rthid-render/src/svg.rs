@@ -48,12 +48,12 @@ pub fn write_mass_svg(mut writer: impl io::Write, sheet: &MassSheet<'_>) -> io::
     let settings_y = h + gap;
     let total_w = 2.0 * w + gap;
     let labels = [
-        format!("sigma: {}", number(f64::from(sheet.options.sigma))?),
+        format!("sigma: {}", setting(sheet.options.sigma)?),
         format!(
             "thresholds: {} {} {}",
-            number(f64::from(sheet.options.thresholds[0]))?,
-            number(f64::from(sheet.options.thresholds[1]))?,
-            number(f64::from(sheet.options.thresholds[2]))?
+            setting(sheet.options.thresholds[0])?,
+            setting(sheet.options.thresholds[1])?,
+            setting(sheet.options.thresholds[2])?
         ),
         format!(
             "polarity: {}",
@@ -198,6 +198,17 @@ fn number(value: f64) -> io::Result<String> {
     Ok(text)
 }
 
+// Settings keep round-trip precision so distinct thresholds stay distinct.
+fn setting(value: f32) -> io::Result<String> {
+    if !value.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-finite SVG setting",
+        ));
+    }
+    Ok(value.to_string())
+}
+
 fn color(rgb: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
 }
@@ -337,5 +348,8 @@ mod tests {
             number(f64::NAN).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(setting(0.2501).unwrap(), "0.2501");
+        assert_ne!(setting(0.2501).unwrap(), setting(0.2502).unwrap());
+        assert!(setting(f32::INFINITY).is_err());
     }
 }
