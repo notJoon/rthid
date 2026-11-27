@@ -40,3 +40,9 @@ strength = 0.8
 
 Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
 `stucki`, `sierra-lite`, `bayer2`, `bayer4`, `bayer8`, `noise`.
+
+## Benchmarks and profiling
+
+Run the CPU benchmarks with `mise run bench`; CodSpeed also runs them in CI.
+For profiling, install samply with `cargo install samply`, build with
+`cargo build --profile profiling` and run `samply record target/profiling/rthid`.

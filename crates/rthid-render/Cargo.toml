@@ -9,8 +9,13 @@ rthid-dither = { path = "../rthid-dither" }
 png = "0.18"
 
 [dev-dependencies]
+divan.workspace = true
 image.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "cpu"
+harness = false
 
 [lints]
 workspace = true
