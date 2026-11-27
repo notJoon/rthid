@@ -1,6 +1,12 @@
-//! Width-aware key hints.
+//! Width-aware key hints and references.
 
-use ratatui::text::{Line, Span};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
 
 /// One key and what it does now.
 ///
@@ -14,6 +20,81 @@ pub struct Hint {
     pub key: &'static str,
     /// What the key does now.
     pub label: &'static str,
+}
+
+/// Titled groups of hints shown as an aligned key reference.
+///
+/// Empty sections are omitted. Non-empty sections are separated by one blank
+/// line, and every key is aligned to the widest key in the whole reference.
+///
+/// # Examples
+///
+/// ```
+/// use ratatui::{buffer::Buffer, layout::Rect};
+/// use rthid_widgets::{Hint, KeyHelp};
+///
+/// let navigation = [Hint::new("j/k", "move"), Hint::new("Enter", "choose")];
+/// let sections = [("List", navigation.as_slice())];
+/// let help = KeyHelp { sections: &sections };
+/// assert_eq!(help.size(), (13, 3));
+/// let mut buffer = Buffer::empty(Rect::new(0, 0, 13, 3));
+/// help.render(buffer.area, &mut buffer);
+/// assert_eq!(buffer[(0, 1)].symbol(), "j");
+/// ```
+pub struct KeyHelp<'a> {
+    /// Section titles and their key hints, in display order.
+    pub sections: &'a [(&'a str, &'a [Hint])],
+}
+
+impl KeyHelp<'_> {
+    /// Content size in cells (width, height) to pass to [`crate::Dialog::area`].
+    pub fn size(&self) -> (u16, u16) {
+        let lines = self.lines();
+        let width = lines.iter().map(Line::width).max().unwrap_or(0);
+        (
+            width.min(u16::MAX as usize) as u16,
+            lines.len().min(u16::MAX as usize) as u16,
+        )
+    }
+
+    /// Draws titles and `key  label` rows, clipped to `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(self.lines()).render(area, buf);
+    }
+
+    fn lines(&self) -> Vec<Line<'_>> {
+        let key_width = self.key_width();
+        let mut lines = Vec::new();
+        for &(title, hints) in self.sections.iter().filter(|(_, hints)| !hints.is_empty()) {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(hints.iter().map(|hint| {
+                let width = Line::raw(hint.key).width();
+                Line::raw(format!(
+                    "{}{:<padding$}{}",
+                    hint.key,
+                    "",
+                    hint.label,
+                    padding = key_width - width + 2
+                ))
+            }));
+        }
+        lines
+    }
+
+    fn key_width(&self) -> usize {
+        self.sections
+            .iter()
+            .flat_map(|(_, hints)| hints.iter())
+            .map(|hint| Line::raw(hint.key).width())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl Hint {
@@ -164,5 +245,44 @@ mod tests {
         let first = hint_line(HINTS, Some(Hint::new("?", "more")), 30);
         let second = hint_line(HINTS, Some(Hint::new("?", "more")), 30);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn key_help_size_matches_aligned_wide_rendering() {
+        let first = [Hint::new("한", "열기"), Hint::new("x", "close")];
+        let second = [Hint::new("Enter", "choose")];
+        let sections = [("한국어", first.as_slice()), ("Other", second.as_slice())];
+        let help = KeyHelp {
+            sections: &sections,
+        };
+        assert_eq!(help.size(), (13, 6));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 13, 6));
+        help.render(buf.area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "한");
+        assert_eq!(buf[(0, 1)].symbol(), "한");
+        assert_eq!(buf[(7, 1)].symbol(), "열");
+        assert_eq!(buf[(7, 2)].symbol(), "c");
+        assert_eq!(buf[(12, 5)].symbol(), "e");
+    }
+
+    #[test]
+    fn key_help_omits_empty_sections_and_clips_tiny_areas() {
+        let hints = [Hint::new("Enter", "choose")];
+        let sections = [("Empty", &[][..]), ("List", hints.as_slice())];
+        let help = KeyHelp {
+            sections: &sections,
+        };
+        assert_eq!(help.size(), (13, 2));
+        let mut empty = Buffer::empty(Rect::default());
+        help.render(Rect::default(), &mut empty);
+        let mut tiny = Buffer::empty(Rect::new(0, 0, 2, 1));
+        help.render(tiny.area, &mut tiny);
+        assert_eq!(
+            tiny.content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>(),
+            "Li"
+        );
     }
 }

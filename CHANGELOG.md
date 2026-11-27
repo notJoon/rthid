@@ -5,6 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `?` opens a full keyboard and mouse reference outside dialogs
+
 ### Changed
 
 - The help line shows only currently usable keys, fits the terminal width, and

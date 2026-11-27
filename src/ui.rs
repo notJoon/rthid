@@ -11,13 +11,80 @@ use crate::{
     viewport,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout as Split, Rect};
+use ratatui::layout::{Constraint, Layout as Split, Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
-use rthid_widgets::{Dialog, Hint, ListPicker, TextInput, hint_line};
+use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, TextInput, hint_line};
 
 use crate::{app::App, settings::Setting};
+
+const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
+    (
+        "Parameters",
+        &[
+            ListPicker::MOVE,
+            Hint::new("Left/Right h/l", "change"),
+            Hint::new("Enter", "new seed"),
+            Hint::new("d", "reset"),
+        ],
+    ),
+    (
+        "Preview",
+        &[
+            Hint::new("hjkl/arrows", "pan"),
+            Hint::new("HJKL", "page"),
+            Hint::new("+/=/-", "zoom"),
+            Hint::new("0", "fit"),
+            Hint::new("m", "map"),
+            Hint::new("M", "mass map"),
+        ],
+    ),
+    (
+        "Image",
+        &[
+            Hint::new("Space", "original/dithered"),
+            Hint::new("a", "mass study"),
+            Hint::new("r/R", "rotate"),
+            Hint::new("f", "flip"),
+        ],
+    ),
+];
+
+const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
+    (
+        "Files",
+        &[
+            Hint::new("o", "open"),
+            Hint::new("P", "presets"),
+            Hint::new("T", "templates"),
+        ],
+    ),
+    (
+        "General",
+        &[
+            Hint::new("Tab/Esc", "focus"),
+            Hint::new("?", "keys"),
+            Hint::new("q/Ctrl+C", "quit"),
+        ],
+    ),
+    (
+        "Mouse: preview",
+        &[
+            Hint::new("minimap click/drag", "center view"),
+            Hint::new("drag on preview", "move image"),
+            Hint::new("wheel", "pan"),
+        ],
+    ),
+    (
+        "Mouse: dialogs",
+        &[
+            ListPicker::CLICK,
+            ListPicker::CLICK_AGAIN,
+            ListPicker::WHEEL,
+        ],
+    ),
+];
 
 fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
     let can_zoom_in =
@@ -34,6 +101,9 @@ fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
 }
 
 fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
+    if app.keys_open {
+        return vec![Hint::new("Esc/?", "close")];
+    }
     if let Some(modal) = &app.modal {
         return modal.hints(&app.modal_ctx());
     }
@@ -102,6 +172,10 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+fn more_hint(app: &App) -> Option<Hint> {
+    (app.modal.is_none() && !app.keys_open).then_some(Hint::new("?", "keys"))
 }
 
 /// Terminal regions shared by input handling and rendering.
@@ -250,15 +324,64 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         frame.buffer_mut(),
     );
     frame.render_widget(
-        Paragraph::new(hint_line(&hints(app, &geometry), None, layout.help.width)),
+        Paragraph::new(hint_line(
+            &hints(app, &geometry),
+            more_hint(app),
+            layout.help.width,
+        )),
         layout.help,
     );
     frame.render_widget(
         Paragraph::new(status(app, &geometry, report)),
         layout.status,
     );
-    if app.modal.is_some() {
+    if app.keys_open {
+        draw_key_help(frame, layout);
+    } else if app.modal.is_some() {
         draw_modal(frame, app, layout);
+    }
+}
+
+fn draw_key_help(frame: &mut Frame, layout: &Layout) {
+    let left = KeyHelp {
+        sections: KEY_HELP_LEFT,
+    };
+    let right = KeyHelp {
+        sections: KEY_HELP_RIGHT,
+    };
+    let left_size = left.size();
+    let right_size = right.size();
+    let gap = 3;
+    let dialog = Dialog {
+        title: "Keys",
+        min_width: 28,
+    };
+    let body = Rect {
+        height: layout.help.y.saturating_sub(layout.screen.y),
+        ..layout.screen
+    };
+    let area = dialog.area(
+        layout.preview,
+        body,
+        (
+            left_size.0.saturating_add(gap).saturating_add(right_size.0),
+            left_size.1.max(right_size.1),
+        ),
+    );
+    let inner = dialog.render(area, frame.buffer_mut());
+    let content = inner.inner(Margin::new(1, 0));
+    left.render(content, frame.buffer_mut());
+    let right_offset = left_size.0.saturating_add(gap);
+    // ponytail: below 71 columns the right column clips; add a one-column reflow if needed.
+    if content.width > right_offset {
+        right.render(
+            Rect {
+                x: content.x + right_offset,
+                width: content.width - right_offset,
+                ..content
+            },
+            frame.buffer_mut(),
+        );
     }
 }
 
@@ -477,6 +600,7 @@ fn draw_preview(
         return PreviewReport::default();
     };
     let image_mode = app.modal.is_none()
+        && !app.keys_open
         && renderer.graphics.is_some()
         && app.layer == Layer::Original
         && geometry.zoom == viewport::Zoom::Fit
@@ -660,6 +784,8 @@ mod tests {
         SmallFitPreview,
         OverflowPreview,
         Seed,
+        SeedPreview,
+        Keys,
         OpenFile,
         Presets,
         PresetsConfirm,
@@ -705,11 +831,13 @@ mod tests {
                 app.preview_focus = true;
                 app.viewport.zoom = viewport::Zoom::In(1);
             }
-            HintState::Seed => {
+            HintState::Seed | HintState::SeedPreview => {
                 app.panel.select(row(Setting::Seed));
                 app.settings.dither = Dither::Noise;
                 app.settings.seed = 7;
+                app.preview_focus = matches!(state, HintState::SeedPreview);
             }
+            HintState::Keys => app.keys_open = true,
             HintState::OpenFile => {
                 app.modal = Some(Modal::open_file("/images".into(), 1));
                 app.set_listing(
@@ -796,27 +924,94 @@ mod tests {
         app
     }
 
-    fn named_keys(text: &str) -> Vec<KeyCode> {
+    fn named_keys(text: &str) -> Vec<ratatui::crossterm::event::KeyEvent> {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         if text == "any other key" {
-            return vec![KeyCode::Esc];
+            return vec![key(KeyCode::Esc)];
         }
         text.split_whitespace()
             .flat_map(|group| group.split('/'))
             .flat_map(|token| match token {
-                "Enter" => vec![KeyCode::Enter],
-                "Esc" => vec![KeyCode::Esc],
-                "Tab" => vec![KeyCode::Tab],
-                "Space" => vec![KeyCode::Char(' ')],
-                "Up" => vec![KeyCode::Up],
-                "Down" => vec![KeyCode::Down],
-                "Left" => vec![KeyCode::Left],
-                "Right" => vec![KeyCode::Right],
-                "Home" => vec![KeyCode::Home],
-                "End" => vec![KeyCode::End],
-                "arrows" => vec![KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right],
-                token => token.chars().map(KeyCode::Char).collect(),
+                "Enter" => vec![key(KeyCode::Enter)],
+                "Esc" => vec![key(KeyCode::Esc)],
+                "Tab" => vec![key(KeyCode::Tab)],
+                "Space" => vec![key(KeyCode::Char(' '))],
+                "Up" => vec![key(KeyCode::Up)],
+                "Down" => vec![key(KeyCode::Down)],
+                "Left" => vec![key(KeyCode::Left)],
+                "Right" => vec![key(KeyCode::Right)],
+                "Home" => vec![key(KeyCode::Home)],
+                "End" => vec![key(KeyCode::End)],
+                "Ctrl+C" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+                "arrows" => [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
+                    .into_iter()
+                    .map(key)
+                    .collect(),
+                token => token.chars().map(|c| key(KeyCode::Char(c))).collect(),
             })
             .collect()
+    }
+
+    const HINT_STATES: &[HintState] = &[
+        HintState::EmptyPanel,
+        HintState::EmptyPreview,
+        HintState::FitPanel,
+        HintState::FitPreview,
+        HintState::SmallFitPreview,
+        HintState::OverflowPreview,
+        HintState::Seed,
+        HintState::SeedPreview,
+        HintState::Keys,
+        HintState::OpenFile,
+        HintState::Presets,
+        HintState::PresetsConfirm,
+        HintState::TemplatesEmpty,
+        HintState::Templates,
+        HintState::TemplatesPrompt,
+        HintState::TemplatesConfirm,
+        HintState::EditorColor,
+        HintState::EditorMode,
+        HintState::EditorInput,
+    ];
+
+    fn state_hints(app: &App, screen: &Layout) -> Vec<Hint> {
+        let mut result = hints(app, &app.geometry(screen.preview));
+        result.extend(more_hint(app));
+        result
+    }
+
+    fn key_changes(state: HintState, key: ratatui::crossterm::event::KeyEvent) -> bool {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut app = hint_fixture(state);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut renderer = Renderer::default();
+        let screen = layout(Rect::new(0, 0, 80, 30));
+        app.sync(screen.preview);
+        if matches!(state, HintState::OverflowPreview) {
+            let geometry = app.geometry(screen.preview);
+            app.viewport.x = (geometry.grid.0 - geometry.visible.0) / 2;
+            app.viewport.y = (geometry.grid.1 - geometry.visible.1) / 2;
+        }
+        if matches!(key.code, KeyCode::Right | KeyCode::End)
+            && let Some(modal) = &mut app.modal
+            && let Some(input) = modal.text_input_mut()
+        {
+            input.handle_key(KeyEvent::new(
+                if key.code == KeyCode::Right {
+                    KeyCode::Left
+                } else {
+                    KeyCode::Home
+                },
+                KeyModifiers::NONE,
+            ));
+        }
+        let before = snapshot(&mut app, &mut terminal, &mut renderer);
+        let geometry = app.geometry(screen.preview);
+        app.handle_key(key, &geometry);
+        before != snapshot(&mut app, &mut terminal, &mut renderer)
     }
 
     fn snapshot(
@@ -834,69 +1029,175 @@ mod tests {
 
     #[test]
     fn every_advertised_key_changes_the_representative_state() {
-        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
-
-        let states = [
-            HintState::EmptyPanel,
-            HintState::EmptyPreview,
-            HintState::FitPanel,
-            HintState::FitPreview,
-            HintState::SmallFitPreview,
-            HintState::OverflowPreview,
-            HintState::Seed,
-            HintState::OpenFile,
-            HintState::Presets,
-            HintState::PresetsConfirm,
-            HintState::TemplatesEmpty,
-            HintState::Templates,
-            HintState::TemplatesPrompt,
-            HintState::TemplatesConfirm,
-            HintState::EditorColor,
-            HintState::EditorMode,
-            HintState::EditorInput,
-        ];
-        for state in states {
+        for &state in HINT_STATES {
             let mut source = hint_fixture(state);
             let screen = layout(Rect::new(0, 0, 80, 30));
             source.sync(screen.preview);
-            let state_hints = hints(&source, &source.geometry(screen.preview));
+            let state_hints = state_hints(&source, &screen);
             for hint in state_hints {
-                for code in named_keys(hint.key) {
+                for key in named_keys(hint.key) {
                     if matches!(state, HintState::EditorMode)
-                        && matches!(code, KeyCode::Down | KeyCode::Char('j'))
+                        && matches!(key.code, KeyCode::Down | KeyCode::Char('j'))
                     {
                         continue;
                     }
-                    let mut app = hint_fixture(state);
-                    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-                    let mut renderer = Renderer::default();
-                    app.sync(screen.preview);
-                    if matches!(state, HintState::OverflowPreview) {
-                        let geometry = app.geometry(screen.preview);
-                        app.viewport.x = (geometry.grid.0 - geometry.visible.0) / 2;
-                        app.viewport.y = (geometry.grid.1 - geometry.visible.1) / 2;
-                    }
-                    if matches!(code, KeyCode::Right | KeyCode::End)
-                        && let Some(modal) = &mut app.modal
-                        && let Some(input) = modal.text_input_mut()
-                    {
-                        input.handle_key(KeyEvent::new(
-                            if code == KeyCode::Right {
-                                KeyCode::Left
-                            } else {
-                                KeyCode::Home
-                            },
-                            KeyModifiers::NONE,
-                        ));
-                    }
-                    let before = snapshot(&mut app, &mut terminal, &mut renderer);
-                    let geometry = app.geometry(screen.preview);
-                    app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &geometry);
-                    let after = snapshot(&mut app, &mut terminal, &mut renderer);
-                    assert!(before != after, "{state:?}: {} ({code:?})", hint.key);
+                    assert!(key_changes(state, key), "{state:?}: {} ({key:?})", hint.key);
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_overlay_key_is_handled_in_a_representative_state() {
+        for sections in [KEY_HELP_LEFT, KEY_HELP_RIGHT] {
+            for &(section, section_hints) in sections {
+                if section.starts_with("Mouse:") {
+                    continue;
+                }
+                for hint in section_hints {
+                    for key in named_keys(hint.key) {
+                        assert!(
+                            HINT_STATES.iter().copied().any(|state| {
+                                hint_fixture(state).modal.is_none() && key_changes(state, key)
+                            }),
+                            "{section}: {} ({key:?})",
+                            hint.key
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changed_keys_are_advertised_outside_dialogs() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let keys = ('!'..='~')
+            .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .chain(named_keys("Space Enter Esc Tab arrows"));
+        for &state in HINT_STATES {
+            let mut app = hint_fixture(state);
+            if app.modal.is_some() {
+                continue;
+            }
+            let screen = layout(Rect::new(0, 0, 80, 30));
+            app.sync(screen.preview);
+            let advertised: Vec<_> = state_hints(&app, &screen)
+                .iter()
+                .flat_map(|hint| named_keys(hint.key))
+                .collect();
+            for key in keys.clone() {
+                let allowed = match key.code {
+                    // Enter also rerolls an active Noise seed while preview has focus.
+                    KeyCode::Enter => {
+                        app.preview_focus && app.settings.can_reseed(app.selected_setting())
+                    }
+                    // = is the unshifted alias for the advertised + zoom binding.
+                    KeyCode::Char('=') => true,
+                    _ => false,
+                };
+                assert!(
+                    !key_changes(state, key) || advertised.contains(&key) || allowed,
+                    "{state:?}: changed without a hint: {key:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_overlay_clips_on_a_tiny_screen_and_captures_input() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut app = hint_fixture(HintState::Keys);
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(36, 6)).unwrap();
+        let before = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(before.contains("Keys"));
+        assert!(before.contains("Esc/?: close"));
+        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &geometry,
+        );
+        assert_eq!(draw_text(&mut terminal, &app, &mut renderer), before);
+        assert!(!app.handle_mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &geometry,
+            Rect::new(0, 0, 36, 6),
+        ));
+        assert!(app.keys_open);
+        app.set_notice("notice".into());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &geometry);
+        assert!(!app.keys_open);
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn key_overlay_fits_every_reference_row_at_80_by_24() {
+        let app = hint_fixture(HintState::Keys);
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let text: Vec<char> = draw_text(&mut terminal, &app, &mut renderer)
+            .chars()
+            .collect();
+        let rows: Vec<String> = text.chunks(80).map(|row| row.iter().collect()).collect();
+        for sections in [KEY_HELP_LEFT, KEY_HELP_RIGHT] {
+            for &(section, hints) in sections {
+                assert!(
+                    rows.iter().any(|row| row.contains(section)),
+                    "missing section: {section}"
+                );
+                for hint in hints {
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.contains(hint.key) && row.contains(hint.label)),
+                        "missing row: {}  {}",
+                        hint.key,
+                        hint.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paste_closes_key_overlay_and_opens_the_dropped_image() {
+        let mut app = hint_fixture(HintState::Keys);
+        app.handle_paste("'/tmp/My Photo.jpg'");
+        assert!(!app.keys_open);
+        assert_eq!(app.notice(), Some("Loading My Photo.jpg"));
+    }
+
+    #[test]
+    fn question_mark_stays_text_inside_a_dialog() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut app = hint_fixture(HintState::OpenFile);
+        let screen = layout(Rect::new(0, 0, 80, 30));
+        let before = app
+            .modal
+            .as_mut()
+            .unwrap()
+            .text_input_mut()
+            .unwrap()
+            .text()
+            .to_owned();
+        let geometry = app.geometry(screen.preview);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &geometry,
+        );
+        assert!(!app.keys_open);
+        assert_eq!(
+            app.modal.as_mut().unwrap().text_input_mut().unwrap().text(),
+            format!("{before}?")
+        );
     }
 
     #[test]
