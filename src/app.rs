@@ -593,23 +593,11 @@ impl App {
         let was_dragging = self.dragging();
         if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
-            let selection = |modal: &Modal| match modal {
-                Modal::OpenFile(picker) => {
-                    (picker.list.selected(picker.entries.len()), picker.typed)
-                }
-                Modal::Presets { list, .. } => (list.selected(self.library.palettes.len()), false),
-                Modal::Templates { list, .. } => {
-                    (list.selected(self.library.templates.len()), false)
-                }
-                Modal::Editor(editor) => {
-                    (editor.rows.selected(editor.draft.colors.len() + 2), false)
-                }
-            };
-            let before = selection(&modal);
             let ctx = self.modal_ctx();
+            let before = modal.selection(&ctx);
             let layout = modal.layout(geometry.area, screen, &ctx);
             let step = modal.handle_mouse(mouse, &layout, ctx);
-            let changed = before != selection(&modal)
+            let changed = before != modal.selection(&self.modal_ctx())
                 || step.effect.is_some()
                 || !matches!(step.next, Next::Stay);
             self.modal = Some(modal);
