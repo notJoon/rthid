@@ -50,6 +50,10 @@ use image::{ImageBuffer, Luma, imageops::FilterType};
 
 use crate::dither::PaletteColor;
 
+mod contour;
+
+pub use contour::{Ring, rasterize};
+
 /// Maximum analysis grid width, and the width every distance parameter is tuned at.
 ///
 /// Wider sources are averaged down to this width. Blur and closing distances scale by the
@@ -881,6 +885,13 @@ fn components(
     result
 }
 
+/// Whether any of `cells` lies on the grid border.
+fn touches_border(cells: &[usize], w: usize, h: usize) -> bool {
+    cells
+        .iter()
+        .any(|&p| p % w == 0 || p % w == w - 1 || p / w == 0 || p / w == h - 1)
+}
+
 /// Simplifies one threshold mask into a few solid regions.
 ///
 /// Closing (dilate, then erode by the same disk) bridges gaps narrower than the disk.
@@ -916,11 +927,7 @@ fn clean_mask(
     // as both a region link and a way out of a hole.
     for hole in components(&out, w, h, false, false) {
         // Background that reaches the border is outside space, not a hole.
-        if hole.len() <= max_hole
-            && !hole
-                .iter()
-                .any(|&p| p % w == 0 || p % w == w - 1 || p / w == 0 || p / w == h - 1)
-        {
+        if hole.len() <= max_hole && !touches_border(&hole, w, h) {
             for p in hole {
                 out[p] = true;
             }
