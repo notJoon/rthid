@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
-- `rasterize` removed. Use `rthid_render::write_png` to produce images.
+- The crate-root `rasterize` was removed. Use `rthid_render::write_png` to produce images.
 
 - Move `serpentine` and `strength` from `Options` into the `Diffusion` payload of
   `Algorithm::Diffusion`. Atkinson stays the default with unchanged output.
@@ -35,6 +35,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `MassStudy::rings`, `mass::Ring` and `mass::rasterize` trace mass-study tiers and
+  rasterize them back to indices
 - Bayer 2, 4 and 8 ordered dithering and seeded noise thresholds
 - Floyd Steinberg, Jarvis Judice Ninke, Stucki and Sierra Lite kernels selected
   through `Algorithm`
