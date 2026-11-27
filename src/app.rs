@@ -54,6 +54,7 @@ enum PreviewKey {
     ToggleOriginal,
     ToggleMass,
     ToggleMinimap,
+    ToggleMinimapMass,
     Zoom(Zoom),
     Pan(i64, i64),
 }
@@ -93,6 +94,8 @@ pub struct App {
     pub panel: ListPicker,
     /// Selected preview layer, initially Original.
     pub layer: Layer,
+    /// Whether the minimap shows the mass study instead of the main layer.
+    pub mass_minimap: bool,
     /// Geometry controls for the mass study.
     pub mass: MassOptions,
     /// Fixed mass study tones, or None to follow the dither palette.
@@ -131,6 +134,7 @@ impl App {
             settings: Settings::default(),
             panel: ListPicker::new(0),
             layer: Layer::Original,
+            mass_minimap: true,
             mass: MassOptions::default(),
             mass_tones: None,
             quit: false,
@@ -205,7 +209,7 @@ impl App {
         self.settings.pan_x = 0;
         self.settings.pan_y = 0;
         self.layer = Layer::Original;
-        self.refresh();
+        self.refresh(false);
     }
 
     /// Supplies directory entries to the open dialog if it is still open.
@@ -435,7 +439,8 @@ impl App {
             )
         };
         let before = versions(&self.grid_cache);
-        self.refresh();
+        let inset_mass = self.mass_minimap && self.geometry(preview).minimap.is_some();
+        self.refresh(inset_mass);
         self.clamp_viewport(preview);
         before != versions(&self.grid_cache)
     }
@@ -454,7 +459,7 @@ impl App {
         self.viewport.clamp(w, h, area);
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, inset_mass: bool) {
         let need_dither = self.layer == Layer::Dithered || self.has_export();
         let tones = self
             .mass_tones
@@ -462,7 +467,7 @@ impl App {
         let changed = self.grid_cache.refresh(
             &self.settings,
             need_dither,
-            self.layer == Layer::Mass,
+            self.layer == Layer::Mass || inset_mass,
             &self.mass,
             &tones,
         );
@@ -533,9 +538,23 @@ impl App {
         })
     }
 
+    /// Minimap pixels after sync, or None without a source.
+    pub fn inset(&self) -> Option<Pixels<'_>> {
+        if self.mass_minimap
+            && let Some(image) = self.grid_cache.mass()
+        {
+            return Some(Pixels::Rgb {
+                image,
+                version: self.grid_cache.mass_version(),
+                layer: Layer::Mass,
+            });
+        }
+        self.displayed()
+    }
+
     /// Queues the final export including changes received with quit.
     pub fn finish(&mut self) {
-        self.refresh();
+        self.refresh(false);
     }
 
     /// Returns the last companion PNG write result.
@@ -733,6 +752,9 @@ impl App {
                 PreviewKey::ToggleMinimap => {
                     self.viewport.hide_minimap = !self.viewport.hide_minimap;
                 }
+                PreviewKey::ToggleMinimapMass => {
+                    self.mass_minimap = !self.mass_minimap;
+                }
                 PreviewKey::Zoom(zoom) => {
                     self.viewport.set_zoom(zoom, geometry);
                     self.last_drag = None;
@@ -780,6 +802,7 @@ impl App {
             KeyCode::Char(' ') => Some(PreviewKey::ToggleOriginal),
             KeyCode::Char('a') => Some(PreviewKey::ToggleMass),
             KeyCode::Char('m') => Some(PreviewKey::ToggleMinimap),
+            KeyCode::Char('M') => Some(PreviewKey::ToggleMinimapMass),
             KeyCode::Char('0') => Some(PreviewKey::Zoom(Zoom::Fit)),
             KeyCode::Char('+' | '=' | '-') => Some(PreviewKey::Zoom(self.viewport.zoom.step(
                 code != KeyCode::Char('-'),
@@ -941,12 +964,12 @@ mod tests {
             (60, 40)
         );
         app.layer = Layer::Mass;
-        app.refresh();
+        app.refresh(false);
         assert!(jobs(&mut app).is_empty());
         let before = versions(&app);
         let mass_version = app.grid_cache.mass_version();
         app.settings.dot = 40;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), before);
         assert_eq!(app.grid_cache.mass_version(), mass_version);
         assert_eq!(app.layer, Layer::Mass);
@@ -956,7 +979,7 @@ mod tests {
             (120, 80)
         );
         app.settings.rotation = Rotation::R90;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(app.grid_size(), (20, 30));
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
@@ -964,19 +987,19 @@ mod tests {
         );
         app.settings.margin = 20;
         app.settings.bleed = 3;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
             (184, 224)
         );
-        app.refresh();
+        app.refresh(false);
         assert!(jobs(&mut app).is_empty());
 
         let mut app = App::builtin(RgbaImage::new(30, 20), Some("preview.png".into()));
         jobs(&mut app);
         let before = versions(&app);
         app.settings.dot = 40;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), before);
         assert!(jobs(&mut app).is_empty());
     }
@@ -990,7 +1013,7 @@ mod tests {
             let job = jobs(&mut app).pop().unwrap();
             app.settings.bleed = 3;
             assert_eq!(encoded_export(job).1.dimensions(), expected);
-            app.refresh();
+            app.refresh(false);
             let expected = if dpi.is_some() {
                 (1323, 2268)
             } else {
@@ -1437,7 +1460,7 @@ mod tests {
         app.settings.pan_y = -40;
         app.settings.flip = true;
         app.layer = Layer::Dithered;
-        app.refresh();
+        app.refresh(false);
         let settings = app.settings.clone();
         let before = versions(&app);
         app.viewport.zoom = Zoom::In(2);
@@ -2195,6 +2218,114 @@ mod tests {
     }
 
     #[test]
+    fn mass_minimap_builds_only_when_visible() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        assert!(app.mass_minimap);
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 0);
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+
+        app.viewport.hide_minimap = true;
+        app.viewport.zoom = Zoom::In(2);
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 0);
+        app.viewport.hide_minimap = false;
+        assert!(app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 1);
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Mass,
+                ..
+            })
+        ));
+        assert!(matches!(
+            app.displayed(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+
+        app.viewport.hide_minimap = true;
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 1);
+        // The cached mass inset is retained while the hidden minimap is not drawn.
+        assert!(app.geometry(area).minimap.is_none());
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Mass,
+                ..
+            })
+        ));
+        app.mass_minimap = false;
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+        app.layer = Layer::Dithered;
+        app.sync(area);
+        assert!(matches!(app.inset(), Some(Pixels::Indexed { .. })));
+        assert!(matches!(app.displayed(), Some(Pixels::Indexed { .. })));
+    }
+
+    #[test]
+    fn mass_minimap_refreshes_after_card_grid_changes() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        app.viewport.zoom = Zoom::In(2);
+        assert!(app.sync(area));
+        app.settings = Settings::for_pixels(200, 200);
+        assert!(app.sync(area));
+        let Some(Pixels::Rgb {
+            image,
+            layer: Layer::Mass,
+            ..
+        }) = app.inset()
+        else {
+            panic!("expected mass inset");
+        };
+        assert_eq!(image.dimensions(), (200, 200));
+        assert_eq!(image.dimensions(), app.grid_size());
+        assert_eq!(app.grid_cache.mass_version(), 2);
+    }
+
+    #[test]
+    fn mass_minimap_toggle_preserves_grid_and_visibility() {
+        for focus in [false, true] {
+            let mut app = App::builtin(RgbaImage::new(400, 400), None);
+            let area = Rect::new(0, 0, 69, 36);
+            app.preview_focus = focus;
+            app.viewport.zoom = Zoom::In(2);
+            assert!(app.sync(area));
+            let before = versions(&app);
+            for enabled in [false, true] {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+                    &app.geometry(area),
+                );
+                assert_eq!(app.mass_minimap, enabled);
+                assert!(!app.sync(area));
+                assert_eq!(versions(&app), before);
+                assert_eq!(app.grid_cache.mass_version(), 1);
+                assert!(!app.viewport.hide_minimap);
+                assert_eq!(app.layer, Layer::Original);
+            }
+        }
+    }
+
+    #[test]
     fn image_template_apply_uses_the_loaded_source() {
         for (source, margin, expected_dot, expected_margin, modal_open, notice) in [
             (None, 100, 8, 100, false, None),
@@ -2322,7 +2453,7 @@ mod tests {
         let expected = source.as_raw().clone();
         let mut app = App::builtin(source, None);
         app.settings = Settings::for_pixels(8, 8);
-        app.refresh();
+        app.refresh(false);
         let Some(Pixels::Rgb { image: pixels, .. }) = app.displayed() else {
             panic!("expected original RGB pixels");
         };
@@ -2563,7 +2694,7 @@ mod tests {
             &app.geometry(test_layout().preview),
         );
         let version = versions(&app);
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), version);
     }
 
@@ -2585,7 +2716,7 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let version = versions(&app);
         app.handle_key(ctrl('r'), &app.geometry(test_layout().preview));
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), version);
         app.handle_key(ctrl('c'), &app.geometry(test_layout().preview));
         assert!(app.quit);
@@ -2599,7 +2730,7 @@ mod tests {
                 app.settings = Settings::for_pixels(16, 12);
                 app.preview_focus = focus;
                 app.layer = layer;
-                app.refresh();
+                app.refresh(false);
                 assert!(!app.settings.flip);
                 for expected in [true, false] {
                     let before = versions(&app);
@@ -2608,7 +2739,7 @@ mod tests {
                     assert_eq!(app.layer, layer);
                     let after = (before.0 + 1, before.1 + u64::from(layer == Layer::Dithered));
                     assert_eq!(versions(&app), after);
-                    app.refresh();
+                    app.refresh(false);
                     assert_eq!(versions(&app), after);
                 }
                 press(&mut app, KeyCode::Char('o'));
@@ -2643,7 +2774,7 @@ mod tests {
     fn global_zoom_and_preview_pans_skip_redithering() {
         let mut app = App::builtin(RgbaImage::new(400, 400), None);
         app.settings = Settings::for_pixels(400, 400);
-        app.refresh();
+        app.refresh(false);
         for focus in [false, true] {
             app.preview_focus = focus;
             assert!(!press(&mut app, KeyCode::Char('0')));
@@ -2712,7 +2843,7 @@ mod tests {
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         app.settings = Settings::for_pixels(120, 120);
-        app.refresh();
+        app.refresh(false);
         let area = Rect::new(2, 3, 48, 18);
         app.viewport.zoom = Zoom::In(1);
         let map = app.geometry(area).minimap.unwrap().map;
@@ -2723,7 +2854,7 @@ mod tests {
                 &app.geometry(area),
                 test_layout().screen,
             );
-            app.refresh();
+            app.refresh(false);
             assert_eq!(versions(app), version);
             assert!(!app.preview_focus);
         };
@@ -2873,7 +3004,7 @@ mod tests {
         assert_eq!(app.layer, Layer::Original);
         assert!(!app.sync(test_layout().preview));
         app.layer = Layer::Dithered;
-        app.refresh();
+        app.refresh(false);
         for (setting, key) in [
             (Setting::Zoom, KeyCode::Right),
             (Setting::PanX, KeyCode::Right),
@@ -2890,7 +3021,7 @@ mod tests {
             app.settings.zoom = 400;
             app.settings.pan_x = 100;
             app.settings.pan_y = 100;
-            app.refresh();
+            app.refresh(false);
             select(&mut app, setting);
             let before = versions(&app);
             assert!(!press(&mut app, KeyCode::Right));
@@ -2907,7 +3038,7 @@ mod tests {
         };
         app.settings.tone.brightness = -0.5;
         app.layer = Layer::Dithered;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(app.grid_size(), (8, 8));
         assert_eq!(app.grid_cache.dithered().unwrap(), &vec![1; 64]);
         assert!(

@@ -31,6 +31,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("hjkl/arrows", "pan"),
     ("HJKL", "page"),
     ("m", "map"),
+    ("M", "map: mass"),
     ("mouse", "drag/wheel/map"),
     ("r/R", "rotate"),
     ("f", "flip"),
@@ -46,6 +47,7 @@ const PANEL_HINTS: &[(&str, &str)] = &[
     ("+/-", "zoom"),
     ("0", "fit"),
     ("m", "map"),
+    ("M", "map: mass"),
     ("mouse", "drag/wheel/map"),
     ("Up/Down k/j", "select"),
     ("Left/Right h/l", "change"),
@@ -138,7 +140,7 @@ pub fn log_minimap(
         "[minimap] frame={} grid={w}x{h} view={:?} area={:?}",
         frame.count, app.viewport, geometry.area
     )?;
-    let Some(pixels) = app.displayed() else {
+    let Some(pixels) = app.inset() else {
         return log.flush();
     };
     let mut overview = ratatui::buffer::Buffer::empty(geometry.area);
@@ -150,6 +152,7 @@ pub fn log_minimap(
     {
         let area = Block::bordered().inner(inset);
         cells::render(
+            pixels,
             pixels,
             app.glyphs,
             &viewport::geometry(&viewport::Viewport::default(), geometry.grid, area),
@@ -475,6 +478,7 @@ fn draw_preview(
     } else {
         let approximate = cells::render(
             pixels,
+            app.inset().unwrap_or(pixels),
             app.glyphs,
             geometry,
             frame.buffer_mut(),
@@ -1082,11 +1086,24 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
         app.settings = crate::settings::Settings::for_pixels(180, 180);
-        app.sync(layout(Rect::new(0, 0, 100, 40)).preview);
+        app.mass_tones = Some(
+            [rthid_dither::dither::PaletteColor {
+                rgb: [80, 120, 160],
+            }; 4],
+        );
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
-        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        let area = layout(terminal.size().unwrap()).preview;
+        app.sync(area);
+        let geometry = app.geometry(area);
+        assert!(matches!(
+            app.inset(),
+            Some(cells::Pixels::Rgb {
+                layer: Layer::Mass,
+                ..
+            })
+        ));
         let frame = terminal
             .draw(|f| {
                 draw(f, &app, &layout(f.area()), &mut renderer);
@@ -1106,7 +1123,7 @@ mod tests {
         let (displayed, overview) = corner.split_once(" overview=").unwrap();
         for cell in [displayed, overview] {
             assert!(cell.contains("fg: Reset"));
-            assert!(cell.contains("bg: Rgb(255, 255, 255)"));
+            assert!(cell.contains("bg: Rgb(80, 120, 160)"));
         }
         assert_eq!(frame.buffer[(map.x, map.y)].symbol(), " ");
         let outside = text
@@ -1115,9 +1132,9 @@ mod tests {
             .unwrap();
         let (displayed, overview) = outside.split_once(" overview=").unwrap();
         assert!(displayed.contains("fg: Reset"));
-        assert!(displayed.contains("bg: Rgb(127, 127, 127)"));
+        assert!(displayed.contains("bg: Rgb(40, 60, 80)"));
         assert!(overview.contains("fg: Reset"));
-        assert!(overview.contains("bg: Rgb(255, 255, 255)"));
+        assert!(overview.contains("bg: Rgb(80, 120, 160)"));
 
         assert!(
             log_minimap(
@@ -1230,11 +1247,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: map: mass | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: map: mass | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
         );
     }
 

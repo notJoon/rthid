@@ -179,6 +179,7 @@ fn render_minimap(
 /// sampled Dithered approximation.
 pub fn render(
     pixels: Pixels<'_>,
+    inset: Pixels<'_>,
     glyphs: Glyphs,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
@@ -193,7 +194,7 @@ pub fn render(
     } else {
         render_overview(pixels, glyphs, geometry, buffer, &mut caches.full)
     };
-    draw_minimap(pixels, glyphs, geometry, buffer, &mut caches.inset);
+    draw_minimap(inset, glyphs, geometry, buffer, &mut caches.inset);
     approximate
 }
 
@@ -476,6 +477,7 @@ mod tests {
     ) -> bool {
         render(
             pixels,
+            pixels,
             glyphs,
             geometry,
             buffer,
@@ -737,6 +739,11 @@ mod tests {
                     version,
                     layer: Layer::Original,
                 },
+                Pixels::Rgb {
+                    image: &pixels,
+                    version,
+                    layer: Layer::Original,
+                },
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
                 &mut buffer,
@@ -751,6 +758,11 @@ mod tests {
                 version: 2,
                 layer: Layer::Original,
             },
+            Pixels::Rgb {
+                image: &pixels,
+                version: 2,
+                layer: Layer::Original,
+            },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
             &mut Buffer::empty(area),
@@ -760,6 +772,11 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let updated = rgb(1, 2, &[[0; 3], [255; 3]]);
         render(
+            Pixels::Rgb {
+                image: &updated,
+                version: 3,
+                layer: Layer::Original,
+            },
             Pixels::Rgb {
                 image: &updated,
                 version: 3,
@@ -997,6 +1014,54 @@ mod tests {
         assert_eq!(buffer[(0, 1)].bg, Color::Reset);
     }
     #[test]
+    fn minimap_uses_inset_pixels_while_main_view_uses_original() {
+        let original = RgbaImage::from_pixel(120, 120, Rgba([200, 100, 50, 255]));
+        let inset = RgbaImage::from_pixel(120, 120, Rgba([40, 80, 120, 255]));
+        let area = Rect::new(0, 0, 69, 36);
+        let geometry = geometry(
+            &Viewport {
+                zoom: Zoom::In(2),
+                ..Viewport::default()
+            },
+            original.dimensions(),
+            area,
+        );
+        let mut buffer = Buffer::empty(area);
+        render(
+            Pixels::Rgb {
+                image: &original,
+                version: 1,
+                layer: Layer::Original,
+            },
+            Pixels::Rgb {
+                image: &inset,
+                version: 1,
+                layer: Layer::Mass,
+            },
+            Glyphs::default(),
+            &geometry,
+            &mut buffer,
+            &mut OverviewCaches::default(),
+        );
+        let map = geometry.minimap.unwrap();
+        for pos in map.map.positions() {
+            let expected = if map.viewport.contains(pos) {
+                Color::Rgb(40, 80, 120)
+            } else {
+                Color::Rgb(20, 40, 60)
+            };
+            assert_eq!(buffer[pos].bg, expected);
+        }
+        for pos in geometry
+            .target
+            .positions()
+            .filter(|&pos| !map.frame.contains(pos))
+        {
+            assert_eq!(buffer[pos].bg, Color::Rgb(200, 100, 50));
+        }
+    }
+
+    #[test]
     fn minimap_fills_the_same_rectangle_used_for_projection() {
         let area = Rect::new(0, 0, 48, 18);
         let mut buffer = Buffer::empty(area);
@@ -1031,6 +1096,11 @@ mod tests {
                     ..Viewport::default()
                 };
                 render(
+                    Pixels::Rgb {
+                        image: &pixels,
+                        version,
+                        layer: Layer::Original,
+                    },
                     Pixels::Rgb {
                         image: &pixels,
                         version,
@@ -1155,6 +1225,7 @@ mod tests {
             ] {
                 let mut buffer = Buffer::empty(area);
                 assert!(!render(
+                    pixels,
                     pixels,
                     Glyphs::default(),
                     &g,
