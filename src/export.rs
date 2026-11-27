@@ -13,6 +13,8 @@ pub struct Export {
     path: PathBuf,
     dpi: Option<u32>,
     error: Option<String>,
+    /// PNG size of the last submitted job.
+    pub(crate) png_size: Option<(u32, u32)>,
 }
 
 impl Export {
@@ -22,6 +24,7 @@ impl Export {
             path,
             dpi,
             error: None,
+            png_size: None,
         }
     }
 
@@ -35,23 +38,46 @@ impl Export {
         &self.path
     }
 
-    /// Copies the current grid into an owned export job.
-    ///
-    /// # Errors
-    /// Returns an export error if the grid, palette indices or output size are invalid.
-    pub fn job(&self, indices: &[u8], w: u32, h: u32, settings: &Settings) -> Result<Job, IoError> {
-        let invalid = |error| IoError {
+    /// Resolves and validates the companion PNG size before submission.
+    pub(crate) fn size(
+        &self,
+        w: u32,
+        h: u32,
+        settings: &Settings,
+        source: (u32, u32),
+    ) -> Result<(u32, u32), IoError> {
+        let size = match self.dpi {
+            Some(dpi) => crate::print::png_size(settings, source, dpi),
+            None => Ok(preview_size(w, h)),
+        };
+        size.and_then(|size| check_output_size(size).map(|()| size))
+            .map_err(|error| self.invalid(error))
+    }
+
+    fn invalid(&self, error: io::Error) -> IoError {
+        IoError {
             op: Op::Encode,
             path: self.path.clone(),
             cause: Cause::Io(error),
-        };
-        let size = match self.dpi {
-            Some(dpi) => crate::print::png_size(settings, dpi),
-            None => Ok(preview_size(w, h)),
         }
-        .and_then(|size| check_output_size(size).map(|()| size))
-        .map_err(invalid)?;
-        let grid = Grid::new(indices.to_vec(), w, h, settings.palette.clone()).map_err(invalid)?;
+    }
+
+    /// Copies the current grid into an owned export job and retains its PNG size.
+    ///
+    /// # Errors
+    /// Returns an export error if the grid, palette indices or output size are invalid.
+    pub fn job(
+        &mut self,
+        indices: &[u8],
+        w: u32,
+        h: u32,
+        settings: &Settings,
+        size: (u32, u32),
+    ) -> Result<Job, IoError> {
+        check_output_size(size).map_err(|error| self.invalid(error))?;
+        let grid = Grid::new(indices.to_vec(), w, h, settings.palette.clone())
+            .map_err(|error| self.invalid(error))?;
+        self.png_size = Some(size);
         let dpi = self.dpi;
         Ok(Job::Export {
             path: self.path.clone(),
@@ -88,7 +114,10 @@ mod tests {
     #[test]
     fn invalid_grid_fails_before_submission() {
         let mut export = Export::new("preview.png".into(), None);
-        let error = export.job(&[], 1, 1, &Settings::default()).err().unwrap();
+        let error = export
+            .job(&[], 1, 1, &Settings::default(), (4, 4))
+            .err()
+            .unwrap();
         assert!(
             matches!(&error.cause, Cause::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
         );

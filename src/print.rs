@@ -1,12 +1,18 @@
 //! Physical PNG sizing and integer placement inside a physical card.
 
-use crate::settings::{Rotation, Settings};
+use crate::settings::{Rotation, Settings, round};
 
-/// Rounds each card axis including bleed to pixels, independently of the dot grid.
+/// Rounds each resolved physical axis including bleed to PNG pixels.
 /// Returns `InvalidInput` when a dimension is zero or overflows `u32`.
-pub(crate) fn png_size(settings: &Settings, dpi: u32) -> std::io::Result<(u32, u32)> {
-    let axis = |mm: u32| {
-        let mm = f64::from(mm) + 2.0 * f64::from(settings.bleed);
+pub(crate) fn png_size(
+    settings: &Settings,
+    source: (u32, u32),
+    dpi: u32,
+) -> std::io::Result<(u32, u32)> {
+    let dimensions = settings
+        .dimensions(source)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let axis = |mm: f64| {
         let pixels = (mm / 25.4 * f64::from(dpi)).round();
         if !(1.0..=f64::from(u32::MAX)).contains(&pixels) {
             return Err(std::io::Error::new(
@@ -16,15 +22,15 @@ pub(crate) fn png_size(settings: &Settings, dpi: u32) -> std::io::Result<(u32, u
         }
         Ok(pixels as u32)
     };
-    Ok((axis(settings.card.w_mm)?, axis(settings.card.h_mm)?))
+    Ok((axis(dimensions.mm.0)?, axis(dimensions.mm.1)?))
 }
 
 /// Placement also serves as the complete geometry cache key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Placement {
-    /// Fixed dot grid width.
+    /// Dot grid width.
     pub width: u32,
-    /// Fixed dot grid height.
+    /// Dot grid height.
     pub height: u32,
     /// Paper border in dots.
     pub inset: u32,
@@ -52,26 +58,12 @@ pub(crate) struct Placement {
     pub flip: bool,
 }
 
-// Ties go toward positive infinity, including negative image offsets.
-fn round(value: f64) -> f64 {
-    (value + 0.5).floor()
-}
-
 impl Placement {
     /// Rejects impossible source sizes and placements before allocating pixels.
     pub fn new(source: (u32, u32), settings: &Settings) -> Result<Self, &'static str> {
-        let (width, height) = settings.grid_dimensions()?;
-        if source.0 == 0 || source.1 == 0 {
-            return Err("empty source");
-        }
-        let inset = if settings.margin > 0 {
-            round(
-                (i64::from(settings.bleed) * 100 + i64::from(settings.margin) * 10) as f64
-                    / f64::from(settings.dot),
-            ) as u32
-        } else {
-            0
-        };
+        let dimensions = settings.dimensions(source)?;
+        let (width, height) = dimensions.grid;
+        let inset = dimensions.inset;
         let aw = width.saturating_sub(inset.saturating_mul(2));
         let ah = height.saturating_sub(inset.saturating_mul(2));
         let mut result = Self {
@@ -90,7 +82,7 @@ impl Placement {
             pan_x: settings.pan_x,
             pan_y: settings.pan_y,
         };
-        if aw <= 2 || ah <= 2 {
+        if settings.card.size_mm.is_some() && (aw <= 2 || ah <= 2) {
             result.aw = 0;
             result.ah = 0;
             return Ok(result);
@@ -141,9 +133,85 @@ mod tests {
     use super::*;
     use crate::settings::{CARDS, Card};
 
+    fn grid_dimensions(settings: &Settings) -> Result<(u32, u32), &'static str> {
+        Ok(settings.dimensions((1, 1))?.grid)
+    }
+
+    #[test]
+    fn image_card_follows_source_and_adds_paper_around_it() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.card.id, "image");
+        assert_eq!(settings.card.label, "Image");
+        assert_eq!(Card::from_id("unknown"), settings.card);
+        assert_eq!(grid_dimensions(&settings), Ok((1, 1)));
+        for (rotation, size) in [
+            (Rotation::R0, (300, 200)),
+            (Rotation::R90, (200, 300)),
+            (Rotation::R180, (300, 200)),
+            (Rotation::R270, (200, 300)),
+        ] {
+            settings.rotation = rotation;
+            for (margin, bleed, inset) in [(0, 0, 0), (20, 0, 10), (0, 3, 15), (20, 3, 25)] {
+                settings.margin = margin;
+                settings.bleed = bleed;
+                let p = Placement::new((300, 200), &settings).unwrap();
+                assert_eq!(
+                    (p.width, p.height),
+                    (size.0 + 2 * inset, size.1 + 2 * inset)
+                );
+                assert_eq!((p.inset, p.aw, p.ah), (inset, size.0, size.1));
+                assert_eq!((p.sw, p.sh, p.x, p.y), (size.0, size.1, 0, 0));
+                assert_eq!(p.covered(), (0, 0, size.0, size.1));
+            }
+        }
+        settings = Settings::default();
+        for source in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(settings.dimensions(source).err(), Some("empty source"));
+            assert_eq!(
+                Placement::new(source, &settings).unwrap_err(),
+                "empty source"
+            );
+        }
+        assert!(Placement::new((u32::MAX, 1), &settings).is_err());
+        assert!(Placement::new((2001, 2000), &settings).is_err());
+        settings.bleed = i32::MAX;
+        assert!(Placement::new((300, 200), &settings).is_err());
+    }
+
+    #[test]
+    fn image_physical_size_and_png_follow_dot_size() {
+        let mut settings = Settings::default();
+        for (dot, mm, png) in [
+            (20, (60.0, 40.0), (1417, 945)),
+            (40, (120.0, 80.0), (2835, 1890)),
+        ] {
+            settings.dot = dot;
+            let dimensions = settings.dimensions((300, 200)).unwrap();
+            assert_eq!(dimensions.grid, (300, 200));
+            assert_eq!(dimensions.mm, mm);
+            assert_eq!(png_size(&settings, (300, 200), 600).unwrap(), png);
+            settings.rotation = Rotation::R90;
+            assert_eq!(
+                png_size(&settings, (300, 200), 600).unwrap(),
+                (png.1, png.0)
+            );
+            settings.rotation = Rotation::R0;
+        }
+        settings.dot = 25;
+        settings.margin = 20;
+        settings.bleed = 3;
+        let dimensions = settings.dimensions((300, 200)).unwrap();
+        assert_eq!(dimensions.grid, (340, 240));
+        assert_eq!(dimensions.mm, (85.0, 60.0));
+        assert_eq!(png_size(&settings, (300, 200), 600).unwrap(), (2008, 1417));
+        settings.dot = 20;
+        settings.margin = 15;
+        assert_eq!(settings.dimensions((300, 200)).unwrap().inset, 23);
+    }
+
     #[test]
     fn png_presets_round_each_axis_at_print_resolutions() {
-        for (card, expected) in CARDS.into_iter().zip([
+        for (card, expected) in CARDS.into_iter().skip(1).zip([
             [(591, 1063), (1181, 2126), (2362, 4252)],
             [(1063, 591), (2126, 1181), (4252, 2362)],
             [(650, 1004), (1299, 2008), (2598, 4016)],
@@ -156,40 +224,44 @@ mod tests {
                 ..Settings::default()
             };
             for (dpi, expected) in [300, 600, 1200].into_iter().zip(expected) {
-                assert_eq!(png_size(&settings, dpi).unwrap(), expected);
+                assert_eq!(png_size(&settings, (300, 200), dpi).unwrap(), expected);
                 settings.dot = 8;
                 settings.rotation = Rotation::R90;
-                assert_eq!(png_size(&settings, dpi).unwrap(), expected);
+                assert_eq!(png_size(&settings, (300, 200), dpi).unwrap(), expected);
             }
         }
         let mut settings = Settings {
             bleed: 3,
+            card: Card::from_id("business-portrait"),
             ..Settings::default()
         };
-        assert_eq!(png_size(&settings, 600).unwrap(), (1323, 2268));
-        settings.card.w_mm = 127;
+        assert_eq!(png_size(&settings, (300, 200), 600).unwrap(), (1323, 2268));
+        settings.card.size_mm = Some((127, 90));
         settings.bleed = 0;
-        assert_eq!(png_size(&settings, 1).unwrap().0, 5);
-        assert_eq!(png_size(&settings, 3).unwrap().0, 15);
+        assert_eq!(png_size(&settings, (300, 200), 1).unwrap().0, 5);
+        assert_eq!(png_size(&settings, (300, 200), 3).unwrap().0, 15);
     }
 
     #[test]
     fn png_size_rejects_zero_and_overflow_before_casting() {
-        let mut settings = Settings::default();
-        assert!(png_size(&settings, 0).is_err());
-        settings.card.w_mm = 0;
-        assert!(png_size(&settings, 600).is_err());
-        settings.card.w_mm = u32::MAX;
+        let mut settings = Settings {
+            card: Card::from_id("business-portrait"),
+            ..Settings::default()
+        };
+        assert!(png_size(&settings, (300, 200), 0).is_err());
+        settings.card.size_mm = Some((0, 90));
+        assert!(png_size(&settings, (300, 200), 600).is_err());
+        settings.card.size_mm = Some((u32::MAX, 90));
         settings.bleed = i32::MAX;
-        assert!(png_size(&settings, 4800).is_err());
-        settings.card = CARDS[0];
+        assert!(png_size(&settings, (300, 200), 4800).is_err());
+        settings.card = Card::from_id("business-portrait");
         settings.bleed = i32::MIN;
-        assert!(png_size(&settings, 600).is_err());
+        assert!(png_size(&settings, (300, 200), 600).is_err());
     }
 
     #[test]
     fn presets_and_axes_round_independently() {
-        for (card, expected) in CARDS.into_iter().zip([
+        for (card, expected) in CARDS.into_iter().skip(1).zip([
             (250, 450),
             (450, 250),
             (275, 425),
@@ -201,22 +273,23 @@ mod tests {
                 card,
                 ..Settings::default()
             };
-            assert_eq!(settings.grid_dimensions(), Ok(expected));
+            assert_eq!(grid_dimensions(&settings), Ok(expected));
         }
         let settings = Settings {
-            card: CARDS[2],
+            card: Card::from_id("euro-business"),
             dot: 8,
             ..Settings::default()
         };
-        assert_eq!(settings.grid_dimensions(), Ok((688, 1063)));
+        assert_eq!(grid_dimensions(&settings), Ok((688, 1063)));
         let settings = Settings::for_pixels(1, 2);
-        assert_eq!(settings.grid_dimensions(), Ok((8, 8)));
+        assert_eq!(grid_dimensions(&settings), Ok((8, 8)));
     }
 
     #[test]
     fn margin_zero_covers_bleed_and_positive_margin_insets_it() {
         let mut settings = Settings {
             bleed: 3,
+            card: Card::from_id("business-portrait"),
             ..Settings::default()
         };
         let full = Placement::new((100, 100), &settings).unwrap();
@@ -292,21 +365,29 @@ mod tests {
 
     #[test]
     fn overflow_and_dot_cap_are_rejected() {
-        let mut settings = Settings::default();
-        assert!(Placement::new((0, 1), &settings).is_err());
+        let mut settings = Settings {
+            card: Card::from_id("business-portrait"),
+            ..Settings::default()
+        };
+        for source in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(settings.dimensions(source).err(), Some("empty source"));
+            assert_eq!(
+                Placement::new(source, &settings).unwrap_err(),
+                "empty source"
+            );
+        }
         assert!(Placement::new((u32::MAX, 1), &settings).is_err());
         settings.card = Card {
-            w_mm: u32::MAX,
-            h_mm: u32::MAX,
-            ..CARDS[0]
+            size_mm: Some((u32::MAX, u32::MAX)),
+            ..Card::from_id("business-portrait")
         };
-        assert!(settings.grid_dimensions().is_err());
-        settings.card = CARDS[0];
+        assert!(grid_dimensions(&settings).is_err());
+        settings.card = Card::from_id("business-portrait");
         settings.bleed = i32::MAX;
-        assert!(settings.grid_dimensions().is_err());
+        assert!(grid_dimensions(&settings).is_err());
         settings.bleed = 0;
         settings.dot = 0;
-        assert!(settings.grid_dimensions().is_err());
+        assert!(grid_dimensions(&settings).is_err());
         for card in CARDS {
             let settings = Settings {
                 card,
@@ -314,7 +395,7 @@ mod tests {
                 bleed: 3,
                 ..Settings::default()
             };
-            assert!(settings.grid_dimensions().is_ok());
+            assert!(grid_dimensions(&settings).is_ok());
         }
     }
 }

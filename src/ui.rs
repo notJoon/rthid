@@ -523,6 +523,9 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     let Some(placement) = app.grid_cache.placement(&app.settings) else {
         return "No image".into();
     };
+    let source = app.source_size();
+    let dimensions = app.settings.dimensions(source).expect("valid placement");
+    let (card_w, card_h) = dimensions.card_mm;
     let (gw, gh) = geometry.grid;
     let mode = if geometry.zoom == viewport::Zoom::Fit {
         format!(
@@ -560,9 +563,9 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
         format!(
             // Print fields lead so an 80 column terminal clips navigation, not them.
             "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}",
-            app.settings.card.w_mm,
-            app.settings.card.h_mm,
-            if app.settings.bleed > 0 {
+            card_w,
+            card_h,
+            if app.settings.bleed > 0 && app.settings.card.size_mm.is_some() {
                 format!("+{}", app.settings.bleed)
             } else {
                 String::new()
@@ -571,7 +574,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             app.settings.rotation.degrees(),
             if app.settings.flip { " Flip" } else { "" },
             app.export_dpi()
-                .and_then(|dpi| crate::print::png_size(&app.settings, dpi)
+                .and_then(|dpi| crate::print::png_size(&app.settings, source, dpi)
                     .ok()
                     .map(|(w, h)| { format!(" | PNG {w}x{h} @{dpi}dpi") }))
                 .unwrap_or_default(),
@@ -587,6 +590,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::BUSINESS_CARD;
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -859,11 +863,11 @@ mod tests {
                 .unwrap();
             assert!(
                 draw_text(&mut terminal, &app, &mut renderer)
-                    .contains("Z | Black/white | tone | Atkinson | Business 50x90 0.20 mm")
+                    .contains("Z | Black/white | tone | Atkinson | Image 0.20 mm")
             );
             let mut print = crate::settings::Template::capture("P".into(), &Settings::default());
             (print.card, print.dot, print.margin, print.bleed) =
-                (crate::settings::CARDS[5], 12, 15, 3);
+                (crate::settings::Card::from_id("postcard"), 12, 15, 3);
             app.library.templates.upsert(print).unwrap();
             assert!(
                 template_rows(&app.modal_ctx()).iter().any(|row| row.to_string()
@@ -1125,6 +1129,8 @@ mod tests {
     fn draws_settings_and_truecolor_backgrounds() {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
+        app.settings.card = BUSINESS_CARD;
+        app.sync(Rect::new(0, 0, 180, 30));
         assert!(app.show_original);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
@@ -1399,8 +1405,37 @@ mod tests {
         }
     }
     #[test]
+    fn image_status_uses_resolved_physical_size() {
+        let mut app = App::builtin(RgbaImage::new(30, 20), None);
+        let text = |app: &App| {
+            status(
+                app,
+                &app.geometry(Rect::new(0, 0, 100, 20)),
+                PreviewReport::default(),
+            )
+        };
+        assert!(text(&app).starts_with("Card 6x4mm | Dots 30x20 @0.20mm"));
+        app.settings.dot = 40;
+        app.settings.rotation = crate::settings::Rotation::R90;
+        assert!(text(&app).starts_with("Card 8x12mm | Dots 20x30 @0.40mm"));
+        app.settings.margin = 20;
+        app.settings.bleed = 3;
+        assert!(text(&app).starts_with("Card 18.4x22.4mm | Dots 46x56 @0.40mm"));
+        assert_eq!(
+            status(
+                &App::empty(),
+                &app.geometry(Rect::default()),
+                PreviewReport::default()
+            ),
+            "No image"
+        );
+    }
+
+    #[test]
     fn print_status_includes_bleed_and_empty_area_and_truncates() {
         let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.settings.card = BUSINESS_CARD;
+        app.sync(Rect::new(0, 0, 180, 30));
         app.settings.bleed = 3;
         app.settings.rotation = crate::settings::Rotation::R90;
         app.settings.flip = true;

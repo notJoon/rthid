@@ -18,8 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Image is the default card and template fallback. It keeps one dot per source pixel,
+  follows rotation and adds margin and bleed around the image. Dot sets its physical
+  size for the status and DPI export. Fixed cards keep their existing behavior
+
 - Scale is replaced by card, dot, margin, bleed, zoom and pan controls. Rotation
-  turns the image inside the fixed card grid, and uncovered areas stay paper
+  turns the image inside fixed card grids, and uncovered areas stay paper
 - The status line starts with card size, dot count and dot size, ahead of the
   layer and navigation fields, so they stay visible in 80 columns. Templates save physical
   print settings and ignore old `scale` fields, retaining config version 1

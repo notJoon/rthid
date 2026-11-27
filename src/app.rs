@@ -174,6 +174,14 @@ impl App {
         self.source_path.as_deref()
     }
 
+    /// Loaded source size or a single pixel placeholder.
+    pub(crate) fn source_size(&self) -> (u32, u32) {
+        self.grid_cache
+            .source
+            .as_ref()
+            .map_or((1, 1), RgbaImage::dimensions)
+    }
+
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.source_path = Some(path);
@@ -208,6 +216,7 @@ impl App {
             .as_ref()
             .map(|request| request.label.as_str())
             .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
+            .or_else(|| self.settings.dimensions(self.source_size()).err())
             .or_else(|| self.library.notice())
             .or_else(|| self.export_status())
     }
@@ -430,18 +439,29 @@ impl App {
 
     fn refresh(&mut self) {
         let need_dither = !self.show_original || self.has_export();
-        if self.grid_cache.refresh(&self.settings, need_dither)
+        let changed = self.grid_cache.refresh(&self.settings, need_dither);
+        let source = self.source_size();
+        if self.grid_cache.placement(&self.settings).is_some()
             && let Some(export) = &mut self.export
         {
             let (w, h) = self.grid_cache.grid().expect("processed grid").dimensions();
-            let job = export.job(
-                self.grid_cache.dithered().expect("dithered grid"),
-                w,
-                h,
-                &self.settings,
-            );
+            let job = export.size(w, h, &self.settings, source).and_then(|size| {
+                if !changed && export.png_size == Some(size) {
+                    return Ok(None);
+                }
+                export
+                    .job(
+                        self.grid_cache.dithered().expect("dithered grid"),
+                        w,
+                        h,
+                        &self.settings,
+                        size,
+                    )
+                    .map(Some)
+            });
             match job {
-                Ok(job) => self.outbox.push((job, 0)),
+                Ok(Some(job)) => self.outbox.push((job, 0)),
+                Ok(None) => {}
                 Err(error) => {
                     export.complete(Err(&error));
                 }
@@ -695,10 +715,11 @@ impl App {
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
-                self.settings = self.settings.with_default(
+                let next = self.settings.with_default(
                     Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()],
                     &self.library.palettes,
-                )
+                );
+                let _ = self.set_settings(next, self.show_original);
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -731,15 +752,13 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
-                self.settings = settings;
-                self.show_original = false;
+                self.set_settings(settings, false)?;
             }
             Effect::Restore {
                 settings,
                 show_original,
             } => {
-                self.settings = settings;
-                self.show_original = show_original;
+                self.set_settings(settings, show_original)?;
             }
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
@@ -770,14 +789,18 @@ impl App {
         self.apply_setting(setting, next);
     }
 
-    // Shared by Enter and by Left and Right so both follow one preview switch rule.
+    fn set_settings(&mut self, settings: Settings, show_original: bool) -> Result<(), String> {
+        settings.dimensions(self.source_size())?;
+        self.settings = settings;
+        self.show_original = show_original;
+        Ok(())
+    }
+
+    // Enter and arrow keys share the preview rule and preserve it for rejected edits.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        // Clamped presses and inactive rows preserve the current preview selection.
-        if next != self.settings && setting.shows_dithered() {
-            self.apply(Effect::Preview(next)).expect("preview is valid");
-        } else {
-            self.settings = next;
-        }
+        let show_original =
+            self.show_original && (next == self.settings || !setting.shows_dithered());
+        let _ = self.set_settings(next, show_original);
     }
 }
 
@@ -812,11 +835,18 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 mod tests {
     use super::*;
     use crate::{
-        settings::{Dither, Rotation, Templates},
+        settings::{BUSINESS_CARD, Dither, Rotation, Templates},
         ui::Layout,
     };
     use ratatui::layout::Rect;
     use rthid_dither::dither::Mode;
+
+    fn business_app(source: RgbaImage, preview_png: Option<PathBuf>) -> App {
+        let mut app = App::new(None, preview_png, None, Loaded::default());
+        app.settings.card = BUSINESS_CARD;
+        app.open_image("test.png".into(), source);
+        app
+    }
 
     fn opened_photo() -> IoOutcome {
         IoOutcome::Opened(Ok(Opened::Image {
@@ -851,14 +881,58 @@ mod tests {
     }
 
     #[test]
+    fn image_export_updates_for_dot_size_and_rotation() {
+        let mut app = App::new(
+            Some(("test.png".into(), RgbaImage::new(30, 20))),
+            Some("preview.png".into()),
+            Some(254),
+            Loaded::default(),
+        );
+        assert_eq!(
+            encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
+            (60, 40)
+        );
+        let before = versions(&app);
+        app.settings.dot = 40;
+        app.refresh();
+        assert_eq!(versions(&app), before);
+        assert_eq!(app.grid_size(), (30, 20));
+        assert_eq!(
+            encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
+            (120, 80)
+        );
+        app.settings.rotation = Rotation::R90;
+        app.refresh();
+        assert_eq!(app.grid_size(), (20, 30));
+        assert_eq!(
+            encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
+            (80, 120)
+        );
+        app.settings.margin = 20;
+        app.settings.bleed = 3;
+        app.refresh();
+        assert_eq!(
+            encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
+            (184, 224)
+        );
+        app.refresh();
+        assert!(jobs(&mut app).is_empty());
+
+        let mut app = App::builtin(RgbaImage::new(30, 20), Some("preview.png".into()));
+        jobs(&mut app);
+        let before = versions(&app);
+        app.settings.dot = 40;
+        app.refresh();
+        assert_eq!(versions(&app), before);
+        assert!(jobs(&mut app).is_empty());
+    }
+
+    #[test]
     fn export_size_snapshots_use_preview_or_physical_dimensions() {
         for (dpi, expected) in [(None, (1000, 1800)), (Some(600), (1181, 2126))] {
-            let mut app = App::new(
-                Some(("test.png".into(), RgbaImage::new(4, 4))),
-                Some("preview.png".into()),
-                dpi,
-                Loaded::default(),
-            );
+            let mut app = App::new(None, Some("preview.png".into()), dpi, Loaded::default());
+            app.settings.card = BUSINESS_CARD;
+            app.open_image("test.png".into(), RgbaImage::new(4, 4));
             let job = jobs(&mut app).pop().unwrap();
             app.settings.bleed = 3;
             assert_eq!(encoded_export(job).1.dimensions(), expected);
@@ -883,7 +957,7 @@ mod tests {
             Some(4800),
             Loaded::default(),
         );
-        app.settings.card = crate::settings::CARDS[5];
+        app.settings.card = crate::settings::Card::from_id("postcard");
         app.open_image("test.png".into(), RgbaImage::new(4, 4));
         assert!(jobs(&mut app).is_empty());
         assert_eq!(
@@ -922,6 +996,7 @@ mod tests {
             entries: vec![],
         };
         let mut app = App::empty();
+        app.settings.card = BUSINESS_CARD;
         app.set_notice("retained".into());
         assert!(!app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
         assert_eq!(app.notice(), Some("retained"));
@@ -1086,7 +1161,7 @@ mod tests {
     fn export_jobs_protect_the_destination_and_retain_errors_until_success() {
         use rthid_io::io::Op;
         let path = PathBuf::from("preview.png");
-        let mut app = App::builtin(RgbaImage::new(4, 2), Some(path.clone()));
+        let mut app = business_app(RgbaImage::new(4, 2), Some(path.clone()));
         app.request_open("photo.png".into(), Some("/images".into()));
         let mut queued = jobs(&mut app);
         let (output, image) = encoded_export(queued.remove(0));
@@ -1129,7 +1204,7 @@ mod tests {
 
     #[test]
     fn sync_reports_only_grid_or_dither_rebuilds() {
-        let mut app = App::builtin(RgbaImage::new(4, 2), None);
+        let mut app = business_app(RgbaImage::new(4, 2), None);
         let preview = test_layout().preview;
         assert!(!app.sync(preview));
         app.settings.dot = 10;
@@ -1236,6 +1311,7 @@ mod tests {
     #[test]
     fn empty_preview_ignores_navigation_but_keeps_panel_edits() {
         let mut app = App::empty();
+        app.settings.card = BUSINESS_CARD;
         assert!(app.source_path().is_none());
         assert!(app.displayed().is_none());
         assert_eq!(app.grid_size(), (0, 0));
@@ -1277,7 +1353,10 @@ mod tests {
         }
         app.preview_focus = false;
         press(&mut app, KeyCode::Right);
-        assert_eq!(app.settings.card, crate::settings::CARDS[1]);
+        assert_eq!(
+            app.settings.card,
+            crate::settings::Card::from_id("business-landscape")
+        );
         assert!(app.displayed().is_none());
         app.open_image(PathBuf::from("first.png"), RgbaImage::new(20, 10));
         assert_eq!(app.grid_size(), (450, 250));
@@ -1290,7 +1369,7 @@ mod tests {
     fn open_image_resets_navigation_and_rewrites_companion() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("preview.png");
-        let mut app = App::builtin(RgbaImage::new(4, 2), Some(output.clone()));
+        let mut app = business_app(RgbaImage::new(4, 2), Some(output.clone()));
         let (path, image) = encoded_export(jobs(&mut app).pop().unwrap());
         assert_eq!(path, output);
         assert_eq!(image.dimensions(), (1000, 1800));
@@ -1881,7 +1960,7 @@ mod tests {
 
     #[test]
     fn grid_cache_rebuilds_only_stale_stages() {
-        let mut app = App::builtin(RgbaImage::new(20, 10), None);
+        let mut app = business_app(RgbaImage::new(20, 10), None);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 0);
         app.show_original = false;
@@ -1970,6 +2049,147 @@ mod tests {
             assert!(press(&mut app, code));
             assert!(app.show_original);
         }
+    }
+
+    #[test]
+    fn image_grid_edits_use_the_loaded_source() {
+        for (source, margin, expected_margin, expected_card, dot_margin, expected_dot) in [
+            (None, 95, 100, crate::settings::CARDS[0], 400, 8),
+            (Some((1, 1)), 95, 100, crate::settings::CARDS[0], 400, 8),
+            (Some((16, 16)), 95, 100, crate::settings::CARDS[0], 400, 8),
+            (
+                Some((1024, 1024)),
+                95,
+                100,
+                crate::settings::CARDS[0],
+                400,
+                9,
+            ),
+            (Some((1774, 1774)), 95, 95, BUSINESS_CARD, 0, 8),
+        ] {
+            let mut app = App::empty();
+            if let Some((w, h)) = source {
+                app.open_image("source.png".into(), RgbaImage::new(w, h));
+            }
+            app.settings.dot = 8;
+            app.settings.margin = margin;
+            select(&mut app, Setting::Margin);
+            app.adjust(1);
+            assert_eq!(app.settings.margin, expected_margin);
+
+            app.settings.card = BUSINESS_CARD;
+            app.settings.margin = 100;
+            select(&mut app, Setting::Card);
+            app.adjust(-1);
+            assert_eq!(app.settings.card, expected_card);
+
+            app.settings.card = crate::settings::CARDS[0];
+            app.settings.dot = 9;
+            app.settings.margin = dot_margin;
+            select(&mut app, Setting::Dot);
+            app.adjust(-1);
+            assert_eq!(app.settings.dot, expected_dot);
+            assert_eq!(app.settings.margin, dot_margin);
+        }
+    }
+
+    #[test]
+    fn image_template_apply_uses_the_loaded_source() {
+        for (source, margin, expected_dot, expected_margin, modal_open, notice) in [
+            (None, 100, 8, 100, false, None),
+            (Some((16, 16)), 100, 8, 100, false, None),
+            (
+                Some((1774, 1774)),
+                100,
+                20,
+                0,
+                true,
+                Some("grid exceeds four million dots"),
+            ),
+        ] {
+            let mut app = App::empty();
+            if let Some((w, h)) = source {
+                app.open_image("source.png".into(), RgbaImage::new(w, h));
+            }
+            let settings = Settings {
+                dot: 8,
+                margin,
+                ..Settings::default()
+            };
+            app.library
+                .commit(Change::UpsertTemplate(Template::capture(
+                    "Border".into(),
+                    &settings,
+                )))
+                .unwrap();
+            press(&mut app, KeyCode::Char('T'));
+            press(&mut app, KeyCode::Enter);
+            assert!(
+                app.settings
+                    == Settings {
+                        dot: expected_dot,
+                        margin: expected_margin,
+                        ..Settings::default()
+                    }
+            );
+            assert_eq!(app.modal.is_some(), modal_open);
+            assert_eq!(app.notice(), notice);
+        }
+    }
+
+    #[test]
+    fn image_template_validation_preserves_large_margins() {
+        for (source, expected_dot, expected_margin, modal_open, notice) in [
+            ((1, 1), 8, 400, false, None),
+            ((16, 16), 8, 400, false, None),
+            (
+                (1024, 1024),
+                20,
+                0,
+                true,
+                Some("grid exceeds four million dots"),
+            ),
+        ] {
+            let mut app = App::builtin(RgbaImage::new(source.0, source.1), None);
+            let template = Template::capture(
+                "Border".into(),
+                &Settings {
+                    dot: 8,
+                    margin: 400,
+                    ..Settings::default()
+                },
+            );
+            app.modal = Some(Modal::templates());
+            app.apply_step(Step {
+                next: Next::Close,
+                effect: Some(Effect::Preview(template.apply(&app.settings).unwrap())),
+            });
+            assert!(
+                app.settings
+                    == Settings {
+                        dot: expected_dot,
+                        margin: expected_margin,
+                        ..Settings::default()
+                    }
+            );
+            assert_eq!(app.modal.is_some(), modal_open);
+            assert_eq!(app.notice(), notice);
+        }
+    }
+
+    #[test]
+    fn oversized_loaded_image_reports_the_limit_until_corrected() {
+        let mut app = App::empty();
+        app.settings.dot = 8;
+        app.settings.margin = 400;
+        app.open_image("large.png".into(), RgbaImage::new(1024, 1024));
+        assert!(app.grid_cache.has_source());
+        assert_eq!(app.notice(), Some("grid exceeds four million dots"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.notice(), Some("grid exceeds four million dots"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.grid_cache.placement(&app.settings).is_some());
+        assert!(app.notice().is_none());
     }
 
     #[test]
@@ -2137,7 +2357,7 @@ mod tests {
         assert!(app.settings.flip);
         assert_eq!(
             (app.settings.card, app.settings.rotation),
-            (crate::settings::CARDS[1], Rotation::R90)
+            (BUSINESS_CARD, Rotation::R90)
         );
         select(&mut app, Setting::Palette);
         press(&mut app, KeyCode::Right);
@@ -2150,7 +2370,7 @@ mod tests {
         assert!(!p.flip);
         assert_eq!(p.palette_name, "Black/white");
         assert_eq!(p.palette.len(), 2);
-        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 250 * 450);
+        assert_eq!(app.grid_cache.dithered.get().unwrap().len(), 4 * 4);
     }
 
     #[test]
@@ -2194,11 +2414,12 @@ mod tests {
             } else {
                 KeyCode::Left
             };
-            assert!(press(&mut app, change), "{setting:?}");
-            assert!(press(&mut app, KeyCode::Char('d')), "{setting:?}");
+            let rebuilds = setting != Setting::Dot;
+            assert_eq!(press(&mut app, change), rebuilds, "{setting:?}");
+            assert_eq!(press(&mut app, KeyCode::Char('d')), rebuilds, "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('d')), "{setting:?}");
-            assert!(press(&mut app, change), "{setting:?}");
-            assert!(press(&mut app, KeyCode::Char('D')), "{setting:?}");
+            assert_eq!(press(&mut app, change), rebuilds, "{setting:?}");
+            assert_eq!(press(&mut app, KeyCode::Char('D')), rebuilds, "{setting:?}");
             assert!(!press(&mut app, KeyCode::Char('D')), "{setting:?}");
         }
         let mut app = app_at(Setting::Card);
@@ -2276,7 +2497,7 @@ mod tests {
 
     #[test]
     fn rotation_keeps_the_actual_dither_grid() {
-        let mut app = App::builtin(RgbaImage::new(256, 128), None);
+        let mut app = business_app(RgbaImage::new(256, 128), None);
         app.show_original = false;
         let size = app.grid_size();
         for (key, expected) in [
@@ -2333,7 +2554,7 @@ mod tests {
         assert_eq!(app.viewport.zoom, Zoom::Fit);
         press(&mut app, KeyCode::Tab);
         assert!(press(&mut app, KeyCode::Right));
-        assert_eq!(app.settings.card, crate::settings::CARDS[1]);
+        assert_eq!(app.settings.card, BUSINESS_CARD);
     }
 
     #[test]
@@ -2502,7 +2723,7 @@ mod tests {
     fn finish_exports_changes_queued_with_quit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preview.png");
-        let mut app = App::builtin(RgbaImage::new(4, 2), Some(path.clone()));
+        let mut app = business_app(RgbaImage::new(4, 2), Some(path.clone()));
         for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
             app.handle_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
@@ -2520,7 +2741,7 @@ mod tests {
     }
     #[test]
     fn print_controls_rebuild_once_and_preserve_the_layer() {
-        let mut app = App::builtin(RgbaImage::new(20, 10), None);
+        let mut app = business_app(RgbaImage::new(20, 10), None);
         select(&mut app, Setting::Dot);
         let before = versions(&app);
         assert!(press(&mut app, KeyCode::Right));
