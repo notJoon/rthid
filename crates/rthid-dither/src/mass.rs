@@ -231,10 +231,8 @@ impl std::error::Error for MassError {}
 /// their full range before alpha scales coverage. Uniform or fully transparent
 /// images have zero ink because they contain no visible luma contrast.
 ///
-/// Panics when the buffer length does not match the dimensions, which is checked before
-/// the empty size check, so an empty size with a non empty buffer panics instead of
-/// returning an error. Also panics when the pixel count overflows or a dimension exceeds
-/// `u32::MAX`.
+/// Panics when a non empty size has a buffer whose length does not match the dimensions.
+/// Also panics when the pixel count overflows or a dimension exceeds `u32::MAX`.
 #[track_caller]
 pub fn mass_study(
     rgba: &[u8],
@@ -242,6 +240,9 @@ pub fn mass_study(
     h: usize,
     options: &MassOptions,
 ) -> Result<MassStudy, MassError> {
+    if w == 0 || h == 0 {
+        return Err(MassError::EmptyImage);
+    }
     let n = w
         .checked_mul(h)
         .unwrap_or_else(|| panic!("image {w}x{h} exceeds {} pixels", usize::MAX));
@@ -253,9 +254,6 @@ pub fn mass_study(
         "rgba has {} bytes, expected {w}x{h}x4 = {bytes}",
         rgba.len()
     );
-    if w == 0 || h == 0 {
-        return Err(MassError::EmptyImage);
-    }
     if !options.sigma.is_finite() || options.sigma < 0.0 {
         return Err(MassError::InvalidSigma {
             sigma: options.sigma,
@@ -664,6 +662,14 @@ mod tests {
         let options = MassOptions::default();
         assert_eq!(mass_study(&[], 0, 2, &options), Err(MassError::EmptyImage));
         assert_eq!(mass_study(&[], 2, 0, &options), Err(MassError::EmptyImage));
+        assert_eq!(
+            mass_study(&[0; 4], 0, 1, &options),
+            Err(MassError::EmptyImage)
+        );
+        assert_eq!(
+            mass_study(&[0; 4], 1, 0, &options),
+            Err(MassError::EmptyImage)
+        );
         for sigma in [-1.0, f32::NAN, f32::INFINITY] {
             let error = mass_study(
                 &[0; 4],
