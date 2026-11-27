@@ -38,6 +38,7 @@ pub(crate) struct MassBuild {
 
 /// Source image, card grid, dithered indices and mass image. Each stage
 /// rebuilds only when its key changes.
+#[derive(Default)]
 pub struct GridCache {
     /// Loaded image before scaling and rotation.
     pub(crate) source: Option<RgbaImage>,
@@ -292,9 +293,7 @@ mod tests {
     fn cache(source: RgbaImage) -> GridCache {
         GridCache {
             source: Some(source),
-            grid: Memo::default(),
-            dithered: Memo::default(),
-            mass: Memo::default(),
+            ..GridCache::default()
         }
     }
 
@@ -384,7 +383,7 @@ mod tests {
             zoom: 50,
             ..Settings::for_pixels(12, 12)
         };
-        settings.palette = crate::settings::build_palette(&["#123", "#fed"]).unwrap();
+        settings.palette = crate::settings::Palette::custom(&["#123", "#fed"]);
         settings.tone.brightness = -0.5;
         settings.tone.contrast = 1.0;
         let mut cache = cache(RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255])));
@@ -416,7 +415,7 @@ mod tests {
         assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
         assert!(cache.grid().unwrap().pixels().all(|p| p.0 == [255; 4]));
         assert!(cache.dithered().unwrap().iter().all(|&i| i == 1));
-        settings.palette = crate::settings::build_palette(&["#000", "#777", "#fff"]).unwrap();
+        settings.palette = crate::settings::Palette::custom(&["#000", "#777", "#fff"]);
         let version = cache.grid_version();
         assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
         assert_eq!(cache.grid_version(), version);
@@ -470,12 +469,7 @@ mod tests {
 
     #[test]
     fn mass_cache_tracks_grid_options_and_tones() {
-        let mut cache = GridCache {
-            source: None,
-            grid: Memo::default(),
-            dithered: Memo::default(),
-            mass: Memo::default(),
-        };
+        let mut cache = GridCache::default();
         let mut settings = Settings::for_pixels(8, 12);
         let mut options = MassOptions::default();
         cache.set_source(RgbaImage::new(8, 4));
@@ -526,9 +520,7 @@ mod tests {
     fn invalid_mass_options_use_the_background_tone_and_clear_error_on_success() {
         let mut cache = GridCache {
             source: Some(RgbaImage::new(3, 2)),
-            grid: Memo::default(),
-            dithered: Memo::default(),
-            mass: Memo::default(),
+            ..GridCache::default()
         };
         let options = MassOptions {
             sigma: -1.0,

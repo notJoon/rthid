@@ -715,9 +715,26 @@ impl Modal {
         }
     }
 
+    /// Inserts pasted text into the active field, recognizing dropped paths.
+    pub fn paste(&mut self, text: &str) {
+        if let Self::OpenFile(picker) = self
+            && let Some(path) = rthid_io::paste::dropped_path(text)
+        {
+            picker.input = TextInput::new(path.to_string_lossy(), PATH_MAX_CHARS);
+            picker.typed = true;
+            return;
+        }
+        if let Some(input) = self.text_input_mut() {
+            input.insert_str(text);
+            if let Self::OpenFile(picker) = self {
+                picker.typed = true;
+            }
+        }
+    }
+
     /// Opens on the current preset, or the first preset for detached colors.
     pub fn presets(settings: &Settings, palettes: &Palettes) -> Self {
-        let list = ListPicker::new(palettes.find(&settings.palette_name).unwrap_or(0));
+        let list = ListPicker::new(palettes.find(settings.palette.name()).unwrap_or(0));
         list.reset_scroll();
         Self::Presets {
             list,
@@ -806,7 +823,7 @@ impl Modal {
                         let draft = if key.code == KeyCode::Char('n') {
                             Preset {
                                 name: String::new(),
-                                colors: ctx.settings.palette_hex.clone(),
+                                colors: ctx.settings.palette.hex().to_vec(),
                                 mode: None,
                                 builtin: false,
                             }
@@ -1284,7 +1301,7 @@ mod tests {
             matches!(&modal, Modal::Editor(e) if e.rows.selected(e.draft.colors.len() + 2) == Some(1) && e.draft.colors.len() == 2 && e.input.as_ref().is_some_and(|i| i.text() == "#123456"))
         );
         let step = press(&mut modal, KeyCode::Enter, &palettes, &templates, &original);
-        assert!(matches!(step.effect, Some(Effect::Preview(s)) if s.palette_hex[0] == "#123456"));
+        assert!(matches!(step.effect, Some(Effect::Preview(s)) if s.palette.hex()[0] == "#123456"));
         assert!(
             matches!(&modal, Modal::Editor(e) if e.input.is_none() && e.draft.colors[0] == "#123456")
         );
