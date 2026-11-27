@@ -43,6 +43,7 @@ struct Drag {
     point: (u16, u16),
     origin: (u32, u32),
     moved: bool,
+    minimap: bool,
 }
 
 enum Source {
@@ -610,6 +611,11 @@ impl App {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
         if !geometry.overflows() || !geometry.area.contains(point.into()) {
+            self.last_drag = prev.filter(|drag| {
+                drag.minimap
+                    && geometry.overflows()
+                    && matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+            });
             return was_dragging;
         }
         let (dx, dy) = geometry.zoom.dots_per_cell(geometry.grid, geometry.area);
@@ -618,20 +624,32 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(minimap) = geometry.minimap
                     && minimap.map.contains(point.into())
-                    && !(matches!(mouse.kind, MouseEventKind::Drag(_)) && prev.is_some())
+                    && !(matches!(mouse.kind, MouseEventKind::Drag(_))
+                        && prev.is_some_and(|drag| !drag.minimap))
                 {
                     self.viewport.center_on_minimap(point, geometry);
+                    self.last_drag = Some(Drag {
+                        point,
+                        origin: geometry.origin,
+                        moved: false,
+                        minimap: true,
+                    });
                 } else if matches!(mouse.kind, MouseEventKind::Down(_))
                     && geometry
                         .minimap
                         .is_some_and(|minimap| minimap.frame.contains(point.into()))
                 {
                     return was_dragging;
+                } else if matches!(mouse.kind, MouseEventKind::Drag(_))
+                    && prev.is_some_and(|drag| drag.minimap)
+                {
+                    self.last_drag = prev;
                 } else {
                     let mut drag = Drag {
                         point,
                         origin: geometry.origin,
                         moved: false,
+                        minimap: false,
                     };
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
                         && let Some(anchor) = prev
@@ -1479,6 +1497,7 @@ mod tests {
             point: (3, 4),
             origin: (1, 0),
             moved: true,
+            minimap: false,
         });
         let path = PathBuf::from("replacement.png");
         app.open_image(path.clone(), RgbaImage::new(3, 5));
@@ -2932,6 +2951,59 @@ mod tests {
     }
 
     #[test]
+    fn minimap_drag_centers_after_leaving_map() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        let area = Rect::new(2, 3, 48, 18);
+        let minimap = app.geometry(area).minimap.unwrap();
+        let map = minimap.map;
+        for outside in [
+            (minimap.frame.x, map.y + 1),
+            (minimap.frame.x - 1, map.y + 1),
+            (0, 0),
+        ] {
+            let geometry = app.geometry(area);
+            assert!(app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                map.x + 4,
+                map.y + 1,
+                &geometry,
+                test_layout().screen,
+            ));
+            let centered = (app.viewport.x, app.viewport.y);
+            assert!(!app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside.0,
+                outside.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), centered);
+            let point = (map.right() - 1, map.bottom() - 1);
+            let geometry = app.geometry(area);
+            let mut expected = app.viewport;
+            expected.center_on_minimap(point, &geometry);
+            assert!(app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                point.0,
+                point.1,
+                &geometry,
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), (expected.x, expected.y));
+            assert!(!app.dragging());
+            assert!(!app.mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                point.0,
+                point.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert!(app.last_drag.is_none());
+        }
+    }
+
+    #[test]
     fn preview_drag_continues_over_minimap() {
         let mut app = App::drag_fixture();
         app.viewport.hide_minimap = false;
@@ -2996,7 +3068,7 @@ mod tests {
     }
 
     #[test]
-    fn minimap_map_press_centers_and_clears_drag() {
+    fn minimap_map_press_centers_and_replaces_preview_drag() {
         let mut app = App::drag_fixture();
         app.viewport.hide_minimap = false;
         let area = Rect::new(2, 3, 48, 18);
@@ -3018,7 +3090,8 @@ mod tests {
             test_layout().screen,
         ));
         assert_eq!((app.viewport.x, app.viewport.y), (36, 27));
-        assert!(app.last_drag.is_none());
+        assert!(app.last_drag.is_some_and(|drag| drag.minimap));
+        assert!(!app.dragging());
     }
 
     #[test]
