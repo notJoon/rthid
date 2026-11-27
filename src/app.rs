@@ -78,6 +78,8 @@ pub struct App {
     last_token: u64,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
+    /// Whether the full key reference is capturing input.
+    pub(crate) keys_open: bool,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
     /// Preview zoom, minimap and dot origin.
@@ -146,6 +148,7 @@ impl App {
             open_request: None,
             last_token: 0,
             modal: None,
+            keys_open: false,
             settings: Settings::default(),
             panel: ListPicker::new(0),
             layer: Layer::Original,
@@ -393,6 +396,7 @@ impl App {
     }
 
     fn show_modal(&mut self, modal: Modal) {
+        self.keys_open = false;
         self.modal = Some(modal);
         self.last_drag = None;
     }
@@ -436,6 +440,7 @@ impl App {
 
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
+        self.keys_open = false;
         if let Some(modal) = &mut self.modal {
             modal.paste(text);
         } else if let Some(path) = rthid_io::paste::dropped_path(text) {
@@ -610,6 +615,10 @@ impl App {
         screen: Rect,
     ) -> bool {
         let was_dragging = self.dragging();
+        if self.keys_open {
+            self.last_drag = None;
+            return was_dragging;
+        }
         if let Some(mut modal) = self.modal.take() {
             self.last_drag = None;
             let ctx = self.modal_ctx();
@@ -731,9 +740,19 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        self.notice = None;
+        if self.keys_open {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Esc | KeyCode::Char('?'))
+            {
+                self.keys_open = false;
+            }
             return;
         }
         if key
@@ -746,6 +765,11 @@ impl App {
             let step = modal.handle_key(key, self.modal_ctx());
             self.modal = Some(modal);
             self.apply_step(step);
+            return;
+        }
+        if key.code == KeyCode::Char('?') {
+            self.keys_open = true;
+            self.last_drag = None;
             return;
         }
         if key.code == KeyCode::Char('o') {
@@ -1528,6 +1552,15 @@ mod tests {
             panic!("open dialog expected")
         };
         assert_eq!(picker.input.text().chars().count(), PATH_MAX_CHARS);
+    }
+
+    #[test]
+    fn key_overlay_yields_to_new_modals() {
+        let mut app = App::empty();
+        app.keys_open = true;
+        app.show_modal(Modal::templates());
+        assert!(!app.keys_open);
+        assert!(matches!(app.modal, Some(Modal::Templates { .. })));
     }
 
     #[test]

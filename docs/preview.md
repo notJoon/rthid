@@ -103,7 +103,8 @@ fields stay visible and the layer and navigation fields are cut first.
 ## Keys
 
 The help line lists the keys usable right now, Enter and Esc first in dialogs,
-and drops the least specific ones to fit the width.
+and ends with `?: keys` outside dialogs. It drops the least specific keys first
+to fit the width.
 
 The parameter panel has focus initially. A cyan border marks the focused panel.
 
@@ -111,6 +112,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | --- | --- | --- |
 | Any, outside modals | `o` | Open an image |
 | Any, outside modals | `P` / `T` | Manage palette presets / settings templates |
+| Any, outside modals | `?` | Show all keys |
 | Any | `Tab` | Switch focus between parameters and preview |
 | Any | `Space` | Toggle original / dithered, or show dithered from mass; compute a pending result if needed |
 | Any | `a` | Show mass / return to the previous layer |

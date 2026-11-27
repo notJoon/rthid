@@ -54,6 +54,15 @@ impl ListPicker {
     /// Esc closes the picker.
     pub const CANCEL: Hint = Hint::new("Esc", "close");
 
+    /// Clicking a row selects it.
+    pub const CLICK: Hint = Hint::new("click", "select");
+
+    /// Clicking the selected row chooses it.
+    pub const CLICK_AGAIN: Hint = Hint::new("click again", "choose");
+
+    /// Scrolling the wheel moves the selection.
+    pub const WHEEL: Hint = Hint::new("wheel", "move");
+
     /// Creates a picker with `selected` as the initial index and no scroll.
     ///
     /// An index past the end is allowed and is clamped to the last item when

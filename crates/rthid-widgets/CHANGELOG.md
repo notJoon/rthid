@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `Hint`, width-aware `hint_line`, and key hint constants on input widgets
+- `KeyHelp` renders titled groups of display-width-aligned key references
+- `ListPicker` mouse hint constants for click, repeated click, and wheel actions
 
 ### Breaking
 

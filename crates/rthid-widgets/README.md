@@ -71,6 +71,7 @@ open. Validate values on `Submit` before closing the component. An invalid value
 | `Dialog` | Centered popup area with a cleared background and a border |
 | `Hint` | One key and what it does now |
 | `hint_line` | Fits an ordered prefix of key hints into a display width |
+| `KeyHelp` | Titled, aligned groups of key hints for a full reference |
 
 ## List selection
 
@@ -102,7 +103,8 @@ padding column on each side.
 `TextInput` filters control characters from initial and pasted text. `Confirm`
 approves only an unmodified lowercase `y`; other pressed keys cancel.
 
-Widgets expose `Hint` constants for the keys they handle. Use `hint_line` for
-help lines that must fit a width.
+Widgets expose `Hint` constants for the keys and mouse actions they handle. Use
+`hint_line` for help lines that must fit a width and `KeyHelp` for a full key
+reference.
 
 See the crate docs (`cargo doc -p rthid-widgets --open`) for the API and examples.
