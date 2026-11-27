@@ -325,10 +325,9 @@ impl Viewport {
             return None;
         }
         let (mw, mh) = fit_aspect(w, h, inner, CELL_ASPECT);
-        Some((
-            frame,
-            inner.centered(Constraint::Length(mw), Constraint::Length(mh)),
-        ))
+        let frame = Rect::new(area.right() - mw - 2, area.y, mw + 2, mh + 2);
+        let map = Block::bordered().inner(frame);
+        Some((frame, map))
     }
 
     /// Whole dots that fit. A clipped edge dot is excluded so it stays reachable by panning
@@ -589,11 +588,27 @@ mod tests {
         assert_eq!(
             geometry(&viewport, (120, 120), area).minimap,
             Some(Minimap {
-                frame: Rect::new(34, 3, 16, 6),
-                map: Rect::new(38, 4, 9, 4),
-                viewport: Rect::new(43, 6, 4, 2),
+                frame: Rect::new(39, 3, 11, 6),
+                map: Rect::new(40, 4, 9, 4),
+                viewport: Rect::new(45, 6, 4, 2),
             })
         );
+    }
+
+    #[test]
+    fn minimap_frame_hugs_wide_map_at_top_right() {
+        let area = Rect::new(2, 3, 48, 18);
+        let viewport = Viewport {
+            zoom: Zoom::In(1),
+            ..Viewport::default()
+        };
+        let (frame, map) = viewport.minimap(480, 120, area).unwrap();
+        assert_eq!((map.width, map.height), (14, 1));
+        assert_eq!(frame.width, map.width + 2);
+        assert_eq!(frame.height, map.height + 2);
+        assert_eq!(frame.right(), area.right());
+        assert_eq!(frame.y, area.y);
+        assert_eq!(map, Block::bordered().inner(frame));
     }
 
     #[test]

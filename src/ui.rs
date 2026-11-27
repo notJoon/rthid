@@ -150,12 +150,13 @@ pub fn log_minimap(
         viewport,
     }) = geometry.minimap
     {
-        let area = Block::bordered().inner(inset);
+        let mut fitted = viewport::geometry(&viewport::Viewport::default(), geometry.grid, map);
+        fitted.target = map;
         cells::render(
             pixels,
             pixels,
             app.glyphs,
-            &viewport::geometry(&viewport::Viewport::default(), geometry.grid, area),
+            &fitted,
             &mut overview,
             &mut cells::OverviewCaches::default(),
         );

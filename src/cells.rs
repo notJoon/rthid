@@ -162,16 +162,12 @@ fn render_minimap(
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
 ) {
-    let Some(Minimap { frame, .. }) = geometry.minimap else {
+    let Some(Minimap { frame, map, .. }) = geometry.minimap else {
         return;
     };
-    // Letterboxing hides the main preview beneath the inset.
     Clear.render(frame, buffer);
-    let fitted = crate::viewport::geometry(
-        &Viewport::default(),
-        geometry.grid,
-        Block::bordered().inner(frame),
-    );
+    let mut fitted = crate::viewport::geometry(&Viewport::default(), geometry.grid, map);
+    fitted.target = map;
     render_overview(pixels, glyphs, &fitted, buffer, cache);
 }
 
@@ -1076,13 +1072,25 @@ mod tests {
             &crate::viewport::geometry(&viewport, (120, 120), area),
             &mut buffer,
         );
-        // The square grid fits 9x4 cells inside the 14x4 border of a 16x6 frame at x 32.
-        assert_eq!(buffer[(32, 0)].symbol(), "┌");
+        assert_eq!(buffer[(37, 0)].symbol(), "┌");
         assert_eq!(buffer[(47, 5)].symbol(), "┘");
         assert_eq!(buffer[(33, 2)].symbol(), " ");
-        assert_eq!(buffer[(33, 2)].bg, Color::Reset);
+        assert_eq!(buffer[(33, 2)].bg, Color::Rgb(0, 0, 0));
         let (_, map) = viewport.minimap(120, 120, area).unwrap();
         assert_eq!(buffer[(map.x, map.y)].fg, Color::Reset);
+
+        let geometry = crate::viewport::geometry(&viewport, (480, 120), area);
+        let mut buffer = Buffer::empty(area);
+        render_minimap(
+            indexed(&vec![0; 480 * 120], &palette),
+            Glyphs::default(),
+            &geometry,
+            &mut buffer,
+            &mut Memo::default(),
+        );
+        for pos in geometry.minimap.unwrap().map.positions() {
+            assert_eq!(buffer[pos].bg, Color::Rgb(0, 0, 0));
+        }
     }
     #[test]
     fn rgb_overview_and_minimap_keep_separate_memos() {
