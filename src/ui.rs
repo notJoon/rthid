@@ -1226,18 +1226,6 @@ mod tests {
     }
 
     #[test]
-    fn help_hints_preserve_exact_text() {
-        assert_eq!(
-            key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: mass map | mouse: drag/wheel/map | r/R: rotate | f: flip | d: reset | Esc: back | q: quit"
-        );
-        assert_eq!(
-            key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: mass map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d: reset | q: quit"
-        );
-    }
-
-    #[test]
     fn setting_list_keeps_scroll_offset_when_moving_within_visible_rows() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

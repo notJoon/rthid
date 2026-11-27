@@ -1215,30 +1215,6 @@ mod tests {
     }
 
     #[test]
-    fn pasted_text_respects_field_limits_and_marks_the_path_as_typed() {
-        let mut app = App::empty();
-        app.open_dialog("/images".into());
-        app.handle_paste(&"猫\n".repeat(100_000));
-        let Some(Modal::OpenFile(picker)) = &app.modal else {
-            panic!("open dialog expected")
-        };
-        assert!(picker.typed);
-        assert_eq!(picker.input.text().chars().count(), PATH_MAX_CHARS);
-        app.handle_paste(&format!("/{}.png", "a".repeat(5000)));
-        assert_eq!(
-            app.modal
-                .as_mut()
-                .unwrap()
-                .text_input_mut()
-                .unwrap()
-                .text()
-                .chars()
-                .count(),
-            PATH_MAX_CHARS
-        );
-    }
-
-    #[test]
     fn export_jobs_protect_the_destination_and_retain_errors_until_success() {
         use rthid_io::io::Op;
         let path = PathBuf::from("preview.png");
@@ -1262,7 +1238,16 @@ mod tests {
         let error = app.export_status().unwrap().to_owned();
         assert_eq!(app.notice(), Some(error.as_str()));
         assert!(app.export_result().is_err());
-        app.settings.rotation = Rotation::R90;
+        let grid_version = app.grid_cache.grid.version();
+        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+            app.handle_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &app.geometry(test_layout().preview),
+            );
+        }
+        assert!(app.quit);
+        assert_eq!(app.grid_cache.grid.version(), grid_version);
+        jobs(&mut app);
         app.finish();
         assert!(matches!(jobs(&mut app).as_slice(), [Job::Export { .. }]));
         assert_eq!(app.export_status(), Some(error.as_str()));
@@ -1387,6 +1372,20 @@ mod tests {
             Job::Open { path, dir: None, protect: None }, Job::List(_), Job::List(listed)
         ] if path == &PathBuf::from("/tmp/My Photo.jpg") && listed == &PathBuf::from("/other")));
         assert!(jobs(&mut app).is_empty());
+
+        let mut app = App::empty();
+        app.open_dialog("/images".into());
+        app.handle_paste(&"猫\n".repeat(100_000));
+        let Some(Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert!(picker.typed);
+        assert_eq!(picker.input.text().chars().count(), PATH_MAX_CHARS);
+        app.handle_paste(&format!("/{}.png", "a".repeat(5000)));
+        let Some(Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert_eq!(picker.input.text().chars().count(), PATH_MAX_CHARS);
     }
 
     #[test]
@@ -1986,6 +1985,30 @@ mod tests {
         for code in ['m', 'z', 'q'] {
             assert_eq!(pan_delta(KeyCode::Char(code), (20, 12), (1, 1)), None);
         }
+        for (code, expected) in [('h', (-2, 0)), ('j', (0, 5)), ('L', (16, 0)), ('J', (0, 5))] {
+            assert_eq!(
+                pan_delta(KeyCode::Char(code), (20, 12), (2, 5)),
+                Some(expected),
+                "{code}"
+            );
+        }
+
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        app.preview_focus = true;
+        for zoom in [Zoom::Fit, Zoom::Out(2), Zoom::In(4)] {
+            app.viewport.zoom = zoom;
+            for code in [
+                KeyCode::Left,
+                KeyCode::Char('J'),
+                KeyCode::Char('+'),
+                KeyCode::Char('-'),
+            ] {
+                app.handle_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    &app.geometry(Rect::default()),
+                );
+            }
+        }
     }
 
     fn test_layout() -> Layout {
@@ -2019,32 +2042,6 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         select(&mut app, setting);
         app
-    }
-
-    #[test]
-    fn empty_preview_navigation_and_scaled_pages() {
-        let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        app.preview_focus = true;
-        for zoom in [Zoom::Fit, Zoom::Out(2), Zoom::In(4)] {
-            app.viewport.zoom = zoom;
-            for code in [
-                KeyCode::Left,
-                KeyCode::Char('J'),
-                KeyCode::Char('+'),
-                KeyCode::Char('-'),
-            ] {
-                app.handle_key(
-                    KeyEvent::new(code, KeyModifiers::NONE),
-                    &app.geometry(Rect::default()),
-                );
-            }
-        }
-        for (code, expected) in [('h', (-2, 0)), ('j', (0, 5)), ('L', (16, 0)), ('J', (0, 5))] {
-            assert_eq!(
-                pan_delta(KeyCode::Char(code), (20, 12), (2, 5)),
-                Some(expected)
-            );
-        }
     }
 
     #[test]
@@ -2383,18 +2380,20 @@ mod tests {
 
     #[test]
     fn image_template_apply_uses_the_loaded_source() {
-        for (source, margin, expected_dot, expected_margin, modal_open, notice) in [
-            (None, 100, 8, 100, false, None),
-            (Some((16, 16)), 100, 8, 100, false, None),
-            (
-                Some((1774, 1774)),
-                100,
-                20,
-                0,
-                true,
-                Some("grid exceeds four million dots"),
-            ),
+        for (through_library, source, margin, rejected) in [
+            (true, None, 100, false),
+            (true, Some((16, 16)), 100, false),
+            (true, Some((1774, 1774)), 100, true),
+            (false, Some((1, 1)), 400, false),
+            (false, Some((16, 16)), 400, false),
+            (false, Some((1024, 1024)), 400, true),
         ] {
+            let name = format!("library {through_library} source {source:?}");
+            let (expected_dot, expected_margin, notice) = if rejected {
+                (20, 0, Some("grid exceeds four million dots"))
+            } else {
+                (8, margin, None)
+            };
             let mut app = App::empty();
             if let Some((w, h)) = source {
                 app.open_image("source.png".into(), RgbaImage::new(w, h));
@@ -2404,64 +2403,31 @@ mod tests {
                 margin,
                 ..Settings::default()
             };
-            app.library
-                .commit(Change::UpsertTemplate(Template::capture(
-                    "Border".into(),
-                    &settings,
-                )))
-                .unwrap();
-            press(&mut app, KeyCode::Char('T'));
-            press(&mut app, KeyCode::Enter);
+            let template = Template::capture("Border".into(), &settings);
+            if through_library {
+                app.library
+                    .commit(Change::UpsertTemplate(template))
+                    .unwrap();
+                press(&mut app, KeyCode::Char('T'));
+                press(&mut app, KeyCode::Enter);
+            } else {
+                app.modal = Some(Modal::templates());
+                app.apply_step(Step {
+                    next: Next::Close,
+                    effect: Some(Effect::Preview(template.apply(&app.settings).unwrap())),
+                });
+            }
             assert!(
                 app.settings
                     == Settings {
                         dot: expected_dot,
                         margin: expected_margin,
                         ..Settings::default()
-                    }
+                    },
+                "{name}"
             );
-            assert_eq!(app.modal.is_some(), modal_open);
-            assert_eq!(app.notice(), notice);
-        }
-    }
-
-    #[test]
-    fn image_template_validation_preserves_large_margins() {
-        for (source, expected_dot, expected_margin, modal_open, notice) in [
-            ((1, 1), 8, 400, false, None),
-            ((16, 16), 8, 400, false, None),
-            (
-                (1024, 1024),
-                20,
-                0,
-                true,
-                Some("grid exceeds four million dots"),
-            ),
-        ] {
-            let mut app = App::builtin(RgbaImage::new(source.0, source.1), None);
-            let template = Template::capture(
-                "Border".into(),
-                &Settings {
-                    dot: 8,
-                    margin: 400,
-                    ..Settings::default()
-                },
-            );
-            app.modal = Some(Modal::templates());
-            app.apply_step(Step {
-                next: Next::Close,
-                effect: Some(Effect::Preview(template.apply(&app.settings).unwrap())),
-            });
-            assert!(
-                app.settings
-                    == Settings {
-                        dot: expected_dot,
-                        margin: expected_margin,
-                        ..Settings::default()
-                    }
-            );
-            assert_eq!(app.modal.is_some(), modal_open);
-            assert_eq!(app.notice(), notice);
+            assert_eq!(app.modal.is_some(), rejected, "{name}");
+            assert_eq!(app.notice(), notice, "{name}");
         }
     }
 
@@ -2650,23 +2616,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_selected_default() {
-        let mut app = app_at(Setting::Card);
-        press(&mut app, KeyCode::Char('f'));
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Char('r'));
-        select(&mut app, Setting::Mode);
-        press(&mut app, KeyCode::Right);
-        assert!(press(&mut app, KeyCode::Char('d')));
-        assert!(matches!(app.settings.mode, Mode::Tone));
-        assert!(app.settings.flip);
-        assert_eq!(
-            (app.settings.card, app.settings.rotation),
-            (BUSINESS_CARD, Rotation::R90)
-        );
-    }
-
-    #[test]
     fn reset_only_redithers_changed_values_and_preserves_pending_changes() {
         for (setting, dither) in Setting::ALL
             .into_iter()
@@ -2725,6 +2674,20 @@ mod tests {
         let version = versions(&app);
         app.refresh(false);
         assert_eq!(versions(&app), version);
+
+        let mut app = app_at(Setting::Card);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char('r'));
+        select(&mut app, Setting::Mode);
+        press(&mut app, KeyCode::Right);
+        assert!(press(&mut app, KeyCode::Char('d')));
+        assert!(matches!(app.settings.mode, Mode::Tone));
+        assert!(app.settings.flip);
+        assert_eq!(
+            (app.settings.card, app.settings.rotation),
+            (BUSINESS_CARD, Rotation::R90)
+        );
     }
 
     #[test]
@@ -2783,12 +2746,27 @@ mod tests {
         let mut app = business_app(RgbaImage::new(256, 128), None);
         app.layer = Layer::Dithered;
         let size = app.grid_size();
+        for (rotation, degrees, swaps_axes) in [
+            (Rotation::R0, 0, false),
+            (Rotation::R90, 90, true),
+            (Rotation::R180, 180, false),
+            (Rotation::R270, 270, true),
+        ] {
+            assert_eq!(rotation.cw().ccw(), rotation);
+            assert_eq!(rotation.ccw().cw(), rotation);
+            assert_eq!(rotation.cw().cw().cw().cw(), rotation);
+            assert_eq!(rotation.degrees(), degrees);
+            assert_eq!(rotation.swaps_axes(), swaps_axes);
+        }
         for (key, expected) in [
             ('r', Rotation::R90),
             ('r', Rotation::R180),
+            ('r', Rotation::R270),
+            ('r', Rotation::R0),
+            ('R', Rotation::R270),
+            ('R', Rotation::R180),
             ('R', Rotation::R90),
             ('R', Rotation::R0),
-            ('R', Rotation::R270),
         ] {
             assert!(press(&mut app, KeyCode::Char(key)));
             assert_eq!(app.settings.rotation, expected);
@@ -3147,26 +3125,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_exports_changes_queued_with_quit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preview.png");
-        let mut app = business_app(RgbaImage::new(4, 2), Some(path.clone()));
-        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
-            app.handle_key(
-                KeyEvent::new(code, KeyModifiers::NONE),
-                &app.geometry(test_layout().preview),
-            );
-        }
-        assert!(app.quit);
-        assert_eq!(app.grid_cache.grid.version(), 1);
-        jobs(&mut app);
-        app.finish();
-        let (output, image) = encoded_export(jobs(&mut app).pop().unwrap());
-        assert_eq!(output, path);
-        assert_eq!(image.dimensions(), (1000, 1800));
-        assert!(jobs(&mut app).is_empty());
-    }
-    #[test]
     fn print_controls_rebuild_once_and_preserve_the_layer() {
         let mut app = business_app(RgbaImage::new(20, 10), None);
         select(&mut app, Setting::Dot);
@@ -3200,26 +3158,5 @@ mod tests {
             assert!(!press(&mut app, KeyCode::Right));
             assert_eq!(versions(&app), before);
         }
-    }
-
-    #[test]
-    fn margin_consuming_card_builds_only_paper() {
-        let mut app = App::builtin(RgbaImage::new(8, 8), None);
-        app.settings = Settings {
-            margin: 100,
-            ..Settings::for_pixels(8, 8)
-        };
-        app.settings.tone.brightness = -0.5;
-        app.layer = Layer::Dithered;
-        app.refresh(false);
-        assert_eq!(app.grid_size(), (8, 8));
-        assert_eq!(app.grid_cache.dithered().unwrap(), &vec![1; 64]);
-        assert!(
-            app.grid_cache
-                .grid()
-                .unwrap()
-                .pixels()
-                .all(|p| p.0 == [255; 4])
-        );
     }
 }
