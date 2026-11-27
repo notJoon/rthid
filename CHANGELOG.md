@@ -16,7 +16,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and the current layer. The status shows `Flip` beside rotation. Templates keep
   the current flip, while opening an image or pressing `D` resets it
 
+- A Mass layer shows a flat four tone study of the undithered card grid, so
+  large dark and light shapes can be judged without the dither pattern. `a`
+  shows it and returns to the previous layer. The minimap shows the mass study
+  by default and `M` switches it to the main layer. `--mass-tones palette|mono|warm`
+  selects the tones, following the dither palette by default, and `--mass-invert`
+  treats light pixels as ink
+
 ### Changed
+
+- The minimap frame fits the map instead of a fixed box. A drag that starts on
+  the map keeps centering after the pointer leaves it, and a main preview drag
+  no longer jumps when the pointer crosses the minimap
 
 - Image is the default card and template fallback. It keeps one dot per source pixel,
   follows rotation and adds margin and bleed around the image. Dot sets its physical

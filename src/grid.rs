@@ -1,8 +1,11 @@
-//! Source image, print grid and dithered indices caches.
+//! Source image, print grid and processed preview caches.
 
 use crate::{memo::Memo, print::Placement, settings::Settings};
-use image::{RgbaImage, imageops};
-use rthid_dither::dither::{self, Options};
+use image::{Rgba, RgbaImage, imageops};
+use rthid_dither::{
+    dither::{self, Options, PaletteColor},
+    mass::{self, MassError, MassOptions},
+};
 
 type GridKey = Placement;
 
@@ -19,7 +22,21 @@ pub(crate) struct DitherKey {
     options: Options,
 }
 
-/// Source image, card grid and dithered indices. Each stage
+/// Grid build and the geometry and colors of the mass study.
+#[derive(PartialEq)]
+pub(crate) struct MassKey {
+    grid: u64,
+    options: MassOptions,
+    tones: [PaletteColor; 4],
+}
+
+/// Mass image and the diagnostic from the same build.
+pub(crate) struct MassBuild {
+    image: RgbaImage,
+    error: Option<(MassError, String)>,
+}
+
+/// Source image, card grid, dithered indices and mass image. Each stage
 /// rebuilds only when its key changes.
 pub struct GridCache {
     /// Loaded image before scaling and rotation.
@@ -28,6 +45,8 @@ pub struct GridCache {
     pub(crate) grid: Memo<GridKey, RgbaImage>,
     /// Palette indices from the last requested dither.
     pub(crate) dithered: Memo<DitherKey, Vec<u8>>,
+    /// Four tone colors from the last requested mass study.
+    pub(crate) mass: Memo<MassKey, MassBuild>,
 }
 
 impl GridCache {
@@ -36,11 +55,12 @@ impl GridCache {
         self.source.is_some()
     }
 
-    /// Replaces the image and invalidates both caches without resetting versions.
+    /// Replaces the image and invalidates all caches without resetting versions.
     pub fn set_source(&mut self, image: RgbaImage) {
         self.source = Some(image);
         self.grid.clear();
         self.dithered.clear();
+        self.mass.clear();
     }
 
     /// Current card placement when a source is loaded.
@@ -48,10 +68,16 @@ impl GridCache {
         Placement::new(self.source.as_ref()?.dimensions(), settings).ok()
     }
 
-    /// Rebuilds the grid when the card placement changed and, if
-    /// `need_dither` is set, the indices when the grid or dither options changed.
-    /// Returns true when new indices were built.
-    pub fn refresh(&mut self, settings: &Settings, need_dither: bool) -> bool {
+    /// Rebuilds the grid and requested layers when their inputs change.
+    /// Returns true when new dithered indices were built.
+    pub fn refresh(
+        &mut self,
+        settings: &Settings,
+        need_dither: bool,
+        need_mass: bool,
+        mass_options: &MassOptions,
+        tones: &[PaletteColor; 4],
+    ) -> bool {
         let Some(source) = &self.source else {
             return false;
         };
@@ -83,11 +109,36 @@ impl GridCache {
             }
             grid
         });
+        let grid = self.grid.get().expect("processed grid");
+        let (w, h) = grid.dimensions();
+        let version = self.grid_version();
+        if need_mass {
+            self.mass.update(
+                MassKey {
+                    grid: version,
+                    options: mass_options.clone(),
+                    tones: *tones,
+                },
+                || match mass::mass_study(grid.as_raw(), w as usize, h as usize, mass_options) {
+                    Ok(study) => MassBuild {
+                        image: RgbaImage::from_raw(w, h, study.rgba(w as usize, h as usize, tones))
+                            .expect("mass grid dimensions"),
+                        error: None,
+                    },
+                    Err(error) => MassBuild {
+                        image: RgbaImage::from_pixel(
+                            w,
+                            h,
+                            Rgba([tones[0].rgb[0], tones[0].rgb[1], tones[0].rgb[2], 255]),
+                        ),
+                        error: Some((error, format!("mass study: {error}"))),
+                    },
+                },
+            );
+        }
         if !need_dither {
             return false;
         }
-        let grid = self.grid.get().expect("processed grid");
-        let version = self.grid_version();
         let options = settings.options();
         self.dithered.update_by(
             |key| key.grid == version && key.options == options,
@@ -125,6 +176,25 @@ impl GridCache {
                 indices
             },
         )
+    }
+
+    /// Last mass image, current after a refresh that requested it.
+    pub fn mass(&self) -> Option<&RgbaImage> {
+        self.mass.get().map(|build| &build.image)
+    }
+
+    /// Error and status text from the last mass build, cleared on success.
+    pub fn mass_error(&self) -> Option<(&MassError, &str)> {
+        self.mass
+            .get()?
+            .error
+            .as_ref()
+            .map(|(error, text)| (error, text.as_str()))
+    }
+
+    /// Number of mass builds for preview cache invalidation.
+    pub fn mass_version(&self) -> u64 {
+        self.mass.version()
     }
 
     /// The composed card image that is shown as Original and dithered.
@@ -217,13 +287,14 @@ fn triangle_weights(input: u32, output: u32, position: u32) -> (u32, Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgba;
+    use crate::settings::Rotation;
 
     fn cache(source: RgbaImage) -> GridCache {
         GridCache {
             source: Some(source),
             grid: Memo::default(),
             dithered: Memo::default(),
+            mass: Memo::default(),
         }
     }
 
@@ -239,12 +310,24 @@ mod tests {
                     ..Settings::default()
                 };
                 let mut cache = cache(source.clone());
-                cache.refresh(&settings, false);
+                cache.refresh(
+                    &settings,
+                    false,
+                    false,
+                    &MassOptions::default(),
+                    &mass::MONO,
+                );
                 assert_eq!(cache.grid().unwrap(), &rotation.apply(source.clone()));
                 settings.zoom = 200;
                 settings.pan_x = 100;
                 settings.pan_y = -100;
-                cache.refresh(&settings, false);
+                cache.refresh(
+                    &settings,
+                    false,
+                    false,
+                    &MassOptions::default(),
+                    &mass::MONO,
+                );
                 let p = cache.placement(&settings).unwrap();
                 assert_eq!((p.sw, p.sh), (p.aw * 2, p.ah * 2));
                 assert_eq!((p.x, p.y), (-i64::from(p.aw), 0));
@@ -273,7 +356,13 @@ mod tests {
                     ..Settings::for_pixels(width, height)
                 };
                 let mut cache = cache(source.clone());
-                cache.refresh(&settings, false);
+                cache.refresh(
+                    &settings,
+                    false,
+                    false,
+                    &MassOptions::default(),
+                    &mass::MONO,
+                );
                 let grid = cache.grid().unwrap();
                 for y in 0..height {
                     for x in 0..width {
@@ -299,7 +388,7 @@ mod tests {
         settings.tone.brightness = -0.5;
         settings.tone.contrast = 1.0;
         let mut cache = cache(RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255])));
-        assert!(cache.refresh(&settings, true));
+        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
         let p = cache.placement(&settings).unwrap();
         assert_eq!(
             (p.inset, p.aw, p.ah, p.sw, p.sh, p.x, p.y),
@@ -324,12 +413,12 @@ mod tests {
             }
         }
         settings.margin = 100;
-        assert!(cache.refresh(&settings, true));
+        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
         assert!(cache.grid().unwrap().pixels().all(|p| p.0 == [255; 4]));
         assert!(cache.dithered().unwrap().iter().all(|&i| i == 1));
         settings.palette = crate::settings::build_palette(&["#000", "#777", "#fff"]).unwrap();
         let version = cache.grid_version();
-        assert!(cache.refresh(&settings, true));
+        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
         assert_eq!(cache.grid_version(), version);
         assert!(cache.dithered().unwrap().iter().all(|&i| i == 2));
     }
@@ -373,9 +462,113 @@ mod tests {
             let mut cache = cache(source);
             settings.pan_x = 100;
             settings.pan_y = -100;
-            assert!(cache.refresh(&settings, true));
+            assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
             assert_eq!(cache.grid().unwrap().dimensions(), (250, 450));
             assert!(cache.dithered().unwrap().iter().all(|&i| i == 0));
         }
+    }
+
+    #[test]
+    fn mass_cache_tracks_grid_options_and_tones() {
+        let mut cache = GridCache {
+            source: None,
+            grid: Memo::default(),
+            dithered: Memo::default(),
+            mass: Memo::default(),
+        };
+        let mut settings = Settings::for_pixels(8, 12);
+        let mut options = MassOptions::default();
+        cache.set_source(RgbaImage::new(8, 4));
+        cache.refresh(&settings, false, false, &options, &mass::MONO);
+        assert!(cache.mass().is_none());
+        for (tones, expected) in [(mass::MONO, 1), (mass::MONO, 1), (mass::WARM, 2)] {
+            assert!(!cache.refresh(&settings, false, true, &options, &tones));
+            assert_eq!(cache.mass_version(), expected);
+            assert_eq!(cache.mass().unwrap().dimensions(), (8, 12));
+            assert_eq!(cache.mass().unwrap().get_pixel(0, 0).0[..3], tones[0].rgb);
+        }
+        options.invert = true;
+        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        assert_eq!(cache.mass_version(), 3);
+        settings.rotation = Rotation::R90;
+        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        assert_eq!(cache.mass_version(), 4);
+        assert_eq!(cache.mass().unwrap().dimensions(), (8, 12));
+        assert!(cache.dithered().is_none());
+        cache.set_source(RgbaImage::new(2, 3));
+        assert!(cache.mass().is_none());
+        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        assert_eq!(cache.mass_version(), 5);
+    }
+
+    #[test]
+    fn mass_study_uses_the_composed_card_including_paper() {
+        let settings = Settings {
+            margin: 10,
+            zoom: 50,
+            ..Settings::for_pixels(16, 12)
+        };
+        let mut cache = cache(RgbaImage::from_pixel(16, 12, Rgba([0, 0, 0, 255])));
+        let options = MassOptions::default();
+        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        let grid = cache.grid().unwrap();
+        assert_eq!(grid.dimensions(), (16, 12));
+        assert_eq!(grid.get_pixel(0, 0).0, [255; 4]);
+        assert_eq!(grid.get_pixel(8, 6).0, [0, 0, 0, 255]);
+        let study = mass::mass_study(grid.as_raw(), 16, 12, &options).unwrap();
+        assert_eq!(
+            cache.mass().unwrap().as_raw(),
+            &study.rgba(16, 12, &mass::WARM)
+        );
+    }
+
+    #[test]
+    fn invalid_mass_options_use_the_background_tone_and_clear_error_on_success() {
+        let mut cache = GridCache {
+            source: Some(RgbaImage::new(3, 2)),
+            grid: Memo::default(),
+            dithered: Memo::default(),
+            mass: Memo::default(),
+        };
+        let options = MassOptions {
+            sigma: -1.0,
+            ..MassOptions::default()
+        };
+        cache.refresh(
+            &Settings::for_pixels(8, 8),
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
+        let image = cache.mass().unwrap();
+        assert_eq!(image.dimensions(), (8, 8));
+        assert!(image.pixels().all(|p| p.0 == [255; 4]));
+        assert_eq!(
+            cache.mass_error().map(|(error, _)| error),
+            Some(&MassError::InvalidSigma { sigma: -1.0 })
+        );
+        assert_eq!(cache.mass_version(), 1);
+        cache.refresh(
+            &Settings::for_pixels(8, 8),
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
+        assert_eq!(
+            cache.mass_error().map(|(error, _)| error),
+            Some(&MassError::InvalidSigma { sigma: -1.0 })
+        );
+        assert_eq!(cache.mass_version(), 1);
+        cache.refresh(
+            &Settings::for_pixels(8, 8),
+            false,
+            true,
+            &MassOptions::default(),
+            &mass::WARM,
+        );
+        assert!(cache.mass_error().is_none());
+        assert_eq!(cache.mass_version(), 2);
     }
 }

@@ -1,7 +1,7 @@
 //! Interactive state and the key and mouse handling that changes it.
 
 use crate::{
-    cells::{Glyphs, Pixels},
+    cells::{Glyphs, Layer, Pixels},
     export::Export,
     grid::GridCache,
     memo::Memo,
@@ -15,6 +15,10 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use rthid_dither::{
+    dither::PaletteColor,
+    mass::{self, MassOptions},
+};
 use rthid_io::{
     dir::Entry,
     io::{Done, Job, Opened, Outcome as IoOutcome},
@@ -39,6 +43,7 @@ struct Drag {
     point: (u16, u16),
     origin: (u32, u32),
     moved: bool,
+    minimap: bool,
 }
 
 enum Source {
@@ -48,7 +53,9 @@ enum Source {
 
 enum PreviewKey {
     ToggleOriginal,
+    ToggleMass,
     ToggleMinimap,
+    ToggleMinimapMass,
     Zoom(Zoom),
     Pan(i64, i64),
 }
@@ -78,6 +85,8 @@ pub struct App {
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
     last_drag: Option<Drag>,
+    /// Whether the last synced preview has a visible minimap.
+    minimap_visible: bool,
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Named configuration lists and their pending saves.
@@ -86,9 +95,16 @@ pub struct App {
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
     pub panel: ListPicker,
-    /// Whether the preview shows Original (the card grid) instead of Dithered.
-    /// Starts true.
-    pub show_original: bool,
+    /// Selected preview layer, initially Original.
+    pub layer: Layer,
+    /// Layer that `a` returns to from the mass study.
+    pub mass_return: Layer,
+    /// Whether the minimap shows the mass study instead of the main layer.
+    pub mass_minimap: bool,
+    /// Geometry controls for the mass study.
+    pub mass: MassOptions,
+    /// Fixed mass study tones, or None to follow the dither palette.
+    pub mass_tones: Option<[PaletteColor; 4]>,
     /// Whether the event loop should exit.
     pub quit: bool,
 }
@@ -108,10 +124,12 @@ impl App {
             viewport: Viewport::default(),
             preview_focus: false,
             last_drag: None,
+            minimap_visible: false,
             grid_cache: GridCache {
                 source: None,
                 grid: Memo::default(),
                 dithered: Memo::default(),
+                mass: Memo::default(),
             },
             library: Library::new(loaded),
             notice: None,
@@ -121,7 +139,11 @@ impl App {
             modal: None,
             settings: Settings::default(),
             panel: ListPicker::new(0),
-            show_original: true,
+            layer: Layer::Original,
+            mass_return: Layer::Original,
+            mass_minimap: true,
+            mass: MassOptions::default(),
+            mass_tones: None,
             quit: false,
         };
         if let Some((path, image)) = source {
@@ -145,6 +167,8 @@ impl App {
     #[cfg(test)]
     pub(crate) fn drag_fixture() -> Self {
         let mut app = Self::builtin(RgbaImage::new(120, 120), None);
+        app.settings = Settings::for_pixels(120, 120);
+        app.refresh(false);
         app.viewport.zoom = Zoom::In(1);
         app.viewport.hide_minimap = true;
         app
@@ -193,8 +217,9 @@ impl App {
         self.settings.zoom = 100;
         self.settings.pan_x = 0;
         self.settings.pan_y = 0;
-        self.show_original = true;
-        self.refresh();
+        self.layer = Layer::Original;
+        self.mass_return = Layer::Original;
+        self.refresh(false);
     }
 
     /// Supplies directory entries to the open dialog if it is still open.
@@ -210,13 +235,18 @@ impl App {
     }
 
     /// Status text with loading and the current notice before persistent diagnostics.
-    /// Fallbacks are save errors, load warnings and blocked saving, then export status.
+    /// Fallbacks are card limits, visible mass errors, library diagnostics and export status.
     pub fn notice(&self) -> Option<&str> {
         self.open_request
             .as_ref()
             .map(|request| request.label.as_str())
             .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
             .or_else(|| self.settings.dimensions(self.source_size()).err())
+            .or_else(|| {
+                (self.layer == Layer::Mass || (self.mass_minimap && self.minimap_visible))
+                    .then(|| self.grid_cache.mass_error().map(|(_, text)| text))
+                    .flatten()
+            })
             .or_else(|| self.library.notice())
             .or_else(|| self.export_status())
     }
@@ -412,14 +442,22 @@ impl App {
             .map_or((0, 0), |p| (p.width, p.height))
     }
 
-    /// Rebuilds the grid and dither if settings changed, sends a new dither to the
+    /// Rebuilds the grid and requested layers, sends a new dither to the
     /// companion PNG and clamps the viewport to the preview area. Call before each draw.
-    /// Returns whether the grid or dither was rebuilt.
+    /// Returns whether the grid, dither or mass study was rebuilt.
     pub fn sync(&mut self, preview: Rect) -> bool {
-        let versions = |cache: &GridCache| (cache.grid.version(), cache.dithered.version());
+        let versions = |cache: &GridCache| {
+            (
+                cache.grid.version(),
+                cache.dithered.version(),
+                cache.mass_version(),
+            )
+        };
         let before = versions(&self.grid_cache);
-        self.refresh();
+        let inset_mass = self.mass_minimap && self.geometry(preview).minimap.is_some();
+        self.refresh(inset_mass);
         self.clamp_viewport(preview);
+        self.minimap_visible = self.geometry(preview).minimap.is_some();
         before != versions(&self.grid_cache)
     }
 
@@ -437,9 +475,18 @@ impl App {
         self.viewport.clamp(w, h, area);
     }
 
-    fn refresh(&mut self) {
-        let need_dither = !self.show_original || self.has_export();
-        let changed = self.grid_cache.refresh(&self.settings, need_dither);
+    fn refresh(&mut self, inset_mass: bool) {
+        let need_dither = self.layer == Layer::Dithered || self.has_export();
+        let tones = self
+            .mass_tones
+            .unwrap_or_else(|| mass::tones_from_palette(&self.settings.palette, &self.mass));
+        let changed = self.grid_cache.refresh(
+            &self.settings,
+            need_dither,
+            self.layer == Layer::Mass || inset_mass,
+            &self.mass,
+            &tones,
+        );
         let source = self.source_size();
         if self.grid_cache.placement(&self.settings).is_some()
             && let Some(export) = &mut self.export
@@ -486,22 +533,44 @@ impl App {
 
     /// Selected preview pixels after sync, or None without a source.
     ///
-    /// Panics in dithered mode if its result was never built.
+    /// Panics if the selected processed layer was never built.
     pub fn displayed(&self) -> Option<Pixels<'_>> {
         let grid = self.grid_cache.grid()?;
-        Some(if self.show_original {
-            Pixels::Rgb(grid, self.grid_cache.grid_version())
-        } else {
-            Pixels::Indexed {
+        Some(match self.layer {
+            Layer::Original => Pixels::Rgb {
+                image: grid,
+                version: self.grid_cache.grid_version(),
+                layer: Layer::Original,
+            },
+            Layer::Dithered => Pixels::Indexed {
                 indices: self.grid_cache.dithered().expect("dithered grid"),
                 palette: &self.settings.palette,
-            }
+            },
+            Layer::Mass => Pixels::Rgb {
+                image: self.grid_cache.mass().expect("mass grid"),
+                version: self.grid_cache.mass_version(),
+                layer: Layer::Mass,
+            },
         })
+    }
+
+    /// Minimap pixels after sync, or None without a source.
+    pub fn inset(&self) -> Option<Pixels<'_>> {
+        if self.mass_minimap
+            && let Some(image) = self.grid_cache.mass()
+        {
+            return Some(Pixels::Rgb {
+                image,
+                version: self.grid_cache.mass_version(),
+                layer: Layer::Mass,
+            });
+        }
+        self.displayed()
     }
 
     /// Queues the final export including changes received with quit.
     pub fn finish(&mut self) {
-        self.refresh();
+        self.refresh(false);
     }
 
     /// Returns the last companion PNG write result.
@@ -555,6 +624,11 @@ impl App {
         let prev = self.last_drag.take();
         let point = (mouse.column, mouse.row);
         if !geometry.overflows() || !geometry.area.contains(point.into()) {
+            self.last_drag = prev.filter(|drag| {
+                drag.minimap
+                    && geometry.overflows()
+                    && matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+            });
             return was_dragging;
         }
         let (dx, dy) = geometry.zoom.dots_per_cell(geometry.grid, geometry.area);
@@ -563,13 +637,32 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(minimap) = geometry.minimap
                     && minimap.map.contains(point.into())
+                    && !(matches!(mouse.kind, MouseEventKind::Drag(_))
+                        && prev.is_some_and(|drag| !drag.minimap))
                 {
                     self.viewport.center_on_minimap(point, geometry);
+                    self.last_drag = Some(Drag {
+                        point,
+                        origin: geometry.origin,
+                        moved: false,
+                        minimap: true,
+                    });
+                } else if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && geometry
+                        .minimap
+                        .is_some_and(|minimap| minimap.frame.contains(point.into()))
+                {
+                    return was_dragging;
+                } else if matches!(mouse.kind, MouseEventKind::Drag(_))
+                    && prev.is_some_and(|drag| drag.minimap)
+                {
+                    self.last_drag = prev;
                 } else {
                     let mut drag = Drag {
                         point,
                         origin: geometry.origin,
                         moved: false,
+                        minimap: false,
                     };
                     if matches!(mouse.kind, MouseEventKind::Drag(_))
                         && let Some(anchor) = prev
@@ -607,7 +700,7 @@ impl App {
             palettes: &self.library.palettes,
             templates: &self.library.templates,
             settings: &self.settings,
-            show_original: self.show_original,
+            layer: self.layer,
         }
     }
 
@@ -682,9 +775,26 @@ impl App {
         }
         if let Some(preview_key) = preview_key {
             match preview_key {
-                PreviewKey::ToggleOriginal => self.show_original = !self.show_original,
+                PreviewKey::ToggleOriginal => {
+                    self.layer = if self.layer == Layer::Dithered {
+                        Layer::Original
+                    } else {
+                        Layer::Dithered
+                    };
+                }
+                PreviewKey::ToggleMass => {
+                    if self.layer == Layer::Mass {
+                        self.layer = self.mass_return;
+                    } else {
+                        self.mass_return = self.layer;
+                        self.layer = Layer::Mass;
+                    }
+                }
                 PreviewKey::ToggleMinimap => {
                     self.viewport.hide_minimap = !self.viewport.hide_minimap;
+                }
+                PreviewKey::ToggleMinimapMass => {
+                    self.mass_minimap = !self.mass_minimap;
                 }
                 PreviewKey::Zoom(zoom) => {
                     self.viewport.set_zoom(zoom, geometry);
@@ -719,7 +829,7 @@ impl App {
                     Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()],
                     &self.library.palettes,
                 );
-                let _ = self.set_settings(next, self.show_original);
+                let _ = self.set_settings(next, self.layer);
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -731,7 +841,9 @@ impl App {
     fn preview_key(&self, code: KeyCode, geometry: &PreviewGeometry) -> Option<PreviewKey> {
         match code {
             KeyCode::Char(' ') => Some(PreviewKey::ToggleOriginal),
+            KeyCode::Char('a') => Some(PreviewKey::ToggleMass),
             KeyCode::Char('m') => Some(PreviewKey::ToggleMinimap),
+            KeyCode::Char('M') => Some(PreviewKey::ToggleMinimapMass),
             KeyCode::Char('0') => Some(PreviewKey::Zoom(Zoom::Fit)),
             KeyCode::Char('+' | '=' | '-') => Some(PreviewKey::Zoom(self.viewport.zoom.step(
                 code != KeyCode::Char('-'),
@@ -752,13 +864,15 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
-                self.set_settings(settings, false)?;
+                let layer = if self.layer == Layer::Mass {
+                    Layer::Mass
+                } else {
+                    Layer::Dithered
+                };
+                self.set_settings(settings, layer)?;
             }
-            Effect::Restore {
-                settings,
-                show_original,
-            } => {
-                self.set_settings(settings, show_original)?;
+            Effect::Restore { settings, layer } => {
+                self.set_settings(settings, layer)?;
             }
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
@@ -789,18 +903,23 @@ impl App {
         self.apply_setting(setting, next);
     }
 
-    fn set_settings(&mut self, settings: Settings, show_original: bool) -> Result<(), String> {
+    fn set_settings(&mut self, settings: Settings, layer: Layer) -> Result<(), String> {
         settings.dimensions(self.source_size())?;
         self.settings = settings;
-        self.show_original = show_original;
+        self.layer = layer;
         Ok(())
     }
 
     // Enter and arrow keys share the preview rule and preserve it for rejected edits.
+    // The mass study stays selected because palette edits recolor its tones.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        let show_original =
-            self.show_original && (next == self.settings || !setting.shows_dithered());
-        let _ = self.set_settings(next, show_original);
+        let layer =
+            if next != self.settings && setting.shows_dithered() && self.layer != Layer::Mass {
+                Layer::Dithered
+            } else {
+                self.layer
+            };
+        let _ = self.set_settings(next, layer);
     }
 }
 
@@ -892,17 +1011,23 @@ mod tests {
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
             (60, 40)
         );
+        app.layer = Layer::Mass;
+        app.refresh(false);
+        assert!(jobs(&mut app).is_empty());
         let before = versions(&app);
+        let mass_version = app.grid_cache.mass_version();
         app.settings.dot = 40;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), before);
+        assert_eq!(app.grid_cache.mass_version(), mass_version);
+        assert_eq!(app.layer, Layer::Mass);
         assert_eq!(app.grid_size(), (30, 20));
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
             (120, 80)
         );
         app.settings.rotation = Rotation::R90;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(app.grid_size(), (20, 30));
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
@@ -910,19 +1035,19 @@ mod tests {
         );
         app.settings.margin = 20;
         app.settings.bleed = 3;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
             (184, 224)
         );
-        app.refresh();
+        app.refresh(false);
         assert!(jobs(&mut app).is_empty());
 
         let mut app = App::builtin(RgbaImage::new(30, 20), Some("preview.png".into()));
         jobs(&mut app);
         let before = versions(&app);
         app.settings.dot = 40;
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), before);
         assert!(jobs(&mut app).is_empty());
     }
@@ -936,7 +1061,7 @@ mod tests {
             let job = jobs(&mut app).pop().unwrap();
             app.settings.bleed = 3;
             assert_eq!(encoded_export(job).1.dimensions(), expected);
-            app.refresh();
+            app.refresh(false);
             let expected = if dpi.is_some() {
                 (1323, 2268)
             } else {
@@ -1067,7 +1192,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(app.settings == original);
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
 
         for outcome in [listing(), image()] {
             app.open_dialog("/images".into());
@@ -1210,7 +1335,7 @@ mod tests {
         app.settings.dot = 10;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         app.settings.strength = 0.5;
@@ -1348,7 +1473,7 @@ mod tests {
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
             assert!(!app.viewport.hide_minimap);
             assert!(app.last_drag.is_none());
-            assert!(app.show_original);
+            assert_eq!(app.layer, Layer::Original);
             assert_eq!(versions(&app), (0, 0));
         }
         app.preview_focus = false;
@@ -1361,7 +1486,7 @@ mod tests {
         app.open_image(PathBuf::from("first.png"), RgbaImage::new(20, 10));
         assert_eq!(app.grid_size(), (450, 250));
         assert!(app.displayed().is_some());
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         assert_eq!(versions(&app), (1, 0));
     }
 
@@ -1382,8 +1507,8 @@ mod tests {
         app.settings.pan_x = 25;
         app.settings.pan_y = -40;
         app.settings.flip = true;
-        app.show_original = false;
-        app.refresh();
+        app.layer = Layer::Dithered;
+        app.refresh(false);
         let settings = app.settings.clone();
         let before = versions(&app);
         app.viewport.zoom = Zoom::In(2);
@@ -1393,6 +1518,7 @@ mod tests {
             point: (3, 4),
             origin: (1, 0),
             moved: true,
+            minimap: false,
         });
         let path = PathBuf::from("replacement.png");
         app.open_image(path.clone(), RgbaImage::new(3, 5));
@@ -1400,7 +1526,7 @@ mod tests {
         assert_eq!(app.viewport.zoom, Zoom::Fit);
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
         assert!(!app.viewport.hide_minimap);
-        assert!(app.last_drag.is_none() && app.show_original);
+        assert!(app.last_drag.is_none() && app.layer == Layer::Original);
         assert_eq!(app.settings.rotation, Rotation::R0);
         assert!(!app.settings.flip);
         assert_eq!(
@@ -1444,7 +1570,11 @@ mod tests {
         assert_eq!(app.settings.strength, 0.5);
         assert!(app.settings.flip);
         assert_eq!(app.settings.rotation, Rotation::R90);
-        assert!(!app.show_original && app.modal.is_none() && take_changes(&mut app).is_empty());
+        assert!(
+            app.layer == Layer::Dithered
+                && app.modal.is_none()
+                && take_changes(&mut app).is_empty()
+        );
     }
 
     #[test]
@@ -1474,7 +1604,11 @@ mod tests {
         }
         assert_eq!(app.settings.palette_name, "Z");
         assert!(app.library.palettes.find("Z").is_some());
-        assert!(app.modal.is_none() && !take_changes(&mut app).is_empty() && !app.show_original);
+        assert!(
+            app.modal.is_none()
+                && !take_changes(&mut app).is_empty()
+                && app.layer == Layer::Dithered
+        );
     }
 
     // Takes the queued save job with the tag its result echoes.
@@ -1963,7 +2097,7 @@ mod tests {
         let mut app = business_app(RgbaImage::new(20, 10), None);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 0);
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.dithered.version(), 1);
         app.sync(test_layout().preview);
@@ -1973,13 +2107,13 @@ mod tests {
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 2);
-        app.show_original = true;
+        app.layer = Layer::Original;
         app.settings.rotation = Rotation::R180;
         app.settings.dot = 19;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 2);
         assert_eq!(app.grid_cache.dithered.version(), 2);
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.dithered.version(), 3);
         assert_eq!(app.grid_size(), (263, 474));
@@ -2028,26 +2162,81 @@ mod tests {
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::builtin(RgbaImage::new(20, 10), None);
         select(&mut app, Setting::Strength);
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
             assert_eq!(press(&mut app, KeyCode::Char(' ')), rebuilt);
-            assert!(!app.show_original);
+            assert_eq!(app.layer, Layer::Dithered);
             assert!(!press(&mut app, KeyCode::Char(' ')));
-            assert!(app.show_original);
+            assert_eq!(app.layer, Layer::Original);
         }
         app.preview_focus = false;
         assert!(!press(&mut app, KeyCode::Right));
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         assert!(press(&mut app, KeyCode::Left));
-        assert!(!app.show_original);
+        assert_eq!(app.layer, Layer::Dithered);
         assert!(!press(&mut app, KeyCode::Char(' ')));
         app.panel = ListPicker::new(0);
         assert!(press(&mut app, KeyCode::Left));
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d'), KeyCode::Char('D')] {
             assert!(press(&mut app, code));
-            assert!(app.show_original);
+            assert_eq!(app.layer, Layer::Original);
+        }
+        app.layer = Layer::Mass;
+        select(&mut app, Setting::Strength);
+        let strength = app.settings.strength;
+        press(&mut app, KeyCode::Left);
+        assert_ne!(app.settings.strength, strength);
+        assert_eq!(app.layer, Layer::Mass);
+        app.apply(Effect::Preview(app.settings.clone())).unwrap();
+        assert_eq!(app.layer, Layer::Mass);
+    }
+
+    #[test]
+    fn mass_toggle_builds_rgb_and_redraws_without_rebuilding_grid() {
+        for focus in [false, true] {
+            let mut app = App::builtin(RgbaImage::new(20, 10), None);
+            app.preview_focus = focus;
+            app.settings = Settings::for_pixels(8, 10);
+            app.settings.rotation = Rotation::R90;
+            let area = test_layout().preview;
+            app.sync(area);
+            let grid_version = app.grid_cache.grid_version();
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &app.geometry(area),
+            );
+            assert_eq!(app.layer, Layer::Mass);
+            assert!(app.sync(area));
+            assert_eq!(app.grid_cache.grid_version(), grid_version);
+            assert_eq!(app.grid_cache.dithered.version(), 0);
+            let Some(Pixels::Rgb {
+                image,
+                version,
+                layer: Layer::Mass,
+            }) = app.displayed()
+            else {
+                panic!("expected mass RGB pixels");
+            };
+            assert_eq!(image.dimensions(), (8, 10));
+            assert_eq!(version, app.grid_cache.mass_version());
+            assert!(!app.sync(area));
+            assert!(!press(&mut app, KeyCode::Char('a')));
+            assert_eq!(app.layer, Layer::Original);
+            press(&mut app, KeyCode::Char('a'));
+            press(&mut app, KeyCode::Char(' '));
+            assert_eq!(app.layer, Layer::Dithered);
+            press(&mut app, KeyCode::Char('a'));
+            assert_eq!(app.layer, Layer::Mass);
+            press(&mut app, KeyCode::Char('a'));
+            assert_eq!(app.layer, Layer::Dithered);
+            press(&mut app, KeyCode::Char('a'));
+            app.open_image(PathBuf::from("next.png"), RgbaImage::new(20, 10));
+            assert_eq!(
+                (app.layer, app.mass_return),
+                (Layer::Original, Layer::Original)
+            );
         }
     }
 
@@ -2090,6 +2279,150 @@ mod tests {
             app.adjust(-1);
             assert_eq!(app.settings.dot, expected_dot);
             assert_eq!(app.settings.margin, dot_margin);
+        }
+    }
+
+    #[test]
+    fn mass_error_notice_follows_layer_and_minimap_visibility() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        app.mass.sigma = -1.0;
+        app.layer = Layer::Mass;
+        app.sync(area);
+        let expected = format!("mass study: {}", app.grid_cache.mass_error().unwrap().0);
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        assert!(!app.sync(area));
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        app.set_notice("retained".into());
+        assert_eq!(app.notice(), Some("retained"));
+        app.notice = None;
+        assert_eq!(app.notice(), Some(expected.as_str()));
+
+        app.layer = Layer::Original;
+        app.sync(area);
+        assert!(app.notice().is_none());
+        app.viewport.zoom = Zoom::In(2);
+        app.sync(area);
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        app.mass_minimap = false;
+        app.sync(area);
+        assert!(app.notice().is_none());
+        app.mass_minimap = true;
+        app.viewport.hide_minimap = true;
+        app.sync(area);
+        assert!(app.notice().is_none());
+
+        app.layer = Layer::Mass;
+        app.mass = MassOptions::default();
+        app.sync(area);
+        assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn mass_minimap_builds_only_when_visible() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        assert!(app.mass_minimap);
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 0);
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+
+        app.viewport.hide_minimap = true;
+        app.viewport.zoom = Zoom::In(2);
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 0);
+        app.viewport.hide_minimap = false;
+        assert!(app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 1);
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Mass,
+                ..
+            })
+        ));
+        assert!(matches!(
+            app.displayed(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+
+        app.viewport.hide_minimap = true;
+        assert!(!app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), 1);
+        // The cached mass inset is retained while the hidden minimap is not drawn.
+        assert!(app.geometry(area).minimap.is_none());
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Mass,
+                ..
+            })
+        ));
+        app.mass_minimap = false;
+        assert!(matches!(
+            app.inset(),
+            Some(Pixels::Rgb {
+                layer: Layer::Original,
+                ..
+            })
+        ));
+        app.layer = Layer::Dithered;
+        app.sync(area);
+        assert!(matches!(app.inset(), Some(Pixels::Indexed { .. })));
+        assert!(matches!(app.displayed(), Some(Pixels::Indexed { .. })));
+    }
+
+    #[test]
+    fn mass_minimap_refreshes_after_card_grid_changes() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        app.viewport.zoom = Zoom::In(2);
+        assert!(app.sync(area));
+        app.settings = Settings::for_pixels(200, 200);
+        assert!(app.sync(area));
+        let Some(Pixels::Rgb {
+            image,
+            layer: Layer::Mass,
+            ..
+        }) = app.inset()
+        else {
+            panic!("expected mass inset");
+        };
+        assert_eq!(image.dimensions(), (200, 200));
+        assert_eq!(image.dimensions(), app.grid_size());
+        assert_eq!(app.grid_cache.mass_version(), 2);
+    }
+
+    #[test]
+    fn mass_minimap_toggle_preserves_grid_and_visibility() {
+        for focus in [false, true] {
+            let mut app = App::builtin(RgbaImage::new(400, 400), None);
+            let area = Rect::new(0, 0, 69, 36);
+            app.preview_focus = focus;
+            app.viewport.zoom = Zoom::In(2);
+            assert!(app.sync(area));
+            let before = versions(&app);
+            for enabled in [false, true] {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+                    &app.geometry(area),
+                );
+                assert_eq!(app.mass_minimap, enabled);
+                assert!(!app.sync(area));
+                assert_eq!(versions(&app), before);
+                assert_eq!(app.grid_cache.mass_version(), 1);
+                assert!(!app.viewport.hide_minimap);
+                assert_eq!(app.layer, Layer::Original);
+            }
         }
     }
 
@@ -2193,14 +2526,36 @@ mod tests {
     }
 
     #[test]
+    fn mass_tones_follow_palette_changes() {
+        let mut app = App::builtin(RgbaImage::new(20, 10), None);
+        assert_eq!(app.mass_tones, None);
+        app.layer = Layer::Mass;
+        let area = test_layout().preview;
+        app.sync(area);
+        let version = app.grid_cache.mass_version();
+        app.settings.palette = vec![
+            PaletteColor { rgb: [10, 20, 30] },
+            PaletteColor {
+                rgb: [210, 220, 230],
+            },
+        ];
+        assert!(app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), version + 1);
+        assert_eq!(
+            app.grid_cache.mass().unwrap().get_pixel(0, 0).0,
+            [210, 220, 230, 255]
+        );
+    }
+
+    #[test]
     fn original_preserves_rgb_and_alpha() {
         let source =
             RgbaImage::from_raw(8, 8, [255, 0, 0, 0, 25, 26, 128, 255].repeat(32)).unwrap();
         let expected = source.as_raw().clone();
         let mut app = App::builtin(source, None);
         app.settings = Settings::for_pixels(8, 8);
-        app.refresh();
-        let Some(Pixels::Rgb(pixels, _)) = app.displayed() else {
+        app.refresh(false);
+        let Some(Pixels::Rgb { image: pixels, .. }) = app.displayed() else {
             panic!("expected original RGB pixels");
         };
         assert_eq!(pixels.as_raw(), &expected);
@@ -2248,7 +2603,7 @@ mod tests {
         app.settings.dither = Dither::Bayer4;
         app.settings.seed = 42;
         app.sync(test_layout().preview);
-        app.show_original = true;
+        app.layer = Layer::Original;
         for setting in [Setting::Strength, Setting::Serpentine] {
             select(&mut app, setting);
             for key in [
@@ -2260,11 +2615,11 @@ mod tests {
                 let before = app.settings.clone();
                 assert!(!press(&mut app, key));
                 assert!(app.settings == before);
-                assert!(app.show_original);
+                assert_eq!(app.layer, Layer::Original);
             }
         }
         select(&mut app, Setting::Dither);
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         assert!(press(&mut app, KeyCode::Char('d')));
         assert_eq!(app.settings.dither, Dither::Atkinson);
         assert_eq!(app.settings.strength, 0.9);
@@ -2278,19 +2633,19 @@ mod tests {
         let before = app.settings.clone();
         assert!(!press(&mut app, KeyCode::Enter));
         assert!(app.settings == before);
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         app.settings.dither = Dither::Noise;
         app.settings.seed = 0;
         assert!(!press(&mut app, KeyCode::Left));
         assert_eq!(app.settings.seed, 0);
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!(app.settings.seed, 1);
         let seed = app.settings.seed;
-        app.show_original = true;
+        app.layer = Layer::Original;
         assert!(press(&mut app, KeyCode::Enter));
         assert_ne!(app.settings.seed, seed);
-        assert!(!app.show_original);
+        assert_eq!(app.layer, Layer::Dithered);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert_eq!(app.settings.seed, 0);
     }
@@ -2389,7 +2744,7 @@ mod tests {
             app.sync(test_layout().preview);
             if !setting.is_active(&app.settings) {
                 let before = app.settings.clone();
-                app.show_original = true;
+                app.layer = Layer::Original;
                 for key in [
                     KeyCode::Left,
                     KeyCode::Right,
@@ -2398,7 +2753,7 @@ mod tests {
                 ] {
                     assert!(!press(&mut app, key));
                     assert!(app.settings == before);
-                    assert!(app.show_original);
+                    assert_eq!(app.layer, Layer::Original);
                 }
                 continue;
             }
@@ -2427,7 +2782,7 @@ mod tests {
         assert!(!press(&mut app, KeyCode::Char('d')));
         assert!(press(&mut app, KeyCode::Char('D')));
         app.settings.tone.gamma = 2.0;
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         app.sync(test_layout().preview);
         assert!(press(&mut app, KeyCode::Char('D')));
         assert_eq!(app.settings.tone.gamma, 1.0);
@@ -2440,7 +2795,7 @@ mod tests {
             &app.geometry(test_layout().preview),
         );
         let version = versions(&app);
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), version);
     }
 
@@ -2462,7 +2817,7 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let version = versions(&app);
         app.handle_key(ctrl('r'), &app.geometry(test_layout().preview));
-        app.refresh();
+        app.refresh(false);
         assert_eq!(versions(&app), version);
         app.handle_key(ctrl('c'), &app.geometry(test_layout().preview));
         assert!(app.quit);
@@ -2471,21 +2826,21 @@ mod tests {
     #[test]
     fn flip_toggles_in_both_focuses_and_layers_and_rebuilds_once() {
         for focus in [false, true] {
-            for original in [false, true] {
+            for layer in [Layer::Original, Layer::Dithered, Layer::Mass] {
                 let mut app = App::builtin(RgbaImage::new(16, 12), None);
                 app.settings = Settings::for_pixels(16, 12);
                 app.preview_focus = focus;
-                app.show_original = original;
-                app.refresh();
+                app.layer = layer;
+                app.refresh(false);
                 assert!(!app.settings.flip);
                 for expected in [true, false] {
                     let before = versions(&app);
                     assert!(press(&mut app, KeyCode::Char('f')));
                     assert_eq!(app.settings.flip, expected);
-                    assert_eq!(app.show_original, original);
-                    let after = (before.0 + 1, before.1 + u64::from(!original));
+                    assert_eq!(app.layer, layer);
+                    let after = (before.0 + 1, before.1 + u64::from(layer == Layer::Dithered));
                     assert_eq!(versions(&app), after);
-                    app.refresh();
+                    app.refresh(false);
                     assert_eq!(versions(&app), after);
                 }
                 press(&mut app, KeyCode::Char('o'));
@@ -2498,7 +2853,7 @@ mod tests {
     #[test]
     fn rotation_keeps_the_actual_dither_grid() {
         let mut app = business_app(RgbaImage::new(256, 128), None);
-        app.show_original = false;
+        app.layer = Layer::Dithered;
         let size = app.grid_size();
         for (key, expected) in [
             ('r', Rotation::R90),
@@ -2520,7 +2875,7 @@ mod tests {
     fn global_zoom_and_preview_pans_skip_redithering() {
         let mut app = App::builtin(RgbaImage::new(400, 400), None);
         app.settings = Settings::for_pixels(400, 400);
-        app.refresh();
+        app.refresh(false);
         for focus in [false, true] {
             app.preview_focus = focus;
             assert!(!press(&mut app, KeyCode::Char('0')));
@@ -2589,7 +2944,7 @@ mod tests {
     fn mouse_centers_pans_and_scrolls_without_focus_or_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         app.settings = Settings::for_pixels(120, 120);
-        app.refresh();
+        app.refresh(false);
         let area = Rect::new(2, 3, 48, 18);
         app.viewport.zoom = Zoom::In(1);
         let map = app.geometry(area).minimap.unwrap().map;
@@ -2600,7 +2955,7 @@ mod tests {
                 &app.geometry(area),
                 test_layout().screen,
             );
-            app.refresh();
+            app.refresh(false);
             assert_eq!(versions(app), version);
             assert!(!app.preview_focus);
         };
@@ -2666,6 +3021,150 @@ mod tests {
             map.y,
         );
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
+    }
+
+    #[test]
+    fn minimap_drag_centers_after_leaving_map() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        let area = Rect::new(2, 3, 48, 18);
+        let minimap = app.geometry(area).minimap.unwrap();
+        let map = minimap.map;
+        for outside in [
+            (minimap.frame.x, map.y + 1),
+            (minimap.frame.x - 1, map.y + 1),
+            (0, 0),
+        ] {
+            let geometry = app.geometry(area);
+            assert!(app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                map.x + 4,
+                map.y + 1,
+                &geometry,
+                test_layout().screen,
+            ));
+            let centered = (app.viewport.x, app.viewport.y);
+            assert!(!app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside.0,
+                outside.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), centered);
+            let point = (map.right() - 1, map.bottom() - 1);
+            let geometry = app.geometry(area);
+            let mut expected = app.viewport;
+            expected.center_on_minimap(point, &geometry);
+            assert!(app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                point.0,
+                point.1,
+                &geometry,
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), (expected.x, expected.y));
+            assert!(!app.dragging());
+            assert!(!app.mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                point.0,
+                point.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert!(app.last_drag.is_none());
+        }
+    }
+
+    #[test]
+    fn preview_drag_continues_over_minimap() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        app.viewport.x = 60;
+        app.viewport.y = 60;
+        let area = Rect::new(2, 3, 48, 18);
+        let geometry = app.geometry(area);
+        let map = geometry.minimap.unwrap().map;
+        let start = (map.x - 2, map.y + 2);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            start.0,
+            start.1,
+            &geometry,
+            test_layout().screen,
+        );
+        for (point, expected) in [
+            ((map.x + 2, map.y + 1), (56, 62)),
+            ((map.x + 3, map.y + 2), (55, 60)),
+        ] {
+            assert!(app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                point.0,
+                point.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), expected);
+            let anchor = app.last_drag.as_ref().unwrap();
+            assert_eq!(anchor.point, start);
+            assert_eq!(anchor.origin, geometry.origin);
+            assert!(app.dragging());
+        }
+    }
+
+    #[test]
+    fn minimap_press_updates_viewport_and_replaces_preview_drag() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        app.viewport.x = 60;
+        app.viewport.y = 60;
+        let area = Rect::new(2, 3, 48, 18);
+        let geometry = app.geometry(area);
+        let minimap = geometry.minimap.unwrap();
+        let map = minimap.map;
+        for (name, point, expected_return, expected_viewport, expected_last_drag) in [
+            (
+                "border",
+                (minimap.frame.x, minimap.frame.y),
+                false,
+                geometry.origin,
+                None,
+            ),
+            ("map", (map.x + 4, map.y + 1), true, (36, 27), Some(true)),
+        ] {
+            app.viewport.x = geometry.origin.0;
+            app.viewport.y = geometry.origin.1;
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                map.x - 2,
+                map.y + 1,
+                &geometry,
+                test_layout().screen,
+            );
+            assert!(app.last_drag.is_some(), "{name}");
+            assert_eq!(
+                app.mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    point.0,
+                    point.1,
+                    &geometry,
+                    test_layout().screen,
+                ),
+                expected_return,
+                "{name}",
+            );
+            assert_eq!(
+                (app.viewport.x, app.viewport.y),
+                expected_viewport,
+                "{name}",
+            );
+            assert_eq!(
+                app.last_drag.as_ref().map(|drag| drag.minimap),
+                expected_last_drag,
+                "{name}",
+            );
+            assert!(!app.dragging(), "{name}");
+        }
     }
 
     #[test]
@@ -2747,10 +3246,10 @@ mod tests {
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!(app.grid_size(), (238, 429));
         assert_eq!(versions(&app), (before.0 + 1, before.1));
-        assert!(app.show_original);
+        assert_eq!(app.layer, Layer::Original);
         assert!(!app.sync(test_layout().preview));
-        app.show_original = false;
-        app.refresh();
+        app.layer = Layer::Dithered;
+        app.refresh(false);
         for (setting, key) in [
             (Setting::Zoom, KeyCode::Right),
             (Setting::PanX, KeyCode::Right),
@@ -2760,14 +3259,14 @@ mod tests {
             let before = versions(&app);
             assert!(press(&mut app, key));
             assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
-            assert!(!app.show_original);
+            assert_eq!(app.layer, Layer::Dithered);
             assert!(!app.sync(test_layout().preview));
         }
         for setting in [Setting::Zoom, Setting::PanX, Setting::PanY] {
             app.settings.zoom = 400;
             app.settings.pan_x = 100;
             app.settings.pan_y = 100;
-            app.refresh();
+            app.refresh(false);
             select(&mut app, setting);
             let before = versions(&app);
             assert!(!press(&mut app, KeyCode::Right));
@@ -2783,8 +3282,8 @@ mod tests {
             ..Settings::for_pixels(8, 8)
         };
         app.settings.tone.brightness = -0.5;
-        app.show_original = false;
-        app.refresh();
+        app.layer = Layer::Dithered;
+        app.refresh(false);
         assert_eq!(app.grid_size(), (8, 8));
         assert_eq!(app.grid_cache.dithered().unwrap(), &vec![1; 64]);
         assert!(

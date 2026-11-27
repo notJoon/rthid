@@ -2,6 +2,11 @@
 
 Terminal independent palette dithering used by the rthid binary.
 
+The `mass` module turns undithered RGBA images into four flat tones using a
+blurred ink field and nested masks at a maximum analysis width of 450 pixels.
+Its index grid can render at any size with tones from `tones_from_palette` by
+default, or the `MONO` / `WARM` presets.
+
 ## Quick start
 
 This crate is not published to crates.io. Add it to your app's `Cargo.toml`,
@@ -30,6 +35,24 @@ Defaults use a black and white palette, Tone mode, serpentine Atkinson error
 diffusion at strength 1, and no tone adjustment.
 
 Use [rthid-render](../rthid-render) to turn indices into PNG output with `write_png`.
+
+## Mass study
+
+Analyze the source, derive tones from a palette, then resample to the output size:
+
+```rust
+use rthid_dither::dither::PaletteColor;
+use rthid_dither::mass::{MassOptions, mass_study, tones_from_palette};
+
+let source = [0, 0, 0, 255, 255, 255, 255, 255];
+let palette = [PaletteColor { rgb: [0; 3] }, PaletteColor { rgb: [255; 3] }];
+let options = MassOptions::default();
+let study = mass_study(&source, 2, 1, &options)?;
+let tones = tones_from_palette(&palette, &options);
+let rgba = study.rgba(4, 2, &tones);
+assert_eq!(rgba.len(), 4 * 2 * 4);
+# Ok::<(), rthid_dither::MassError>(())
+```
 
 ## Choosing an algorithm
 
@@ -160,7 +183,7 @@ panics.
 
 ## Not provided
 
-- Alpha compositing. Alpha is ignored, so composite onto a background first.
+- Alpha compositing. `dither` ignores alpha, so composite onto a background first.
 - Color management. Color mode uses a fixed weighted RGB distance with no Lab
   distance or profiles.
 - Blue noise. Noise is plain random threshold dithering.

@@ -81,6 +81,13 @@ struct Args {
     /// Glyph set for the sampled Dithered preview and minimap.
     #[arg(long, value_enum)]
     glyphs: Option<CliGlyphs>,
+    /// Tone colors for the mass study layer, from the dither palette or a fixed set.
+    #[arg(long, value_enum, default_value = "palette")]
+    mass_tones: CliMassTones,
+    /// Treat light pixels as ink in the mass study, for light subjects on dark backgrounds.
+    /// With `--mass-tones palette` the darkest palette color becomes the background; fixed tone sets keep their order.
+    #[arg(long)]
+    mass_invert: bool,
     /// Detect terminal graphics or use glyph rendering.
     #[arg(long, value_enum, default_value = "auto")]
     graphics: CliGraphics,
@@ -92,6 +99,13 @@ struct Args {
 enum CliGlyphs {
     Sextant,
     Quadrant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliMassTones {
+    Palette,
+    Mono,
+    Warm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -138,6 +152,8 @@ fn run() -> io::Result<()> {
         dpi,
         config,
         glyphs,
+        mass_tones,
+        mass_invert,
         graphics,
     } = Args::parse();
     let glyphs = glyphs.map(|glyphs| match glyphs {
@@ -186,6 +202,12 @@ fn run() -> io::Result<()> {
     let mut app = App::new(source, preview_png.clone(), dpi, loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
+    app.mass_tones = match mass_tones {
+        CliMassTones::Palette => None,
+        CliMassTones::Mono => Some(rthid_dither::mass::MONO),
+        CliMassTones::Warm => Some(rthid_dither::mass::WARM),
+    };
+    app.mass.invert = mass_invert;
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
     #[allow(clippy::needless_update, reason = "Keep future input modes disabled.")]
@@ -413,6 +435,8 @@ mod tests {
         assert_eq!(args.dpi, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
+        assert_eq!(args.mass_tones, CliMassTones::Palette);
+        assert!(!args.mass_invert);
         assert!(matches!(args.graphics, CliGraphics::Auto));
     }
 
@@ -436,6 +460,9 @@ mod tests {
             "off",
             "--glyphs",
             "quadrant",
+            "--mass-tones",
+            "warm",
+            "--mass-invert",
             "--preview-png",
             "dots.png",
             "--config",
@@ -447,6 +474,8 @@ mod tests {
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
+        assert_eq!(args.mass_tones, CliMassTones::Warm);
+        assert!(args.mass_invert);
     }
 
     #[test]
@@ -472,6 +501,7 @@ mod tests {
         for args in [
             vec!["--graphics", "kitty"],
             vec!["--glyphs", "unknown"],
+            vec!["--mass-tones", "unknown"],
             vec!["--preview-png", ""],
             vec!["--config", ""],
             vec!["a", "b"],
