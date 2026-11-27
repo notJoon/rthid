@@ -571,7 +571,15 @@ mod tests {
     use super::*;
     use crate::settings::BUSINESS_CARD;
     use image::RgbaImage;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal, TerminalOptions, Viewport,
+        backend::TestBackend,
+        crossterm::{
+            event::{MouseButton, MouseEventKind},
+            style::Colored,
+        },
+    };
+    use std::io::{self, BufWriter, Write};
 
     #[test]
     fn ansi256_uses_nearest_cube_or_gray() {
@@ -607,9 +615,127 @@ mod tests {
             .collect()
     }
 
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: usize,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes += bytes.len();
+            self.writes += 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn panning_terminal_output_stays_within_budget() {
+        const AREA: Rect = Rect::new(0, 0, 200, 55);
+        const FRAMES: usize = 60;
+        // See scripts/profile/results/2026-11-26.md for why bytes per frame bound pan speed.
+        let cases = [
+            (1, Layer::Original, 103_000),
+            (1, Layer::Dithered, 56_000),
+            (2, Layer::Original, 40_000),
+            (2, Layer::Dithered, 25_500),
+        ];
+        let source = rthid_io::image::load_image(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/rthid-dither/tests/fixtures/pratt.png"
+        )))
+        .unwrap();
+        assert_eq!(source.dimensions(), (569, 1024));
+        // Override crossterm's process-wide NO_COLOR cache so counts do not depend on the environment.
+        Colored::set_ansi_color_disabled(false);
+
+        println!(
+            "case                         first bytes   avg bytes/frame   budget   avg writes/frame"
+        );
+        for (k, layer, budget) in cases {
+            let zoom = viewport::Zoom::In(k);
+            let mut app = App::builtin(source.clone(), None);
+            let mut renderer = Renderer::new(None);
+            let mut terminal = Terminal::with_options(
+                rthid_term::ElidingBackend::new(BufWriter::with_capacity(
+                    1024 * 1024,
+                    CountingWriter::default(),
+                )),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(AREA),
+                },
+            )
+            .unwrap();
+            let layout = layout(AREA);
+            app.viewport.set_zoom(zoom, &app.geometry(layout.preview));
+            app.layer = layer;
+            app.sync(layout.preview);
+
+            let geometry = app.geometry(layout.preview);
+            let start = (
+                geometry.target.right() - 2,
+                geometry.target.y + geometry.target.height / 2,
+            );
+            assert!(!app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                start.0,
+                start.1,
+                &geometry,
+                layout.screen,
+            ));
+            let start_x = geometry.origin.0;
+            // Frame 0 is the full first draw; the budget covers frames 1..=FRAMES.
+            let (mut first_bytes, mut first_writes) = (0, 0);
+            for frame in 0..=FRAMES {
+                if frame > 0 {
+                    let geometry = app.geometry(layout.preview);
+                    assert!(app.mouse_at(
+                        MouseEventKind::Drag(MouseButton::Left),
+                        start.0 - frame as u16 * u16::from(k),
+                        start.1,
+                        &geometry,
+                        layout.screen,
+                    ));
+                    assert_eq!(
+                        app.geometry(layout.preview).origin.0,
+                        start_x + frame as u32
+                    );
+                    app.sync(layout.preview);
+                }
+                rthid_term::synchronized_draw(&mut terminal, |terminal| {
+                    terminal
+                        .draw(|frame| draw(frame, &app, &layout, &mut renderer))
+                        .map(|_| ())
+                })
+                .unwrap();
+                if frame == 0 {
+                    let writer = terminal.backend().writer().get_ref();
+                    (first_bytes, first_writes) = (writer.bytes, writer.writes);
+                }
+            }
+
+            let writer = terminal.backend().writer().get_ref();
+            let bytes = writer.bytes - first_bytes;
+            let writes = writer.writes - first_writes;
+            let average = bytes.div_ceil(FRAMES);
+            let name = format!("{} {:?}", layer.name(), zoom);
+            println!(
+                "{name:<28} {first_bytes:>11} {average:>17} {budget:>8} {:>18.2}",
+                writes as f64 / FRAMES as f64,
+            );
+            assert!(
+                average <= budget,
+                "{name}: measured {average} average bytes/frame exceeds budget {budget}; update the budget table if the increase is intended"
+            );
+        }
+    }
+
     #[test]
     fn drag_colors_preserve_minimap_dithered_and_exact_cache() {
-        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         let area = Rect::new(0, 0, 48, 18);
         let image = RgbaImage::from_fn(120, 120, |x, y| {
             image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
@@ -686,7 +812,6 @@ mod tests {
 
     #[test]
     fn original_click_and_drag_end_keep_full_color() {
-        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         let mut app = App::drag_fixture();
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
