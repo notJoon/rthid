@@ -89,8 +89,7 @@ bottom edge alignment. Negative values align the opposite edges. Paper always us
 in Dithered, regardless of tone settings. Original uses white RGB for paper.
 
 These composition controls change the output. The preview zoom keys and preview
-panning only navigate the result. `d` restores the selected control and `D`
-restores all settings, including composition.
+panning only navigate the result. `d` restores the selected control.
 
 For Business 50x90, the status starts with `Card 50x90mm | Dots 250x450 @0.20mm | Rot 0°`, where
 `@0.20mm` is the dot size. When flipped, the rotation reads, for example,
@@ -115,7 +114,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `Esc` | Return focus to parameters |
 | Any | `r` / `R` | Rotate 90° clockwise / counterclockwise |
 | Any, outside modals | `f` | Flip left and right on the card |
-| Any | `d` / `D` | Reset selected parameter / all parameters and composition |
+| Any | `d` | Reset selected parameter |
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
 | Parameters, Seed row with Noise | `Enter` | Draw a new noise pattern |
