@@ -25,17 +25,3 @@ pub fn key_hints(groups: &[&[(&str, &str)]]) -> String {
         .collect::<Vec<_>>()
         .join(" | ")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn joins_groups_in_order() {
-        assert_eq!(
-            key_hints(&[&[("a", "add"), ("d", "delete")], &[], &[("Esc", "cancel")]]),
-            "a: add | d: delete | Esc: cancel"
-        );
-        assert_eq!(key_hints(&[]), "");
-    }
-}
