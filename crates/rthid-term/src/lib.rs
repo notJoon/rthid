@@ -219,26 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_draw_returns_the_closure_value() {
-        use ratatui::{TerminalOptions, Viewport, layout::Rect};
-
-        let mut terminal = Terminal::with_options(
-            ElidingBackend::new(Vec::new()),
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 0, 10, 1)),
-            },
-        )
-        .unwrap();
-        let value = synchronized_draw(&mut terminal, |terminal| {
-            terminal.draw(|frame| frame.render_widget("frame", frame.area()))?;
-            Ok(42)
-        })
-        .unwrap();
-        assert_eq!(value, 42);
-        assert!(terminal.backend().writer().ends_with(b"\x1b[?2026l"));
-    }
-
-    #[test]
     fn modes_are_opt_in_and_cleanup_continues_after_failure() {
         let mut output = Vec::new();
         enable_modes(&mut output, SessionOptions::default()).unwrap();
@@ -369,9 +349,9 @@ mod tests {
                 if fail {
                     return Err(io::Error::other("draw failed"));
                 }
-                Ok(())
+                Ok(42)
             });
-            assert_eq!(result.is_err(), fail);
+            assert_eq!(result.ok(), (!fail).then_some(42));
             let end = output.borrow().len();
             Write::flush(terminal.backend_mut()).unwrap();
             assert_eq!(output.borrow().len(), end);

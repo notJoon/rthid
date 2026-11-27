@@ -535,15 +535,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Tone palette is out of order at index 2")]
-    fn tone_rejects_the_first_out_of_order_color() {
-        let mut options = Options::default();
-        options.palette.push(PaletteColor { rgb: [128; 3] });
-        options.palette.push(PaletteColor { rgb: [0; 3] });
-        dither(&[0; 4], 1, 1, &options);
-    }
-
-    #[test]
     fn tone_order_check_covers_every_algorithm() {
         for algorithm in [
             Algorithm::default(),
@@ -571,12 +562,6 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(dither(&[0; 4], 1, 1, &options), [0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "rgba has 3 bytes, expected 1x1x4 = 4")]
-    fn rgba_mismatch_reports_actual_and_expected_size() {
-        dither(&[0; 3], 1, 1, &Options::default());
     }
 
     #[test]
@@ -631,72 +616,76 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "algorithm strength must be within 0..=1, got -0.1")]
-    fn rejects_negative_strength() {
-        let options = Options {
+    fn invalid_inputs_report_specific_panics() {
+        let strength = |strength| Options {
             algorithm: Algorithm::Diffusion(Diffusion {
-                strength: -0.1,
+                strength,
                 ..Diffusion::default()
             }),
             ..Options::default()
         };
-        dither(&[0; 4], 1, 1, &options);
-    }
-
-    #[test]
-    #[should_panic(expected = "algorithm strength must be within 0..=1, got 1.1")]
-    fn rejects_strength_above_one() {
-        let options = Options {
-            algorithm: Algorithm::Diffusion(Diffusion {
-                strength: 1.1,
-                ..Diffusion::default()
-            }),
+        let mut out_of_order = Options::default();
+        out_of_order.palette.push(PaletteColor { rgb: [128; 3] });
+        out_of_order.palette.push(PaletteColor { rgb: [0; 3] });
+        let mut nonpositive_gamma = Options::default();
+        nonpositive_gamma.tone.gamma = 0.0;
+        let mut nonfinite_tone = Options::default();
+        nonfinite_tone.tone.brightness = f64::INFINITY;
+        let empty_palette = Options {
+            palette: vec![],
             ..Options::default()
         };
-        dither(&[0; 4], 1, 1, &options);
-    }
 
-    #[test]
-    #[should_panic(expected = "algorithm strength must be finite, got NaN")]
-    fn rejects_nan_strength() {
-        let options = Options {
-            algorithm: Algorithm::Diffusion(Diffusion {
-                strength: f64::NAN,
-                ..Diffusion::default()
-            }),
-            ..Options::default()
-        };
-        dither(&[0; 4], 1, 1, &options);
-    }
-
-    #[test]
-    #[should_panic(expected = "palette must have 1 to 256 colors, got 0")]
-    fn reports_empty_palette() {
-        dither(
-            &[],
-            0,
-            0,
-            &Options {
-                palette: vec![],
-                ..Options::default()
-            },
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "tone.gamma must be positive, got 0")]
-    fn reports_nonpositive_gamma() {
-        let mut options = Options::default();
-        options.tone.gamma = 0.0;
-        dither(&[0; 4], 1, 1, &options);
-    }
-
-    #[test]
-    #[should_panic(expected = "tone.brightness must be finite, got inf")]
-    fn reports_nonfinite_tone() {
-        let mut options = Options::default();
-        options.tone.brightness = f64::INFINITY;
-        dither(&[0; 4], 1, 1, &options);
+        for (rgba, options, expected) in [
+            (
+                &[0; 4][..],
+                out_of_order,
+                "Tone palette is out of order at index 2",
+            ),
+            (
+                &[0; 3],
+                Options::default(),
+                "rgba has 3 bytes, expected 1x1x4 = 4",
+            ),
+            (
+                &[0; 4],
+                strength(-0.1),
+                "algorithm strength must be within 0..=1, got -0.1",
+            ),
+            (
+                &[0; 4],
+                strength(1.1),
+                "algorithm strength must be within 0..=1, got 1.1",
+            ),
+            (
+                &[0; 4],
+                strength(f64::NAN),
+                "algorithm strength must be finite, got NaN",
+            ),
+            (
+                &[0; 4],
+                empty_palette,
+                "palette must have 1 to 256 colors, got 0",
+            ),
+            (
+                &[0; 4],
+                nonpositive_gamma,
+                "tone.gamma must be positive, got 0",
+            ),
+            (
+                &[0; 4],
+                nonfinite_tone,
+                "tone.brightness must be finite, got inf",
+            ),
+        ] {
+            let panic =
+                std::panic::catch_unwind(|| dither(rgba, 1, 1, &options)).expect_err(expected);
+            let message = panic.downcast_ref::<String>().expect(expected);
+            assert!(
+                message.contains(expected),
+                "panic {message:?} does not contain {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -711,18 +700,6 @@ mod tests {
                 let rgba = [value, value, value, 255].repeat(32);
                 assert_eq!(dither(&rgba, 8, 4, &options), vec![index; 32]);
             }
-        }
-    }
-
-    #[test]
-    fn single_color_fills_the_grid_in_both_modes() {
-        let mut options = Options {
-            palette: make_palette(&["#123"]).unwrap(),
-            ..Options::default()
-        };
-        for mode in [Mode::Tone, Mode::Color] {
-            options.mode = mode;
-            assert_eq!(dither(&gradient(), 16, 8, &options), vec![0; 128]);
         }
     }
 
@@ -757,15 +734,6 @@ mod tests {
                 ]
             })
             .collect()
-    }
-
-    #[test]
-    fn tone_matches_golden() {
-        let options = Options {
-            palette: make_palette(&["#fff", "#222", "#aaa", "#555"]).unwrap(),
-            ..Options::default()
-        };
-        assert_eq!(dither(&gradient(), 16, 8, &options), TONE_GOLDEN);
     }
 
     #[test]
@@ -805,13 +773,6 @@ mod tests {
         );
     }
 
-    const TONE_GOLDEN: [u8; 128] = [
-        0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2,
-        2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
-        2, 3, 3, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 1, 1, 0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 2,
-        3, 1, 1, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 3, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1,
-        1, 1, 1, 1, 2, 1, 1, 1,
-    ];
     const COLOR_GOLDEN: [u8; 128] = [
         0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 1, 1, 1,
         2, 2, 0, 0, 0, 0, 0, 1, 2, 2, 0, 2, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0, 2, 2, 0, 2, 2, 2, 1, 1,

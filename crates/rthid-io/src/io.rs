@@ -1127,21 +1127,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_jobs_are_reported_as_skipped() {
-        for op in [Op::Decode, Op::List, Op::Encode, Op::Save] {
-            let error = IoError {
-                op,
-                path: "photo.png".into(),
-                cause: Cause::Stopped,
-            };
-            assert_eq!(
-                error.to_string(),
-                format!("{op}: photo.png: skipped because the IO worker shut down")
-            );
-        }
-    }
-
-    #[test]
     fn notices_preserve_existing_text_and_decode_errors_remain_typed() {
         for (op, expected) in [
             (Op::Decode, "open: Could not load photo.png: failed"),
@@ -1156,6 +1141,15 @@ mod tests {
             };
             assert_eq!(error.to_string(), expected);
             assert!(std::error::Error::source(&error).is_some());
+            let stopped = IoError {
+                op,
+                path: "photo.png".into(),
+                cause: Cause::Stopped,
+            };
+            assert_eq!(
+                stopped.to_string(),
+                format!("{op}: photo.png: skipped because the IO worker shut down")
+            );
         }
         let error = IoError {
             op: Op::Decode,
