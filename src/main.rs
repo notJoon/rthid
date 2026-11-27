@@ -1,13 +1,13 @@
 //! rthid previews dithering of an image in the terminal.
 //!
-//! The source is loaded and shrunk once. `grid::GridCache` scales and rotates it into
+//! The source is loaded and shrunk once. `grid::GridCache` places it inside
 //! the grid and, when Dithered or a companion PNG needs it, dithers the grid
 //! into palette indices. `app::App` holds `settings::Settings` and the
 //! `viewport::Viewport`. `ui::draw` turns them into a frame through `cells` (cell glyphs) or `graphics`
 //! (terminal images), and `Export` writes the dithered grid to the companion PNG.
 //!
 //! Glossary:
-//! - Grid: the scaled and rotated image. Its pixels are also called dots.
+//! - Grid: the composed card image. Its pixels are also called dots.
 //! - Cell: one terminal character position.
 //! - Half block: the `▀` glyph whose fg and bg colors show two stacked dots in one cell.
 //! - Sextant and Quadrant: glyph sets for the sampled Dithered preview and minimap that split a
@@ -28,12 +28,14 @@ mod cells;
 mod export;
 /// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for Original at Fit.
 mod graphics;
-/// Source image, scaled grid and dithered indices caches.
+/// Source image, card grid and dithered indices caches.
 mod grid;
 /// Single entry caches with build versions.
 mod memo;
 /// Modal input and preset editing.
 mod modal;
+/// Physical card composition.
+mod print;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -70,6 +72,9 @@ struct Args {
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
     preview_png: Option<PathBuf>,
+    /// Size the PNG at N DPI (1 to 4800), requiring --preview-png.
+    #[arg(long, value_name = "N", requires = "preview_png", value_parser = clap::value_parser!(u32).range(1..=4800))]
+    dpi: Option<u32>,
     /// Load user presets and templates from this TOML file.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -130,6 +135,7 @@ fn run() -> io::Result<()> {
     let Args {
         image: path,
         preview_png,
+        dpi,
         config,
         glyphs,
         graphics,
@@ -177,7 +183,7 @@ fn run() -> io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut app = App::new(source, preview_png.clone(), loaded);
+    let mut app = App::new(source, preview_png.clone(), dpi, loaded);
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
@@ -404,6 +410,7 @@ mod tests {
         let args = Args::try_parse_from(["rthid"]).unwrap();
         assert_eq!(args.image, None);
         assert_eq!(args.preview_png, None);
+        assert_eq!(args.dpi, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
         assert!(matches!(args.graphics, CliGraphics::Auto));
@@ -440,6 +447,24 @@ mod tests {
         assert_eq!(args.preview_png, Some(PathBuf::from("dots.png")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
+    }
+
+    #[test]
+    fn cli_validates_dpi_range() {
+        for dpi in ["1", "600", "4800"] {
+            assert_eq!(
+                Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi])
+                    .unwrap()
+                    .dpi,
+                Some(dpi.parse().unwrap())
+            );
+        }
+        assert!(Args::try_parse_from(["rthid", "--dpi", "600"]).is_err());
+        for dpi in ["0", "4801", "-1", "1.5", "abc", "4294967296"] {
+            assert!(
+                Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi]).is_err()
+            );
+        }
     }
 
     #[test]

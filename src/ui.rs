@@ -31,6 +31,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("m", "map"),
     ("mouse", "drag/wheel/map"),
     ("r/R", "rotate"),
+    ("f", "flip"),
     ("d/D", "reset"),
     ("Esc", "back"),
     ("q", "quit"),
@@ -46,6 +47,7 @@ const PANEL_HINTS: &[(&str, &str)] = &[
     ("Up/Down k/j", "select"),
     ("Left/Right h/l", "change"),
     ("r/R", "rotate"),
+    ("f", "flip"),
     ("d/D", "reset"),
     ("q", "quit"),
 ];
@@ -518,7 +520,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     if let Some(message) = app.notice() {
         return message.to_owned();
     }
-    let Some((sw, sh)) = app.grid_cache.source_size() else {
+    let Some(placement) = app.grid_cache.placement(&app.settings) else {
         return "No image".into();
     };
     let (gw, gh) = geometry.grid;
@@ -556,8 +558,28 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
-            "{displayed} | {mode} | Source {sw}x{sh} | Grid {gw}x{gh} | Rotation {}°",
+            // Print fields lead so an 80 column terminal clips navigation, not them.
+            "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}",
+            app.settings.card.w_mm,
+            app.settings.card.h_mm,
+            if app.settings.bleed > 0 {
+                format!("+{}", app.settings.bleed)
+            } else {
+                String::new()
+            },
+            f64::from(app.settings.dot) / 100.0,
             app.settings.rotation.degrees(),
+            if app.settings.flip { " Flip" } else { "" },
+            app.export_dpi()
+                .and_then(|dpi| crate::print::png_size(&app.settings, dpi)
+                    .ok()
+                    .map(|(w, h)| { format!(" | PNG {w}x{h} @{dpi}dpi") }))
+                .unwrap_or_default(),
+            if placement.aw == 0 {
+                " | no image area"
+            } else {
+                ""
+            },
         )
     })
 }
@@ -836,7 +858,16 @@ mod tests {
                 ))
                 .unwrap();
             assert!(
-                draw_text(&mut terminal, &app, &mut renderer).contains("Z | Black/white | tone")
+                draw_text(&mut terminal, &app, &mut renderer)
+                    .contains("Z | Black/white | tone | Atkinson | Business 50x90 0.20 mm")
+            );
+            let mut print = crate::settings::Template::capture("P".into(), &Settings::default());
+            (print.card, print.dot, print.margin, print.bleed) =
+                (crate::settings::CARDS[5], 12, 15, 3);
+            app.library.templates.upsert(print).unwrap();
+            assert!(
+                template_rows(&app.modal_ctx()).iter().any(|row| row.to_string()
+                    == "P | Black/white | tone | Atkinson | Postcard 100x148 0.12 mm +1.5 mm margin +3 mm bleed")
             );
             let mut template = crate::settings::Template::capture(
                 "A template with a long name".into(),
@@ -941,7 +972,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original | Fit (sextant) approximate |")
+            .ends_with(" | Original | Fit (sextant) approximate")
         );
         assert!(
             status(
@@ -952,7 +983,7 @@ mod tests {
                     ..PreviewReport::default()
                 },
             )
-            .starts_with("Original (kitty) | Fit (sextant) |")
+            .ends_with(" | Original (kitty) | Fit (sextant)")
         );
         let dir = tempfile::tempdir().unwrap();
         for with_export in [false, true] {
@@ -1041,6 +1072,8 @@ mod tests {
     fn minimap_log_records_completed_cells_and_uncovered_reference() {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(180, 180, image::Rgba([255; 4])), None);
+        app.settings = crate::settings::Settings::for_pixels(180, 180);
+        app.sync(layout(Rect::new(0, 0, 100, 40)).preview);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
@@ -1094,11 +1127,17 @@ mod tests {
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         assert!(app.show_original);
         app.viewport.zoom = viewport::Zoom::In(1);
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
         for label in [
-            "Scale",
+            "Card",
+            "Dot:",
+            "Margin:",
+            "Bleed:",
+            "Zoom:",
+            "Pan X:",
+            "Pan Y:",
             "Mode",
             "Palette",
             "Strength",
@@ -1109,10 +1148,7 @@ mod tests {
             "Black: 0.00",
             "White: 1.00",
             "Sharpen: 0.00",
-            "Original | 100%",
-            "Source 3x3",
-            "Grid 3x3",
-            "Rotation 0",
+            "Card 50x90mm | Dots 250x450 @0.20mm | Rot 0° | Original | 100%",
         ] {
             assert!(text.contains(label), "missing {label}");
         }
@@ -1183,11 +1219,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | +/-: zoom | 0: fit | m: map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
         );
     }
 
@@ -1198,7 +1234,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
-        for _ in 0..8 {
+        for _ in 0..14 {
             app.handle_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                 &app.geometry(layout(terminal.size().unwrap()).preview),
@@ -1209,15 +1245,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(8));
-        assert_eq!(app.panel.offset(), 6);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(14));
+        assert_eq!(app.panel.offset(), 12);
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(7));
-        assert_eq!(app.panel.offset(), 6);
+        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(13));
+        assert_eq!(app.panel.offset(), 12);
         for label in ["Seed", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}");
         }
@@ -1226,7 +1262,8 @@ mod tests {
     #[test]
     fn overview_and_exact_modes_show_their_status() {
         let mut renderer = Renderer::default();
-        let mut app = App::builtin(RgbaImage::new(4, 6), None);
+        let mut app = App::builtin(RgbaImage::new(8, 12), None);
+        app.settings = crate::settings::Settings::for_pixels(8, 12);
         app.show_original = false;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1239,7 +1276,7 @@ mod tests {
         app.preview_focus = true;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        assert!(text.contains("100% x 1-4 y 1-6"));
+        assert!(text.contains("100% x 1-8 y 1-12"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
     }
     #[test]
@@ -1360,5 +1397,56 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn print_status_includes_bleed_and_empty_area_and_truncates() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.settings.bleed = 3;
+        app.settings.rotation = crate::settings::Rotation::R90;
+        app.settings.flip = true;
+        let geometry = app.geometry(Rect::new(0, 0, 100, 20));
+        let text = status(&app, &geometry, PreviewReport::default());
+        assert!(text.starts_with("Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | "));
+        assert!(!text.contains("PNG"));
+        let with_dpi = |dpi| {
+            let mut exporting = App::new(
+                Some(("test.png".into(), RgbaImage::new(8, 8))),
+                Some("p.png".into()),
+                Some(dpi),
+                crate::store::Loaded::default(),
+            );
+            exporting.settings = app.settings.clone();
+            exporting
+        };
+        assert!(
+            status(&with_dpi(600), &geometry, PreviewReport::default())
+                .contains("Rot 90° Flip | PNG 1323x2268 @600dpi | ")
+        );
+        // Worst case: the widest PNG size and DPI still fit in 80 columns.
+        let report = PreviewReport {
+            approximate: true,
+            ..PreviewReport::default()
+        };
+        let text = status(&with_dpi(4800), &geometry, report);
+        let print =
+            "Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | PNG 10583x18142 @4800dpi";
+        assert!(text.starts_with(print), "{text}");
+        assert!(print.chars().count() <= 80);
+        app.settings = crate::settings::Settings {
+            margin: 100,
+            ..crate::settings::Settings::for_pixels(8, 8)
+        };
+        app.sync(Rect::new(0, 0, 100, 20));
+        let geometry = app.geometry(Rect::new(0, 0, 100, 20));
+        let text = status(&app, &geometry, PreviewReport::default());
+        assert!(text.contains("no image area"));
+        assert!(!text.contains("bleed"));
+        assert!(!text.contains("Flip"));
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 7)).unwrap();
+        let _ = draw_text(&mut terminal, &app, &mut renderer);
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..20).map(|x| buffer[(x, 6)].symbol()).collect();
+        assert_eq!(row, text.chars().take(20).collect::<String>());
     }
 }

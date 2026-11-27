@@ -7,10 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Optional DPI records PNG resolution metadata in pixels per metre on both axes
+- `check_output_size` exposes output validation before job submission
+- Direct PNG encoding preserves existing bytes when DPI is omitted
+
 - Owned `Grid` with public indices, dimensions in dots and palette, deriving `Debug` and `Clone`
 - `Grid::new` validates grid invariants independently of output size
 - `preview_size` chooses the preview output size in pixels with an integer dot size from 1 to 4
-- `write_png(writer, &grid, (width, height))` samples dots with nearest neighbor
+- `write_png(writer, &grid, (width, height), dpi)` samples dots with nearest neighbor
   sampling and encodes opaque RGBA PNG
 - `MAX_OUTPUT_PIXELS` limits output area to bound the RGBA buffer to about 1 GiB
 - `write_png` together with `rthid_io::atomic::replace` replaces `rthid_io::png::write_atomic`

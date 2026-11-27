@@ -2134,6 +2134,7 @@ name = "rthid-render"
 version = "0.1.0"
 dependencies = [
  "image",
+ "png",
  "rthid-dither",
  "tempfile",
 ]

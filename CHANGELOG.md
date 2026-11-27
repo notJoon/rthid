@@ -5,7 +5,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.1] - Unreleased
 
+### Added
+
+- `--dpi 1..4800` sizes companion PNGs from the card including bleed and records
+  resolution metadata. It requires `--preview-png`. The status shows PNG dimensions
+  and DPI. Oversized outputs are rejected before submission. Omitting DPI preserves
+  preview sizing and bytes
+
+- `f` mirrors left and right on the card after rotation, keeping pan directions
+  and the current layer. The status shows `Flip` beside rotation. Templates keep
+  the current flip, while opening an image or pressing `D` resets it
+
 ### Changed
+
+- Scale is replaced by card, dot, margin, bleed, zoom and pan controls. Rotation
+  turns the image inside the fixed card grid, and uncovered areas stay paper
+- The status line starts with card size, dot count and dot size, ahead of the
+  layer and navigation fields, so they stay visible in 80 columns. Templates save physical
+  print settings and ignore old `scale` fields, retaining config version 1
 
 - Faster panning of a zoomed image: Original cells use 256 colors while the
   preview is dragged and return to full color on release, and cells whose two
