@@ -160,6 +160,8 @@ impl App {
     #[cfg(test)]
     pub(crate) fn drag_fixture() -> Self {
         let mut app = Self::builtin(RgbaImage::new(120, 120), None);
+        app.settings = Settings::for_pixels(120, 120);
+        app.refresh(false);
         app.viewport.zoom = Zoom::In(1);
         app.viewport.hide_minimap = true;
         app
@@ -616,8 +618,15 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(minimap) = geometry.minimap
                     && minimap.map.contains(point.into())
+                    && !(matches!(mouse.kind, MouseEventKind::Drag(_)) && prev.is_some())
                 {
                     self.viewport.center_on_minimap(point, geometry);
+                } else if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && geometry
+                        .minimap
+                        .is_some_and(|minimap| minimap.frame.contains(point.into()))
+                {
+                    return was_dragging;
                 } else {
                     let mut drag = Drag {
                         point,
@@ -2920,6 +2929,96 @@ mod tests {
             map.y,
         );
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
+    }
+
+    #[test]
+    fn preview_drag_continues_over_minimap() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        app.viewport.x = 60;
+        app.viewport.y = 60;
+        let area = Rect::new(2, 3, 48, 18);
+        let geometry = app.geometry(area);
+        let map = geometry.minimap.unwrap().map;
+        let start = (map.x - 2, map.y + 2);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            start.0,
+            start.1,
+            &geometry,
+            test_layout().screen,
+        );
+        for (point, expected) in [
+            ((map.x + 2, map.y + 1), (56, 62)),
+            ((map.x + 3, map.y + 2), (55, 60)),
+        ] {
+            assert!(app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                point.0,
+                point.1,
+                &app.geometry(area),
+                test_layout().screen,
+            ));
+            assert_eq!((app.viewport.x, app.viewport.y), expected);
+            let anchor = app.last_drag.as_ref().unwrap();
+            assert_eq!(anchor.point, start);
+            assert_eq!(anchor.origin, geometry.origin);
+            assert!(app.dragging());
+        }
+    }
+
+    #[test]
+    fn minimap_border_press_leaves_viewport_and_clears_drag() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        app.viewport.x = 60;
+        app.viewport.y = 60;
+        let area = Rect::new(2, 3, 48, 18);
+        let geometry = app.geometry(area);
+        let minimap = geometry.minimap.unwrap();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            minimap.frame.x - 1,
+            minimap.frame.y + 1,
+            &geometry,
+            test_layout().screen,
+        );
+        assert!(app.last_drag.is_some());
+        assert!(!app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            minimap.frame.x,
+            minimap.frame.y,
+            &geometry,
+            test_layout().screen,
+        ));
+        assert_eq!((app.viewport.x, app.viewport.y), geometry.origin);
+        assert!(app.last_drag.is_none());
+    }
+
+    #[test]
+    fn minimap_map_press_centers_and_clears_drag() {
+        let mut app = App::drag_fixture();
+        app.viewport.hide_minimap = false;
+        let area = Rect::new(2, 3, 48, 18);
+        let geometry = app.geometry(area);
+        let map = geometry.minimap.unwrap().map;
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            map.x - 2,
+            map.y + 1,
+            &geometry,
+            test_layout().screen,
+        );
+        assert!(app.last_drag.is_some());
+        assert!(app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            map.x + 4,
+            map.y + 1,
+            &geometry,
+            test_layout().screen,
+        ));
+        assert_eq!((app.viewport.x, app.viewport.y), (36, 27));
+        assert!(app.last_drag.is_none());
     }
 
     #[test]
