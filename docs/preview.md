@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```text
-rthid [image] [--preview-png path] [--dpi N] [--glyphs sextant|quadrant] [--graphics auto|off] [--config path]
+rthid [image] [--preview-png path] [--dpi N] [--glyphs sextant|quadrant] [--mass-tones palette|mono|warm] [--mass-invert] [--graphics auto|off] [--config path]
 ```
 
 Use `rthid --help` for option details and `rthid --version` for the version.
@@ -14,7 +14,7 @@ with Unicode half block support and support for the selected overview glyphs
 
 ## Display
 
-Original / Dithered selects the image layer. Zoom selects its display scale.
+Original, Dithered or Mass selects the image layer. Zoom selects its display scale.
 The preview starts with Original at Fit.
 
 - **Original / Dithered**: Original shows the composed card grid, including white paper outside the image, as real pixels
@@ -22,9 +22,17 @@ The preview starts with Original at Fit.
   protocol only while drawing an image. Graphics preserve aspect using the
   terminal's cell pixel size. Otherwise Original uses truecolor half blocks,
   averaged at Fit and reduced zoom levels. Press `Space` to toggle the layer.
+  From Mass, `Space` shows Dithered.
   Dithering is deferred while Original is shown unless a companion PNG is enabled.
-  Changing a dither parameter reveals Dithered. Print controls, rotation, flip,
-  and resets keep the selected layer. PNG exports always use the dithered result.
+  Changing a dither parameter reveals Dithered unless Mass is shown. Print controls,
+  rotation, flip, and resets keep the selected layer. PNG exports always use the dithered result.
+- **Mass**: a flat four tone study of the undithered card grid for judging
+  composition: where the large dark and light masses sit, without the dither
+  pattern. Tones run background, base, shadow and accent, from no ink to the
+  densest ink. Press `a` to show it and `a` again to return to the previous layer.
+  Mass uses truecolor half blocks and the status line names it `Mass`. Palette
+  changes recolor its tones. The study is built only while a view shows it, and
+  a build error appears in the status line while it is visible.
 - **Fit**: shows the whole grid with terminal cell aspect correction. For Dithered,
   `Fit (sextant)` or `Fit (quadrant)` names the sampling glyphs. `approximate`
   means samples needed color reduction. Sampling may omit detail without this label.
@@ -38,6 +46,10 @@ The preview starts with Original at Fit.
   These crisp half blocks make dots look 12.5 percent taller.
   The status line shows inclusive, one based x/y dot ranges at every level except Fit.
 - **Minimap**: appears in the upper right whenever the image overflows the preview.
+  It shows the mass study by default, so the main view keeps detail while the
+  minimap shows composition. Press `M` to switch it between the mass study and the
+  main layer. While it shows the mass study and the main layer is not Mass, the
+  status line ends with `| map Mass`. Its frame fits the map.
   The visible region keeps its colors and the rest is dimmed. It is hidden when
   the terminal is too small. Press `m` in either focus to hide or show it.
 
@@ -98,7 +110,8 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any, outside modals | `o` | Open an image |
 | Any, outside modals | `P` / `T` | Manage palette presets / settings templates |
 | Any | `Tab` | Switch focus between parameters and preview |
-| Any | `Space` | Toggle original / dithered; compute a pending result if needed |
+| Any | `Space` | Toggle original / dithered, or show dithered from mass; compute a pending result if needed |
+| Any | `a` | Show mass / return to the previous layer |
 | Any | `Esc` | Return focus to parameters |
 | Any | `r` / `R` | Rotate 90° clockwise / counterclockwise |
 | Any, outside modals | `f` | Flip left and right on the card |
@@ -110,6 +123,7 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `+` / `=` / `-` | Zoom in / in / out |
 | Any | `0` | Return to Fit |
 | Any | `m` | Toggle minimap |
+| Any | `M` | Switch minimap between mass study and main layer |
 | Preview | Arrows or `h` / `j` / `k` / `l` | Pan one cell worth of dots, at least one dot |
 | Preview | `H` / `J` / `K` / `L` | Pan one visible page with two cells of overlap, at least one step |
 
@@ -205,8 +219,8 @@ zoom regardless of keyboard focus.
 
 | Input | Action |
 | --- | --- |
-| Left click or drag on the minimap image | Center the viewport there |
-| Left drag on the main preview | Move the image with the pointer |
+| Left click or drag on the minimap image | Center the viewport there; a drag that leaves the map pauses until it returns |
+| Left drag on the main preview | Move the image with the pointer, including over the minimap |
 | Wheel or horizontal trackpad scroll | Pan six cells worth of dots per step in the scroll direction |
 
 ## Options
@@ -221,6 +235,14 @@ If detection fails or no graphics protocol is available, Original uses half bloc
 `--glyphs sextant|quadrant`: select Dithered sampling and minimap glyphs:
 sextants use 2×3 sub-cells; quadrants use 2×2. Defaults to `quadrant` when `TERM_PROGRAM`
 is `Apple_Terminal`, otherwise `sextant`. An explicit value overrides the default.
+
+`--mass-tones palette|mono|warm`: select the Mass tones. `palette`, the default,
+samples four tones along the dither palette sorted by luma, so the study follows
+the selected palette. `mono` and `warm` are fixed sets.
+
+`--mass-invert`: treat light pixels as ink in the mass study, for light subjects
+on dark backgrounds. With `palette` tones the darkest palette color becomes the
+background. Fixed tone sets keep their order.
 
 `--preview-png path`: save a PNG on startup and after each re-dither, replacing
 any existing file at `path`. The destination directory must exist; the path
