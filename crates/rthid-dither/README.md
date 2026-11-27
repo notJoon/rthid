@@ -2,6 +2,10 @@
 
 Terminal independent palette dithering used by the rthid binary.
 
+The `mass` module turns undithered RGBA images into four flat tones using a
+blurred ink field and nested masks at a maximum analysis width of 450 pixels.
+Its index grid can render at any size with the monochrome or warm tone presets.
+
 ## Quick start
 
 This crate is not published to crates.io. Add it to your app's `Cargo.toml`,
