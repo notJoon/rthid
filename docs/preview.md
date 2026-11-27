@@ -43,10 +43,16 @@ The preview starts with Original at Fit.
 
 ## Print grid
 
-The card and dot size determine the grid independently of the source image.
-Card cycles through Business 50x90, Business 90x50, Euro business 55x85,
-Trading 63x88, Square 65x65 and Postcard 100x148, all in millimetres.
-The default is Business 50x90 with 0.20 mm dots, giving 250x450 dots.
+Card cycles through Image, Business 50x90, Business 90x50, Euro business 55x85,
+Trading 63x88, Square 65x65 and Postcard 100x148. Fixed card sizes are in millimetres.
+The default is Image with 0.20 mm dots. Image keeps one dot per loaded source
+pixel and follows its rotation, so the whole image is visible at Zoom 1.00x and
+zero pan. Loading shrinks the source to at most 1024 pixels on its long side.
+Dot changes Image's physical size, not its image area dot count. Margin and
+bleed add paper around the image area, rounded together to the nearest dot on
+each side. Its physical size including paper is the grid size times Dot.
+Without a loaded source, settings validation uses a single pixel placeholder
+for Image and the preview shows `No image`.
 
 | Parameter | Range | Step | Default |
 | --- | --- | --- | --- |
@@ -56,7 +62,7 @@ The default is Business 50x90 with 0.20 mm dots, giving 250x450 dots.
 | Zoom | 0.30x to 4.00x | 0.05x | 1.00x |
 | Pan X / Pan Y | -1.00 to +1.00 | 0.05 | 0.00 |
 
-Bleed extends every edge of the card. Each axis rounds to the nearest dot,
+On fixed cards, bleed extends every edge of the card. Each axis rounds to the nearest dot,
 with halves rounded up, and has a minimum of eight dots. Grids above four
 million dots are rejected. Every preset fits this limit at every allowed setting.
 Margin zero fills the bleed. A positive margin reserves both bleed and margin
@@ -64,7 +70,7 @@ as paper. If either remaining image axis is at most two dots, the whole grid is
 paper and the status shows `no image area`.
 
 The source covers the image area at Zoom 1.00x. Smaller values can expose paper.
-Rotation turns the source inside the fixed card. `f` mirrors left and right after
+Rotation turns the source inside fixed cards and turns the Image card with the source. `f` mirrors left and right after
 rotation, before cover placement. Pan directions stay relative to the card.
 Positive Pan X moves toward right edge alignment and positive Pan Y toward
 bottom edge alignment. Negative values align the opposite edges. Paper always uses the brightest palette color
@@ -74,9 +80,11 @@ These composition controls change the output. The preview zoom keys and preview
 panning only navigate the result. `d` restores the selected control and `D`
 restores all settings, including composition.
 
-The status starts with `Card 50x90mm | Dots 250x450 @0.20mm | Rot 0°`, where
+For Business 50x90, the status starts with `Card 50x90mm | Dots 250x450 @0.20mm | Rot 0°`, where
 `@0.20mm` is the dot size. When flipped, the rotation reads, for example,
 `Rot 90° Flip`. With bleed it shows, for example, `Card 50x90+3mm`.
+For Image, the card dimensions include the rounded margin and bleed paper,
+for example `Card 60x40mm` for a 300x200 source at 0.20 mm with no insets.
 The layer and preview navigation information follow these fields.
 Long status lines are clipped to the terminal width, so in 80 columns the print
 fields stay visible and the layer and navigation fields are cut first.
@@ -184,9 +192,9 @@ Strength and Serpentine apply to diffusion algorithms. Seed applies to Noise.
 Unused rows stay visible and dimmed, and their values survive algorithm changes.
 
 Templates keep their own colors, card, dot size, margin and bleed, so later
-preset edits or removal do not alter them. Card ids are `business-portrait`,
+preset edits or removal do not alter them. Card ids are `image`, `business-portrait`,
 `business-landscape`, `euro-business`, `trading`, `square` and `postcard`.
-Unknown ids use the default card. Numeric print values round to their stored
+Unknown ids use Image. Numeric print values round to their stored
 units, the margin snaps to its 0.5 mm step, and all clamp to the control bounds. Old `scale` fields are ignored and missing
 print fields use defaults. The config version remains 1.
 
@@ -227,12 +235,14 @@ keeping the long side within 2048 pixels unless the grid itself is larger.
 The PNG contains no resolution metadata and retains the existing encoder bytes.
 
 `--dpi N` requires `--preview-png` and accepts integers from 1 to 4800. Each PNG axis is
-`round((card mm + 2 * bleed mm) / 25.4 * N)`. Dot size does not change these
-pixel dimensions. Nearest sampling keeps dot boundaries, including when pixels
+`round((card mm + 2 * bleed mm) / 25.4 * N)` for fixed cards. Dot size does not
+change their pixel dimensions. For Image, each axis is
+`round(grid dots * dot mm / 25.4 * N)`, including the paper insets, so Dot
+changes the PNG size. Nearest sampling keeps dot boundaries, including when pixels
 per dot are not integers. The PNG records resolution in pixels per metre on both
 axes, rounded from `N / 0.0254`.
 
-At 600 DPI, the default 50x90 mm card produces 1181x2126 pixels. With 3 mm bleed
+At 600 DPI, the Business 50x90 mm card produces 1181x2126 pixels. With 3 mm bleed
 it produces 1323x2268 pixels. The status includes `PNG 1181x2126 @600dpi` when DPI
 is set. Output sides must be positive and at most `i32::MAX`, and output area
 must not exceed 268435456 pixels. Invalid sizes appear as export errors before

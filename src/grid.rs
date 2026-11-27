@@ -228,6 +228,31 @@ mod tests {
     }
 
     #[test]
+    fn image_card_preserves_every_source_pixel_at_each_rotation() {
+        use crate::settings::Rotation;
+
+        for (w, h) in [(30, 20), (1, 2)] {
+            let source = RgbaImage::from_fn(w, h, |x, y| Rgba([x as u8, y as u8, 0, 255]));
+            for rotation in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+                let mut settings = Settings {
+                    rotation,
+                    ..Settings::default()
+                };
+                let mut cache = cache(source.clone());
+                cache.refresh(&settings, false);
+                assert_eq!(cache.grid().unwrap(), &rotation.apply(source.clone()));
+                settings.zoom = 200;
+                settings.pan_x = 100;
+                settings.pan_y = -100;
+                cache.refresh(&settings, false);
+                let p = cache.placement(&settings).unwrap();
+                assert_eq!((p.sw, p.sh), (p.aw * 2, p.ah * 2));
+                assert_eq!((p.x, p.y), (-i64::from(p.aw), 0));
+            }
+        }
+    }
+
+    #[test]
     fn flip_mirrors_rotated_pixels_before_cover_and_pan() {
         use crate::settings::Rotation;
 
@@ -338,6 +363,7 @@ mod tests {
     fn extreme_source_aspect_uses_bounded_resize() {
         let mut settings = Settings {
             zoom: 400,
+            card: crate::settings::Card::from_id("business-portrait"),
             ..Settings::default()
         };
         for source in [

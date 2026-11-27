@@ -39,14 +39,21 @@ impl Export {
     ///
     /// # Errors
     /// Returns an export error if the grid, palette indices or output size are invalid.
-    pub fn job(&self, indices: &[u8], w: u32, h: u32, settings: &Settings) -> Result<Job, IoError> {
+    pub fn job(
+        &self,
+        indices: &[u8],
+        w: u32,
+        h: u32,
+        settings: &Settings,
+        source: (u32, u32),
+    ) -> Result<Job, IoError> {
         let invalid = |error| IoError {
             op: Op::Encode,
             path: self.path.clone(),
             cause: Cause::Io(error),
         };
         let size = match self.dpi {
-            Some(dpi) => crate::print::png_size(settings, dpi),
+            Some(dpi) => crate::print::png_size(settings, source, dpi),
             None => Ok(preview_size(w, h)),
         }
         .and_then(|size| check_output_size(size).map(|()| size))
@@ -88,7 +95,10 @@ mod tests {
     #[test]
     fn invalid_grid_fails_before_submission() {
         let mut export = Export::new("preview.png".into(), None);
-        let error = export.job(&[], 1, 1, &Settings::default()).err().unwrap();
+        let error = export
+            .job(&[], 1, 1, &Settings::default(), (1, 1))
+            .err()
+            .unwrap();
         assert!(
             matches!(&error.cause, Cause::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
         );

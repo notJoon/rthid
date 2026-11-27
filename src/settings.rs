@@ -255,56 +255,63 @@ impl Dither {
     }
 }
 
-/// Physical card dimensions before bleed.
+/// Fixed physical dimensions or a card that follows the source image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Card {
     /// Stable template identifier.
     pub id: &'static str,
     /// Panel label.
     pub label: &'static str,
-    /// Width in whole millimetres.
-    pub w_mm: u32,
-    /// Height in whole millimetres.
-    pub h_mm: u32,
+    /// Fixed size in whole millimetres, or None for Image.
+    pub size_mm: Option<(u32, u32)>,
+}
+
+/// Resolved card dimensions including bleed.
+pub struct Dimensions {
+    /// Dot grid width and height.
+    pub grid: (u32, u32),
+    /// Physical width and height in millimetres.
+    pub mm: (f64, f64),
+    /// Paper border on each side in dots.
+    pub inset: u32,
 }
 
 /// Card choices in panel order, with the default first.
-pub const CARDS: [Card; 6] = [
+pub const CARDS: [Card; 7] = [
+    Card {
+        id: "image",
+        label: "Image",
+        size_mm: None,
+    },
     Card {
         id: "business-portrait",
         label: "Business 50x90",
-        w_mm: 50,
-        h_mm: 90,
+        size_mm: Some((50, 90)),
     },
     Card {
         id: "business-landscape",
         label: "Business 90x50",
-        w_mm: 90,
-        h_mm: 50,
+        size_mm: Some((90, 50)),
     },
     Card {
         id: "euro-business",
         label: "Euro business 55x85",
-        w_mm: 55,
-        h_mm: 85,
+        size_mm: Some((55, 85)),
     },
     Card {
         id: "trading",
         label: "Trading 63x88",
-        w_mm: 63,
-        h_mm: 88,
+        size_mm: Some((63, 88)),
     },
     Card {
         id: "square",
         label: "Square 65x65",
-        w_mm: 65,
-        h_mm: 65,
+        size_mm: Some((65, 65)),
     },
     Card {
         id: "postcard",
         label: "Postcard 100x148",
-        w_mm: 100,
-        h_mm: 148,
+        size_mm: Some((100, 148)),
     },
 ];
 
@@ -817,33 +824,74 @@ impl Settings {
             card: Card {
                 id: "test",
                 label: "Test",
-                w_mm: w,
-                h_mm: h,
+                size_mm: Some((w, h)),
             },
             dot: 100,
             ..Self::default()
         }
     }
 
-    /// Rejects grids above four million dots before allocation.
-    /// Preset cards and panel bounds always fit this limit.
+    /// Grid size without a source, using a single pixel placeholder for Image.
     pub fn grid_dimensions(&self) -> Result<(u32, u32), &'static str> {
+        Ok(self.dimensions((1, 1))?.grid)
+    }
+
+    /// Resolves grid, paper inset and physical size including bleed from the source.
+    pub fn dimensions(&self, source: (u32, u32)) -> Result<Dimensions, &'static str> {
         if self.dot <= 0 || self.bleed < 0 {
             return Err("invalid print dimensions");
         }
-        let axis = |mm: u32| -> Option<u32> {
-            let units = u64::from(mm)
-                .checked_add(u64::try_from(self.bleed).ok()?.checked_mul(2)?)?
-                .checked_mul(100)?;
-            let dot = u64::try_from(self.dot).ok()?;
-            u32::try_from(((units.checked_mul(2)?.checked_add(dot)?) / (dot * 2)).max(8)).ok()
+        let dot = f64::from(self.dot);
+        let inset = if self.margin > 0 || self.card.size_mm.is_none() {
+            ((i64::from(self.bleed) * 100 + i64::from(self.margin.max(0)) * 10) as f64 / dot + 0.5)
+                .floor() as u32
+        } else {
+            0
         };
-        let w = axis(self.card.w_mm).ok_or("grid overflows")?;
-        let h = axis(self.card.h_mm).ok_or("grid overflows")?;
-        if u64::from(w) * u64::from(h) > MAX_DOTS {
+        let (grid, mm) = if let Some((w, h)) = self.card.size_mm {
+            let axis = |mm: u32| -> Option<u32> {
+                let units = u64::from(mm)
+                    .checked_add(u64::try_from(self.bleed).ok()?.checked_mul(2)?)?
+                    .checked_mul(100)?;
+                let dot = u64::try_from(self.dot).ok()?;
+                u32::try_from(((units.checked_mul(2)?.checked_add(dot)?) / (dot * 2)).max(8)).ok()
+            };
+            (
+                (
+                    axis(w).ok_or("grid overflows")?,
+                    axis(h).ok_or("grid overflows")?,
+                ),
+                (
+                    f64::from(w) + 2.0 * f64::from(self.bleed),
+                    f64::from(h) + 2.0 * f64::from(self.bleed),
+                ),
+            )
+        } else {
+            if source.0 == 0 || source.1 == 0 {
+                return Err("empty source");
+            }
+            let (w, h) = if self.rotation.swaps_axes() {
+                (source.1, source.0)
+            } else {
+                source
+            };
+            let border = inset.checked_mul(2).ok_or("grid overflows")?;
+            let grid = (
+                w.checked_add(border).ok_or("grid overflows")?,
+                h.checked_add(border).ok_or("grid overflows")?,
+            );
+            (
+                grid,
+                (
+                    f64::from(grid.0) * dot / 100.0,
+                    f64::from(grid.1) * dot / 100.0,
+                ),
+            )
+        };
+        if u64::from(grid.0) * u64::from(grid.1) > MAX_DOTS {
             return Err("grid exceeds four million dots");
         }
-        Ok((w, h))
+        Ok(Dimensions { grid, mm, inset })
     }
 
     /// Builds library options from the current panel values.
