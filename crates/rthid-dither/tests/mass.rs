@@ -10,18 +10,19 @@ fn tone_counts(study: &MassStudy) -> [usize; 4] {
     counts
 }
 
-fn component_count(mask: &[bool], w: usize, h: usize) -> usize {
+fn connected_components(mask: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
     let mut seen = vec![false; mask.len()];
     let mut stack = Vec::new();
-    let mut count = 0;
+    let mut regions = Vec::new();
     for first in 0..mask.len() {
         if !mask[first] || seen[first] {
             continue;
         }
-        count += 1;
+        let mut cells = Vec::new();
         seen[first] = true;
         stack.push(first);
         while let Some(p) = stack.pop() {
+            cells.push(p);
             let (x, y) = (p % w, p / w);
             for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
                 for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
@@ -33,8 +34,10 @@ fn component_count(mask: &[bool], w: usize, h: usize) -> usize {
                 }
             }
         }
+        cells.sort_unstable();
+        regions.push(cells);
     }
-    count
+    regions
 }
 
 #[test]
@@ -47,7 +50,10 @@ fn pratt_mass_masks() {
         source.as_raw(),
         source.width() as usize,
         source.height() as usize,
-        &MassOptions::default(),
+        &MassOptions {
+            ellipses: false,
+            ..MassOptions::default()
+        },
     )
     .unwrap();
     assert_eq!((study.w(), study.h()), (450, 250));
@@ -86,8 +92,8 @@ fn pratt_mass_masks() {
             reference_counts[i] += usize::from(expected);
         }
         ious[i] = intersection as f64 / union as f64;
-        components[i] = component_count(&masks[i], study.w(), study.h());
-        reference_components[i] = component_count(&expected, study.w(), study.h());
+        components[i] = connected_components(&masks[i], study.w(), study.h()).len();
+        reference_components[i] = connected_components(&expected, study.w(), study.h()).len();
     }
     println!("IoU: {ious:?}, cells: {counts:?}, components: {components:?}");
     println!("Reference cells: {reference_counts:?}, components: {reference_components:?}");
@@ -97,4 +103,51 @@ fn pratt_mass_masks() {
     for (iou, gate) in ious.into_iter().zip([0.95, 0.95, 0.90]) {
         assert!(iou >= gate, "IoU {iou} below {gate}");
     }
+    let fitted = mass_study(
+        source.as_raw(),
+        source.width() as usize,
+        source.height() as usize,
+        &MassOptions::default(),
+    )
+    .unwrap();
+    let mut accent = Vec::new();
+    let (mut intersection, mut union) = (0, 0);
+    for (p, (&before, &after)) in study.indices().iter().zip(fitted.indices()).enumerate() {
+        assert_eq!(before >= 1, after >= 1);
+        assert_eq!(before >= 2, after >= 2);
+        let cell = after == 3;
+        accent.push(cell);
+        let expected = reference.as_raw()[p * 3 + 2] >= 128;
+        intersection += usize::from(cell && expected);
+        union += usize::from(cell || expected);
+    }
+    let accent_iou = intersection as f64 / union as f64;
+    assert!(accent_iou >= 0.85, "Accent IoU {accent_iou} below 0.85");
+    let before = connected_components(&masks[2], study.w(), study.h());
+    let after = connected_components(&accent, study.w(), study.h());
+    assert!(after.len() <= before.len());
+    let mut changed = 0;
+    for original in &before {
+        let mut fitted_cells = Vec::new();
+        for region in &after {
+            let mut overlaps = false;
+            for p in region {
+                if original.binary_search(p).is_ok() {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if overlaps {
+                fitted_cells.extend_from_slice(region);
+            }
+        }
+        fitted_cells.sort_unstable();
+        changed += usize::from(fitted_cells != *original);
+    }
+    println!(
+        "Accent components before: {}, after: {}, changed: {changed}, IoU: {accent_iou}",
+        before.len(),
+        after.len()
+    );
+    assert!((2..=4).contains(&changed), "Changed components: {changed}");
 }

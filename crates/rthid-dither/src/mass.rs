@@ -31,6 +31,10 @@ use crate::dither::PaletteColor;
 /// Area limits are fractions of the grid area instead.
 const ANALYSIS_WIDTH: u32 = 450;
 
+const ELLIPSE_MIN_IOU: f64 = 0.74;
+const ELLIPSE_MIN_CONTAINMENT: f64 = 0.98;
+const ELLIPSE_MAX_ASPECT_SQUARED: f64 = 9.0;
+
 /// Fixed monochrome tones: background, base, shadow, accent, independent of invert.
 pub const MONO: [PaletteColor; 4] = [
     PaletteColor {
@@ -113,6 +117,8 @@ pub struct MassOptions {
     /// Treat light pixels as ink for light on dark images. Also keeps palette tones darkest
     /// first, so the background takes the darkest color.
     pub invert: bool,
+    /// Replace compact accent regions by their moment ellipse when the fit is close.
+    pub ellipses: bool,
 }
 
 impl Default for MassOptions {
@@ -121,6 +127,7 @@ impl Default for MassOptions {
             sigma: 4.5,
             thresholds: [0.25, 0.72, 0.90],
             invert: false,
+            ellipses: true,
         }
     }
 }
@@ -321,7 +328,7 @@ pub fn mass_study(
         ah,
         options.sigma as f64 * aw as f64 / ANALYSIS_WIDTH as f64,
     );
-    let masks = masks(&density, aw, ah, &options.thresholds);
+    let masks = masks(&density, aw, ah, &options.thresholds, options.ellipses);
     // The masks are nested, so counting the ones that contain a cell gives its tone index.
     let mut indices = vec![0; aw * ah];
     for mask in masks {
@@ -385,8 +392,16 @@ fn blur(density: &mut [f32], w: usize, h: usize, sigma: f64) {
 
 // Closing radius is three pixels at 450 columns, so grids of 75 columns or fewer skip
 // closing. Base, shadow and accent keep at most 3, 6 and 5 regions. Accent allows regions
-// half as small so small dark accents survive. Holes up to 0.3 percent of the area are filled.
-fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<bool>> {
+// half as small so small dark accents survive. The accent cap applies before fitting.
+// Two blobs may merge under one ellipse, so the count never rises.
+// Holes up to 0.3 percent of the area are filled.
+fn masks(
+    density: &[f32],
+    w: usize,
+    h: usize,
+    thresholds: &[f32; 3],
+    ellipses: bool,
+) -> Vec<Vec<bool>> {
     let radius = (3.0 * w as f64 / ANALYSIS_WIDTH as f64).round_ties_even() as isize;
     let mut result: Vec<Vec<bool>> = Vec::new();
     for i in 0..3 {
@@ -412,10 +427,107 @@ fn masks(density: &[f32], w: usize, h: usize, thresholds: &[f32; 3]) -> Vec<Vec<
             for (cell, &p) in mask.iter_mut().zip(parent) {
                 *cell &= p;
             }
+            if i == 2 && ellipses {
+                mask = fit_ellipses(&mask, parent, w, h);
+            }
         }
         result.push(mask);
     }
     result
+}
+
+fn fit_ellipses(accent: &[bool], shadow: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let mut out = accent.to_vec();
+    let mut accepted = Vec::new();
+    for mut cells in components(accent, w, h, true, true) {
+        if cells.len() < 5 {
+            continue;
+        }
+        cells.sort_unstable();
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0, 0);
+        let (mut cx, mut cy) = (0.0, 0.0);
+        for &p in &cells {
+            let (x, y) = (p % w, p / w);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            cx += x as f64 + 0.5;
+            cy += y as f64 + 0.5;
+        }
+        if min_x == 0 || min_y == 0 || max_x == w - 1 || max_y == h - 1 {
+            continue;
+        }
+        let n = cells.len() as f64;
+        cx /= n;
+        cy /= n;
+        let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+        for &p in &cells {
+            let dx = (p % w) as f64 + 0.5 - cx;
+            let dy = (p / w) as f64 + 0.5 - cy;
+            sxx += dx * dx;
+            sxy += dx * dy;
+            syy += dy * dy;
+        }
+        sxx /= n;
+        sxy /= n;
+        syy /= n;
+        let m = (sxx + syy) / 2.0;
+        let d = (((sxx - syy) / 2.0).powi(2) + sxy * sxy).sqrt();
+        let (major, minor) = (m + d, m - d);
+        if minor <= 0.0 || major > ELLIPSE_MAX_ASPECT_SQUARED * minor {
+            continue;
+        }
+        let (a, b) = (2.0 * major.sqrt(), 2.0 * minor.sqrt());
+        let (mut vx, mut vy) = if d < 1e-9 {
+            (1.0, 0.0)
+        } else {
+            // atan2 avoids eigenvector cancellation to noise when the major axis is vertical.
+            let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+            (theta.cos(), theta.sin())
+        };
+        if vx < 0.0 || (vx == 0.0 && vy < 0.0) {
+            vx = -vx;
+            vy = -vy;
+        }
+        let padding = a.ceil() as usize + 1;
+        let mut ellipse = Vec::new();
+        let (mut intersection, mut contained) = (0, 0);
+        for y in min_y.saturating_sub(padding)..=max_y.saturating_add(padding).min(h - 1) {
+            for x in min_x.saturating_sub(padding)..=max_x.saturating_add(padding).min(w - 1) {
+                let dx = x as f64 + 0.5 - cx;
+                let dy = y as f64 + 0.5 - cy;
+                let u = dx * vx + dy * vy;
+                let t = -dx * vy + dy * vx;
+                if (u / a).powi(2) + (t / b).powi(2) <= 1.0 {
+                    let p = y * w + x;
+                    ellipse.push(p);
+                    intersection += usize::from(cells.binary_search(&p).is_ok());
+                    contained += usize::from(shadow[p]);
+                }
+            }
+        }
+        if ellipse.is_empty() {
+            continue;
+        }
+        let iou = intersection as f64 / (ellipse.len() + cells.len() - intersection) as f64;
+        let containment = contained as f64 / ellipse.len() as f64;
+        if iou >= ELLIPSE_MIN_IOU && containment >= ELLIPSE_MIN_CONTAINMENT {
+            accepted.push((cells, ellipse));
+        }
+    }
+    // Clear every accepted component before painting so later fits cannot erase earlier ellipses.
+    for (cells, _) in &accepted {
+        for &p in cells {
+            out[p] = false;
+        }
+    }
+    for (_, ellipse) in accepted {
+        for p in ellipse {
+            out[p] = shadow[p];
+        }
+    }
+    out
 }
 
 // Grows or shrinks the mask by a disk of the given radius. Edge cells are repeated outward
@@ -568,6 +680,206 @@ mod tests {
         rows.iter()
             .flat_map(|row| row.bytes().map(|c| c == b'#'))
             .collect()
+    }
+
+    fn drawn_ellipse(
+        w: usize,
+        h: usize,
+        cx: f64,
+        cy: f64,
+        a: f64,
+        b: f64,
+        angle: f64,
+    ) -> Vec<bool> {
+        let mut mask = vec![false; w * h];
+        let (vy, vx) = angle.sin_cos();
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f64 + 0.5 - cx;
+                let dy = y as f64 + 0.5 - cy;
+                let u = dx * vx + dy * vy;
+                let t = -dx * vy + dy * vx;
+                mask[y * w + x] = (u / a).powi(2) + (t / b).powi(2) <= 1.0;
+            }
+        }
+        mask
+    }
+
+    #[test]
+    fn fits_a_rotated_ellipse() {
+        let accent = drawn_ellipse(60, 40, 30.0, 20.0, 20.0, 12.5, 30.0_f64.to_radians());
+        let shadow = morphology(&accent, 60, 40, 2, true);
+        let fitted = fit_ellipses(&accent, &shadow, 60, 40);
+        assert_eq!(fitted, accent);
+        let mut intersection = 0;
+        let mut union = 0;
+        for (&a, &b) in fitted.iter().zip(&accent) {
+            intersection += usize::from(a && b);
+            union += usize::from(a || b);
+        }
+        assert!(intersection as f64 / union as f64 > 0.9);
+        // A missing interior cell makes acceptance observable without changing the outline.
+        let mut chipped = accent.clone();
+        chipped[20 * 60 + 30] = false;
+        assert_eq!(fit_ellipses(&chipped, &shadow, 60, 40), accent);
+    }
+
+    #[test]
+    fn fits_an_upright_ellipse_off_the_pixel_grid() {
+        let accent = drawn_ellipse(40, 40, 20.0, 20.2, 8.0, 16.0, 0.0);
+        let shadow = morphology(&accent, 40, 40, 2, true);
+        let mut chipped = accent.clone();
+        chipped[12 * 40 + 19] = false;
+        chipped[12 * 40 + 20] = false;
+        let fitted = fit_ellipses(&chipped, &shadow, 40, 40);
+        assert!(fitted[12 * 40 + 19] && fitted[12 * 40 + 20]);
+        let changed = fitted.iter().zip(&accent).filter(|(a, b)| a != b).count();
+        assert!(
+            changed <= 8,
+            "{changed} cells differ from the drawn ellipse"
+        );
+    }
+
+    #[test]
+    fn keeps_an_earlier_ellipse_when_a_later_fit_clears_cells() {
+        let (w, h) = (80, 60);
+        let mut first = drawn_ellipse(w, h, 40.0, 25.0, 25.0, 16.0, 0.0);
+        let mut second = drawn_ellipse(w, h, 38.0, 33.0, 3.0, 3.0, 0.0);
+        second[28 * w + 38] = true;
+        second[29 * w + 38] = true;
+        for y in 1..h - 1 {
+            for x in 1..w - 1 {
+                if second[y * w + x] {
+                    for ny in y - 1..=y + 1 {
+                        for nx in x - 1..=x + 1 {
+                            first[ny * w + nx] = false;
+                        }
+                    }
+                }
+            }
+        }
+        let shadow = vec![true; w * h];
+        let fitted_first = fit_ellipses(&first, &shadow, w, h);
+        let fitted_second = fit_ellipses(&second, &shadow, w, h);
+        assert_ne!(fitted_first, first);
+        assert_ne!(fitted_second, second);
+        let mut accent = vec![false; w * h];
+        let mut expected = vec![false; w * h];
+        let mut overlap = 0;
+        for p in 0..accent.len() {
+            accent[p] = first[p] || second[p];
+            expected[p] = fitted_first[p] || fitted_second[p];
+            overlap += usize::from(fitted_first[p] && second[p] && !fitted_second[p]);
+        }
+        assert!(overlap > 0);
+        assert_eq!(components(&accent, w, h, true, true).len(), 2);
+        assert_eq!(fit_ellipses(&accent, &shadow, w, h), expected);
+    }
+
+    #[test]
+    fn leaves_thin_border_and_small_components_unchanged() {
+        let mut bar = vec![false; 60 * 40];
+        for y in 18..22 {
+            for x in 10..50 {
+                bar[y * 60 + x] = true;
+            }
+        }
+        let mut edge = drawn_ellipse(60, 40, 30.0, 20.0, 20.0, 12.0, 30.0_f64.to_radians());
+        let mut left = 60;
+        for (p, &cell) in edge.iter().enumerate() {
+            if cell {
+                left = left.min(p % 60);
+            }
+        }
+        let mut translated = vec![false; edge.len()];
+        for p in 0..edge.len() {
+            if edge[p] {
+                translated[p - left] = true;
+            }
+        }
+        edge = translated;
+        assert!(edge.iter().step_by(60).any(|&cell| cell));
+        for accent in [bar, edge] {
+            assert_eq!(fit_ellipses(&accent, &[true; 60 * 40], 60, 40), accent);
+        }
+        let small = grid(&["....", ".##.", ".##.", "...."]);
+        assert_eq!(fit_ellipses(&small, &[true; 16], 4, 4), small);
+    }
+
+    #[test]
+    fn rejects_an_ellipse_outside_shadow() {
+        let accent = drawn_ellipse(40, 40, 20.0, 20.0, 12.0, 12.0, 0.0);
+        let mut shadow = accent.clone();
+        let mut area = 0;
+        for &cell in &accent {
+            area += usize::from(cell);
+        }
+        let mut removed = 0;
+        for cell in &mut shadow {
+            if *cell && removed < area / 10 {
+                *cell = false;
+                removed += 1;
+            }
+        }
+        let mut chipped = accent.clone();
+        chipped[20 * 40 + 20] = false;
+        assert_ne!(fit_ellipses(&chipped, &accent, 40, 40), chipped);
+        assert_eq!(fit_ellipses(&chipped, &shadow, 40, 40), chipped);
+    }
+
+    #[test]
+    fn equal_eigenvalues_and_vertical_axes_are_deterministic() {
+        for (a, b) in [(12.0, 12.0), (8.0, 16.0)] {
+            let accent = drawn_ellipse(40, 40, 20.0, 20.0, a, b, 0.0);
+            let first = fit_ellipses(&accent, &[true; 1600], 40, 40);
+            assert_eq!(first, fit_ellipses(&accent, &[true; 1600], 40, 40));
+            assert_eq!(first, accent);
+        }
+    }
+
+    #[test]
+    fn ellipse_option_preserves_old_indices_and_ancestor_masks() {
+        let (w, h) = (60, 40);
+        let mut accent = drawn_ellipse(w, h, 30.0, 20.0, 20.0, 12.0, 30.0_f64.to_radians());
+        for y in 18..22 {
+            for x in 28..32 {
+                accent[y * w + x] = false;
+            }
+        }
+        let shadow = morphology(&accent, w, h, 2, true);
+        let mut rgba = Vec::new();
+        let mut expected = Vec::new();
+        for p in 0..accent.len() {
+            let (v, index) = if accent[p] {
+                (0, 3)
+            } else if shadow[p] {
+                (50, 2)
+            } else {
+                (255, 0)
+            };
+            rgba.extend_from_slice(&[v, v, v, 255]);
+            expected.push(index);
+        }
+        let options = MassOptions {
+            sigma: 0.0,
+            ellipses: false,
+            ..MassOptions::default()
+        };
+        let old = study(&rgba, w, h, &options);
+        assert_eq!(old.indices(), expected);
+        let fitted = study(
+            &rgba,
+            w,
+            h,
+            &MassOptions {
+                ellipses: true,
+                ..options
+            },
+        );
+        assert_ne!(old.indices(), fitted.indices());
+        for (&a, &b) in old.indices().iter().zip(fitted.indices()) {
+            assert!(a == b || ((a == 2 || a == 3) && (b == 2 || b == 3)));
+        }
     }
 
     #[test]
@@ -768,6 +1080,7 @@ mod tests {
                 sigma: 0.0,
                 thresholds: [0.25, 0.5, 1.0],
                 invert,
+                ..MassOptions::default()
             };
             assert_eq!(
                 study(&rgba, 4, 1, &options).indices(),
@@ -821,7 +1134,7 @@ mod tests {
                 }
             }
         }
-        let masks = masks(&density, 100, 100, &[0.25, 0.72, 0.90]);
+        let masks = masks(&density, 100, 100, &[0.25, 0.72, 0.90], false);
         check_masks(&masks);
         assert_eq!(components(&masks[0], 100, 100, true, true).len(), 3);
         assert_eq!(masks[0], masks[1]);
@@ -895,6 +1208,7 @@ mod tests {
                 sigma: 0.0,
                 thresholds: [0.25, 0.5, 0.9],
                 invert: false,
+                ..MassOptions::default()
             },
         );
         assert_eq!(tone_counts(&result), [1; 4]);
