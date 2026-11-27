@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_and_definition() {
+    fn cli_defaults_definition_and_values() {
         Args::command().debug_assert();
         let args = Args::try_parse_from(["rthid"]).unwrap();
         assert_eq!(args.image, None);
@@ -437,10 +437,6 @@ mod tests {
         assert_eq!(args.mass_tones, CliMassTones::Palette);
         assert!(!args.mass_invert);
         assert!(matches!(args.graphics, CliGraphics::Auto));
-    }
-
-    #[test]
-    fn cli_accepts_enum_values_and_paths() {
         for (value, expected) in [("auto", CliGraphics::Auto), ("off", CliGraphics::Off)] {
             let args = Args::try_parse_from(["rthid", "--graphics", value]).unwrap();
             assert_eq!(args.graphics, expected);
@@ -475,6 +471,19 @@ mod tests {
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
         assert_eq!(args.mass_tones, CliMassTones::Warm);
         assert!(args.mass_invert);
+        for args in [
+            ["--graphics", "kitty"],
+            ["--glyphs", "unknown"],
+            ["--mass-tones", "unknown"],
+            ["--preview-png", ""],
+            ["--config", ""],
+            ["a", "b"],
+        ] {
+            assert!(
+                Args::try_parse_from(std::iter::once("rthid").chain(args)).is_err(),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -491,23 +500,6 @@ mod tests {
         for dpi in ["0", "4801", "-1", "1.5", "abc", "4294967296"] {
             assert!(
                 Args::try_parse_from(["rthid", "--preview-png", "out.png", "--dpi", dpi]).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn cli_rejects_invalid_arguments() {
-        for args in [
-            vec!["--graphics", "kitty"],
-            vec!["--glyphs", "unknown"],
-            vec!["--mass-tones", "unknown"],
-            vec!["--preview-png", ""],
-            vec!["--config", ""],
-            vec!["a", "b"],
-        ] {
-            assert!(
-                Args::try_parse_from(std::iter::once("rthid").chain(args.iter().copied())).is_err(),
-                "{args:?}"
             );
         }
     }

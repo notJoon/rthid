@@ -164,18 +164,6 @@ mod tests {
                 assert_eq!(p.covered(), (0, 0, size.0, size.1));
             }
         }
-        settings = Settings::default();
-        for source in [(0, 1), (1, 0), (0, 0)] {
-            assert_eq!(settings.dimensions(source).err(), Some("empty source"));
-            assert_eq!(
-                Placement::new(source, &settings).unwrap_err(),
-                "empty source"
-            );
-        }
-        assert!(Placement::new((u32::MAX, 1), &settings).is_err());
-        assert!(Placement::new((2001, 2000), &settings).is_err());
-        settings.bleed = i32::MAX;
-        assert!(Placement::new((300, 200), &settings).is_err());
     }
 
     #[test]
@@ -377,6 +365,36 @@ mod tests {
             );
         }
         assert!(Placement::new((u32::MAX, 1), &settings).is_err());
+        for (name, settings, source, expected) in [
+            (
+                "image dot cap",
+                Settings::default(),
+                (2001, 2000),
+                "grid exceeds four million dots",
+            ),
+            (
+                "image bleed overflow",
+                Settings {
+                    bleed: i32::MAX,
+                    ..Settings::default()
+                },
+                (300, 200),
+                "grid overflows",
+            ),
+            (
+                "image margin dot cap",
+                Settings {
+                    dot: 8,
+                    margin: 400,
+                    ..Settings::default()
+                },
+                (1024, 1024),
+                "grid exceeds four million dots",
+            ),
+        ] {
+            assert_eq!(settings.dimensions(source).err(), Some(expected), "{name}");
+            assert!(Placement::new(source, &settings).is_err(), "{name}");
+        }
         settings.card = Card {
             size_mm: Some((u32::MAX, u32::MAX)),
             ..Card::from_id("business-portrait")

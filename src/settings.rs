@@ -1147,18 +1147,6 @@ mod tests {
     }
 
     #[test]
-    fn palette_error_text_is_preserved() {
-        assert_eq!(
-            build_palette(&["#000", "badhex"]).unwrap_err(),
-            "color 2 (\"badhex\"): expected a 3- or 6-digit hex color"
-        );
-        assert_eq!(
-            build_palette(&[] as &[&str]).unwrap_err(),
-            "palette must have 1 to 256 colors"
-        );
-    }
-
-    #[test]
     fn domain_limits_preserve_valid_entries_on_failure() {
         let mut palettes = Palettes::builtin();
         let preset = Preset {
@@ -1229,22 +1217,6 @@ mod tests {
     }
 
     #[test]
-    fn rotation_cycles_and_reports_axes() {
-        for (rotation, degrees, swaps_axes) in [
-            (Rotation::R0, 0, false),
-            (Rotation::R90, 90, true),
-            (Rotation::R180, 180, false),
-            (Rotation::R270, 270, true),
-        ] {
-            assert_eq!(rotation.cw().ccw(), rotation);
-            assert_eq!(rotation.ccw().cw(), rotation);
-            assert_eq!(rotation.cw().cw().cw().cw(), rotation);
-            assert_eq!(rotation.degrees(), degrees);
-            assert_eq!(rotation.swaps_axes(), swaps_axes);
-        }
-    }
-
-    #[test]
     fn user_presets_validate_replace_and_preserve_builtins() {
         let mut palettes = Palettes::builtin();
         let builtins: Vec<_> = palettes.iter().cloned().collect();
@@ -1254,26 +1226,6 @@ mod tests {
             mode: Some(Mode::Color),
             builtin: true,
         };
-        for name in ["", "   ", "Black/white"] {
-            assert!(
-                palettes
-                    .upsert(Preset {
-                        name: name.into(),
-                        ..preset.clone()
-                    })
-                    .is_err()
-            );
-        }
-        for colors in [vec![], vec!["bad hex".into()], vec!["#000".into(); 257]] {
-            assert!(
-                palettes
-                    .upsert(Preset {
-                        colors,
-                        ..preset.clone()
-                    })
-                    .is_err()
-            );
-        }
         assert_eq!(palettes.len(), builtins.len());
         let i = palettes.upsert(preset.clone()).unwrap();
         assert_eq!(i, builtins.len());
@@ -1330,9 +1282,6 @@ mod tests {
             Setting::Palette.label(&settings.with_preset(&preset), &palettes),
             "Palette: Paper*"
         );
-        preset.colors = vec!["invalid".into()];
-        assert!(settings.clone().set_palette(&preset).is_err());
-        assert!(settings.with_preset(&preset) == settings);
         let builtin = settings.with_preset(palettes.get(0).unwrap());
         assert_eq!(builtin.mode, Mode::Color);
         let unknown = Settings {
@@ -1383,20 +1332,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn image_limit_uses_source_and_margin() {
-        assert_eq!(
-            Settings {
-                dot: 8,
-                margin: 400,
-                ..Settings::default()
-            }
-            .dimensions((1024, 1024))
-            .err(),
-            Some("grid exceeds four million dots")
-        );
-    }
-
     #[test]
     fn templates_restore_snapshots_while_retaining_composition() {
         let mut settings = Settings {

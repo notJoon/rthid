@@ -697,6 +697,7 @@ mod tests {
         let template = Template::capture("Pattern".into(), &settings);
         let (text, loaded) = merge(None, &[Change::UpsertTemplate(template.clone())]).unwrap();
         assert!(text.contains("algorithm = \"bayer4\""));
+        assert!(text.contains("card = \"image\""));
         assert_eq!(loaded.templates.get(0), Some(&template));
     }
 
@@ -1110,15 +1111,6 @@ mod tests {
         );
         assert_eq!(path_from_env(None, None, path("relative"), None), None);
     }
-    #[test]
-    fn image_template_round_trip_keeps_its_card() {
-        let template = Template::capture("Image".into(), &Settings::default());
-        let (text, loaded) = merge(None, &[Change::UpsertTemplate(template.clone())]).unwrap();
-        assert!(text.contains("card = \"image\""));
-        assert_eq!(loaded.templates.get(0), Some(&template));
-        assert_eq!(loaded.templates.get(0).unwrap().card.id, "image");
-    }
-
     #[test]
     fn print_templates_ignore_old_scale_and_round_trip_physical_units() {
         let old = parse("version = 1\n[[template]]\nname = 'Old'\nscale = 50\n");
