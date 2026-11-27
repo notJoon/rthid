@@ -97,6 +97,8 @@ pub struct App {
     pub panel: ListPicker,
     /// Selected preview layer, initially Original.
     pub layer: Layer,
+    /// Layer that `a` returns to from the mass study.
+    pub mass_return: Layer,
     /// Whether the minimap shows the mass study instead of the main layer.
     pub mass_minimap: bool,
     /// Geometry controls for the mass study.
@@ -138,6 +140,7 @@ impl App {
             settings: Settings::default(),
             panel: ListPicker::new(0),
             layer: Layer::Original,
+            mass_return: Layer::Original,
             mass_minimap: true,
             mass: MassOptions::default(),
             mass_tones: None,
@@ -215,6 +218,7 @@ impl App {
         self.settings.pan_x = 0;
         self.settings.pan_y = 0;
         self.layer = Layer::Original;
+        self.mass_return = Layer::Original;
         self.refresh(false);
     }
 
@@ -779,11 +783,12 @@ impl App {
                     };
                 }
                 PreviewKey::ToggleMass => {
-                    self.layer = if self.layer == Layer::Mass {
-                        Layer::Original
+                    if self.layer == Layer::Mass {
+                        self.layer = self.mass_return;
                     } else {
-                        Layer::Mass
-                    };
+                        self.mass_return = self.layer;
+                        self.layer = Layer::Mass;
+                    }
                 }
                 PreviewKey::ToggleMinimap => {
                     self.viewport.hide_minimap = !self.viewport.hide_minimap;
@@ -859,7 +864,12 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
-                self.set_settings(settings, Layer::Dithered)?;
+                let layer = if self.layer == Layer::Mass {
+                    Layer::Mass
+                } else {
+                    Layer::Dithered
+                };
+                self.set_settings(settings, layer)?;
             }
             Effect::Restore { settings, layer } => {
                 self.set_settings(settings, layer)?;
@@ -901,12 +911,14 @@ impl App {
     }
 
     // Enter and arrow keys share the preview rule and preserve it for rejected edits.
+    // The mass study stays selected because palette edits recolor its tones.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        let layer = if next != self.settings && setting.shows_dithered() {
-            Layer::Dithered
-        } else {
-            self.layer
-        };
+        let layer =
+            if next != self.settings && setting.shows_dithered() && self.layer != Layer::Mass {
+                Layer::Dithered
+            } else {
+                self.layer
+            };
         let _ = self.set_settings(next, layer);
     }
 }
@@ -2171,6 +2183,14 @@ mod tests {
             assert!(press(&mut app, code));
             assert_eq!(app.layer, Layer::Original);
         }
+        app.layer = Layer::Mass;
+        select(&mut app, Setting::Strength);
+        let strength = app.settings.strength;
+        press(&mut app, KeyCode::Left);
+        assert_ne!(app.settings.strength, strength);
+        assert_eq!(app.layer, Layer::Mass);
+        app.apply(Effect::Preview(app.settings.clone())).unwrap();
+        assert_eq!(app.layer, Layer::Mass);
     }
 
     #[test]
@@ -2209,6 +2229,14 @@ mod tests {
             assert_eq!(app.layer, Layer::Dithered);
             press(&mut app, KeyCode::Char('a'));
             assert_eq!(app.layer, Layer::Mass);
+            press(&mut app, KeyCode::Char('a'));
+            assert_eq!(app.layer, Layer::Dithered);
+            press(&mut app, KeyCode::Char('a'));
+            app.open_image(PathBuf::from("next.png"), RgbaImage::new(20, 10));
+            assert_eq!(
+                (app.layer, app.mass_return),
+                (Layer::Original, Layer::Original)
+            );
         }
     }
 

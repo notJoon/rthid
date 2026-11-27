@@ -84,7 +84,8 @@ struct Args {
     /// Tone colors for the mass study layer, from the dither palette or a fixed set.
     #[arg(long, value_enum, default_value = "palette")]
     mass_tones: CliMassTones,
-    /// Treat light pixels as ink in the mass study.
+    /// Treat light pixels as ink in the mass study, for light subjects on dark backgrounds.
+    /// With `--mass-tones palette` the darkest palette color becomes the background; fixed tone sets keep their order.
     #[arg(long)]
     mass_invert: bool,
     /// Detect terminal graphics or use glyph rendering.

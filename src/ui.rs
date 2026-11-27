@@ -31,7 +31,7 @@ const PREVIEW_HINTS: &[(&str, &str)] = &[
     ("hjkl/arrows", "pan"),
     ("HJKL", "page"),
     ("m", "map"),
-    ("M", "map: mass"),
+    ("M", "mass map"),
     ("mouse", "drag/wheel/map"),
     ("r/R", "rotate"),
     ("f", "flip"),
@@ -47,7 +47,7 @@ const PANEL_HINTS: &[(&str, &str)] = &[
     ("+/-", "zoom"),
     ("0", "fit"),
     ("m", "map"),
-    ("M", "map: mass"),
+    ("M", "mass map"),
     ("mouse", "drag/wheel/map"),
     ("Up/Down k/j", "select"),
     ("Left/Right h/l", "change"),
@@ -568,7 +568,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     report.graphics_error.unwrap_or_else(|| {
         format!(
             // Print fields lead so an 80 column terminal clips navigation, not them.
-            "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}",
+            "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}{}",
             card_w,
             card_h,
             if app.settings.bleed > 0 && app.settings.card.size_mm.is_some() {
@@ -586,6 +586,11 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
                 .unwrap_or_default(),
             if placement.aw == 0 {
                 " | no image area"
+            } else {
+                ""
+            },
+            if geometry.minimap.is_some() && app.mass_minimap && app.layer != Layer::Mass {
+                " | map Mass"
             } else {
                 ""
             },
@@ -1105,6 +1110,14 @@ mod tests {
                 ..
             })
         ));
+        let report = PreviewReport::default;
+        assert!(status(&app, &geometry, report()).ends_with(" | map Mass"));
+        app.layer = Layer::Mass;
+        assert!(!status(&app, &geometry, report()).contains("map Mass"));
+        app.layer = Layer::Original;
+        app.mass_minimap = false;
+        assert!(!status(&app, &geometry, report()).contains("map Mass"));
+        app.mass_minimap = true;
         let frame = terminal
             .draw(|f| {
                 draw(f, &app, &layout(f.area()), &mut renderer);
@@ -1248,11 +1261,11 @@ mod tests {
     fn help_hints_preserve_exact_text() {
         assert_eq!(
             key_hints(&[MODAL_HINTS, PREVIEW_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: map: mass | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | hjkl/arrows: pan | HJKL: page | m: map | M: mass map | mouse: drag/wheel/map | r/R: rotate | f: flip | d/D: reset | Esc: back | q: quit"
         );
         assert_eq!(
             key_hints(&[MODAL_HINTS, PANEL_HINTS]),
-            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: map: mass | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
+            "o: open | P: presets | T: templates | Tab: focus | Space: original/dithered | a: mass study | +/-: zoom | 0: fit | m: map | M: mass map | mouse: drag/wheel/map | Up/Down k/j: select | Left/Right h/l: change | r/R: rotate | f: flip | d/D: reset | q: quit"
         );
     }
 
