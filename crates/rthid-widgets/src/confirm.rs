@@ -2,7 +2,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{Outcome, outcome::is_release};
+use crate::{Hint, Outcome, outcome::is_release};
 
 /// Yes or no question that treats every key except an unmodified lowercase y as a no.
 ///
@@ -26,6 +26,19 @@ pub struct Confirm {
 }
 
 impl Confirm {
+    /// An unmodified lowercase y confirms the action.
+    ///
+    /// ```
+    /// use rthid_widgets::{Confirm, hint_line};
+    ///
+    /// let line = hint_line(&[Confirm::YES, Confirm::CANCEL], None, 80);
+    /// assert_eq!(line.to_string(), "y: yes | any other key: cancel");
+    /// ```
+    pub const YES: Hint = Hint::new("y", "yes");
+
+    /// Any key other than an unmodified lowercase y cancels the action.
+    pub const CANCEL: Hint = Hint::new("any other key", "cancel");
+
     /// Creates a question with the message the caller will display.
     ///
     /// # Examples
@@ -86,6 +99,8 @@ impl Confirm {
 
     /// Key and action pairs that describe [`Confirm::handle_key`], ready to
     /// pass to [`key_hints`](crate::key_hints).
+    /// [`Self::YES`] and [`Self::CANCEL`] provide the same hints for
+    /// [`hint_line`](crate::hint_line).
     ///
     /// # Examples
     ///
@@ -94,8 +109,10 @@ impl Confirm {
     ///
     /// assert_eq!(key_hints(&[Confirm::HINTS]), "y: yes | any other key: cancel");
     /// ```
-    pub const HINTS: &'static [(&'static str, &'static str)] =
-        &[("y", "yes"), ("any other key", "cancel")];
+    pub const HINTS: &'static [(&'static str, &'static str)] = &[
+        (Self::YES.key, Self::YES.label),
+        (Self::CANCEL.key, Self::CANCEL.label),
+    ];
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@
 /// given order. Groups let callers combine hints from several components,
 /// such as [`Confirm::HINTS`](crate::Confirm::HINTS), with their own. Empty
 /// groups add nothing and no groups give an empty string.
+/// For help lines that must fit an area, use [`hint_line`](crate::hint_line)
+/// with [`Hint`](crate::Hint) values such as the widget constants.
 ///
 /// # Examples
 ///

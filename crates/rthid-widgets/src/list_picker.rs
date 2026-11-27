@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, List, ListState, StatefulWidget},
 };
 
-use crate::{Outcome, outcome::is_release};
+use crate::{Hint, Outcome, outcome::is_release};
 
 /// Selection over a list of items the caller owns and passes in on each call.
 ///
@@ -38,6 +38,22 @@ pub struct ListPicker {
 }
 
 impl ListPicker {
+    /// Up, Down, k and j move the selection.
+    ///
+    /// ```
+    /// use rthid_widgets::{ListPicker, hint_line};
+    ///
+    /// let line = hint_line(&[ListPicker::MOVE, ListPicker::SUBMIT], None, 80);
+    /// assert_eq!(line.to_string(), "Up/Down k/j: select | Enter: choose");
+    /// ```
+    pub const MOVE: Hint = Hint::new("Up/Down k/j", "select");
+
+    /// Enter chooses the selected item when the list is non-empty.
+    pub const SUBMIT: Hint = Hint::new("Enter", "choose");
+
+    /// Esc closes the picker.
+    pub const CANCEL: Hint = Hint::new("Esc", "close");
+
     /// Creates a picker with `selected` as the initial index and no scroll.
     ///
     /// An index past the end is allowed and is clamped to the last item when
