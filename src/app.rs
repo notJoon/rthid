@@ -466,7 +466,7 @@ impl App {
         let need_dither = self.layer == Layer::Dithered || self.has_export();
         let tones = self
             .mass_tones
-            .unwrap_or_else(|| mass::tones_from_palette(&self.settings.palette, self.mass.invert));
+            .unwrap_or_else(|| mass::tones_from_palette(&self.settings.palette, &self.mass));
         let changed = self.grid_cache.refresh(
             &self.settings,
             need_dither,

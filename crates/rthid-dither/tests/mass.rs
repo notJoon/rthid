@@ -1,6 +1,14 @@
 //! Fixture agreement for cumulative graphic mass masks.
 
-use rthid_dither::mass::{MassOptions, mass_study};
+use rthid_dither::mass::{MassOptions, MassStudy, mass_study};
+
+fn tone_counts(study: &MassStudy) -> [usize; 4] {
+    let mut counts = [0; 4];
+    for &index in study.indices() {
+        counts[index as usize] += 1;
+    }
+    counts
+}
 
 fn component_count(mask: &[bool], w: usize, h: usize) -> usize {
     let mut seen = vec![false; mask.len()];
@@ -42,8 +50,11 @@ fn pratt_mass_masks() {
         &MassOptions::default(),
     )
     .unwrap();
-    assert_eq!((study.w, study.h), (450, 250));
-    assert_eq!(study.tone_counts().iter().sum::<usize>(), study.w * study.h);
+    assert_eq!((study.w(), study.h()), (450, 250));
+    assert_eq!(
+        tone_counts(&study).iter().sum::<usize>(),
+        study.w() * study.h()
+    );
     let reference = image::open("tests/fixtures/pratt_mass_masks.png")
         .unwrap()
         .to_rgb8();
@@ -54,7 +65,7 @@ fn pratt_mass_masks() {
     let mut components = [0; 3];
     let mut reference_components = [0; 3];
     let masks: Vec<Vec<bool>> = (1..=3)
-        .map(|i| study.indices.iter().map(|&v| v >= i).collect())
+        .map(|i| study.indices().iter().map(|&v| v >= i).collect())
         .collect();
     for pair in masks.windows(2) {
         assert!(
@@ -75,8 +86,8 @@ fn pratt_mass_masks() {
             reference_counts[i] += usize::from(expected);
         }
         ious[i] = intersection as f64 / union as f64;
-        components[i] = component_count(&masks[i], study.w, study.h);
-        reference_components[i] = component_count(&expected, study.w, study.h);
+        components[i] = component_count(&masks[i], study.w(), study.h());
+        reference_components[i] = component_count(&expected, study.w(), study.h());
     }
     println!("IoU: {ious:?}, cells: {counts:?}, components: {components:?}");
     println!("Reference cells: {reference_counts:?}, components: {reference_components:?}");

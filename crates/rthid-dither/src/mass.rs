@@ -1,4 +1,18 @@
 //! Flat graphic masses from a blurred ink field with nested foreground masks.
+//!
+//! ```
+//! use rthid_dither::dither::PaletteColor;
+//! use rthid_dither::mass::{MassOptions, mass_study, tones_from_palette};
+//!
+//! let source = [0, 0, 0, 255, 255, 255, 255, 255];
+//! let palette = [PaletteColor { rgb: [0; 3] }, PaletteColor { rgb: [255; 3] }];
+//! let options = MassOptions::default();
+//! let study = mass_study(&source, 2, 1, &options)?;
+//! let tones = tones_from_palette(&palette, &options);
+//! let rgba = study.rgba(4, 2, &tones);
+//! assert_eq!(rgba.len(), 4 * 2 * 4);
+//! # Ok::<(), rthid_dither::MassError>(())
+//! ```
 
 use std::fmt;
 
@@ -6,10 +20,10 @@ use image::{ImageBuffer, Luma, imageops::FilterType};
 
 use crate::dither::PaletteColor;
 
-/// Analysis width all distance parameters are specified at.
-pub const ANALYSIS_WIDTH: u32 = 450;
+/// Maximum analysis width all distance parameters are specified at.
+const ANALYSIS_WIDTH: u32 = 450;
 
-/// Default monochrome tones: background, base, shadow, accent.
+/// Fixed monochrome tones: background, base, shadow, accent, independent of invert.
 pub const MONO: [PaletteColor; 4] = [
     PaletteColor {
         rgb: [245, 245, 242],
@@ -23,7 +37,7 @@ pub const MONO: [PaletteColor; 4] = [
     PaletteColor { rgb: [17, 17, 17] },
 ];
 
-/// Warm tones with the same geometry, for style comparison.
+/// Fixed warm tones for style comparison, independent of invert.
 pub const WARM: [PaletteColor; 4] = [
     PaletteColor {
         rgb: [255, 255, 255],
@@ -37,14 +51,16 @@ pub const WARM: [PaletteColor; 4] = [
 
 /// Four tones sampled from a palette as a gradient from its lightest to its darkest color.
 ///
-/// The palette must be sorted by luma ascending. Tones sit at 0, 1/3, 2/3 and 1 of the
-/// gradient, so a four color palette is used as is and a two color palette gets two blended
-/// steps. `invert` reverses the direction for light ink on dark backgrounds. Fewer than two
-/// colors fall back to [`MONO`].
-pub fn tones_from_palette(palette: &[PaletteColor], invert: bool) -> [PaletteColor; 4] {
+/// A local copy is stably sorted by luma ascending. Tones sit at 0, 1/3, 2/3 and 1 of the
+/// gradient, so four colors keep their values and two colors get two blended steps.
+/// `options.invert` reverses the direction for light ink on dark backgrounds. Fewer than
+/// two colors fall back to the fixed [`MONO`] tones regardless of invert.
+pub fn tones_from_palette(palette: &[PaletteColor], options: &MassOptions) -> [PaletteColor; 4] {
     if palette.len() < 2 {
         return MONO;
     }
+    let mut palette = palette.to_vec();
+    palette.sort_by(|a, b| luma(&a.rgb).total_cmp(&luma(&b.rgb)));
     let mut tones = std::array::from_fn(|i| {
         let position = i as f64 * (palette.len() - 1) as f64 / 3.0;
         let lower = position.floor() as usize;
@@ -58,18 +74,23 @@ pub fn tones_from_palette(palette: &[PaletteColor], invert: bool) -> [PaletteCol
             }),
         }
     });
-    if !invert {
+    if !options.invert {
         tones.reverse();
     }
     tones
 }
 
+/// Rec. 601 luma in [0, 1], shared by ink extraction and tone ordering.
+fn luma(rgb: &[u8; 3]) -> f32 {
+    (0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32) / 255.0
+}
+
 /// Controls smoothing and the three cumulative ink masks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MassOptions {
-    /// Gaussian sigma at [`ANALYSIS_WIDTH`], scaled by the actual analysis width.
+    /// Gaussian sigma at 450 pixels, scaled by the actual analysis width. Zero disables blur.
     pub sigma: f32,
-    /// Strictly increasing base, shadow and accent thresholds in (0, 1].
+    /// Strictly increasing base, shadow and accent thresholds in (0, 1]. Higher covers less area.
     pub thresholds: [f32; 3],
     /// Treat light pixels as ink for light on dark images.
     pub invert: bool,
@@ -85,33 +106,48 @@ impl Default for MassOptions {
     }
 }
 
-/// Four tone grid at analysis size, with indices from background (0) to accent (3).
+/// Four tone grid at analysis size, from the lightest background (0) to accent (3).
+///
+/// Tone order is opposite to dither palette order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MassStudy {
     /// One tone index per cell in row major order.
-    pub indices: Vec<u8>,
+    indices: Vec<u8>,
     /// Number of columns.
-    pub w: usize,
+    w: usize,
     /// Number of rows.
-    pub h: usize,
+    h: usize,
 }
 
 impl MassStudy {
+    /// Number of analysis columns, at most 450.
+    pub fn w(&self) -> usize {
+        self.w
+    }
+
+    /// Number of analysis rows, preserving the source aspect ratio.
+    pub fn h(&self) -> usize {
+        self.h
+    }
+
+    /// Tone indices in row major order, from background (0) to accent (3).
+    pub fn indices(&self) -> &[u8] {
+        &self.indices
+    }
+
     /// Opaque RGBA at any output size with nearest neighbor sampling.
     ///
-    /// Panics if the grid dimensions or tone indices are inconsistent, or a
-    /// nonempty output samples an empty grid.
+    /// Panics on output size overflow.
+    #[track_caller]
     pub fn rgba(&self, out_w: usize, out_h: usize, tones: &[PaletteColor; 4]) -> Vec<u8> {
-        self.check_grid();
         let len = out_w
             .checked_mul(out_h)
             .and_then(|n| n.checked_mul(4))
-            .expect("image size overflow");
+            .unwrap_or_else(|| panic!("output {out_w}x{out_h}x4 exceeds {} bytes", usize::MAX));
         let mut rgba = Vec::with_capacity(len);
         if len == 0 {
             return rgba;
         }
-        assert!(self.w > 0 && self.h > 0, "cannot sample an empty grid");
         for y in 0..out_h {
             let sy = (y as u128 * self.h as u128 / out_h as u128) as usize;
             for x in 0..out_w {
@@ -122,49 +158,39 @@ impl MassStudy {
         }
         rgba
     }
-
-    /// Counts cells whose value is exactly each tone index, without accumulation.
-    ///
-    /// Panics if the grid dimensions or tone indices are inconsistent.
-    pub fn tone_counts(&self) -> [usize; 4] {
-        self.check_grid();
-        let mut counts = [0; 4];
-        for &index in &self.indices {
-            counts[index as usize] += 1;
-        }
-        counts
-    }
-
-    fn check_grid(&self) {
-        assert_eq!(
-            Some(self.indices.len()),
-            self.w.checked_mul(self.h),
-            "grid size mismatch"
-        );
-        assert!(self.indices.iter().all(|&i| i < 4), "invalid tone index");
-    }
 }
 
 /// Invalid analysis options or an empty source image.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MassError {
     /// Sigma must be finite and nonnegative.
-    InvalidSigma,
+    InvalidSigma {
+        /// Rejected blur sigma.
+        sigma: f32,
+    },
     /// Thresholds must be finite, strictly increasing and in (0, 1].
-    InvalidThresholds,
+    InvalidThresholds {
+        /// Rejected cumulative mask thresholds.
+        thresholds: [f32; 3],
+    },
     /// Both source dimensions must be positive.
     EmptyImage,
 }
 
 impl fmt::Display for MassError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InvalidSigma => "sigma must be finite and nonnegative",
-            Self::InvalidThresholds => {
-                "thresholds must be finite, strictly increasing and in (0, 1]"
+        match self {
+            Self::InvalidSigma { sigma } => {
+                write!(f, "sigma must be finite and nonnegative, got {sigma}")
             }
-            Self::EmptyImage => "source image must not be empty",
-        })
+            Self::InvalidThresholds { thresholds } => {
+                write!(
+                    f,
+                    "thresholds must be finite, strictly increasing and in (0, 1], got {thresholds:?}"
+                )
+            }
+            Self::EmptyImage => f.write_str("source image must not be empty"),
+        }
     }
 }
 
@@ -172,34 +198,47 @@ impl std::error::Error for MassError {}
 
 /// Computes a mass study from the undithered RGBA source image.
 ///
+/// The returned grid is at most 450 columns wide with the source aspect ratio preserved.
+/// [`MassStudy::rgba`] resamples it to any output size.
+///
 /// Ink is relative to the image's own darkest and lightest pixels with nonzero
 /// alpha, so two color images map to 0 and 1 and continuous tone images use
 /// their full range before alpha scales coverage. Uniform or fully transparent
 /// images have zero ink because they contain no visible luma contrast.
 ///
 /// Panics on mismatched RGBA dimensions or image size overflow.
+#[track_caller]
 pub fn mass_study(
     rgba: &[u8],
     w: usize,
     h: usize,
     options: &MassOptions,
 ) -> Result<MassStudy, MassError> {
-    let n = w.checked_mul(h).expect("image size overflow");
-    assert_eq!(
-        rgba.len(),
-        n.checked_mul(4).expect("image size overflow"),
-        "RGBA size mismatch"
+    let n = w
+        .checked_mul(h)
+        .unwrap_or_else(|| panic!("image {w}x{h} exceeds {} pixels", usize::MAX));
+    let bytes = n
+        .checked_mul(4)
+        .unwrap_or_else(|| panic!("image {w}x{h}x4 exceeds {} bytes", usize::MAX));
+    assert!(
+        rgba.len() == bytes,
+        "rgba has {} bytes, expected {w}x{h}x4 = {bytes}",
+        rgba.len()
     );
     if w == 0 || h == 0 {
         return Err(MassError::EmptyImage);
     }
     if !options.sigma.is_finite() || options.sigma < 0.0 {
-        return Err(MassError::InvalidSigma);
+        return Err(MassError::InvalidSigma {
+            sigma: options.sigma,
+        });
     }
     let mut previous = 0.0;
     for &threshold in &options.thresholds {
         if !threshold.is_finite() || threshold <= previous || threshold > 1.0 {
-            return Err(MassError::InvalidThresholds);
+            return Err(MassError::InvalidThresholds {
+                thresholds: options.thresholds,
+            });
         }
         previous = threshold;
     }
@@ -209,8 +248,7 @@ pub fn mass_study(
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
     for pixel in rgba.as_chunks::<4>().0 {
-        let luma =
-            (0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32) / 255.0;
+        let luma = luma(&[pixel[0], pixel[1], pixel[2]]);
         if pixel[3] > 0 {
             lo = lo.min(luma);
             hi = hi.max(luma);
@@ -230,15 +268,16 @@ pub fn mass_study(
         };
     }
     let source = ImageBuffer::<Luma<f32>, _>::from_raw(
-        u32::try_from(w).expect("image width overflow"),
-        u32::try_from(h).expect("image height overflow"),
+        u32::try_from(w).unwrap_or_else(|_| panic!("image width {w} exceeds {} pixels", u32::MAX)),
+        u32::try_from(h).unwrap_or_else(|_| panic!("image height {h} exceeds {} pixels", u32::MAX)),
         ink,
     )
-    .expect("RGBA size mismatch");
+    .expect("validated image dimensions");
     let mut density = image::imageops::resize(
         &source,
         aw as u32,
-        u32::try_from(ah).expect("image height overflow"),
+        u32::try_from(ah)
+            .unwrap_or_else(|_| panic!("analysis height {ah} exceeds {} pixels", u32::MAX)),
         FilterType::Triangle,
     )
     .into_raw();
@@ -443,15 +482,23 @@ mod tests {
         }
     }
 
+    fn tone_counts(study: &MassStudy) -> [usize; 4] {
+        let mut counts = [0; 4];
+        for &index in study.indices() {
+            counts[index as usize] += 1;
+        }
+        counts
+    }
+
     fn study(rgba: &[u8], w: usize, h: usize, options: &MassOptions) -> MassStudy {
         let result = mass_study(rgba, w, h, options).unwrap();
         let cumulative: Vec<Vec<bool>> = (1..=3)
-            .map(|i| result.indices.iter().map(|&v| v >= i).collect())
+            .map(|i| result.indices().iter().map(|&v| v >= i).collect())
             .collect();
         check_masks(&cumulative);
         assert_eq!(
-            result.tone_counts().iter().sum::<usize>(),
-            result.w * result.h
+            tone_counts(&result).iter().sum::<usize>(),
+            result.w() * result.h()
         );
         result
     }
@@ -466,7 +513,14 @@ mod tests {
     fn palette_tones_preserve_four_colors_in_background_first_order() {
         let mut palette = WARM;
         palette.reverse();
-        assert_eq!(tones_from_palette(&palette, false), WARM);
+        assert_eq!(tones_from_palette(&palette, &MassOptions::default()), WARM);
+    }
+
+    #[test]
+    fn palette_tones_sort_without_changing_the_input() {
+        let palette = [WARM[2], WARM[0], WARM[3], WARM[1]];
+        assert_eq!(tones_from_palette(&palette, &MassOptions::default()), WARM);
+        assert_eq!(palette, [WARM[2], WARM[0], WARM[3], WARM[1]]);
     }
 
     #[test]
@@ -478,7 +532,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            tones_from_palette(&palette, false).map(|tone| tone.rgb),
+            tones_from_palette(&palette, &MassOptions::default()).map(|tone| tone.rgb),
             [[100, 110, 120], [67, 77, 87], [33, 43, 53], [0, 10, 20]]
         );
     }
@@ -489,7 +543,7 @@ mod tests {
             rgb: [i as u8 * 16; 3],
         });
         assert_eq!(
-            tones_from_palette(&palette, false),
+            tones_from_palette(&palette, &MassOptions::default()),
             [palette[15], palette[10], palette[5], palette[0]]
         );
     }
@@ -502,16 +556,43 @@ mod tests {
                 rgb: [100, 110, 120],
             },
         ];
-        let mut expected = tones_from_palette(&palette, false);
+        let mut expected = tones_from_palette(&palette, &MassOptions::default());
         expected.reverse();
-        assert_eq!(tones_from_palette(&palette, true), expected);
+        assert_eq!(
+            tones_from_palette(
+                &palette,
+                &MassOptions {
+                    invert: true,
+                    ..MassOptions::default()
+                }
+            ),
+            expected
+        );
     }
 
     #[test]
     fn palette_tones_fall_back_to_mono_for_fewer_than_two_colors() {
         for invert in [false, true] {
-            assert_eq!(tones_from_palette(&[], invert), MONO);
-            assert_eq!(tones_from_palette(&WARM[..1], invert), MONO);
+            assert_eq!(
+                tones_from_palette(
+                    &[],
+                    &MassOptions {
+                        invert,
+                        ..MassOptions::default()
+                    }
+                ),
+                MONO
+            );
+            assert_eq!(
+                tones_from_palette(
+                    &WARM[..1],
+                    &MassOptions {
+                        invert,
+                        ..MassOptions::default()
+                    }
+                ),
+                MONO
+            );
         }
     }
 
@@ -521,17 +602,23 @@ mod tests {
         assert_eq!(mass_study(&[], 0, 2, &options), Err(MassError::EmptyImage));
         assert_eq!(mass_study(&[], 2, 0, &options), Err(MassError::EmptyImage));
         for sigma in [-1.0, f32::NAN, f32::INFINITY] {
+            let error = mass_study(
+                &[0; 4],
+                1,
+                1,
+                &MassOptions {
+                    sigma,
+                    ..options.clone()
+                },
+            )
+            .unwrap_err();
+            let MassError::InvalidSigma { sigma: actual } = error else {
+                panic!("{error}")
+            };
+            assert_eq!(actual.to_bits(), sigma.to_bits());
             assert_eq!(
-                mass_study(
-                    &[0; 4],
-                    1,
-                    1,
-                    &MassOptions {
-                        sigma,
-                        ..options.clone()
-                    }
-                ),
-                Err(MassError::InvalidSigma)
+                error.to_string(),
+                format!("sigma must be finite and nonnegative, got {sigma}")
             );
         }
         for thresholds in [
@@ -542,23 +629,31 @@ mod tests {
             [0.2, f32::NAN, 1.0],
             [0.2, 0.5, f32::INFINITY],
         ] {
+            let error = mass_study(
+                &[0; 4],
+                1,
+                1,
+                &MassOptions {
+                    thresholds,
+                    ..options.clone()
+                },
+            )
+            .unwrap_err();
+            let MassError::InvalidThresholds { thresholds: actual } = error else {
+                panic!("{error}")
+            };
+            assert_eq!(actual.map(f32::to_bits), thresholds.map(f32::to_bits));
             assert_eq!(
-                mass_study(
-                    &[0; 4],
-                    1,
-                    1,
-                    &MassOptions {
-                        thresholds,
-                        ..options.clone()
-                    }
-                ),
-                Err(MassError::InvalidThresholds)
+                error.to_string(),
+                format!(
+                    "thresholds must be finite, strictly increasing and in (0, 1], got {thresholds:?}"
+                )
             );
         }
     }
 
     #[test]
-    #[should_panic(expected = "RGBA size mismatch")]
+    #[should_panic(expected = "rgba has 3 bytes, expected 1x1x4 = 4")]
     fn rejects_length_mismatch() {
         let _ = mass_study(&[0; 3], 1, 1, &MassOptions::default());
     }
@@ -571,15 +666,15 @@ mod tests {
             ..MassOptions::default()
         };
         assert_eq!(
-            study(&[0, 0, 0, 255].repeat(12), 4, 3, &options).indices,
+            study(&[0, 0, 0, 255].repeat(12), 4, 3, &options).indices(),
             vec![0; 12]
         );
-        assert_eq!(study(&[255; 48], 4, 3, &options).indices, vec![0; 12]);
-        assert_eq!(study(&[0; 48], 4, 3, &options).indices, vec![0; 12]);
+        assert_eq!(study(&[255; 48], 4, 3, &options).indices(), vec![0; 12]);
+        assert_eq!(study(&[0; 48], 4, 3, &options).indices(), vec![0; 12]);
         let mut rgba = [17, 17, 17, 255].repeat(6);
         rgba.extend_from_slice(&[245, 245, 245, 255].repeat(6));
         assert_eq!(
-            study(&rgba, 4, 3, &options).indices,
+            study(&rgba, 4, 3, &options).indices(),
             [vec![3; 6], vec![0; 6]].concat()
         );
         assert_eq!(
@@ -589,7 +684,7 @@ mod tests {
                 1,
                 &options
             )
-            .indices,
+            .indices(),
             [3, 2, 0]
         );
     }
@@ -606,15 +701,15 @@ mod tests {
                 invert,
             };
             assert_eq!(
-                study(&rgba, 4, 1, &options).indices,
+                study(&rgba, 4, 1, &options).indices(),
                 if invert { [0, 2, 3, 0] } else { [2, 2, 0, 0] }
             );
             assert_eq!(
-                study(&[17, 17, 17, 255].repeat(4), 4, 1, &options).indices,
+                study(&[17, 17, 17, 255].repeat(4), 4, 1, &options).indices(),
                 [0; 4]
             );
             assert_eq!(
-                study(&[0, 0, 0, 0, 255, 255, 255, 0], 2, 1, &options).indices,
+                study(&[0, 0, 0, 0, 255, 255, 255, 0], 2, 1, &options).indices(),
                 [0; 2]
             );
         }
@@ -721,12 +816,19 @@ mod tests {
 
     #[test]
     fn rendering_and_counts_accept_any_consistent_grid() {
-        let result = MassStudy {
-            indices: vec![0, 1, 2, 3],
-            w: 2,
-            h: 2,
-        };
-        assert_eq!(result.tone_counts(), [1; 4]);
+        let result = study(
+            &[
+                255, 255, 255, 255, 170, 170, 170, 255, 85, 85, 85, 255, 0, 0, 0, 255,
+            ],
+            2,
+            2,
+            &MassOptions {
+                sigma: 0.0,
+                thresholds: [0.25, 0.5, 0.9],
+                invert: false,
+            },
+        );
+        assert_eq!(tone_counts(&result), [1; 4]);
         let rgba = result.rgba(4, 4, &WARM);
         for y in 0..4 {
             for x in 0..4 {
@@ -735,18 +837,12 @@ mod tests {
                 assert_eq!(rgba[offset + 3], 255);
             }
         }
-        let empty = MassStudy {
-            indices: Vec::new(),
-            w: 0,
-            h: 0,
-        };
-        assert_eq!(empty.tone_counts(), [0; 4]);
-        assert!(empty.rgba(0, 2, &MONO).is_empty());
+        assert!(result.rgba(0, 2, &MONO).is_empty());
     }
 
     #[test]
     fn analysis_height_rounds_ties_to_even() {
         let result = study(&[255; 4].repeat(900 * 5), 900, 5, &MassOptions::default());
-        assert_eq!((result.w, result.h), (450, 2));
+        assert_eq!((result.w(), result.h()), (450, 2));
     }
 }

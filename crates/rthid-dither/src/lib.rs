@@ -6,3 +6,6 @@ pub mod mass;
 
 /// Invalid palette input from [`dither::make_palette`].
 pub use dither::PaletteError;
+
+/// Invalid analysis input from [`mass::mass_study`].
+pub use mass::MassError;
