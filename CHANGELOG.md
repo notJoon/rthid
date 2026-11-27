@@ -3,6 +3,13 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- The help line shows only currently usable keys, fits the terminal width, and
+  puts Enter and Esc first in dialogs
+
 ## [0.2.0] - 2026-11-28
 
 ### Added

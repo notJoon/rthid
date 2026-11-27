@@ -110,6 +110,18 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) fn selected_setting(&self) -> Setting {
+        Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()]
+    }
+
+    pub(crate) fn mass_inset_shown(&self, geometry: &PreviewGeometry) -> bool {
+        self.mass_minimap && self.mass_map_available(geometry)
+    }
+
+    pub(crate) fn mass_map_available(&self, geometry: &PreviewGeometry) -> bool {
+        geometry.minimap.is_some() && self.layer != Layer::Mass
+    }
+
     /// Builds the source grid and queues requested companion exports.
     pub fn new(
         source: Option<(PathBuf, RgbaImage)>,
@@ -802,7 +814,7 @@ impl App {
         match self.panel.handle_key(key, Setting::ALL.len()) {
             Outcome::Ignored => {}
             Outcome::Submit(_) => {
-                let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
+                let setting = self.selected_setting();
                 // Enter picks a new seed on an active Seed row. The clock is read only
                 // here, Settings decides the seed and the engine stays deterministic.
                 let entropy = SystemTime::now()
@@ -820,10 +832,9 @@ impl App {
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
-                let next = self.settings.with_default(
-                    Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()],
-                    &self.library.palettes,
-                );
+                let next = self
+                    .settings
+                    .with_default(self.selected_setting(), &self.library.palettes);
                 let _ = self.set_settings(next, self.layer);
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -885,7 +896,7 @@ impl App {
     }
 
     fn adjust(&mut self, direction: i32) {
-        let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
+        let setting = self.selected_setting();
         let next = self
             .settings
             .adjusted(setting, direction, &self.library.palettes);

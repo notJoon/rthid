@@ -102,6 +102,9 @@ fields stay visible and the layer and navigation fields are cut first.
 
 ## Keys
 
+The help line lists the keys usable right now, Enter and Esc first in dialogs,
+and drops the least specific ones to fit the width.
+
 The parameter panel has focus initially. A cyan border marks the focused panel.
 
 | Context | Key | Action |
@@ -166,8 +169,9 @@ cannot match a built-in preset. Reusing a template name asks to overwrite with
 `y`; any other key returns to the name prompt. `Esc` returns from naming to
 the list or closes the list. Click to select a preset, template, or editor row,
 then click again to apply or edit it. The wheel moves one row. Mouse input is
-ignored during confirmations and while editing a name or editor field. Modal
-keys appear in the help line.
+ignored during confirmations and while editing a name or editor field. The
+help line lists the keys usable right now, Enter and Esc first in dialogs,
+and drops the least specific ones to fit the width.
 
 The config path lookup order is `--config path`, `RTHID_CONFIG`,
 `$XDG_CONFIG_HOME/rthid/config.toml` when `XDG_CONFIG_HOME` is absolute, then

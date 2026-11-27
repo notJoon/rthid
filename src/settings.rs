@@ -950,6 +950,11 @@ impl Settings {
         }
     }
 
+    /// Whether Enter can draw a new pattern for the selected setting.
+    pub fn can_reseed(&self, setting: Setting) -> bool {
+        setting == Setting::Seed && setting.is_active(self)
+    }
+
     /// Changes an active Seed row, ensuring the pattern seed changes.
     ///
     /// The app supplies the entropy and this decides the seed, so the engine stays
@@ -957,7 +962,7 @@ impl Settings {
     /// seed moves up by one, wrapping at u32::MAX. Other rows are left unchanged.
     pub fn reseeded(&self, setting: Setting, entropy: u64) -> Self {
         let mut next = self.clone();
-        if setting == Setting::Seed && setting.is_active(self) {
+        if self.can_reseed(setting) {
             next.seed = entropy as u32;
             if next.seed == self.seed {
                 next.seed = next.seed.wrapping_add(1);

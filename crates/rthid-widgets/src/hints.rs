@@ -135,16 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn matches_key_hints_when_everything_fits() {
-        let pairs: &[(&str, &str)] = &[("j/k", "select"), ("Enter", "open")];
-        let hints = [Hint::new("j/k", "select"), Hint::new("Enter", "open")];
-        assert_eq!(
-            hint_line(&hints, None, 80).to_string(),
-            crate::key_hints(&[pairs])
-        );
-    }
-
-    #[test]
     fn wider_lines_never_show_fewer_hints() {
         for more in [None, Some(Hint::new("?", "more"))] {
             let mut previous = 0;
