@@ -56,4 +56,4 @@ jobs:
         uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: cargo codspeed run
+          run: cargo codspeed run -p rthid-dither -p rthid-render -p rthid-term
