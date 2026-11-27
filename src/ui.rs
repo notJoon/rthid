@@ -523,21 +523,9 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     let Some(placement) = app.grid_cache.placement(&app.settings) else {
         return "No image".into();
     };
-    let source = app
-        .grid_cache
-        .source
-        .as_ref()
-        .expect("loaded source")
-        .dimensions();
+    let source = app.source_size();
     let dimensions = app.settings.dimensions(source).expect("valid placement");
-    let (card_w, card_h) = if app.settings.card.size_mm.is_some() {
-        (
-            dimensions.mm.0 - 2.0 * f64::from(app.settings.bleed),
-            dimensions.mm.1 - 2.0 * f64::from(app.settings.bleed),
-        )
-    } else {
-        dimensions.mm
-    };
+    let (card_w, card_h) = dimensions.card_mm;
     let (gw, gh) = geometry.grid;
     let mode = if geometry.zoom == viewport::Zoom::Fit {
         format!(
@@ -602,6 +590,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::BUSINESS_CARD;
     use image::RgbaImage;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1140,7 +1129,7 @@ mod tests {
     fn draws_settings_and_truecolor_backgrounds() {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
-        app.settings.card = crate::settings::Card::from_id("business-portrait");
+        app.settings.card = BUSINESS_CARD;
         app.sync(Rect::new(0, 0, 180, 30));
         assert!(app.show_original);
         app.viewport.zoom = viewport::Zoom::In(1);
@@ -1445,7 +1434,7 @@ mod tests {
     #[test]
     fn print_status_includes_bleed_and_empty_area_and_truncates() {
         let mut app = App::builtin(RgbaImage::new(8, 8), None);
-        app.settings.card = crate::settings::Card::from_id("business-portrait");
+        app.settings.card = BUSINESS_CARD;
         app.sync(Rect::new(0, 0, 180, 30));
         app.settings.bleed = 3;
         app.settings.rotation = crate::settings::Rotation::R90;

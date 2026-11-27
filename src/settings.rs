@@ -272,6 +272,8 @@ pub struct Dimensions {
     pub grid: (u32, u32),
     /// Physical width and height in millimetres.
     pub mm: (f64, f64),
+    /// Physical card size used by the status line.
+    pub card_mm: (f64, f64),
     /// Paper border on each side in dots.
     pub inset: u32,
 }
@@ -314,6 +316,15 @@ pub const CARDS: [Card; 7] = [
         size_mm: Some((100, 148)),
     },
 ];
+
+/// Business portrait card shared by tests.
+#[cfg(test)]
+pub(crate) const BUSINESS_CARD: Card = CARDS[1];
+
+/// Ties go toward positive infinity, including negative image offsets.
+pub(crate) fn round(value: f64) -> f64 {
+    (value + 0.5).floor()
+}
 
 impl Card {
     /// Unknown template identifiers select the default card.
@@ -382,7 +393,7 @@ impl Template {
     }
 
     /// Restores saved settings while retaining the current rotation, flip, zoom and pan.
-    pub fn apply(&self, settings: &Settings, source: (u32, u32)) -> Result<Settings, String> {
+    pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
         let next = Settings {
             dither: self.dither,
@@ -404,7 +415,6 @@ impl Template {
             mode: self.mode,
             tone: self.tone,
         };
-        next.dimensions(source)?;
         Ok(next)
     }
 }
@@ -832,21 +842,18 @@ impl Settings {
         }
     }
 
-    /// Grid size without a source, using a single pixel placeholder for Image.
-    #[cfg(test)]
-    pub fn grid_dimensions(&self) -> Result<(u32, u32), &'static str> {
-        Ok(self.dimensions((1, 1))?.grid)
-    }
-
     /// Resolves grid, paper inset and physical size including bleed from the source.
     pub fn dimensions(&self, source: (u32, u32)) -> Result<Dimensions, &'static str> {
         if self.dot <= 0 || self.bleed < 0 {
             return Err("invalid print dimensions");
         }
+        if source.0 == 0 || source.1 == 0 {
+            return Err("empty source");
+        }
         let dot = f64::from(self.dot);
         let inset = if self.margin > 0 || self.card.size_mm.is_none() {
-            ((i64::from(self.bleed) * 100 + i64::from(self.margin.max(0)) * 10) as f64 / dot + 0.5)
-                .floor() as u32
+            round((i64::from(self.bleed) * 100 + i64::from(self.margin.max(0)) * 10) as f64 / dot)
+                as u32
         } else {
             0
         };
@@ -869,9 +876,6 @@ impl Settings {
                 ),
             )
         } else {
-            if source.0 == 0 || source.1 == 0 {
-                return Err("empty source");
-            }
             let (w, h) = if self.rotation.swaps_axes() {
                 (source.1, source.0)
             } else {
@@ -893,7 +897,16 @@ impl Settings {
         if u64::from(grid.0) * u64::from(grid.1) > MAX_DOTS {
             return Err("grid exceeds four million dots");
         }
-        Ok(Dimensions { grid, mm, inset })
+        let card_mm = self
+            .card
+            .size_mm
+            .map_or(mm, |(w, h)| (f64::from(w), f64::from(h)));
+        Ok(Dimensions {
+            grid,
+            mm,
+            card_mm,
+            inset,
+        })
     }
 
     /// Builds library options from the current panel values.
@@ -978,13 +991,7 @@ impl Settings {
 
     /// Returns settings moved `dir` steps and clamped to the range. Mode and
     /// Serpentine toggle, Palette wraps around the presets.
-    pub fn adjusted(
-        &self,
-        setting: Setting,
-        dir: i32,
-        palettes: &Palettes,
-        source: (u32, u32),
-    ) -> Self {
+    pub fn adjusted(&self, setting: Setting, dir: i32, palettes: &Palettes) -> Self {
         let mut next = self.clone();
         if !setting.is_active(self) {
             return next;
@@ -1030,9 +1037,6 @@ impl Settings {
                     *value = step(*value);
                 }
             }
-        }
-        if next.dimensions(source).is_err() {
-            return self.clone();
         }
         next
     }
@@ -1105,9 +1109,7 @@ mod tests {
                 ..Settings::default()
             };
             assert_eq!(
-                settings
-                    .adjusted(Setting::Seed, dir, &palettes, (1, 1))
-                    .seed,
+                settings.adjusted(Setting::Seed, dir, &palettes).seed,
                 expected
             );
         }
@@ -1178,7 +1180,7 @@ mod tests {
                 palette_hex: colors,
                 ..template.clone()
             };
-            assert!(invalid.apply(&settings, (1, 1)).is_err());
+            assert!(invalid.apply(&settings).is_err());
             assert!(templates.upsert(invalid).is_err());
         }
         assert_eq!(palettes.get(index), Some(&preset));
@@ -1308,13 +1310,13 @@ mod tests {
         };
         assert_eq!(
             unknown
-                .adjusted(Setting::Palette, 1, &palettes, (1, 1))
+                .adjusted(Setting::Palette, 1, &palettes)
                 .palette_name,
             "4-gray"
         );
         assert_eq!(
             unknown
-                .adjusted(Setting::Palette, -1, &palettes, (1, 1))
+                .adjusted(Setting::Palette, -1, &palettes)
                 .palette_name,
             "Paper"
         );
@@ -1327,11 +1329,11 @@ mod tests {
             zoom: 103,
             ..Settings::default()
         };
-        let next = settings.adjusted(Setting::Zoom, 1, &palettes, (1, 1));
+        let next = settings.adjusted(Setting::Zoom, 1, &palettes);
         assert_eq!(next.zoom, 108);
         assert_eq!(next.with_default(Setting::Zoom, &palettes).zoom, 100);
         for setting in Setting::ALL {
-            let next = settings.adjusted(setting, -1, &palettes, (1, 1));
+            let next = settings.adjusted(setting, -1, &palettes);
             let reset = next.with_default(setting, &palettes);
             assert_eq!(
                 setting.label(&reset, &palettes),
@@ -1341,10 +1343,7 @@ mod tests {
             for dir in [i32::MIN, i32::MAX] {
                 assert!(
                     setting
-                        .label(
-                            &settings.adjusted(setting, dir, &palettes, (1, 1)),
-                            &palettes
-                        )
+                        .label(&settings.adjusted(setting, dir, &palettes), &palettes)
                         .len()
                         <= 25
                 );
@@ -1353,32 +1352,14 @@ mod tests {
     }
     #[test]
     fn image_limit_uses_source_and_margin() {
-        let settings = Settings {
-            dot: 9,
-            margin: 400,
-            ..Settings::default()
-        };
-        let palettes = Palettes::builtin();
-        for source in [(1024, 1024), (1, 1), (16, 16)] {
-            let next = settings.adjusted(Setting::Dot, -1, &palettes, source);
-            assert_eq!(next.dot, if source == (1024, 1024) { 9 } else { 8 });
-            assert_eq!(next.margin, 400);
-            let template = Template::capture(
-                "Border".into(),
-                &Settings {
-                    dot: 8,
-                    ..settings.clone()
-                },
-            );
-            assert_eq!(
-                template.apply(&settings, source).is_err(),
-                source == (1024, 1024)
-            );
-        }
         assert_eq!(
-            Settings { dot: 8, ..settings }
-                .dimensions((1024, 1024))
-                .err(),
+            Settings {
+                dot: 8,
+                margin: 400,
+                ..Settings::default()
+            }
+            .dimensions((1024, 1024))
+            .err(),
             Some("grid exceeds four million dots")
         );
     }
@@ -1416,7 +1397,7 @@ mod tests {
             pan_y: 45,
             ..Settings::default()
         };
-        let restored = template.apply(&current, (1, 1)).unwrap();
+        let restored = template.apply(&current).unwrap();
         assert!(
             restored
                 == Settings {
@@ -1438,6 +1419,6 @@ mod tests {
         assert_eq!(clamped.strength, 0.0);
         assert_eq!(clamped.tone.gamma, 2.5);
         template.palette_hex = vec!["invalid".into()];
-        assert!(template.apply(&current, (1, 1)).is_err());
+        assert!(template.apply(&current).is_err());
     }
 }

@@ -1,6 +1,6 @@
 //! Physical PNG sizing and integer placement inside a physical card.
 
-use crate::settings::{Rotation, Settings};
+use crate::settings::{Rotation, Settings, round};
 
 /// Rounds each resolved physical axis including bleed to PNG pixels.
 /// Returns `InvalidInput` when a dimension is zero or overflows `u32`.
@@ -46,8 +46,6 @@ pub(crate) struct Placement {
     pub x: i64,
     /// Source top edge relative to the image area.
     pub y: i64,
-    /// Image dot size retained so physical exports refresh, zero for fixed cards.
-    pub dot: i32,
     /// Cover magnification retained when rounding leaves the placement unchanged.
     pub zoom: i32,
     /// Horizontal composition control.
@@ -60,19 +58,11 @@ pub(crate) struct Placement {
     pub flip: bool,
 }
 
-// Ties go toward positive infinity, including negative image offsets.
-fn round(value: f64) -> f64 {
-    (value + 0.5).floor()
-}
-
 impl Placement {
     /// Rejects impossible source sizes and placements before allocating pixels.
     pub fn new(source: (u32, u32), settings: &Settings) -> Result<Self, &'static str> {
         let dimensions = settings.dimensions(source)?;
         let (width, height) = dimensions.grid;
-        if source.0 == 0 || source.1 == 0 {
-            return Err("empty source");
-        }
         let inset = dimensions.inset;
         let aw = width.saturating_sub(inset.saturating_mul(2));
         let ah = height.saturating_sub(inset.saturating_mul(2));
@@ -88,11 +78,6 @@ impl Placement {
             y: 0,
             rotation: settings.rotation,
             flip: settings.flip,
-            dot: if settings.card.size_mm.is_none() {
-                settings.dot
-            } else {
-                0
-            },
             zoom: settings.zoom,
             pan_x: settings.pan_x,
             pan_y: settings.pan_y,
@@ -148,13 +133,17 @@ mod tests {
     use super::*;
     use crate::settings::{CARDS, Card};
 
+    fn grid_dimensions(settings: &Settings) -> Result<(u32, u32), &'static str> {
+        Ok(settings.dimensions((1, 1))?.grid)
+    }
+
     #[test]
     fn image_card_follows_source_and_adds_paper_around_it() {
         let mut settings = Settings::default();
         assert_eq!(settings.card.id, "image");
         assert_eq!(settings.card.label, "Image");
         assert_eq!(Card::from_id("unknown"), settings.card);
-        assert_eq!(settings.grid_dimensions(), Ok((1, 1)));
+        assert_eq!(grid_dimensions(&settings), Ok((1, 1)));
         for (rotation, size) in [
             (Rotation::R0, (300, 200)),
             (Rotation::R90, (200, 300)),
@@ -176,7 +165,13 @@ mod tests {
             }
         }
         settings = Settings::default();
-        assert!(Placement::new((0, 1), &settings).is_err());
+        for source in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(settings.dimensions(source).err(), Some("empty source"));
+            assert_eq!(
+                Placement::new(source, &settings).unwrap_err(),
+                "empty source"
+            );
+        }
         assert!(Placement::new((u32::MAX, 1), &settings).is_err());
         assert!(Placement::new((2001, 2000), &settings).is_err());
         settings.bleed = i32::MAX;
@@ -278,16 +273,16 @@ mod tests {
                 card,
                 ..Settings::default()
             };
-            assert_eq!(settings.grid_dimensions(), Ok(expected));
+            assert_eq!(grid_dimensions(&settings), Ok(expected));
         }
         let settings = Settings {
             card: Card::from_id("euro-business"),
             dot: 8,
             ..Settings::default()
         };
-        assert_eq!(settings.grid_dimensions(), Ok((688, 1063)));
+        assert_eq!(grid_dimensions(&settings), Ok((688, 1063)));
         let settings = Settings::for_pixels(1, 2);
-        assert_eq!(settings.grid_dimensions(), Ok((8, 8)));
+        assert_eq!(grid_dimensions(&settings), Ok((8, 8)));
     }
 
     #[test]
@@ -374,19 +369,25 @@ mod tests {
             card: Card::from_id("business-portrait"),
             ..Settings::default()
         };
-        assert!(Placement::new((0, 1), &settings).is_err());
+        for source in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(settings.dimensions(source).err(), Some("empty source"));
+            assert_eq!(
+                Placement::new(source, &settings).unwrap_err(),
+                "empty source"
+            );
+        }
         assert!(Placement::new((u32::MAX, 1), &settings).is_err());
         settings.card = Card {
             size_mm: Some((u32::MAX, u32::MAX)),
             ..Card::from_id("business-portrait")
         };
-        assert!(settings.grid_dimensions().is_err());
+        assert!(grid_dimensions(&settings).is_err());
         settings.card = Card::from_id("business-portrait");
         settings.bleed = i32::MAX;
-        assert!(settings.grid_dimensions().is_err());
+        assert!(grid_dimensions(&settings).is_err());
         settings.bleed = 0;
         settings.dot = 0;
-        assert!(settings.grid_dimensions().is_err());
+        assert!(grid_dimensions(&settings).is_err());
         for card in CARDS {
             let settings = Settings {
                 card,
@@ -394,7 +395,7 @@ mod tests {
                 bleed: 3,
                 ..Settings::default()
             };
-            assert!(settings.grid_dimensions().is_ok());
+            assert!(grid_dimensions(&settings).is_ok());
         }
     }
 }
