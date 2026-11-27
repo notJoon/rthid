@@ -35,6 +35,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `MassStudy::rounded_rings` and `mass::RoundedRing` simplify and round traced mass-study rings
 - `MassStudy::rings`, `mass::Ring` and `mass::rasterize` trace mass-study tiers and
   rasterize them back to indices
 - Bayer 2, 4 and 8 ordered dithering and seeded noise thresholds

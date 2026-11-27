@@ -51,8 +51,10 @@ use image::{ImageBuffer, Luma, imageops::FilterType};
 use crate::dither::PaletteColor;
 
 mod contour;
+mod smooth;
 
 pub use contour::{Ring, rasterize};
+pub use smooth::RoundedRing;
 
 /// Maximum analysis grid width, and the width every distance parameter is tuned at.
 ///
