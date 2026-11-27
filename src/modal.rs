@@ -10,7 +10,8 @@ use crate::settings::{
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    text::Line,
+    style::{Color, Style},
+    text::{Line, Span},
     widgets::Block,
 };
 use rthid_dither::dither::Mode;
@@ -303,10 +304,32 @@ impl Editor {
         }
     }
 
+    /// Rows in the editor list: the name, one per color and the mode.
+    fn row_count(&self) -> usize {
+        self.draft.colors.len() + 2
+    }
+
+    /// Selected editor row, if any.
+    pub(crate) fn selected_row(&self) -> Option<usize> {
+        self.rows.selected(self.row_count())
+    }
+
+    /// Text shown in a name or color row, including any uncommitted edit.
+    fn row_text(&self, row: usize) -> &str {
+        if let Some(input) = &self.input
+            && self.selected_row() == Some(row)
+        {
+            input.text()
+        } else if row == 0 {
+            &self.draft.name
+        } else {
+            &self.draft.colors[row - 1]
+        }
+    }
+
     /// Whether the active hex edit can be committed.
     pub fn invalid_hex(&self) -> bool {
-        self.rows
-            .selected(self.draft.colors.len() + 2)
+        self.selected_row()
             .is_some_and(|row| row > 0 && row <= self.draft.colors.len())
             && self
                 .input
@@ -316,13 +339,12 @@ impl Editor {
 
     /// Color for a draft row, including any uncommitted hex edit.
     pub fn swatch_rgb(&self, row: usize) -> Option<[u8; 3]> {
-        let color = self.draft.colors.get(row.checked_sub(1)?)?;
-        let text = if Some(row) == self.rows.selected(self.draft.colors.len() + 2) {
-            self.input.as_ref().map_or(color.as_str(), TextInput::text)
-        } else {
-            color
-        };
-        build_palette(&[text]).ok().map(|palette| palette[0].rgb)
+        if !(1..=self.draft.colors.len()).contains(&row) {
+            return None;
+        }
+        build_palette(&[self.row_text(row)])
+            .ok()
+            .map(|palette| palette[0].rgb)
     }
 
     // Uses committed values only. The field's own swatch shows the typed color, so partial
@@ -332,7 +354,7 @@ impl Editor {
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Step {
-        let row = self.rows.selected(self.draft.colors.len() + 2).unwrap();
+        let row = self.selected_row().unwrap();
         if let Some(input) = &mut self.input {
             match input.handle_key(key) {
                 Outcome::Cancel => {
@@ -409,14 +431,9 @@ impl Editor {
     }
 
     fn open_input(&mut self) {
-        let row = self.rows.selected(self.draft.colors.len() + 2).unwrap();
-        let text = if row == 0 {
-            &self.draft.name
-        } else {
-            &self.draft.colors[row - 1]
-        };
+        let row = self.selected_row().unwrap();
         self.input = Some(TextInput::new(
-            text.clone(),
+            self.row_text(row).to_owned(),
             if row == 0 { MAX_NAME_CHARS } else { 7 },
         ));
     }
@@ -470,6 +487,43 @@ pub(crate) fn template_rows(ctx: &Ctx<'_>) -> Vec<Line<'static>> {
     }
 }
 
+/// Label before a preset editor row: the name row first, then numbered colors.
+pub(crate) fn editor_prefix(row: usize) -> String {
+    if row == 0 {
+        "Name: ".into()
+    } else {
+        format!("{row}: ")
+    }
+}
+
+/// Color sample drawn after a preset editor row.
+pub(crate) fn swatch_span([r, g, b]: [u8; 3], style: Style) -> Span<'static> {
+    Span::styled("  ██", style.fg(Color::Rgb(r, g, b)))
+}
+
+/// Preset editor rows shared by dialog measurement and drawing.
+pub(crate) fn editor_rows(editor: &Editor) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for row in 0..=editor.draft.colors.len() {
+        let mut spans = vec![
+            Span::raw(editor_prefix(row)),
+            Span::raw(editor.row_text(row).to_owned()),
+        ];
+        if let Some(rgb) = editor.swatch_rgb(row) {
+            spans.push(swatch_span(rgb, Style::default()));
+        }
+        rows.push(Line::from(spans));
+    }
+    rows.push(Line::raw(format!(
+        "Mode: {}",
+        editor
+            .draft
+            .mode
+            .map_or("keep", crate::settings::mode_label)
+    )));
+    rows
+}
+
 impl Modal {
     /// Computes dialog and content rectangles without changing selection or scroll.
     pub fn layout(&self, preview: Rect, screen: Rect, ctx: &Ctx<'_>) -> ModalLayout {
@@ -520,40 +574,12 @@ impl Modal {
                 },
             ),
             Self::Editor(editor) => {
-                let width = (0..=editor.draft.colors.len())
-                    .map(|row| {
-                        let prefix = if row == 0 {
-                            "Name: ".into()
-                        } else {
-                            format!("{row}: ")
-                        };
-                        let text = if let Some(input) = &editor.input
-                            && editor.rows.selected(editor.draft.colors.len() + 2) == Some(row)
-                        {
-                            input.text()
-                        } else if row == 0 {
-                            &editor.draft.name
-                        } else {
-                            &editor.draft.colors[row - 1]
-                        };
-                        Line::raw(format!("{prefix}{text}")).width()
-                            + if editor.swatch_rgb(row).is_some() {
-                                4
-                            } else {
-                                0
-                            }
-                    })
-                    .chain([Line::raw(format!(
-                        "Mode: {}",
-                        editor
-                            .draft
-                            .mode
-                            .map_or("keep", crate::settings::mode_label)
-                    ))
-                    .width()])
+                let width = editor_rows(editor)
+                    .iter()
+                    .map(Line::width)
                     .max()
                     .unwrap_or(0);
-                ("Preset editor", width, editor.draft.colors.len() + 2)
+                ("Preset editor", width, editor.row_count())
             }
         };
         let dialog = Dialog {
@@ -584,10 +610,7 @@ impl Modal {
             ),
             Self::Editor(editor) => {
                 let field = editor.input.as_ref().and_then(|_| {
-                    let row =
-                        editor
-                            .rows
-                            .selected_row(inner, None, editor.draft.colors.len() + 2)?;
+                    let row = editor.rows.selected_row(inner, None, editor.row_count())?;
                     (row.width > 2).then(|| Rect::new(row.x + 2, row.y, row.width - 2, 1))
                 });
                 (field, Some(inner))
@@ -601,16 +624,36 @@ impl Modal {
         }
     }
 
+    fn rows(&self, ctx: &Ctx<'_>) -> usize {
+        match self {
+            Self::OpenFile(picker) => picker.entries.len(),
+            Self::Presets { .. } => ctx.palettes.len(),
+            Self::Templates { .. } => ctx.templates.len(),
+            Self::Editor(editor) => editor.row_count(),
+        }
+    }
+
+    /// Current list selection and whether the open path field is active.
+    pub(crate) fn selection(&self, ctx: &Ctx<'_>) -> (Option<usize>, bool) {
+        let rows = self.rows(ctx);
+        match self {
+            Self::OpenFile(picker) => (picker.list.selected(rows), picker.typed),
+            Self::Presets { list, .. } | Self::Templates { list, .. } => {
+                (list.selected(rows), false)
+            }
+            Self::Editor(editor) => (editor.rows.selected(rows), false),
+        }
+    }
+
     /// Routes list mouse outcomes through the same actions as keyboard input.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &ModalLayout, ctx: Ctx<'_>) -> Step {
         let Some(area) = layout.list else {
             return Step::stay();
         };
+        let rows = self.rows(&ctx);
         let outcome = match self {
             Self::OpenFile(picker) => {
-                let outcome = picker
-                    .list
-                    .handle_mouse(mouse, None, area, picker.entries.len());
+                let outcome = picker.list.handle_mouse(mouse, None, area, rows);
                 if matches!(outcome, Outcome::Consumed | Outcome::Submit(_)) {
                     picker.typed = false;
                 }
@@ -619,16 +662,14 @@ impl Modal {
             Self::Presets {
                 list,
                 confirm: None,
-            } => list.handle_mouse(mouse, None, area, ctx.palettes.len()),
+            } => list.handle_mouse(mouse, None, area, rows),
             Self::Templates {
                 list,
                 prompt: None,
                 confirm: None,
-            } => list.handle_mouse(mouse, None, area, ctx.templates.len()),
+            } => list.handle_mouse(mouse, None, area, rows),
             Self::Editor(editor) if editor.input.is_none() => {
-                editor
-                    .rows
-                    .handle_mouse(mouse, None, area, editor.draft.colors.len() + 2)
+                editor.rows.handle_mouse(mouse, None, area, rows)
             }
             _ => return Step::stay(),
         };

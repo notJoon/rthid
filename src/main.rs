@@ -220,8 +220,7 @@ fn run() -> io::Result<()> {
         let panic_log = debug_log.as_ref().map(File::try_clone).transpose()?;
         let worker_panic = Arc::clone(&worker_panic);
         let previous = std::panic::take_hook();
-        // TODO: Worker panics already arrive as `Cause::Panicked` in `Done`. Keep this hook only to
-        //       silence stderr for the worker thread and report the panic from that result.
+        // The hook must record the message because IO::poll drops superseded results.
         std::panic::set_hook(Box::new(move |info| {
             if std::thread::current().name() == Some(rthid_io::io::WORKER_NAME) {
                 let message = rthid_io::io::panic_message(info.payload());

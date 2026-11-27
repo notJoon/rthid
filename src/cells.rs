@@ -10,6 +10,7 @@ use crate::{
 use image::RgbaImage;
 use ratatui::{
     buffer::{Buffer, Cell},
+    layout::Position,
     style::Color,
     widgets::{Block, Clear, Widget},
 };
@@ -233,6 +234,22 @@ fn render_exact(pixels: Pixels<'_>, geometry: &PreviewGeometry, k: u8, buffer: &
     }
 }
 
+/// Changes every RGB foreground and background color at the given positions.
+pub(crate) fn map_rgb_colors(
+    buffer: &mut Buffer,
+    positions: impl IntoIterator<Item = Position>,
+    map: impl Fn([u8; 3]) -> Color,
+) {
+    for pos in positions {
+        let cell = &mut buffer[pos];
+        for color in [&mut cell.fg, &mut cell.bg] {
+            if let Color::Rgb(r, g, b) = *color {
+                *color = map([r, g, b]);
+            }
+        }
+    }
+}
+
 // Draws the minimap overview and its gray border, then dims map cells outside the
 // viewport to half brightness.
 fn draw_minimap(
@@ -254,14 +271,11 @@ fn draw_minimap(
     Block::bordered()
         .border_style(Color::Gray)
         .render(frame, buffer);
-    for pos in map.positions().filter(|&pos| !viewport_rect.contains(pos)) {
-        let cell = &mut buffer[pos];
-        for color in [&mut cell.fg, &mut cell.bg] {
-            if let Color::Rgb(r, g, b) = *color {
-                *color = Color::Rgb(r / 2, g / 2, b / 2);
-            }
-        }
-    }
+    map_rgb_colors(
+        buffer,
+        map.positions().filter(|&pos| !viewport_rect.contains(pos)),
+        |[r, g, b]| Color::Rgb(r / 2, g / 2, b / 2),
+    );
 }
 
 /// Samples the visible region into its target cells at Fit and Out(n), as drawn in

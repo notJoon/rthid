@@ -7,13 +7,13 @@
 use crate::{
     cells::{self, Layer},
     graphics,
-    modal::{Modal, preset_rows, template_rows},
+    modal::{Modal, editor_prefix, editor_rows, preset_rows, swatch_span, template_rows},
     viewport,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use rthid_widgets::{Dialog, ListPicker, TextInput, key_hints};
 
@@ -239,10 +239,6 @@ struct Editing<'a> {
     swatch: Option<[u8; 3]>,
 }
 
-fn swatch_span([r, g, b]: [u8; 3], style: Style) -> Span<'static> {
-    Span::styled("  ██", style.fg(Color::Rgb(r, g, b)))
-}
-
 fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
     let modal = app.modal.as_ref().unwrap();
     let layout = modal.layout(
@@ -336,44 +332,19 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
             }
         }
         Modal::Editor(editor) => {
-            let mut rows = Vec::new();
-            for row in 0..=editor.draft.colors.len() {
-                let prefix = if row == 0 {
-                    "Name: ".into()
-                } else {
-                    format!("{row}: ")
-                };
-                let text = if let Some(input) = &editor.input
-                    && editor.rows.selected(editor.draft.colors.len() + 2) == Some(row)
-                {
-                    editing = Some(Editing {
-                        input,
-                        prefix: prefix.clone(),
-                        invalid: editor.invalid_hex(),
-                        swatch: editor.swatch_rgb(row),
-                    });
-                    input.text()
-                } else if row == 0 {
-                    &editor.draft.name
-                } else {
-                    &editor.draft.colors[row - 1]
-                };
-                let mut spans = vec![Span::raw(prefix), Span::raw(text.to_owned())];
-                if let Some(rgb) = editor.swatch_rgb(row) {
-                    spans.push(swatch_span(rgb, Style::default()));
-                }
-                rows.push(Line::from(spans));
+            if let Some(input) = &editor.input
+                && let Some(row) = editor.selected_row()
+            {
+                editing = Some(Editing {
+                    input,
+                    prefix: editor_prefix(row),
+                    invalid: editor.invalid_hex(),
+                    swatch: editor.swatch_rgb(row),
+                });
             }
-            rows.push(Line::raw(format!(
-                "Mode: {}",
-                editor
-                    .draft
-                    .mode
-                    .map_or("keep", crate::settings::mode_label)
-            )));
             ModalContent {
                 title: "Preset editor",
-                rows,
+                rows: editor_rows(editor),
                 picker: Some(&editor.rows),
             }
         }
@@ -486,17 +457,14 @@ fn draw_preview(
             &mut renderer.overviews,
         );
         if app.dragging() && matches!(pixels, cells::Pixels::Rgb { .. }) {
-            for pos in geometry.target.positions() {
-                if geometry.minimap.is_some_and(|map| map.frame.contains(pos)) {
-                    continue;
-                }
-                let cell = &mut frame.buffer_mut()[pos];
-                for color in [&mut cell.fg, &mut cell.bg] {
-                    if let Color::Rgb(r, g, b) = *color {
-                        *color = Color::Indexed(rgb_to_ansi256([r, g, b]));
-                    }
-                }
-            }
+            cells::map_rgb_colors(
+                frame.buffer_mut(),
+                geometry
+                    .target
+                    .positions()
+                    .filter(|&pos| !geometry.minimap.is_some_and(|map| map.frame.contains(pos))),
+                |rgb| Color::Indexed(rgb_to_ansi256(rgb)),
+            );
         }
         approximate
     };

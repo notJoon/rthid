@@ -65,7 +65,7 @@ impl Export {
     /// Copies the current grid into an owned export job and retains its PNG size.
     ///
     /// # Errors
-    /// Returns an export error if the grid, palette indices or output size are invalid.
+    /// Returns an export error if the grid or palette indices are invalid.
     pub fn job(
         &mut self,
         indices: &[u8],
@@ -74,7 +74,6 @@ impl Export {
         settings: &Settings,
         size: (u32, u32),
     ) -> Result<Job, IoError> {
-        check_output_size(size).map_err(|error| self.invalid(error))?;
         let grid = Grid::new(indices.to_vec(), w, h, settings.palette.clone())
             .map_err(|error| self.invalid(error))?;
         self.png_size = Some(size);
