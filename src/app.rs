@@ -85,6 +85,8 @@ pub struct App {
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
     last_drag: Option<Drag>,
+    /// Whether the last synced preview has a visible minimap.
+    minimap_visible: bool,
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Named configuration lists and their pending saves.
@@ -120,6 +122,7 @@ impl App {
             viewport: Viewport::default(),
             preview_focus: false,
             last_drag: None,
+            minimap_visible: false,
             grid_cache: GridCache {
                 source: None,
                 grid: Memo::default(),
@@ -228,13 +231,18 @@ impl App {
     }
 
     /// Status text with loading and the current notice before persistent diagnostics.
-    /// Fallbacks are save errors, load warnings and blocked saving, then export status.
+    /// Fallbacks are card limits, visible mass errors, library diagnostics and export status.
     pub fn notice(&self) -> Option<&str> {
         self.open_request
             .as_ref()
             .map(|request| request.label.as_str())
             .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
             .or_else(|| self.settings.dimensions(self.source_size()).err())
+            .or_else(|| {
+                (self.layer == Layer::Mass || (self.mass_minimap && self.minimap_visible))
+                    .then(|| self.grid_cache.mass_error().map(|(_, text)| text))
+                    .flatten()
+            })
             .or_else(|| self.library.notice())
             .or_else(|| self.export_status())
     }
@@ -445,6 +453,7 @@ impl App {
         let inset_mass = self.mass_minimap && self.geometry(preview).minimap.is_some();
         self.refresh(inset_mass);
         self.clamp_viewport(preview);
+        self.minimap_visible = self.geometry(preview).minimap.is_some();
         before != versions(&self.grid_cache)
     }
 
@@ -2243,6 +2252,42 @@ mod tests {
             assert_eq!(app.settings.dot, expected_dot);
             assert_eq!(app.settings.margin, dot_margin);
         }
+    }
+
+    #[test]
+    fn mass_error_notice_follows_layer_and_minimap_visibility() {
+        let mut app = App::builtin(RgbaImage::new(400, 400), None);
+        let area = Rect::new(0, 0, 69, 36);
+        app.mass.sigma = -1.0;
+        app.layer = Layer::Mass;
+        app.sync(area);
+        let expected = format!("mass study: {}", app.grid_cache.mass_error().unwrap().0);
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        assert!(!app.sync(area));
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        app.set_notice("retained".into());
+        assert_eq!(app.notice(), Some("retained"));
+        app.notice = None;
+        assert_eq!(app.notice(), Some(expected.as_str()));
+
+        app.layer = Layer::Original;
+        app.sync(area);
+        assert!(app.notice().is_none());
+        app.viewport.zoom = Zoom::In(2);
+        app.sync(area);
+        assert_eq!(app.notice(), Some(expected.as_str()));
+        app.mass_minimap = false;
+        app.sync(area);
+        assert!(app.notice().is_none());
+        app.mass_minimap = true;
+        app.viewport.hide_minimap = true;
+        app.sync(area);
+        assert!(app.notice().is_none());
+
+        app.layer = Layer::Mass;
+        app.mass = MassOptions::default();
+        app.sync(area);
+        assert!(app.notice().is_none());
     }
 
     #[test]

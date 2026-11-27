@@ -4,7 +4,7 @@ use crate::{memo::Memo, print::Placement, settings::Settings};
 use image::{Rgba, RgbaImage, imageops};
 use rthid_dither::{
     dither::{self, Options, PaletteColor},
-    mass::{self, MassOptions},
+    mass::{self, MassError, MassOptions},
 };
 
 type GridKey = Placement;
@@ -30,6 +30,12 @@ pub(crate) struct MassKey {
     tones: [PaletteColor; 4],
 }
 
+/// Mass image and the diagnostic from the same build.
+pub(crate) struct MassBuild {
+    image: RgbaImage,
+    error: Option<(MassError, String)>,
+}
+
 /// Source image, card grid, dithered indices and mass image. Each stage
 /// rebuilds only when its key changes.
 pub struct GridCache {
@@ -40,7 +46,7 @@ pub struct GridCache {
     /// Palette indices from the last requested dither.
     pub(crate) dithered: Memo<DitherKey, Vec<u8>>,
     /// Four tone colors from the last requested mass study.
-    pub(crate) mass: Memo<MassKey, RgbaImage>,
+    pub(crate) mass: Memo<MassKey, MassBuild>,
 }
 
 impl GridCache {
@@ -114,15 +120,19 @@ impl GridCache {
                     tones: *tones,
                 },
                 || match mass::mass_study(grid.as_raw(), w as usize, h as usize, mass_options) {
-                    Ok(study) => {
-                        RgbaImage::from_raw(w, h, study.rgba(w as usize, h as usize, tones))
-                            .expect("mass grid dimensions")
-                    }
-                    Err(_) => RgbaImage::from_pixel(
-                        w,
-                        h,
-                        Rgba([tones[0].rgb[0], tones[0].rgb[1], tones[0].rgb[2], 255]),
-                    ),
+                    Ok(study) => MassBuild {
+                        image: RgbaImage::from_raw(w, h, study.rgba(w as usize, h as usize, tones))
+                            .expect("mass grid dimensions"),
+                        error: None,
+                    },
+                    Err(error) => MassBuild {
+                        image: RgbaImage::from_pixel(
+                            w,
+                            h,
+                            Rgba([tones[0].rgb[0], tones[0].rgb[1], tones[0].rgb[2], 255]),
+                        ),
+                        error: Some((error, format!("mass study: {error}"))),
+                    },
                 },
             );
         }
@@ -170,7 +180,16 @@ impl GridCache {
 
     /// Last mass image, current after a refresh that requested it.
     pub fn mass(&self) -> Option<&RgbaImage> {
-        self.mass.get()
+        self.mass.get().map(|build| &build.image)
+    }
+
+    /// Error and status text from the last mass build, cleared on success.
+    pub fn mass_error(&self) -> Option<(&MassError, &str)> {
+        self.mass
+            .get()?
+            .error
+            .as_ref()
+            .map(|(error, text)| (error, text.as_str()))
     }
 
     /// Number of mass builds for preview cache invalidation.
@@ -504,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mass_options_use_the_background_tone() {
+    fn invalid_mass_options_use_the_background_tone_and_clear_error_on_success() {
         let mut cache = GridCache {
             source: Some(RgbaImage::new(3, 2)),
             grid: Memo::default(),
@@ -525,5 +544,31 @@ mod tests {
         let image = cache.mass().unwrap();
         assert_eq!(image.dimensions(), (8, 8));
         assert!(image.pixels().all(|p| p.0 == [255; 4]));
+        assert_eq!(
+            cache.mass_error().map(|(error, _)| error),
+            Some(&MassError::InvalidSigma { sigma: -1.0 })
+        );
+        assert_eq!(cache.mass_version(), 1);
+        cache.refresh(
+            &Settings::for_pixels(8, 8),
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
+        assert_eq!(
+            cache.mass_error().map(|(error, _)| error),
+            Some(&MassError::InvalidSigma { sigma: -1.0 })
+        );
+        assert_eq!(cache.mass_version(), 1);
+        cache.refresh(
+            &Settings::for_pixels(8, 8),
+            false,
+            true,
+            &MassOptions::default(),
+            &mass::WARM,
+        );
+        assert!(cache.mass_error().is_none());
+        assert_eq!(cache.mass_version(), 2);
     }
 }
