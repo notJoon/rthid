@@ -51,7 +51,7 @@ jobs:
         with:
           tool: cargo-codspeed@6.1.0
       - name: Build benchmarks
-        run: cargo codspeed build -p rthid-dither -p rthid-render -p rthid-term
+        run: cargo codspeed build -m simulation -p rthid-dither -p rthid-render -p rthid-term
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v5
         with:
