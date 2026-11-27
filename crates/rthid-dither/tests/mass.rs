@@ -1,14 +1,6 @@
 //! Fixture agreement for cumulative graphic mass masks.
 
-use rthid_dither::mass::{MassOptions, MassStudy, mass_study};
-
-fn tone_counts(study: &MassStudy) -> [usize; 4] {
-    let mut counts = [0; 4];
-    for &index in study.indices() {
-        counts[index as usize] += 1;
-    }
-    counts
-}
+use rthid_dither::mass::{MassOptions, mass_study};
 
 fn connected_components(mask: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
     let mut seen = vec![false; mask.len()];
@@ -57,10 +49,7 @@ fn pratt_mass_masks() {
     )
     .unwrap();
     assert_eq!((study.w(), study.h()), (450, 250));
-    assert_eq!(
-        tone_counts(&study).iter().sum::<usize>(),
-        study.w() * study.h()
-    );
+    assert_eq!(study.indices().len(), study.w() * study.h());
     let reference = image::open("tests/fixtures/pratt_mass_masks.png")
         .unwrap()
         .to_rgb8();
@@ -73,14 +62,6 @@ fn pratt_mass_masks() {
     let masks: Vec<Vec<bool>> = (1..=3)
         .map(|i| study.indices().iter().map(|&v| v >= i).collect())
         .collect();
-    for pair in masks.windows(2) {
-        assert!(
-            pair[1]
-                .iter()
-                .zip(&pair[0])
-                .all(|(&child, &parent)| !child || parent)
-        );
-    }
     for i in 0..3 {
         let expected: Vec<bool> = reference.pixels().map(|p| p[i] >= 128).collect();
         let mut intersection = 0;

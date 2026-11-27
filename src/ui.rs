@@ -1426,9 +1426,6 @@ mod tests {
                                 report.graphics_name.is_some(),
                                 layer == Layer::Original && zoom == viewport::Zoom::Fit
                             );
-                            if layer != Layer::Original {
-                                assert!(report.graphics_name.is_none());
-                            }
                         })
                         .unwrap();
                 }

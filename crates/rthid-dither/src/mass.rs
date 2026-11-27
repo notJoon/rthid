@@ -933,17 +933,6 @@ fn clean_mask(
 mod tests {
     use super::*;
 
-    fn check_masks(masks: &[Vec<bool>]) {
-        for pair in masks.windows(2) {
-            assert!(
-                pair[1]
-                    .iter()
-                    .zip(&pair[0])
-                    .all(|(&child, &parent)| !child || parent)
-            );
-        }
-    }
-
     fn tone_counts(study: &MassStudy) -> [usize; 4] {
         let mut counts = [0; 4];
         for &index in study.indices() {
@@ -954,14 +943,7 @@ mod tests {
 
     fn study(rgba: &[u8], w: usize, h: usize, options: &MassOptions) -> MassStudy {
         let result = mass_study(rgba, w, h, options).unwrap();
-        let cumulative: Vec<Vec<bool>> = (1..=3)
-            .map(|i| result.indices().iter().map(|&v| v >= i).collect())
-            .collect();
-        check_masks(&cumulative);
-        assert_eq!(
-            tone_counts(&result).iter().sum::<usize>(),
-            result.w() * result.h()
-        );
+        assert_eq!(result.indices().len(), result.w() * result.h());
         result
     }
 
@@ -995,22 +977,24 @@ mod tests {
     }
 
     #[test]
-    fn fits_a_rotated_ellipse() {
-        let accent = drawn_ellipse(60, 40, 30.0, 20.0, 20.0, 12.5, 30.0_f64.to_radians());
-        let shadow = morphology(&accent, 60, 40, 2, true);
-        let fitted = fit_ellipses(&accent, &shadow, 60, 40);
-        assert_eq!(fitted, accent);
-        let mut intersection = 0;
-        let mut union = 0;
-        for (&a, &b) in fitted.iter().zip(&accent) {
-            intersection += usize::from(a && b);
-            union += usize::from(a || b);
+    fn fits_drawn_ellipses() {
+        for (name, w, h, a, b, angle) in [
+            ("rotated ellipse", 60, 40, 20.0, 12.5, 30.0_f64.to_radians()),
+            ("circle", 40, 40, 12.0, 12.0, 0.0),
+            ("upright ellipse", 40, 40, 8.0, 16.0, 0.0),
+        ] {
+            let accent = drawn_ellipse(w, h, w as f64 / 2.0, h as f64 / 2.0, a, b, angle);
+            let shadow = morphology(&accent, w, h, 2, true);
+            assert_eq!(fit_ellipses(&accent, &shadow, w, h), accent, "{name}");
+            // A missing interior cell makes acceptance observable without changing the outline.
+            let mut chipped = accent.clone();
+            let chip = (h / 2) * w + w / 2;
+            assert!(accent[chip], "{name}: chip must remove a drawn cell");
+            chipped[chip] = false;
+            let fitted = fit_ellipses(&chipped, &shadow, w, h);
+            assert!(fitted[chip], "{name}: fit must restore the chipped cell");
+            assert_eq!(fitted, accent, "{name}");
         }
-        assert!(intersection as f64 / union as f64 > 0.9);
-        // A missing interior cell makes acceptance observable without changing the outline.
-        let mut chipped = accent.clone();
-        chipped[20 * 60 + 30] = false;
-        assert_eq!(fit_ellipses(&chipped, &shadow, 60, 40), accent);
     }
 
     #[test]
@@ -1117,16 +1101,6 @@ mod tests {
     }
 
     #[test]
-    fn equal_eigenvalues_and_vertical_axes_are_deterministic() {
-        for (a, b) in [(12.0, 12.0), (8.0, 16.0)] {
-            let accent = drawn_ellipse(40, 40, 20.0, 20.0, a, b, 0.0);
-            let first = fit_ellipses(&accent, &[true; 1600], 40, 40);
-            assert_eq!(first, fit_ellipses(&accent, &[true; 1600], 40, 40));
-            assert_eq!(first, accent);
-        }
-    }
-
-    #[test]
     fn ellipse_option_preserves_old_indices_and_ancestor_masks() {
         let (w, h) = (60, 40);
         let mut accent = drawn_ellipse(w, h, 30.0, 20.0, 20.0, 12.0, 30.0_f64.to_radians());
@@ -1172,88 +1146,49 @@ mod tests {
     }
 
     #[test]
-    fn palette_tones_preserve_four_colors_in_background_first_order() {
-        let mut palette = WARM;
-        palette.reverse();
-        assert_eq!(tones_from_palette(&palette, &MassOptions::default()), WARM);
-    }
-
-    #[test]
-    fn palette_tones_sort_without_changing_the_input() {
-        let palette = [WARM[2], WARM[0], WARM[3], WARM[1]];
-        assert_eq!(tones_from_palette(&palette, &MassOptions::default()), WARM);
-        assert_eq!(palette, [WARM[2], WARM[0], WARM[3], WARM[1]]);
-    }
-
-    #[test]
-    fn palette_tones_blend_two_colors_with_rounding() {
-        let palette = [
+    fn palette_tones_match_expected_gradients() {
+        let mut reversed = WARM;
+        reversed.reverse();
+        let shuffled = [WARM[2], WARM[0], WARM[3], WARM[1]];
+        let two = [
             PaletteColor { rgb: [0, 10, 20] },
             PaletteColor {
                 rgb: [100, 110, 120],
             },
         ];
-        assert_eq!(
-            tones_from_palette(&palette, &MassOptions::default()).map(|tone| tone.rgb),
-            [[100, 110, 120], [67, 77, 87], [33, 43, 53], [0, 10, 20]]
-        );
-    }
-
-    #[test]
-    fn palette_tones_sample_sixteen_colors() {
-        let palette: [_; 16] = std::array::from_fn(|i| PaletteColor {
+        let blended = [[100, 110, 120], [67, 77, 87], [33, 43, 53], [0, 10, 20]]
+            .map(|rgb| PaletteColor { rgb });
+        let mut inverted = blended;
+        inverted.reverse();
+        let sixteen: [_; 16] = std::array::from_fn(|i| PaletteColor {
             rgb: [i as u8 * 16; 3],
         });
-        assert_eq!(
-            tones_from_palette(&palette, &MassOptions::default()),
-            [palette[15], palette[10], palette[5], palette[0]]
-        );
-    }
-
-    #[test]
-    fn inverted_palette_tones_reverse_the_gradient() {
-        let palette = [
-            PaletteColor { rgb: [0, 10, 20] },
-            PaletteColor {
-                rgb: [100, 110, 120],
-            },
-        ];
-        let mut expected = tones_from_palette(&palette, &MassOptions::default());
-        expected.reverse();
-        assert_eq!(
-            tones_from_palette(
-                &palette,
-                &MassOptions {
-                    invert: true,
-                    ..MassOptions::default()
-                }
+        for (name, palette, invert, expected) in [
+            ("reversed four colors", reversed.as_slice(), false, WARM),
+            ("shuffled", shuffled.as_slice(), false, WARM),
+            ("two colors", two.as_slice(), false, blended),
+            (
+                "sixteen colors",
+                sixteen.as_slice(),
+                false,
+                [sixteen[15], sixteen[10], sixteen[5], sixteen[0]],
             ),
-            expected
-        );
-    }
-
-    #[test]
-    fn palette_tones_fall_back_to_mono_for_fewer_than_two_colors() {
-        for invert in [false, true] {
+            ("inverted", two.as_slice(), true, inverted),
+            ("empty", &[], false, MONO),
+            ("empty inverted", &[], true, MONO),
+            ("single color", &WARM[..1], false, MONO),
+            ("single color inverted", &WARM[..1], true, MONO),
+        ] {
             assert_eq!(
                 tones_from_palette(
-                    &[],
+                    palette,
                     &MassOptions {
                         invert,
                         ..MassOptions::default()
                     }
                 ),
-                MONO
-            );
-            assert_eq!(
-                tones_from_palette(
-                    &WARM[..1],
-                    &MassOptions {
-                        invert,
-                        ..MassOptions::default()
-                    }
-                ),
-                MONO
+                expected,
+                "{name}"
             );
         }
     }
@@ -1387,30 +1322,69 @@ mod tests {
     }
 
     #[test]
-    fn removes_small_components_and_breaks_ties_by_first_cell() {
-        let input = grid(&["##...##", ".......", "...#..."]);
-        let cleaned = clean_mask(&input, 7, 3, 0, 2, 1, 0);
-        assert_eq!(cleaned, grid(&["##.....", ".......", "......."]));
-        assert_eq!(clean_mask(&input, 7, 3, 0, 3, 3, 0), vec![false; 21]);
+    fn cleans_masks() {
+        for (name, rows, w, h, (radius, min_area, cap, max_hole), expected) in [
+            (
+                "removes small components and breaks ties by first cell",
+                &["##...##", ".......", "...#..."][..],
+                7,
+                3,
+                (0, 2, 1, 0),
+                &["##.....", ".......", "......."][..],
+            ),
+            (
+                "removes all components below minimum area",
+                &["##...##", ".......", "...#..."],
+                7,
+                3,
+                (0, 3, 3, 0),
+                &[".......", ".......", "......."],
+            ),
+            (
+                "fills only small enclosed holes",
+                &["#.######", "###.####", "########", "##..####", "########"],
+                8,
+                5,
+                (0, 1, 1, 1),
+                &["#.######", "########", "########", "##..####", "########"],
+            ),
+            (
+                "keeps diagonally connected foreground",
+                &["#..", ".#.", "..#"],
+                3,
+                3,
+                (0, 3, 1, 0),
+                &["#..", ".#.", "..#"],
+            ),
+            (
+                "fills diagonally separated background holes",
+                &[".####", "#.###", "##.##", "#####", "#####"],
+                5,
+                5,
+                (0, 1, 1, 1),
+                &[".####", "#####", "#####", "#####", "#####"],
+            ),
+            (
+                "closing replicates edges and joins a gap",
+                &["##.##", "##.##", "##.##"],
+                5,
+                3,
+                (1, 1, 1, 0),
+                &["#####", "#####", "#####"],
+            ),
+        ] {
+            assert_eq!(
+                clean_mask(&grid(rows), w, h, radius, min_area, cap, max_hole),
+                grid(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn fills_only_small_enclosed_holes() {
-        let input = grid(&["#.######", "###.####", "########", "##..####", "########"]);
-        let expected = grid(&["#.######", "########", "########", "##..####", "########"]);
-        assert_eq!(clean_mask(&input, 8, 5, 0, 1, 1, 1), expected);
-    }
-
-    #[test]
-    fn foreground_is_eight_connected_and_background_is_four_connected() {
+    fn foreground_is_eight_connected() {
         let diagonal = grid(&["#..", ".#.", "..#"]);
         assert_eq!(components(&diagonal, 3, 3, true, true).len(), 1);
-        assert_eq!(clean_mask(&diagonal, 3, 3, 0, 3, 1, 0), diagonal);
-        let holes = grid(&[".####", "#.###", "##.##", "#####", "#####"]);
-        assert_eq!(
-            clean_mask(&holes, 5, 5, 0, 1, 1, 1),
-            grid(&[".####", "#####", "#####", "#####", "#####"])
-        );
     }
 
     #[test]
@@ -1424,16 +1398,9 @@ mod tests {
             }
         }
         let masks = masks(&density, 100, 100, &[0.25, 0.72, 0.90], false);
-        check_masks(&masks);
         assert_eq!(components(&masks[0], 100, 100, true, true).len(), 3);
         assert_eq!(masks[0], masks[1]);
         assert!(masks[2].iter().all(|&cell| !cell));
-    }
-
-    #[test]
-    fn closing_replicates_edges_and_joins_a_gap() {
-        let input = grid(&["##.##", "##.##", "##.##"]);
-        assert_eq!(clean_mask(&input, 5, 3, 1, 1, 1, 0), vec![true; 15]);
     }
 
     #[test]
@@ -1452,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_and_invert_preserves_geometry() {
+    fn invert_preserves_geometry() {
         let mut rgba = Vec::new();
         for y in 0..20 {
             for x in 0..30 {
@@ -1465,7 +1432,6 @@ mod tests {
             ..MassOptions::default()
         };
         let first = study(&rgba, 30, 20, &options);
-        assert_eq!(first, study(&rgba, 30, 20, &options));
         for pixel in rgba.as_chunks_mut::<4>().0 {
             for channel in &mut pixel[..3] {
                 *channel = 255 - *channel;

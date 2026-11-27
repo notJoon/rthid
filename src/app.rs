@@ -3085,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn minimap_border_press_leaves_viewport_and_clears_drag() {
+    fn minimap_press_updates_viewport_and_replaces_preview_drag() {
         let mut app = App::drag_fixture();
         app.viewport.hide_minimap = false;
         app.viewport.x = 60;
@@ -3093,50 +3093,50 @@ mod tests {
         let area = Rect::new(2, 3, 48, 18);
         let geometry = app.geometry(area);
         let minimap = geometry.minimap.unwrap();
-        app.mouse_at(
-            MouseEventKind::Down(MouseButton::Left),
-            minimap.frame.x - 1,
-            minimap.frame.y + 1,
-            &geometry,
-            test_layout().screen,
-        );
-        assert!(app.last_drag.is_some());
-        assert!(!app.mouse_at(
-            MouseEventKind::Down(MouseButton::Left),
-            minimap.frame.x,
-            minimap.frame.y,
-            &geometry,
-            test_layout().screen,
-        ));
-        assert_eq!((app.viewport.x, app.viewport.y), geometry.origin);
-        assert!(app.last_drag.is_none());
-    }
-
-    #[test]
-    fn minimap_map_press_centers_and_replaces_preview_drag() {
-        let mut app = App::drag_fixture();
-        app.viewport.hide_minimap = false;
-        let area = Rect::new(2, 3, 48, 18);
-        let geometry = app.geometry(area);
-        let map = geometry.minimap.unwrap().map;
-        app.mouse_at(
-            MouseEventKind::Down(MouseButton::Left),
-            map.x - 2,
-            map.y + 1,
-            &geometry,
-            test_layout().screen,
-        );
-        assert!(app.last_drag.is_some());
-        assert!(app.mouse_at(
-            MouseEventKind::Down(MouseButton::Left),
-            map.x + 4,
-            map.y + 1,
-            &geometry,
-            test_layout().screen,
-        ));
-        assert_eq!((app.viewport.x, app.viewport.y), (36, 27));
-        assert!(app.last_drag.is_some_and(|drag| drag.minimap));
-        assert!(!app.dragging());
+        let map = minimap.map;
+        for (name, point, expected_return, expected_viewport, expected_last_drag) in [
+            (
+                "border",
+                (minimap.frame.x, minimap.frame.y),
+                false,
+                geometry.origin,
+                None,
+            ),
+            ("map", (map.x + 4, map.y + 1), true, (36, 27), Some(true)),
+        ] {
+            app.viewport.x = geometry.origin.0;
+            app.viewport.y = geometry.origin.1;
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                map.x - 2,
+                map.y + 1,
+                &geometry,
+                test_layout().screen,
+            );
+            assert!(app.last_drag.is_some(), "{name}");
+            assert_eq!(
+                app.mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    point.0,
+                    point.1,
+                    &geometry,
+                    test_layout().screen,
+                ),
+                expected_return,
+                "{name}",
+            );
+            assert_eq!(
+                (app.viewport.x, app.viewport.y),
+                expected_viewport,
+                "{name}",
+            );
+            assert_eq!(
+                app.last_drag.as_ref().map(|drag| drag.minimap),
+                expected_last_drag,
+                "{name}",
+            );
+            assert!(!app.dragging(), "{name}");
+        }
     }
 
     #[test]

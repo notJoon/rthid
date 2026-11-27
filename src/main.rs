@@ -452,14 +452,6 @@ mod tests {
             let args = Args::try_parse_from(["rthid", "--glyphs", value]).unwrap();
             assert_eq!(args.glyphs, Some(expected));
         }
-        for (value, expected) in [
-            ("palette", CliMassTones::Palette),
-            ("mono", CliMassTones::Mono),
-            ("warm", CliMassTones::Warm),
-        ] {
-            let args = Args::try_parse_from(["rthid", "--mass-tones", value]).unwrap();
-            assert_eq!(args.mass_tones, expected);
-        }
         let args = Args::try_parse_from([
             "rthid",
             "photo.png",

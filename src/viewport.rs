@@ -602,13 +602,10 @@ mod tests {
             zoom: Zoom::In(1),
             ..Viewport::default()
         };
-        let (frame, map) = viewport.minimap(480, 120, area).unwrap();
-        assert_eq!((map.width, map.height), (14, 1));
-        assert_eq!(frame.width, map.width + 2);
-        assert_eq!(frame.height, map.height + 2);
-        assert_eq!(frame.right(), area.right());
-        assert_eq!(frame.y, area.y);
-        assert_eq!(map, Block::bordered().inner(frame));
+        assert_eq!(
+            viewport.minimap(480, 120, area),
+            Some((Rect::new(34, 3, 16, 3), Rect::new(35, 4, 14, 1)))
+        );
     }
 
     #[test]
