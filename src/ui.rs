@@ -15,47 +15,94 @@ use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
-use rthid_widgets::{Dialog, ListPicker, TextInput, key_hints};
+use rthid_widgets::{Dialog, Hint, ListPicker, TextInput, hint_line};
 
 use crate::{app::App, settings::Setting};
 
-// Keys that open a modal, shown first on the main screen.
-const MODAL_HINTS: &[(&str, &str)] = &[("o", "open"), ("P", "presets"), ("T", "templates")];
+fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
+    let can_zoom_in =
+        app.viewport.zoom.step(true, geometry.grid, geometry.area) != app.viewport.zoom;
+    let can_zoom_out =
+        app.viewport.zoom.step(false, geometry.grid, geometry.area) != app.viewport.zoom;
+    let key = match (can_zoom_in, can_zoom_out) {
+        (true, true) => "+/-",
+        (true, false) => "+",
+        (false, true) => "-",
+        (false, false) => return None,
+    };
+    Some(Hint::new(key, "zoom"))
+}
 
-const PREVIEW_HINTS: &[(&str, &str)] = &[
-    ("Tab", "focus"),
-    ("Space", "original/dithered"),
-    ("a", "mass study"),
-    ("+/-", "zoom"),
-    ("0", "fit"),
-    ("hjkl/arrows", "pan"),
-    ("HJKL", "page"),
-    ("m", "map"),
-    ("M", "mass map"),
-    ("mouse", "drag/wheel/map"),
-    ("r/R", "rotate"),
-    ("f", "flip"),
-    ("d", "reset"),
-    ("Esc", "back"),
-    ("q", "quit"),
-];
-
-const PANEL_HINTS: &[(&str, &str)] = &[
-    ("Tab", "focus"),
-    ("Space", "original/dithered"),
-    ("a", "mass study"),
-    ("+/-", "zoom"),
-    ("0", "fit"),
-    ("m", "map"),
-    ("M", "mass map"),
-    ("mouse", "drag/wheel/map"),
-    ("Up/Down k/j", "select"),
-    ("Left/Right h/l", "change"),
-    ("r/R", "rotate"),
-    ("f", "flip"),
-    ("d", "reset"),
-    ("q", "quit"),
-];
+fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
+    if let Some(modal) = &app.modal {
+        return modal.hints(&app.modal_ctx());
+    }
+    let selected = app.selected_setting();
+    let reset = app.settings.with_default(selected, &app.library.palettes) != app.settings;
+    let image = app.source_path().is_some();
+    let overflowing = geometry.overflows();
+    let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
+    let mass_map = app.mass_map_available(geometry);
+    if app.preview_focus {
+        return if image {
+            [
+                overflowing.then_some(Hint::new("hjkl/arrows", "pan")),
+                overflowing.then_some(Hint::new("HJKL", "page")),
+                zoom_hint(app, geometry),
+                zoomed.then_some(Hint::new("0", "fit")),
+                overflowing.then_some(Hint::new("m", "map")),
+                mass_map.then_some(Hint::new("M", "mass map")),
+                Some(Hint::new("Space", "original/dithered")),
+                Some(Hint::new("a", "mass study")),
+                Some(Hint::new("Tab/Esc", "parameters")),
+                Some(Hint::new("q", "quit")),
+                Some(Hint::new("r/R", "rotate")),
+                Some(Hint::new("f", "flip")),
+                reset.then_some(Hint::new("d", "reset")),
+                Some(Hint::new("o", "open")),
+                Some(Hint::new("P", "presets")),
+                Some(Hint::new("T", "templates")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        } else {
+            vec![
+                Hint::new("o", "open"),
+                Hint::new("Tab/Esc", "parameters"),
+                Hint::new("q", "quit"),
+                Hint::new("P", "presets"),
+                Hint::new("T", "templates"),
+            ]
+        };
+    }
+    [
+        Some(ListPicker::MOVE),
+        selected
+            .is_active(&app.settings)
+            .then_some(Hint::new("Left/Right h/l", "change")),
+        app.settings
+            .can_reseed(selected)
+            .then_some(Hint::new("Enter", "new seed")),
+        reset.then_some(Hint::new("d", "reset")),
+        Some(Hint::new("Tab", "preview")),
+        Some(Hint::new("q", "quit")),
+        Some(Hint::new("o", "open")),
+        image.then_some(Hint::new("Space", "original/dithered")),
+        image.then_some(Hint::new("a", "mass study")),
+        image.then(|| zoom_hint(app, geometry)).flatten(),
+        (image && zoomed).then_some(Hint::new("0", "fit")),
+        (image && overflowing).then_some(Hint::new("m", "map")),
+        (image && mass_map).then_some(Hint::new("M", "mass map")),
+        Some(Hint::new("P", "presets")),
+        Some(Hint::new("T", "templates")),
+        image.then_some(Hint::new("r/R", "rotate")),
+        image.then_some(Hint::new("f", "flip")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
 
 /// Terminal regions shared by input handling and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,18 +250,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         frame.buffer_mut(),
     );
     frame.render_widget(
-        Paragraph::new(if let Some(modal) = &app.modal {
-            key_hints(&[modal.hints()])
-        } else {
-            key_hints(&[
-                MODAL_HINTS,
-                if app.preview_focus {
-                    PREVIEW_HINTS
-                } else {
-                    PANEL_HINTS
-                },
-            ])
-        }),
+        Paragraph::new(hint_line(&hints(app, &geometry), None, layout.help.width)),
         layout.help,
     );
     frame.render_widget(
@@ -557,7 +593,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             } else {
                 ""
             },
-            if geometry.minimap.is_some() && app.mass_minimap && app.layer != Layer::Mass {
+            if app.mass_inset_shown(geometry) {
                 " | map Mass"
             } else {
                 ""
@@ -569,13 +605,13 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::BUSINESS_CARD;
+    use crate::settings::{BUSINESS_CARD, Dither, Preset, Template};
     use image::RgbaImage;
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         crossterm::{
-            event::{MouseButton, MouseEventKind},
+            event::{KeyCode, MouseButton, MouseEventKind},
             style::Colored,
         },
     };
@@ -613,6 +649,283 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum HintState {
+        EmptyPanel,
+        EmptyPreview,
+        FitPanel,
+        FitPreview,
+        SmallFitPreview,
+        OverflowPreview,
+        Seed,
+        OpenFile,
+        Presets,
+        PresetsConfirm,
+        TemplatesEmpty,
+        Templates,
+        TemplatesPrompt,
+        TemplatesConfirm,
+        EditorColor,
+        EditorMode,
+        EditorInput,
+    }
+
+    fn hint_fixture(state: HintState) -> App {
+        use crate::modal::{Editor, OnYes};
+        use rthid_widgets::Confirm;
+
+        let mut app = match state {
+            HintState::EmptyPanel | HintState::EmptyPreview | HintState::OpenFile => App::empty(),
+            HintState::SmallFitPreview => App::builtin(RgbaImage::new(10, 10), None),
+            _ => App::builtin(RgbaImage::new(120, 120), None),
+        };
+        let add_templates = |app: &mut App| {
+            for (name, seed) in [("One", 1), ("Two", 2), ("Three", 3)] {
+                let mut settings = app.settings.clone();
+                settings.seed = seed;
+                app.library
+                    .templates
+                    .upsert(Template::capture(name.into(), &settings))
+                    .unwrap();
+            }
+        };
+        let row = |setting| Setting::ALL.iter().position(|s| *s == setting).unwrap();
+        match state {
+            HintState::EmptyPanel => app.panel.select(row(Setting::Zoom)),
+            HintState::EmptyPreview | HintState::FitPreview | HintState::SmallFitPreview => {
+                app.preview_focus = true
+            }
+            HintState::FitPanel => {
+                app.panel.select(row(Setting::Brightness));
+                app.settings.tone.brightness = 0.1;
+            }
+            HintState::OverflowPreview => {
+                app.preview_focus = true;
+                app.viewport.zoom = viewport::Zoom::In(1);
+            }
+            HintState::Seed => {
+                app.panel.select(row(Setting::Seed));
+                app.settings.dither = Dither::Noise;
+                app.settings.seed = 7;
+            }
+            HintState::OpenFile => {
+                app.modal = Some(Modal::open_file("/images".into(), 1));
+                app.set_listing(
+                    "/images".into(),
+                    (0..3)
+                        .map(|i| rthid_io::dir::Entry {
+                            file_name: format!("image{i}.png").into(),
+                            name: format!("image{i}.png"),
+                            dir: false,
+                        })
+                        .collect(),
+                );
+                if let Some(Modal::OpenFile(picker)) = &mut app.modal {
+                    picker.list.select(1);
+                    picker.input = TextInput::new(
+                        "/images/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz.png",
+                        4096,
+                    );
+                }
+            }
+            HintState::Presets => {
+                app.modal = Some(Modal::presets(&app.settings, &app.library.palettes));
+                if let Some(Modal::Presets { list, .. }) = &mut app.modal {
+                    list.select(2);
+                }
+            }
+            HintState::PresetsConfirm => {
+                app.modal = Some(Modal::Presets {
+                    list: ListPicker::new(2),
+                    confirm: Some((
+                        Confirm::new("Delete preset?"),
+                        OnYes::RemovePreset("Warm".into()),
+                    )),
+                });
+            }
+            HintState::TemplatesEmpty => app.modal = Some(Modal::templates()),
+            HintState::Templates => {
+                add_templates(&mut app);
+                app.modal = Some(Modal::Templates {
+                    list: ListPicker::new(1),
+                    prompt: None,
+                    confirm: None,
+                });
+            }
+            HintState::TemplatesPrompt => {
+                app.modal = Some(Modal::Templates {
+                    list: ListPicker::new(0),
+                    prompt: Some(TextInput::new("abcdefghijklmnopqrstuvwxyzabcdef", 32)),
+                    confirm: None,
+                });
+            }
+            HintState::TemplatesConfirm => {
+                add_templates(&mut app);
+                app.modal = Some(Modal::Templates {
+                    list: ListPicker::new(1),
+                    prompt: Some(TextInput::new("Two", 32)),
+                    confirm: Some((
+                        Confirm::new("Overwrite template?"),
+                        OnYes::OverwriteTemplate("Two".into()),
+                    )),
+                });
+            }
+            HintState::EditorColor | HintState::EditorMode | HintState::EditorInput => {
+                let mut editor = Editor::new(
+                    &app.modal_ctx(),
+                    Preset {
+                        name: "Draft".into(),
+                        colors: vec!["#000000".into(), "#888888".into(), "#ffffff".into()],
+                        mode: None,
+                        builtin: false,
+                    },
+                );
+                editor.rows.select(match state {
+                    HintState::EditorMode => 4,
+                    HintState::EditorInput => 0,
+                    _ => 2,
+                });
+                if matches!(state, HintState::EditorInput) {
+                    editor.input = Some(TextInput::new("abcdefghijklmnopqrstuvwxyzabcdef", 32));
+                }
+                app.modal = Some(Modal::Editor(Box::new(editor)));
+            }
+        }
+        app
+    }
+
+    fn named_keys(text: &str) -> Vec<KeyCode> {
+        if text == "any other key" {
+            return vec![KeyCode::Esc];
+        }
+        text.split_whitespace()
+            .flat_map(|group| group.split('/'))
+            .flat_map(|token| match token {
+                "Enter" => vec![KeyCode::Enter],
+                "Esc" => vec![KeyCode::Esc],
+                "Tab" => vec![KeyCode::Tab],
+                "Space" => vec![KeyCode::Char(' ')],
+                "Up" => vec![KeyCode::Up],
+                "Down" => vec![KeyCode::Down],
+                "Left" => vec![KeyCode::Left],
+                "Right" => vec![KeyCode::Right],
+                "Home" => vec![KeyCode::Home],
+                "End" => vec![KeyCode::End],
+                "arrows" => vec![KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right],
+                token => token.chars().map(KeyCode::Char).collect(),
+            })
+            .collect()
+    }
+
+    fn snapshot(
+        app: &mut App,
+        terminal: &mut Terminal<TestBackend>,
+        renderer: &mut Renderer,
+    ) -> (ratatui::buffer::Buffer, bool) {
+        let screen = layout(terminal.size().unwrap());
+        app.sync(screen.preview);
+        terminal
+            .draw(|frame| draw(frame, app, &screen, renderer))
+            .unwrap();
+        (terminal.backend().buffer().clone(), app.quit)
+    }
+
+    #[test]
+    fn every_advertised_key_changes_the_representative_state() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let states = [
+            HintState::EmptyPanel,
+            HintState::EmptyPreview,
+            HintState::FitPanel,
+            HintState::FitPreview,
+            HintState::SmallFitPreview,
+            HintState::OverflowPreview,
+            HintState::Seed,
+            HintState::OpenFile,
+            HintState::Presets,
+            HintState::PresetsConfirm,
+            HintState::TemplatesEmpty,
+            HintState::Templates,
+            HintState::TemplatesPrompt,
+            HintState::TemplatesConfirm,
+            HintState::EditorColor,
+            HintState::EditorMode,
+            HintState::EditorInput,
+        ];
+        for state in states {
+            let mut source = hint_fixture(state);
+            let screen = layout(Rect::new(0, 0, 80, 30));
+            source.sync(screen.preview);
+            let state_hints = hints(&source, &source.geometry(screen.preview));
+            for hint in state_hints {
+                for code in named_keys(hint.key) {
+                    if matches!(state, HintState::EditorMode)
+                        && matches!(code, KeyCode::Down | KeyCode::Char('j'))
+                    {
+                        continue;
+                    }
+                    let mut app = hint_fixture(state);
+                    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+                    let mut renderer = Renderer::default();
+                    app.sync(screen.preview);
+                    if matches!(state, HintState::OverflowPreview) {
+                        let geometry = app.geometry(screen.preview);
+                        app.viewport.x = (geometry.grid.0 - geometry.visible.0) / 2;
+                        app.viewport.y = (geometry.grid.1 - geometry.visible.1) / 2;
+                    }
+                    if matches!(code, KeyCode::Right | KeyCode::End)
+                        && let Some(modal) = &mut app.modal
+                        && let Some(input) = modal.text_input_mut()
+                    {
+                        input.handle_key(KeyEvent::new(
+                            if code == KeyCode::Right {
+                                KeyCode::Left
+                            } else {
+                                KeyCode::Home
+                            },
+                            KeyModifiers::NONE,
+                        ));
+                    }
+                    let before = snapshot(&mut app, &mut terminal, &mut renderer);
+                    let geometry = app.geometry(screen.preview);
+                    app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &geometry);
+                    let after = snapshot(&mut app, &mut terminal, &mut renderer);
+                    assert!(before != after, "{state:?}: {} ({code:?})", hint.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_help_keeps_dialog_escape_and_panel_change() {
+        let screen = layout(Rect::new(0, 0, 80, 30));
+        for state in [
+            HintState::OpenFile,
+            HintState::Presets,
+            HintState::PresetsConfirm,
+            HintState::TemplatesEmpty,
+            HintState::Templates,
+            HintState::TemplatesPrompt,
+            HintState::TemplatesConfirm,
+            HintState::EditorColor,
+            HintState::EditorMode,
+            HintState::EditorInput,
+        ] {
+            let mut app = hint_fixture(state);
+            app.sync(screen.preview);
+            let line = hint_line(&hints(&app, &app.geometry(screen.preview)), None, 80).to_string();
+            assert!(
+                line.contains("Esc") || line.contains("any other key"),
+                "{state:?}: {line}"
+            );
+        }
+        let mut app = hint_fixture(HintState::FitPanel);
+        app.sync(screen.preview);
+        let line = hint_line(&hints(&app, &app.geometry(screen.preview)), None, 80).to_string();
+        assert!(line.contains("change"), "{line}");
     }
 
     #[derive(Default)]

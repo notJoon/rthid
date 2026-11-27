@@ -96,23 +96,6 @@ impl Confirm {
             Outcome::Cancel
         }
     }
-
-    /// Key and action pairs that describe [`Confirm::handle_key`], ready to
-    /// pass to [`key_hints`](crate::key_hints).
-    /// [`Self::YES`] and [`Self::CANCEL`] provide the same hints for
-    /// [`hint_line`](crate::hint_line).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use rthid_widgets::{Confirm, key_hints};
-    ///
-    /// assert_eq!(key_hints(&[Confirm::HINTS]), "y: yes | any other key: cancel");
-    /// ```
-    pub const HINTS: &'static [(&'static str, &'static str)] = &[
-        (Self::YES.key, Self::YES.label),
-        (Self::CANCEL.key, Self::CANCEL.label),
-    ];
 }
 
 #[cfg(test)]

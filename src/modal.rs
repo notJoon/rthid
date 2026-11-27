@@ -16,59 +16,10 @@ use ratatui::{
 };
 use rthid_dither::dither::Mode;
 use rthid_io::dir::Entry;
-use rthid_widgets::{Confirm, Dialog, ListPicker, Outcome, TextInput};
+use rthid_widgets::{Confirm, Dialog, Hint, ListPicker, Outcome, TextInput};
 
 /// Character limit of the open dialog's path field.
 pub const PATH_MAX_CHARS: usize = 4096;
-
-const OPEN_HINTS: &[(&str, &str)] = &[
-    ("Up/Down", "select"),
-    ("click", "select"),
-    ("click again", "open"),
-    ("Enter", "open"),
-    ("Esc", "close"),
-];
-
-const PRESET_HINTS: &[(&str, &str)] = &[
-    ("Up/Down j/k", "select"),
-    ("click", "select"),
-    ("click again", "apply"),
-    ("Enter", "apply"),
-    ("n", "new"),
-    ("e", "edit"),
-    ("x", "delete"),
-    ("Esc", "close"),
-];
-const TEMPLATE_HINTS: &[(&str, &str)] = &[
-    ("Up/Down j/k", "select"),
-    ("click", "select"),
-    ("click again", "apply"),
-    ("Enter", "apply"),
-    ("n", "save current settings"),
-    ("x", "delete"),
-    ("Esc", "close"),
-];
-const PROMPT_HINTS: &[(&str, &str)] = &[
-    ("Enter", "save"),
-    ("Esc", "back"),
-    ("arrows/Home/End", "cursor"),
-];
-const INPUT_HINTS: &[(&str, &str)] = &[
-    ("Enter", "commit"),
-    ("Esc", "cancel edit"),
-    ("arrows/Home/End", "cursor"),
-];
-const EDITOR_HINTS: &[(&str, &str)] = &[
-    ("Up/Down j/k", "row"),
-    ("click", "select"),
-    ("click again", "edit"),
-    ("Enter/e", "edit"),
-    ("Left/Right h/l", "mode"),
-    ("a", "add"),
-    ("x", "remove"),
-    ("s", "save"),
-    ("Esc", "cancel"),
-];
 
 /// Read access to the state needed for a modal decision.
 pub struct Ctx<'a> {
@@ -167,16 +118,22 @@ pub enum OnYes {
 }
 
 impl OnYes {
-    // Names the action instead of a generic yes, as the help line did before.
-    fn hints(&self) -> &'static [(&'static str, &'static str)] {
-        match self {
-            Self::RemovePreset(_) | Self::RemoveTemplate(_) => {
-                &[("y", "delete"), ("any other key", "cancel")]
-            }
-            Self::OverwriteTemplate(_) => {
-                &[("y", "overwrite"), ("any other key", "return to name")]
-            }
-        }
+    // Names the action instead of a generic yes.
+    fn hints(&self) -> Vec<Hint> {
+        let (yes, cancel) = match self {
+            Self::RemovePreset(_) | Self::RemoveTemplate(_) => ("delete", "cancel"),
+            Self::OverwriteTemplate(_) => ("overwrite", "return to name"),
+        };
+        vec![
+            Hint {
+                label: yes,
+                ..Confirm::YES
+            },
+            Hint {
+                label: cancel,
+                ..Confirm::CANCEL
+            },
+        ]
     }
 }
 
@@ -314,6 +271,19 @@ impl Editor {
         self.rows.selected(self.row_count())
     }
 
+    pub(crate) fn on_mode_row(&self) -> bool {
+        self.selected_row() == Some(self.row_count() - 1)
+    }
+
+    pub(crate) fn can_add(&self) -> bool {
+        self.draft.colors.len() < MAX_COLORS
+    }
+
+    pub(crate) fn can_remove(&self) -> bool {
+        self.selected_row()
+            .is_some_and(|row| row > 0 && row < self.row_count() - 1 && self.draft.colors.len() > 1)
+    }
+
     /// Text shown in a name or color row, including any uncommitted edit.
     fn row_text(&self, row: usize) -> &str {
         if let Some(input) = &self.input
@@ -395,7 +365,7 @@ impl Editor {
             Outcome::Consumed => self.input = None,
             Outcome::Ignored => match key.code {
                 KeyCode::Char('e') if row < mode_row => self.open_input(),
-                KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if row == mode_row => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if self.on_mode_row() => {
                     self.draft.mode = match (
                         self.draft.mode,
                         matches!(key.code, KeyCode::Left | KeyCode::Char('h')),
@@ -405,12 +375,12 @@ impl Editor {
                         _ => None,
                     };
                 }
-                KeyCode::Char('a') if self.draft.colors.len() < MAX_COLORS => {
+                KeyCode::Char('a') if self.can_add() => {
                     let index = row.min(self.draft.colors.len());
                     self.draft.colors.insert(index, "#888888".into());
                     self.rows = ListPicker::new(index + 1);
                 }
-                KeyCode::Char('x') if row > 0 && row < mode_row && self.draft.colors.len() > 1 => {
+                KeyCode::Char('x') if self.can_remove() => {
                     self.draft.colors.remove(row - 1);
                     self.rows = ListPicker::new(row.min(self.draft.colors.len()));
                 }
@@ -754,9 +724,20 @@ impl Modal {
     }
 
     /// Key descriptions for the component currently receiving input.
-    pub fn hints(&self) -> &'static [(&'static str, &'static str)] {
+    pub fn hints(&self, ctx: &Ctx<'_>) -> Vec<Hint> {
         match self {
-            Self::OpenFile(_) => OPEN_HINTS,
+            Self::OpenFile(picker) => {
+                let listed = !picker.entries.is_empty();
+                [
+                    (picker.typed || listed).then_some(Hint::new("Enter", "open")),
+                    Some(ListPicker::CANCEL),
+                    listed.then_some(Hint::new("Up/Down", "select")),
+                    Some(TextInput::CURSOR),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            }
             Self::Presets {
                 confirm: Some((_, on_yes)),
                 ..
@@ -765,13 +746,77 @@ impl Modal {
                 confirm: Some((_, on_yes)),
                 ..
             } => on_yes.hints(),
-            Self::Presets { .. } => PRESET_HINTS,
+            Self::Presets { .. } => vec![
+                Hint {
+                    label: "apply",
+                    ..ListPicker::SUBMIT
+                },
+                ListPicker::CANCEL,
+                ListPicker::MOVE,
+                Hint::new("n", "new"),
+                Hint::new("e", "edit"),
+                Hint::new("x", "delete"),
+            ],
             Self::Templates {
                 prompt: Some(_), ..
-            } => PROMPT_HINTS,
-            Self::Templates { .. } => TEMPLATE_HINTS,
-            Self::Editor(editor) if editor.input.is_some() => INPUT_HINTS,
-            Self::Editor(_) => EDITOR_HINTS,
+            } => vec![
+                Hint {
+                    label: "save",
+                    ..TextInput::SUBMIT
+                },
+                Hint {
+                    label: "back",
+                    ..TextInput::CANCEL
+                },
+                TextInput::CURSOR,
+            ],
+            Self::Templates { .. } => {
+                let listed = !ctx.templates.is_empty();
+                [
+                    listed.then_some(Hint {
+                        label: "apply",
+                        ..ListPicker::SUBMIT
+                    }),
+                    Some(ListPicker::CANCEL),
+                    listed.then_some(ListPicker::MOVE),
+                    Some(Hint::new("n", "save current")),
+                    listed.then_some(Hint::new("x", "delete")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+            Self::Editor(editor) if editor.input.is_some() => vec![
+                Hint {
+                    label: "commit",
+                    ..TextInput::SUBMIT
+                },
+                Hint {
+                    label: "cancel edit",
+                    ..TextInput::CANCEL
+                },
+                TextInput::CURSOR,
+            ],
+            Self::Editor(editor) => [
+                (!editor.on_mode_row()).then_some(Hint::new("Enter/e", "edit")),
+                Some(Hint {
+                    label: "cancel",
+                    ..ListPicker::CANCEL
+                }),
+                editor
+                    .on_mode_row()
+                    .then_some(Hint::new("Left/Right h/l", "mode")),
+                Some(Hint::new("s", "save")),
+                Some(Hint {
+                    label: "row",
+                    ..ListPicker::MOVE
+                }),
+                editor.can_add().then_some(Hint::new("a", "add")),
+                editor.can_remove().then_some(Hint::new("x", "remove")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         }
     }
 
