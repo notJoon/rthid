@@ -174,6 +174,13 @@ impl App {
         self.source_path.as_deref()
     }
 
+    fn source_size(&self) -> (u32, u32) {
+        self.grid_cache
+            .source
+            .as_ref()
+            .map_or((1, 1), RgbaImage::dimensions)
+    }
+
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.source_path = Some(path);
@@ -208,6 +215,7 @@ impl App {
             .as_ref()
             .map(|request| request.label.as_str())
             .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
+            .or_else(|| self.settings.dimensions(self.source_size()).err())
             .or_else(|| self.library.notice())
             .or_else(|| self.export_status())
     }
@@ -592,6 +600,7 @@ impl App {
             palettes: &self.library.palettes,
             templates: &self.library.templates,
             settings: &self.settings,
+            source: self.source_size(),
             show_original: self.show_original,
         }
     }
@@ -700,10 +709,13 @@ impl App {
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
             KeyCode::Char('d') => {
-                self.settings = self.settings.with_default(
+                let next = self.settings.with_default(
                     Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()],
                     &self.library.palettes,
-                )
+                );
+                if next.dimensions(self.source_size()).is_ok() {
+                    self.settings = next;
+                }
             }
             KeyCode::Char('D') => self.settings = Settings::default(),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
@@ -736,6 +748,7 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
+                settings.dimensions(self.source_size())?;
                 self.settings = settings;
                 self.show_original = false;
             }
@@ -743,6 +756,7 @@ impl App {
                 settings,
                 show_original,
             } => {
+                settings.dimensions(self.source_size())?;
                 self.settings = settings;
                 self.show_original = show_original;
             }
@@ -769,14 +783,20 @@ impl App {
 
     fn adjust(&mut self, direction: i32) {
         let setting = Setting::ALL[self.panel.selected(Setting::ALL.len()).unwrap()];
-        let next = self
-            .settings
-            .adjusted(setting, direction, &self.library.palettes);
+        let next = self.settings.adjusted(
+            setting,
+            direction,
+            &self.library.palettes,
+            self.source_size(),
+        );
         self.apply_setting(setting, next);
     }
 
     // Shared by Enter and by Left and Right so both follow one preview switch rule.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
+        if next.dimensions(self.source_size()).is_err() {
+            return;
+        }
         // Clamped presses and inactive rows preserve the current preview selection.
         if next != self.settings && setting.shows_dithered() {
             self.apply(Effect::Preview(next)).expect("preview is valid");
@@ -2021,6 +2041,89 @@ mod tests {
             assert!(press(&mut app, code));
             assert!(app.show_original);
         }
+    }
+
+    #[test]
+    fn image_grid_edits_use_the_loaded_source() {
+        for source in [None, Some((16, 16)), Some((1774, 1774))] {
+            let mut app = App::empty();
+            if let Some((w, h)) = source {
+                app.open_image("source.png".into(), RgbaImage::new(w, h));
+            }
+            app.settings.dot = 8;
+            app.settings.margin = 95;
+            app.panel = ListPicker::new(
+                Setting::ALL
+                    .iter()
+                    .position(|s| *s == Setting::Margin)
+                    .unwrap(),
+            );
+            app.adjust(1);
+            assert_eq!(
+                app.settings.margin,
+                if source == Some((1774, 1774)) {
+                    95
+                } else {
+                    100
+                }
+            );
+
+            app.settings.card = crate::settings::CARDS[1];
+            app.settings.margin = 100;
+            app.panel = ListPicker::new(0);
+            app.adjust(-1);
+            assert_eq!(
+                app.settings.card,
+                crate::settings::CARDS[usize::from(source == Some((1774, 1774)))]
+            );
+        }
+    }
+
+    #[test]
+    fn image_template_apply_uses_the_loaded_source() {
+        for source in [None, Some((16, 16)), Some((1774, 1774))] {
+            let mut app = App::empty();
+            if let Some((w, h)) = source {
+                app.open_image("source.png".into(), RgbaImage::new(w, h));
+            }
+            let settings = Settings {
+                dot: 8,
+                margin: 100,
+                ..Settings::default()
+            };
+            app.library
+                .commit(Change::UpsertTemplate(Template::capture(
+                    "Border".into(),
+                    &settings,
+                )))
+                .unwrap();
+            let previous = app.settings.clone();
+            press(&mut app, KeyCode::Char('T'));
+            press(&mut app, KeyCode::Enter);
+            if source == Some((1774, 1774)) {
+                assert!(app.settings == previous);
+                assert!(app.modal.is_some());
+                assert_eq!(app.notice(), Some("grid exceeds four million dots"));
+            } else {
+                assert!(app.settings == settings);
+                assert!(app.modal.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_loaded_image_reports_the_limit_until_corrected() {
+        let mut app = App::empty();
+        app.settings.dot = 8;
+        app.settings.margin = 400;
+        app.open_image("large.png".into(), RgbaImage::new(1024, 1024));
+        assert!(app.grid_cache.has_source());
+        assert_eq!(app.notice(), Some("grid exceeds four million dots"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.notice(), Some("grid exceeds four million dots"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.grid_cache.placement(&app.settings).is_some());
+        assert!(app.notice().is_none());
     }
 
     #[test]

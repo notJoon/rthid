@@ -382,7 +382,7 @@ impl Template {
     }
 
     /// Restores saved settings while retaining the current rotation, flip, zoom and pan.
-    pub fn apply(&self, settings: &Settings) -> Result<Settings, String> {
+    pub fn apply(&self, settings: &Settings, source: (u32, u32)) -> Result<Settings, String> {
         let palette = build_palette(&self.palette_hex)?;
         let next = Settings {
             dither: self.dither,
@@ -404,6 +404,7 @@ impl Template {
             mode: self.mode,
             tone: self.tone,
         };
+        next.dimensions(source)?;
         Ok(next)
     }
 }
@@ -832,6 +833,7 @@ impl Settings {
     }
 
     /// Grid size without a source, using a single pixel placeholder for Image.
+    #[cfg(test)]
     pub fn grid_dimensions(&self) -> Result<(u32, u32), &'static str> {
         Ok(self.dimensions((1, 1))?.grid)
     }
@@ -976,7 +978,13 @@ impl Settings {
 
     /// Returns settings moved `dir` steps and clamped to the range. Mode and
     /// Serpentine toggle, Palette wraps around the presets.
-    pub fn adjusted(&self, setting: Setting, dir: i32, palettes: &Palettes) -> Self {
+    pub fn adjusted(
+        &self,
+        setting: Setting,
+        dir: i32,
+        palettes: &Palettes,
+        source: (u32, u32),
+    ) -> Self {
         let mut next = self.clone();
         if !setting.is_active(self) {
             return next;
@@ -1023,7 +1031,7 @@ impl Settings {
                 }
             }
         }
-        if next.grid_dimensions().is_err() {
+        if next.dimensions(source).is_err() {
             return self.clone();
         }
         next
@@ -1097,7 +1105,9 @@ mod tests {
                 ..Settings::default()
             };
             assert_eq!(
-                settings.adjusted(Setting::Seed, dir, &palettes).seed,
+                settings
+                    .adjusted(Setting::Seed, dir, &palettes, (1, 1))
+                    .seed,
                 expected
             );
         }
@@ -1168,7 +1178,7 @@ mod tests {
                 palette_hex: colors,
                 ..template.clone()
             };
-            assert!(invalid.apply(&settings).is_err());
+            assert!(invalid.apply(&settings, (1, 1)).is_err());
             assert!(templates.upsert(invalid).is_err());
         }
         assert_eq!(palettes.get(index), Some(&preset));
@@ -1298,13 +1308,13 @@ mod tests {
         };
         assert_eq!(
             unknown
-                .adjusted(Setting::Palette, 1, &palettes)
+                .adjusted(Setting::Palette, 1, &palettes, (1, 1))
                 .palette_name,
             "4-gray"
         );
         assert_eq!(
             unknown
-                .adjusted(Setting::Palette, -1, &palettes)
+                .adjusted(Setting::Palette, -1, &palettes, (1, 1))
                 .palette_name,
             "Paper"
         );
@@ -1317,11 +1327,11 @@ mod tests {
             zoom: 103,
             ..Settings::default()
         };
-        let next = settings.adjusted(Setting::Zoom, 1, &palettes);
+        let next = settings.adjusted(Setting::Zoom, 1, &palettes, (1, 1));
         assert_eq!(next.zoom, 108);
         assert_eq!(next.with_default(Setting::Zoom, &palettes).zoom, 100);
         for setting in Setting::ALL {
-            let next = settings.adjusted(setting, -1, &palettes);
+            let next = settings.adjusted(setting, -1, &palettes, (1, 1));
             let reset = next.with_default(setting, &palettes);
             assert_eq!(
                 setting.label(&reset, &palettes),
@@ -1331,13 +1341,48 @@ mod tests {
             for dir in [i32::MIN, i32::MAX] {
                 assert!(
                     setting
-                        .label(&settings.adjusted(setting, dir, &palettes), &palettes)
+                        .label(
+                            &settings.adjusted(setting, dir, &palettes, (1, 1)),
+                            &palettes
+                        )
                         .len()
                         <= 25
                 );
             }
         }
     }
+    #[test]
+    fn image_limit_uses_source_and_margin() {
+        let settings = Settings {
+            dot: 9,
+            margin: 400,
+            ..Settings::default()
+        };
+        let palettes = Palettes::builtin();
+        for source in [(1024, 1024), (1, 1), (16, 16)] {
+            let next = settings.adjusted(Setting::Dot, -1, &palettes, source);
+            assert_eq!(next.dot, if source == (1024, 1024) { 9 } else { 8 });
+            assert_eq!(next.margin, 400);
+            let template = Template::capture(
+                "Border".into(),
+                &Settings {
+                    dot: 8,
+                    ..settings.clone()
+                },
+            );
+            assert_eq!(
+                template.apply(&settings, source).is_err(),
+                source == (1024, 1024)
+            );
+        }
+        assert_eq!(
+            Settings { dot: 8, ..settings }
+                .dimensions((1024, 1024))
+                .err(),
+            Some("grid exceeds four million dots")
+        );
+    }
+
     #[test]
     fn templates_restore_snapshots_while_retaining_composition() {
         let mut settings = Settings {
@@ -1371,7 +1416,7 @@ mod tests {
             pan_y: 45,
             ..Settings::default()
         };
-        let restored = template.apply(&current).unwrap();
+        let restored = template.apply(&current, (1, 1)).unwrap();
         assert!(
             restored
                 == Settings {
@@ -1393,6 +1438,6 @@ mod tests {
         assert_eq!(clamped.strength, 0.0);
         assert_eq!(clamped.tone.gamma, 2.5);
         template.palette_hex = vec!["invalid".into()];
-        assert!(template.apply(&current).is_err());
+        assert!(template.apply(&current, (1, 1)).is_err());
     }
 }

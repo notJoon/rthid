@@ -75,6 +75,8 @@ pub struct Ctx<'a> {
     pub templates: &'a Templates,
     /// Current preview settings.
     pub settings: &'a Settings,
+    /// Loaded source dimensions or a single pixel placeholder.
+    pub source: (u32, u32),
     /// Preview selection to restore when editing is cancelled.
     pub show_original: bool,
 }
@@ -839,7 +841,12 @@ impl Modal {
                             return Step::close();
                         }
                         Outcome::Submit(i) => {
-                            return match ctx.templates.get(i).unwrap().apply(ctx.settings) {
+                            return match ctx
+                                .templates
+                                .get(i)
+                                .unwrap()
+                                .apply(ctx.settings, ctx.source)
+                            {
                                 Ok(settings) => {
                                     Step::effect(Next::Close, Effect::Preview(settings))
                                 }
@@ -1138,6 +1145,7 @@ mod tests {
             templates,
             settings,
             show_original: true,
+            source: (1, 1),
         }
     }
 
