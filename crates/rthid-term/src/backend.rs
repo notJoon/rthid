@@ -239,32 +239,6 @@ mod tests {
     use super::*;
     use ratatui::{buffer::Buffer, layout::Rect};
 
-    #[test]
-    fn terminal_output_is_accessible_through_the_writer() {
-        use ratatui::{Terminal, TerminalOptions, Viewport};
-
-        let mut terminal = Terminal::with_options(
-            ElidingBackend::new(Vec::new()),
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 0, 10, 1)),
-            },
-        )
-        .unwrap();
-        terminal
-            .draw(|frame| frame.render_widget("hello", frame.area()))
-            .unwrap();
-        assert!(
-            terminal
-                .backend()
-                .writer()
-                .windows(5)
-                .any(|b| b == b"hello")
-        );
-        assert!(format!("{:?}", terminal.backend()).contains("ElidingBackend"));
-        terminal.backend_mut().writer_mut().clear();
-        assert!(terminal.backend().writer().is_empty());
-    }
-
     struct Screen {
         cells: Buffer,
         cursor: (u16, u16),

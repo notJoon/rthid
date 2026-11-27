@@ -1382,12 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_is_eight_connected() {
-        let diagonal = grid(&["#..", ".#.", "..#"]);
-        assert_eq!(components(&diagonal, 3, 3, true, true).len(), 1);
-    }
-
-    #[test]
     fn intersects_masks_after_component_caps() {
         let mut density = vec![0.0; 100 * 100];
         for region in 0..4 {

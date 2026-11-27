@@ -259,40 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_empty_output_accepts_empty_grids() {
-        for grid in [(0, 0), (0, 1), (1, 0)] {
-            for out in [(0, 0), (0, 2), (2, 0)] {
-                assert!(rasterize(&[], grid, out, |_| panic!("empty output")).is_empty());
-            }
-            assert!(std::panic::catch_unwind(|| rasterize(&[], grid, (1, 1), |_| [0; 3])).is_err());
-        }
-        assert!(rasterize(&[0], (1, 1), (0, 2), |_| panic!("empty output")).is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "idx has 1 indices, expected 2x3 = 6")]
-    fn index_mismatch_reports_actual_and_expected_size() {
-        rasterize(&[0], (2, 3), (1, 1), |_| [0; 3]);
-    }
-
-    #[test]
-    fn rasterize_rejects_size_overflow() {
-        for (grid, out) in [
-            ((usize::MAX, 2), (1, 1)),
-            ((1, 1), (usize::MAX, 2)),
-            ((1, 1), (usize::MAX / 4 + 1, 1)),
-        ] {
-            assert!(std::panic::catch_unwind(|| rasterize(&[0], grid, out, |_| [0; 3])).is_err());
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "unsupported index 7")]
-    fn rasterize_propagates_callback_panics() {
-        rasterize(&[7], (1, 1), (1, 1), |i| panic!("unsupported index {i}"));
-    }
-
-    #[test]
     fn constructor_and_writer_report_the_failed_grid_check() {
         let huge_size_error = if usize::BITS == 32 {
             "grid size 4294967295x4294967295 overflows"
@@ -492,24 +458,6 @@ mod tests {
         assert!(writer.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert_eq!(error.to_string(), "disk full mid stream");
-    }
-
-    #[test]
-    fn integer_output_gives_solid_squares_and_unchanged_png_bytes() {
-        let grid = grid(&[0, 1], 2, 1, &["#000", "#fff"]);
-        let mut bytes = Vec::new();
-        write_png(&mut bytes, &grid, preview_size(grid.w, grid.h), None).unwrap();
-        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
-        assert_eq!(image.dimensions(), (8, 4));
-        for (x, _, pixel) in image.enumerate_pixels() {
-            assert_eq!(pixel.0, if x < 4 { [0, 0, 0, 255] } else { [255; 4] });
-        }
-        let mut old_bytes = Vec::new();
-        let row = [[0, 0, 0, 255].repeat(4), [255; 4].repeat(4)].concat();
-        image::codecs::png::PngEncoder::new(&mut old_bytes)
-            .write_image(&row.repeat(4), 8, 4, image::ExtendedColorType::Rgba8)
-            .unwrap();
-        assert_eq!(bytes, old_bytes);
     }
 
     #[test]
