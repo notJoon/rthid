@@ -35,6 +35,35 @@ pub const WARM: [PaletteColor; 4] = [
     PaletteColor { rgb: [101, 48, 30] },
 ];
 
+/// Four tones sampled from a palette as a gradient from its lightest to its darkest color.
+///
+/// The palette must be sorted by luma ascending. Tones sit at 0, 1/3, 2/3 and 1 of the
+/// gradient, so a four color palette is used as is and a two color palette gets two blended
+/// steps. `invert` reverses the direction for light ink on dark backgrounds. Fewer than two
+/// colors fall back to [`MONO`].
+pub fn tones_from_palette(palette: &[PaletteColor], invert: bool) -> [PaletteColor; 4] {
+    if palette.len() < 2 {
+        return MONO;
+    }
+    let mut tones = std::array::from_fn(|i| {
+        let position = i as f64 * (palette.len() - 1) as f64 / 3.0;
+        let lower = position.floor() as usize;
+        let upper = (lower + 1).min(palette.len() - 1);
+        let fraction = position - lower as f64;
+        PaletteColor {
+            rgb: std::array::from_fn(|channel| {
+                let a = f64::from(palette[lower].rgb[channel]);
+                let b = f64::from(palette[upper].rgb[channel]);
+                (a + (b - a) * fraction).round() as u8
+            }),
+        }
+    });
+    if !invert {
+        tones.reverse();
+    }
+    tones
+}
+
 /// Controls smoothing and the three cumulative ink masks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MassOptions {
@@ -431,6 +460,59 @@ mod tests {
         rows.iter()
             .flat_map(|row| row.bytes().map(|c| c == b'#'))
             .collect()
+    }
+
+    #[test]
+    fn palette_tones_preserve_four_colors_in_background_first_order() {
+        let mut palette = WARM;
+        palette.reverse();
+        assert_eq!(tones_from_palette(&palette, false), WARM);
+    }
+
+    #[test]
+    fn palette_tones_blend_two_colors_with_rounding() {
+        let palette = [
+            PaletteColor { rgb: [0, 10, 20] },
+            PaletteColor {
+                rgb: [100, 110, 120],
+            },
+        ];
+        assert_eq!(
+            tones_from_palette(&palette, false).map(|tone| tone.rgb),
+            [[100, 110, 120], [67, 77, 87], [33, 43, 53], [0, 10, 20]]
+        );
+    }
+
+    #[test]
+    fn palette_tones_sample_sixteen_colors() {
+        let palette: [_; 16] = std::array::from_fn(|i| PaletteColor {
+            rgb: [i as u8 * 16; 3],
+        });
+        assert_eq!(
+            tones_from_palette(&palette, false),
+            [palette[15], palette[10], palette[5], palette[0]]
+        );
+    }
+
+    #[test]
+    fn inverted_palette_tones_reverse_the_gradient() {
+        let palette = [
+            PaletteColor { rgb: [0, 10, 20] },
+            PaletteColor {
+                rgb: [100, 110, 120],
+            },
+        ];
+        let mut expected = tones_from_palette(&palette, false);
+        expected.reverse();
+        assert_eq!(tones_from_palette(&palette, true), expected);
+    }
+
+    #[test]
+    fn palette_tones_fall_back_to_mono_for_fewer_than_two_colors() {
+        for invert in [false, true] {
+            assert_eq!(tones_from_palette(&[], invert), MONO);
+            assert_eq!(tones_from_palette(&WARM[..1], invert), MONO);
+        }
     }
 
     #[test]

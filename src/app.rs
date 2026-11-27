@@ -95,8 +95,8 @@ pub struct App {
     pub layer: Layer,
     /// Geometry controls for the mass study.
     pub mass: MassOptions,
-    /// Background, base, shadow and accent colors for the mass study.
-    pub mass_tones: [PaletteColor; 4],
+    /// Fixed mass study tones, or None to follow the dither palette.
+    pub mass_tones: Option<[PaletteColor; 4]>,
     /// Whether the event loop should exit.
     pub quit: bool,
 }
@@ -132,7 +132,7 @@ impl App {
             panel: ListPicker::new(0),
             layer: Layer::Original,
             mass: MassOptions::default(),
-            mass_tones: mass::MONO,
+            mass_tones: None,
             quit: false,
         };
         if let Some((path, image)) = source {
@@ -456,12 +456,15 @@ impl App {
 
     fn refresh(&mut self) {
         let need_dither = self.layer == Layer::Dithered || self.has_export();
+        let tones = self
+            .mass_tones
+            .unwrap_or_else(|| mass::tones_from_palette(&self.settings.palette, self.mass.invert));
         let changed = self.grid_cache.refresh(
             &self.settings,
             need_dither,
             self.layer == Layer::Mass,
             &self.mass,
-            &self.mass_tones,
+            &tones,
         );
         let source = self.source_size();
         if self.grid_cache.placement(&self.settings).is_some()
@@ -2288,6 +2291,28 @@ mod tests {
         press(&mut app, KeyCode::Char('D'));
         assert!(app.grid_cache.placement(&app.settings).is_some());
         assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn mass_tones_follow_palette_changes() {
+        let mut app = App::builtin(RgbaImage::new(20, 10), None);
+        assert_eq!(app.mass_tones, None);
+        app.layer = Layer::Mass;
+        let area = test_layout().preview;
+        app.sync(area);
+        let version = app.grid_cache.mass_version();
+        app.settings.palette = vec![
+            PaletteColor { rgb: [10, 20, 30] },
+            PaletteColor {
+                rgb: [210, 220, 230],
+            },
+        ];
+        assert!(app.sync(area));
+        assert_eq!(app.grid_cache.mass_version(), version + 1);
+        assert_eq!(
+            app.grid_cache.mass().unwrap().get_pixel(0, 0).0,
+            [210, 220, 230, 255]
+        );
     }
 
     #[test]
