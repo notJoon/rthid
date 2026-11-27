@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```text
-rthid [image] [--preview-png path] [--dpi N] [--glyphs sextant|quadrant] [--mass-tones palette|mono|warm] [--mass-invert] [--graphics auto|off] [--config path]
+rthid [image] [--preview-png path] [--mass-svg path] [--dpi N] [--glyphs sextant|quadrant] [--mass-tones palette|mono|warm] [--mass-invert] [--graphics auto|off] [--config path]
 ```
 
 Use `rthid --help` for option details and `rthid --version` for the version.
@@ -248,6 +248,11 @@ any existing file at `path`. The destination directory must exist; the path
 must differ from the source image. Write errors appear in the status line and
 another re-dither retries. Quit waits for the final export and reports failures
 with a nonzero exit status. No viewer is opened.
+
+`--mass-svg path`: save a self-contained mass-study analysis sheet on startup
+and after each mass rebuild. It embeds the original preview, vector tone layers,
+fitted accent ellipses, and settings. The path must differ from the source and
+from `--preview-png`; quit waits for the final write.
 
 ## PNG sizing
 

@@ -5,8 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.2.0] - Unreleased
 
+### Changed
+
+- Export jobs now coalesce per destination, so companion PNG and SVG writes coexist
+
 ### Breaking
 
+- `check_not_source(source, Option<&Path>)` becomes `check_not_source(source, &[&Path])`; pass `&[]` or a slice of protected destinations
+- `Job::Open::protect: Option<PathBuf>` becomes `Vec<PathBuf>`; use `vec![]` or include every export destination
 - Remove the `png` module. Use `rthid_render` for grids and PNG encoding,
   and `rthid_io::atomic::replace` for atomic file replacement.
   `Job::Export { grid }` becomes `Job::Export { write }`. The closure chooses the

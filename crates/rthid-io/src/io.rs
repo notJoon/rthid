@@ -1,4 +1,4 @@
-//! Background filesystem work with one latest job and result per kind, across destination paths.
+//! Background filesystem work with latest reads and updates, plus one export per destination.
 //!
 //! This is not a queue that guarantees every submission will run. See [`IO`] for replacement
 //! and shutdown policies.
@@ -21,14 +21,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Work kinds. Jobs of the same kind coalesce, different kinds never replace each other.
+/// Work kinds. Jobs of the same kind coalesce, with exports separated by destination path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// Open an image or directory.
     Open,
     /// List a directory.
     List,
-    /// Write an export. Coalesces across paths because the export destination is fixed for a run.
+    /// Write an export. Coalesces by destination path.
     Export,
     /// Replace a text file under its lock. Coalesces across paths, so each edit carries every
     /// unsaved change.
@@ -46,7 +46,7 @@ pub trait Edit: Send {
 
 /// Owned filesystem work for the shared thread.
 ///
-/// [`IO::submit`] replaces queued work of the same variant, even for different paths.
+/// [`IO::submit`] replaces queued work of the same variant. Exports coalesce per path.
 pub enum Job {
     /// Decode an image, or list it when the path is a directory.
     Open {
@@ -54,14 +54,14 @@ pub enum Job {
         path: PathBuf,
         /// Base directory for relative paths.
         dir: Option<PathBuf>,
-        /// Protected export destination that must never be opened as the source.
-        protect: Option<PathBuf>,
+        /// Protected export destinations that must never be opened as the source.
+        protect: Vec<PathBuf>,
     },
     /// List the given directory.
     List(PathBuf),
     /// Runs an encoder into a temporary file and replaces the destination only on success.
     ///
-    /// A newer Export replaces a queued Export regardless of its destination path.
+    /// A newer Export replaces a queued Export for the same destination path.
     Export {
         /// Export destination.
         path: PathBuf,
@@ -358,17 +358,21 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
+struct Queued {
+    slots: [Option<(u64, u64, Job)>; 4],
+    exports: Vec<(PathBuf, (u64, u64, Job))>,
+}
+
 struct Queue {
-    slots: Mutex<[Option<(u64, u64, Job)>; 4]>,
+    queued: Mutex<Queued>,
     ready: Condvar,
 }
 
 /// One filesystem thread with an independent newest result for each work kind.
 ///
-/// Open, List, Export and Update each have one queued slot. A submission replaces queued work
-/// of the same kind **across paths**, and [`Self::poll`] discards superseded results. Work already
-/// running may still complete its filesystem changes. This supports one current source, export
-/// destination and configuration file, rather than independent saves to many files.
+/// Open, List and Update each have one queued slot. Exports have one slot per destination path.
+/// A submission replaces queued work in its slot, and [`Self::poll`] discards superseded results.
+/// Work already running may still complete its filesystem changes.
 ///
 /// Dropping this value can block for up to five seconds. Like [`Self::finish`], it skips queued
 /// reads and updates, attempts the latest queued export, and detaches a worker still running at
@@ -381,6 +385,7 @@ pub struct IO {
     results: Receiver<Done>,
     local: VecDeque<Done>,
     pending: [Option<Pending>; 4],
+    export_pending: Vec<Pending>,
     next_id: u64,
     stopping: Arc<AtomicBool>,
     abandoned: Arc<AtomicBool>,
@@ -398,7 +403,10 @@ impl IO {
     /// Returns an error if the worker thread cannot be started.
     pub fn new(home: Option<PathBuf>) -> io::Result<Self> {
         let jobs = Arc::new(Queue {
-            slots: Mutex::new([None, None, None, None]),
+            queued: Mutex::new(Queued {
+                slots: [None, None, None, None],
+                exports: Vec::new(),
+            }),
             ready: Condvar::new(),
         });
         let queued = Arc::clone(&jobs);
@@ -419,6 +427,7 @@ impl IO {
             results,
             local: VecDeque::new(),
             pending: [None, None, None, None],
+            export_pending: Vec::new(),
             next_id: 0,
             stopping,
             abandoned,
@@ -429,9 +438,9 @@ impl IO {
 
     /// Queues work without waiting. The result echoes `tag` so callers can tell who asked for it.
     ///
-    /// Replaces a queued job of the same kind, even if its path differs. Superseded jobs have no
-    /// result; already running work is not cancelled, but its result is discarded if superseded.
-    /// Update jobs must carry all unsaved changes. This method does not guarantee every write runs.
+    /// Replaces a queued job of the same kind; exports replace only the same destination path.
+    /// Superseded jobs have no result; already running work is not cancelled, but its result is
+    /// discarded if superseded. Update jobs must carry all unsaved changes.
     pub fn submit(&mut self, job: Job, tag: u64) {
         self.enqueue(job, tag);
     }
@@ -442,22 +451,45 @@ impl IO {
         let id = self.next_id;
         let kind = job.kind();
         let (op, path) = job.context();
-        self.pending[kind as usize] = Some(Pending {
+        let pending = Pending {
             id,
             tag,
             op,
-            path,
+            path: path.clone(),
             submitted: Instant::now(),
-        });
-        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
-            self.local.push_back(
-                self.pending[kind as usize]
-                    .as_ref()
-                    .unwrap()
-                    .fail(kind, Cause::Stopped),
-            );
+        };
+        let stopped = self
+            .thread
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+            .then(|| pending.fail(kind, Cause::Stopped));
+        if kind == Kind::Export {
+            // ponytail: normally two destinations; use a map if export counts become user-sized.
+            if let Some(slot) = self
+                .export_pending
+                .iter_mut()
+                .find(|slot| slot.path == path)
+            {
+                *slot = pending;
+            } else {
+                self.export_pending.push(pending);
+            }
         } else {
-            self.jobs.slots.lock().unwrap()[kind as usize] = Some((id, tag, job));
+            self.pending[kind as usize] = Some(pending);
+        }
+        if let Some(stopped) = stopped {
+            self.local.push_back(stopped);
+        } else {
+            let mut queued = self.jobs.queued.lock().unwrap();
+            if kind == Kind::Export {
+                if let Some(slot) = queued.exports.iter_mut().find(|slot| slot.0 == path) {
+                    slot.1 = (id, tag, job);
+                } else {
+                    queued.exports.push((path, (id, tag, job)));
+                }
+            } else {
+                queued.slots[kind as usize] = Some((id, tag, job));
+            }
             self.jobs.ready.notify_one();
         }
         id
@@ -473,14 +505,32 @@ impl IO {
                     Ok(done) => done,
                     Err(mpsc::TryRecvError::Empty) => return None,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        return KINDS.into_iter().find_map(|kind| {
+                        let regular = KINDS.into_iter().find_map(|kind| {
                             self.pending[kind as usize]
                                 .take()
                                 .map(|pending| pending.fail(kind, Cause::Stopped))
                         });
+                        return regular.or_else(|| {
+                            (!self.export_pending.is_empty()).then(|| {
+                                self.export_pending
+                                    .remove(0)
+                                    .fail(Kind::Export, Cause::Stopped)
+                            })
+                        });
                     }
                 }
             };
+            if done.kind() == Kind::Export {
+                if let Some(index) = self
+                    .export_pending
+                    .iter()
+                    .position(|pending| pending.id == done.id)
+                {
+                    self.export_pending.remove(index);
+                    return Some(done);
+                }
+                continue;
+            }
             let pending = &mut self.pending[done.kind() as usize];
             if pending
                 .as_ref()
@@ -494,10 +544,10 @@ impl IO {
 
     /// Whether the newest id of any kind has not yet been polled.
     pub fn busy(&self) -> bool {
-        self.pending.iter().any(Option::is_some)
+        self.pending.iter().any(Option::is_some) || !self.export_pending.is_empty()
     }
 
-    /// Skips queued reads and updates and waits up to five seconds for the newest export.
+    /// Skips queued reads and updates and waits up to five seconds for each newest export.
     /// Returns available results and detaches a worker still running at the deadline.
     ///
     /// Queued jobs may be skipped at shutdown. Collect reads with [`Self::poll`] before
@@ -518,13 +568,18 @@ impl IO {
                 done.push(pending.fail(kind, Cause::TimedOut));
             }
         }
+        done.extend(
+            self.export_pending
+                .drain(..)
+                .map(|pending| pending.fail(Kind::Export, Cause::TimedOut)),
+        );
         done
     }
 
     fn stop_timeout(&mut self, timeout: Duration) {
         self.stopping.store(true, Ordering::SeqCst);
         // Hold the mutex while notifying so an idle worker cannot miss shutdown.
-        let slots = self.jobs.slots.lock().unwrap();
+        let slots = self.jobs.queued.lock().unwrap();
         self.jobs.ready.notify_one();
         drop(slots);
         // A worker still running at the deadline is detached.
@@ -580,21 +635,32 @@ fn run(
 ) {
     loop {
         let (id, tag, job) = {
-            let mut slots = queued.slots.lock().unwrap();
+            let mut queued_jobs = queued.queued.lock().unwrap();
             loop {
-                if let Some(index) = slots
+                let regular = queued_jobs
+                    .slots
                     .iter()
                     .enumerate()
                     .filter_map(|(index, job)| job.as_ref().map(|(id, ..)| (index, *id)))
-                    .min_by_key(|(_, id)| *id)
-                    .map(|(index, _)| index)
-                {
-                    break slots[index].take().unwrap();
+                    .min_by_key(|(_, id)| *id);
+                let export = queued_jobs
+                    .exports
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, (id, ..)))| (index, *id))
+                    .min_by_key(|(_, id)| *id);
+                match (regular, export) {
+                    (Some((index, id)), Some((_, export_id))) if id <= export_id => {
+                        break queued_jobs.slots[index].take().unwrap();
+                    }
+                    (Some((index, _)), None) => break queued_jobs.slots[index].take().unwrap(),
+                    (_, Some((index, _))) => break queued_jobs.exports.remove(index).1,
+                    (None, None) => {}
                 }
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                slots = queued.ready.wait(slots).unwrap();
+                queued_jobs = queued.ready.wait(queued_jobs).unwrap();
             }
         };
         let kind = job.kind();
@@ -648,7 +714,7 @@ fn execute(
                 *op = Op::List;
                 return listing(path).map(|listing| Outcome::Opened(Ok(Opened::Dir(listing))));
             }
-            crate::image::check_not_source(path, protect.as_deref())?;
+            crate::image::check_not_source(path, &protect)?;
             let image = crate::image::load_image(path).map_err(|error| match error {
                 image::ImageError::IoError(error) => Cause::Io(error),
                 error => Cause::Decode(error),
@@ -727,7 +793,7 @@ mod tests {
         Job::Open {
             path,
             dir: None,
-            protect: None,
+            protect: Vec::new(),
         }
     }
 
@@ -760,19 +826,16 @@ mod tests {
     }
 
     #[test]
-    fn exports_coalesce_and_only_the_latest_completion_is_polled() {
+    fn exports_to_the_same_path_coalesce() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
         let mut last = 0;
         for n in 0..100 {
-            last = worker.enqueue(export(dir.path().join(format!("{n}.png")), n == 99), 0);
+            last = worker.enqueue(export(dir.path().join("preview.png"), n == 99), 0);
         }
         assert!(worker.busy());
-        assert_eq!(
-            worker.jobs.slots.lock().unwrap().iter().flatten().count(),
-            1
-        );
+        assert_eq!(worker.jobs.queued.lock().unwrap().exports.len(), 1);
         resume.send(()).unwrap();
         let paused = wait(&mut worker);
         assert_eq!(paused.kind(), Kind::List);
@@ -788,6 +851,29 @@ mod tests {
         assert!(worker.poll().is_none());
         assert!(worker.finish().is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn exports_to_different_paths_both_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = IO::new(None).unwrap();
+        let resume = pause(&mut worker);
+        let first = dir.path().join("preview.png");
+        let second = dir.path().join("mass.svg");
+        worker.enqueue(export(first.clone(), false), 0);
+        worker.enqueue(export(second.clone(), true), 0);
+        resume.send(()).unwrap();
+        assert_eq!(wait(&mut worker).kind(), Kind::List);
+        assert!(matches!(
+            wait(&mut worker).outcome,
+            Outcome::Exported(Ok(_))
+        ));
+        assert!(matches!(
+            wait(&mut worker).outcome,
+            Outcome::Exported(Ok(_))
+        ));
+        assert_eq!(std::fs::read(first).unwrap(), [0]);
+        assert_eq!(std::fs::read(second).unwrap(), [1]);
     }
 
     struct Append(&'static str);
@@ -946,7 +1032,7 @@ mod tests {
             Job::Open {
                 path: "source.png".into(),
                 dir: Some(dir.path().to_path_buf()),
-                protect: None,
+                protect: Vec::new(),
             },
             0,
         );
@@ -961,7 +1047,7 @@ mod tests {
             Job::Open {
                 path: path.clone(),
                 dir: None,
-                protect: Some(path),
+                protect: vec![path],
             },
             0,
         );
@@ -991,13 +1077,13 @@ mod tests {
     }
 
     #[test]
-    fn finish_skips_queued_reads_and_flushes_only_the_newest_export() {
+    fn finish_skips_queued_reads_and_flushes_each_newest_export() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
         let opened = worker.enqueue(open(dir.path().to_path_buf()), 0);
         let listed = worker.enqueue(Job::List(dir.path().to_path_buf()), 0);
-        worker.enqueue(export(dir.path().join("old.png"), false), 0);
+        let first = worker.enqueue(export(dir.path().join("old.png"), false), 0);
         let exported = worker.enqueue(export(dir.path().join("final.png"), true), 0);
         let stopping = Arc::clone(&worker.stopping);
         let release = thread::spawn(move || {
@@ -1012,7 +1098,7 @@ mod tests {
         release.join().unwrap();
         assert_eq!(
             done.iter().map(|done| done.id).collect::<Vec<_>>(),
-            [opened, listed, exported]
+            [opened, listed, first, exported]
         );
         assert!(matches!(
             done[0].outcome,
@@ -1029,17 +1115,19 @@ mod tests {
             }))
         ));
         assert!(matches!(done[2].outcome, Outcome::Exported(Ok(_))));
+        assert!(matches!(done[3].outcome, Outcome::Exported(Ok(_))));
         assert!(dir.path().join("final.png").exists());
-        assert!(!dir.path().join("old.png").exists());
+        assert!(dir.path().join("old.png").exists());
     }
 
     #[test]
     fn stale_results_are_discarded_and_a_stopped_thread_still_returns_ids() {
         let dir = tempfile::tempdir().unwrap();
         let mut worker = IO::new(None).unwrap();
-        worker.enqueue(export(dir.path().join("old.png"), false), 0);
+        let path = dir.path().join("preview.png");
+        worker.enqueue(export(path.clone(), false), 0);
         let resume = pause(&mut worker);
-        let latest = worker.enqueue(export(dir.path().join("latest.png"), true), 0);
+        let latest = worker.enqueue(export(path, true), 0);
         // The earlier Export completed before Pause began and must still be discarded.
         assert!(worker.poll().is_none());
         resume.send(()).unwrap();

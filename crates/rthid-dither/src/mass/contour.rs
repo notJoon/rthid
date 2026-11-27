@@ -227,6 +227,7 @@ mod tests {
                 .collect(),
             w,
             h: rows.len(),
+            ellipses: Vec::new(),
         }
     }
 
@@ -316,6 +317,7 @@ mod tests {
                 indices,
                 w: 3,
                 h: 3,
+                ellipses: Vec::new(),
             };
             assert_eq!(
                 rasterize(&study.rings(), 3, 3, 1),
