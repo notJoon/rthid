@@ -14,7 +14,50 @@ pub struct RoundedRing {
     pub radii: Vec<f64>,
 }
 
+/// One command in a closed mass-study contour path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathCommand {
+    /// Starts a subpath at the point.
+    Move([f64; 2]),
+    /// Draws a straight line to the point.
+    Line([f64; 2]),
+    /// Draws a quadratic curve using the first point as control and the second as its end.
+    Quadratic([f64; 2], [f64; 2]),
+    /// Closes the current subpath.
+    Close,
+}
+
 impl RoundedRing {
+    /// Returns the closed path shared by vector output and raster flattening.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `radii` does not contain one entry for every point in `ring`.
+    pub fn commands(&self) -> Vec<PathCommand> {
+        assert_eq!(self.radii.len(), self.ring.points.len());
+        let mut commands = Vec::with_capacity(self.ring.points.len() * 2 + 1);
+        for i in 0..self.ring.points.len() {
+            let vertex = self.ring.points[i];
+            let radius = self.radii[i];
+            let (point, curve) = if radius == 0.0 {
+                (vertex, None)
+            } else {
+                let (entry, exit) = corner_points(&self.ring.points, i, radius);
+                (entry, Some((vertex, exit)))
+            };
+            commands.push(if i == 0 {
+                PathCommand::Move(point)
+            } else {
+                PathCommand::Line(point)
+            });
+            if let Some((control, end)) = curve {
+                commands.push(PathCommand::Quadratic(control, end));
+            }
+        }
+        commands.push(PathCommand::Close);
+        commands
+    }
+
     /// Flattens the rounded path to a closed polyline suitable for rasterization.
     /// Its first point is the first corner's entry point, not necessarily the topmost-leftmost
     /// point promised by traced [`Ring`] values.
@@ -23,28 +66,35 @@ impl RoundedRing {
     ///
     /// Panics if `radii` does not contain one entry for every point in `ring`.
     pub fn flatten(&self) -> Ring {
-        assert_eq!(self.radii.len(), self.ring.points.len());
         let mut points = Vec::new();
-        for i in 0..self.ring.points.len() {
-            let vertex = self.ring.points[i];
-            let radius = self.radii[i];
-            if radius == 0.0 {
-                push_distinct(&mut points, vertex);
-                continue;
-            }
-            let (entry, exit) = corner_points(&self.ring.points, i, radius);
-            push_distinct(&mut points, entry);
-            let segments = (radius.ceil() as usize).clamp(2, 8);
-            for step in 1..=segments {
-                let t = step as f64 / segments as f64;
-                let u = 1.0 - t;
-                push_distinct(
-                    &mut points,
-                    [
-                        u * u * entry[0] + 2.0 * u * t * vertex[0] + t * t * exit[0],
-                        u * u * entry[1] + 2.0 * u * t * vertex[1] + t * t * exit[1],
-                    ],
-                );
+        let mut current = [0.0; 2];
+        let mut vertex = 0;
+        for command in self.commands() {
+            match command {
+                PathCommand::Move(point) | PathCommand::Line(point) => {
+                    current = point;
+                    push_distinct(&mut points, point);
+                    if self.radii[vertex] == 0.0 {
+                        vertex += 1;
+                    }
+                }
+                PathCommand::Quadratic(control, end) => {
+                    let segments = (self.radii[vertex].ceil() as usize).clamp(2, 8);
+                    for step in 1..=segments {
+                        let t = step as f64 / segments as f64;
+                        let u = 1.0 - t;
+                        push_distinct(
+                            &mut points,
+                            [
+                                u * u * current[0] + 2.0 * u * t * control[0] + t * t * end[0],
+                                u * u * current[1] + 2.0 * u * t * control[1] + t * t * end[1],
+                            ],
+                        );
+                    }
+                    current = end;
+                    vertex += 1;
+                }
+                PathCommand::Close => {}
             }
         }
         Ring {
@@ -390,6 +440,7 @@ mod tests {
                 .collect(),
             w,
             h: rows.len(),
+            ellipses: Vec::new(),
         }
     }
 
@@ -479,6 +530,7 @@ mod tests {
             indices,
             w: size,
             h: size,
+            ellipses: Vec::new(),
         };
         let raw = study.rings();
         let rounded = round_tier(&raw[0], 1.0, 4.0, size as f64, size as f64);
@@ -517,7 +569,12 @@ mod tests {
                     (state >> 30) as u8
                 })
                 .collect();
-            let study = MassStudy { indices, w, h };
+            let study = MassStudy {
+                indices,
+                w,
+                h,
+                ellipses: Vec::new(),
+            };
             let raw = study.rings();
             let make =
                 || std::array::from_fn(|tier| round_tier(&raw[tier], 2.0, 4.0, w as f64, h as f64));

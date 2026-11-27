@@ -33,6 +33,7 @@ pub(crate) struct MassKey {
 /// Mass image and the diagnostic from the same build.
 pub(crate) struct MassBuild {
     image: RgbaImage,
+    study: Option<mass::MassStudy>,
     error: Option<(MassError, String)>,
 }
 
@@ -124,6 +125,7 @@ impl GridCache {
                     Ok(study) => MassBuild {
                         image: RgbaImage::from_raw(w, h, study.rgba(w as usize, h as usize, tones))
                             .expect("mass grid dimensions"),
+                        study: Some(study),
                         error: None,
                     },
                     Err(error) => MassBuild {
@@ -132,6 +134,7 @@ impl GridCache {
                             h,
                             Rgba([tones[0].rgb[0], tones[0].rgb[1], tones[0].rgb[2], 255]),
                         ),
+                        study: None,
                         error: Some((error, format!("mass study: {error}"))),
                     },
                 },
@@ -182,6 +185,11 @@ impl GridCache {
     /// Last mass image, current after a refresh that requested it.
     pub fn mass(&self) -> Option<&RgbaImage> {
         self.mass.get().map(|build| &build.image)
+    }
+
+    /// Last successful mass study, current after a refresh that requested it.
+    pub fn mass_study(&self) -> Option<&mass::MassStudy> {
+        self.mass.get()?.study.as_ref()
     }
 
     /// Error and status text from the last mass build, cleared on success.

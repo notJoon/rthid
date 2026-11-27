@@ -2,7 +2,7 @@
 
 use crate::{
     cells::{Glyphs, Layer, Pixels},
-    export::Export,
+    export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
     settings::{Setting, Settings, Template},
@@ -65,9 +65,10 @@ struct Notice {
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
-/// the optional companion PNG.
+/// optional companion exports.
 pub struct App {
     export: Option<Export>,
+    mass_export: Option<MassExport>,
     source_path: Option<PathBuf>,
     notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
@@ -109,15 +110,17 @@ pub struct App {
 }
 
 impl App {
-    /// Builds the source grid and queues a companion PNG when requested.
+    /// Builds the source grid and queues requested companion exports.
     pub fn new(
         source: Option<(PathBuf, RgbaImage)>,
         preview_png: Option<PathBuf>,
+        mass_svg: Option<PathBuf>,
         dpi: Option<u32>,
         loaded: Loaded,
     ) -> Self {
         let mut app = Self {
             export: preview_png.map(|path| Export::new(path, dpi)),
+            mass_export: mass_svg.map(MassExport::new),
             source_path: None,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
@@ -153,6 +156,7 @@ impl App {
             Some((PathBuf::from("test.png"), source)),
             preview_png,
             None,
+            None,
             Loaded::default(),
         )
     }
@@ -184,7 +188,7 @@ impl App {
     /// Builds an app without an image for tests.
     #[cfg(test)]
     pub fn empty() -> Self {
-        Self::new(None, None, None, Loaded::default())
+        Self::new(None, None, None, None, Loaded::default())
     }
 
     /// Path of the loaded source, if any.
@@ -314,22 +318,30 @@ impl App {
                 }
             }
             IoOutcome::Exported(result) => {
-                if let Some(export) = &mut self.export {
-                    if result.is_ok()
-                        && self
-                            .notice
-                            .as_ref()
-                            .is_some_and(|notice| matches!(notice.source, Source::Export))
-                    {
+                let path = result
+                    .as_ref()
+                    .map_or_else(|error| &error.path, |path| path);
+                let mut export_error = None;
+                let exports = self.export.as_mut().map(Export::state_mut);
+                let mass = self.mass_export.as_mut().map(MassExport::state_mut);
+                for export in exports.into_iter().chain(mass).filter(|e| e.path() == path) {
+                    let clear_notice = result.is_ok()
+                        && export.status().is_some_and(|status| {
+                            self.notice.as_ref().is_some_and(|notice| {
+                                matches!(notice.source, Source::Export) && notice.text == status
+                            })
+                        });
+                    changed |= export.complete(result.as_ref().map(|_| ()));
+                    if clear_notice {
                         self.notice = None;
                         changed = true;
                     }
-                    changed |= export.complete(result.as_ref().map(|_| ()));
+                    export_error = export.status().map(ToOwned::to_owned);
                 }
                 if let Err(error) = result {
                     changed |= self.report_notice(Notice {
                         source: Source::Export,
-                        text: error.to_string(),
+                        text: export_error.unwrap_or_else(|| error.to_string()),
                     });
                 }
             }
@@ -393,7 +405,14 @@ impl App {
             protect: self
                 .export
                 .as_ref()
-                .map(|export| export.path().to_path_buf()),
+                .map(|export| export.path().to_path_buf())
+                .into_iter()
+                .chain(
+                    self.mass_export
+                        .as_ref()
+                        .map(|export| export.path().to_path_buf()),
+                )
+                .collect(),
         };
         self.outbox.push((job, token));
     }
@@ -460,7 +479,7 @@ impl App {
         let changed = self.grid_cache.refresh(
             &self.settings,
             need_dither,
-            self.layer == Layer::Mass || inset_mass,
+            self.layer == Layer::Mass || inset_mass || self.mass_export.is_some(),
             &self.mass,
             &tones,
         );
@@ -480,6 +499,24 @@ impl App {
                 self.outbox.push((job, 0));
             }
         }
+        if let Some(export) = &mut self.mass_export {
+            let version = self.grid_cache.mass_version();
+            if let (Some(preview), Some(study)) =
+                (self.grid_cache.grid(), self.grid_cache.mass_study())
+            {
+                if let Some(job) = export.sync(
+                    version,
+                    preview,
+                    study,
+                    tones.map(|tone| tone.rgb),
+                    &self.mass,
+                ) {
+                    self.outbox.push((job, 0));
+                }
+            } else if let Some((_, error)) = self.grid_cache.mass_error() {
+                export.fail(version, error);
+            }
+        }
     }
 
     /// Whether companion PNG output needs every new dither while Original is shown.
@@ -492,9 +529,12 @@ impl App {
         self.export.as_ref().and_then(Export::dpi)
     }
 
-    /// Latest companion PNG error for the status line.
+    /// Latest companion export error for the status line, with PNG first.
     pub fn export_status(&self) -> Option<&str> {
-        self.export.as_ref().and_then(Export::status)
+        self.export
+            .as_ref()
+            .and_then(Export::status)
+            .or_else(|| self.mass_export.as_ref().and_then(MassExport::status))
     }
 
     /// Selected preview pixels after sync, or None without a source.
@@ -539,9 +579,10 @@ impl App {
         self.refresh(false);
     }
 
-    /// Returns the last companion PNG write result.
+    /// Returns the last companion export result, with PNG first.
     pub fn export_result(&self) -> std::io::Result<()> {
-        self.export.as_ref().map_or(Ok(()), Export::result)
+        self.export.as_ref().map_or(Ok(()), Export::result)?;
+        self.mass_export.as_ref().map_or(Ok(()), MassExport::result)
     }
 
     /// Whether a left mouse drag has panned the preview.
@@ -917,7 +958,7 @@ mod tests {
     use rthid_dither::dither::Mode;
 
     fn business_app(source: RgbaImage, preview_png: Option<PathBuf>) -> App {
-        let mut app = App::new(None, preview_png, None, Loaded::default());
+        let mut app = App::new(None, preview_png, None, None, Loaded::default());
         app.settings.card = BUSINESS_CARD;
         app.open_image("test.png".into(), source);
         app
@@ -960,6 +1001,7 @@ mod tests {
         let mut app = App::new(
             Some(("test.png".into(), RgbaImage::new(30, 20))),
             Some("preview.png".into()),
+            None,
             Some(254),
             Loaded::default(),
         );
@@ -1011,7 +1053,13 @@ mod tests {
     #[test]
     fn export_size_snapshots_use_preview_or_physical_dimensions() {
         for (dpi, expected) in [(None, (1000, 1800)), (Some(600), (1181, 2126))] {
-            let mut app = App::new(None, Some("preview.png".into()), dpi, Loaded::default());
+            let mut app = App::new(
+                None,
+                Some("preview.png".into()),
+                None,
+                dpi,
+                Loaded::default(),
+            );
             app.settings.card = BUSINESS_CARD;
             app.open_image("test.png".into(), RgbaImage::new(4, 4));
             let job = jobs(&mut app).pop().unwrap();
@@ -1035,6 +1083,7 @@ mod tests {
         let mut app = App::new(
             None,
             Some("preview.png".into()),
+            None,
             Some(4800),
             Loaded::default(),
         );
@@ -1048,7 +1097,79 @@ mod tests {
         assert!(app.export_result().is_err());
     }
 
-    fn encoded_export(job: Job) -> (PathBuf, image::RgbaImage) {
+    #[test]
+    fn mass_svg_queues_once_and_writes_svg() {
+        let path = PathBuf::from("mass.svg");
+        let mut app = App::new(
+            Some(("test.png".into(), RgbaImage::new(8, 6))),
+            None,
+            Some(path.clone()),
+            None,
+            Loaded::default(),
+        );
+        let queued = jobs(&mut app);
+        assert_eq!(queued.len(), 1);
+        let (output, bytes) = encoded_bytes(queued.into_iter().next().unwrap());
+        assert_eq!(output, path);
+        assert!(bytes.starts_with(b"<svg"));
+        app.refresh(false);
+        assert!(jobs(&mut app).is_empty());
+        app.finish();
+        assert!(jobs(&mut app).is_empty());
+    }
+
+    #[test]
+    fn mass_svg_reports_a_failed_mass_build_and_recovers() {
+        let path = PathBuf::from("mass.svg");
+        let mut app = App::new(None, None, Some(path.clone()), None, Loaded::default());
+        app.mass.sigma = -1.0;
+        app.open_image("test.png".into(), RgbaImage::new(8, 6));
+        assert!(jobs(&mut app).is_empty());
+        assert!(
+            app.export_status()
+                .is_some_and(|status| status.starts_with("SVG mass.svg: mass study:"))
+        );
+        assert!(app.export_result().is_err());
+
+        app.mass = MassOptions::default();
+        app.refresh(false);
+        assert!(
+            matches!(jobs(&mut app).as_slice(), [Job::Export { path: output, .. }] if output == &path)
+        );
+        app.complete(done(&app, IoOutcome::Exported(Ok(path))));
+        assert!(app.export_status().is_none());
+        assert!(app.export_result().is_ok());
+    }
+
+    #[test]
+    fn png_and_mass_svg_queue_together_and_svg_errors_surface() {
+        let svg = PathBuf::from("mass.svg");
+        let mut app = App::new(
+            Some(("test.png".into(), RgbaImage::new(8, 6))),
+            Some("preview.png".into()),
+            Some(svg.clone()),
+            None,
+            Loaded::default(),
+        );
+        let queued = jobs(&mut app);
+        assert_eq!(queued.len(), 2);
+        assert!(
+            queued
+                .iter()
+                .any(|job| matches!(job, Job::Export { path, .. } if path == &svg))
+        );
+        let error = rthid_io::io::IoError {
+            op: rthid_io::io::Op::Encode,
+            path: svg,
+            cause: rthid_io::io::Cause::Io(std::io::Error::other("denied")),
+        };
+        app.complete(done(&app, IoOutcome::Exported(Err(error))));
+        assert_eq!(app.export_status(), Some("SVG mass.svg: denied"));
+        app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
+        assert_eq!(app.notice(), Some("SVG mass.svg: denied"));
+    }
+
+    fn encoded_bytes(job: Job) -> (PathBuf, Vec<u8>) {
         let Job::Export { path, write } = job else {
             panic!("expected export");
         };
@@ -1058,13 +1179,23 @@ mod tests {
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
+        (path, bytes)
+    }
+
+    fn encoded_export(job: Job) -> (PathBuf, image::RgbaImage) {
+        let (path, bytes) = encoded_bytes(job);
         (path, image::load_from_memory(&bytes).unwrap().to_rgba8())
     }
 
     fn failure(op: rthid_io::io::Op) -> rthid_io::io::IoError {
         rthid_io::io::IoError {
             op,
-            path: "failed.png".into(),
+            path: if op == rthid_io::io::Op::Encode {
+                "preview.png"
+            } else {
+                "failed.png"
+            }
+            .into(),
             cause: rthid_io::io::Cause::Io(std::io::Error::other("denied")),
         }
     }
@@ -1230,8 +1361,8 @@ mod tests {
                 .all(|pixel| pixel.0[..3] == app.settings.palette.colors()[0].rgb)
         );
         assert!(
-            matches!(queued.as_slice(), [Job::Open { path: source, dir: Some(dir), protect: Some(protect) }]
-            if protect == &path && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images"))
+            matches!(queued.as_slice(), [Job::Open { path: source, dir: Some(dir), protect }]
+            if protect == &vec![path.clone()] && source == &PathBuf::from("photo.png") && dir == &PathBuf::from("/images"))
         );
         app.complete(done(&app, IoOutcome::Opened(Err(failure(Op::Decode)))));
         assert!(app.complete(done(&app, IoOutcome::Exported(Err(failure(Op::Encode))))));
@@ -1305,8 +1436,8 @@ mod tests {
             );
             press(&mut app, KeyCode::Enter);
             assert!(
-                matches!(jobs(&mut app).as_slice(), [Job::Open { path, dir: Some(base), protect: None }]
-                if path == &PathBuf::from("bad.png") && base == &PathBuf::from(dir))
+                matches!(jobs(&mut app).as_slice(), [Job::Open { path, dir: Some(base), protect }]
+                if protect.is_empty() && path == &PathBuf::from("bad.png") && base == &PathBuf::from(dir))
             );
             app.complete(done(
                 &app,
@@ -1330,8 +1461,8 @@ mod tests {
                 app.handle_paste(path);
                 press(&mut app, KeyCode::Enter);
                 assert!(
-                    matches!(jobs(&mut app).as_slice(), [Job::Open { path: entered, dir: Some(base), protect: None }]
-                    if entered == &PathBuf::from(path) && base == &PathBuf::from(dir))
+                    matches!(jobs(&mut app).as_slice(), [Job::Open { path: entered, dir: Some(base), protect }]
+                    if protect.is_empty() && entered == &PathBuf::from(path) && base == &PathBuf::from(dir))
                 );
             }
         }
@@ -1369,8 +1500,8 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
         app.apply(Effect::ListDir(PathBuf::from("/other"))).unwrap();
         assert!(matches!(jobs(&mut app).as_slice(), [
-            Job::Open { path, dir: None, protect: None }, Job::List(_), Job::List(listed)
-        ] if path == &PathBuf::from("/tmp/My Photo.jpg") && listed == &PathBuf::from("/other")));
+            Job::Open { path, dir: None, protect }, Job::List(_), Job::List(listed)
+        ] if protect.is_empty() && path == &PathBuf::from("/tmp/My Photo.jpg") && listed == &PathBuf::from("/other")));
         assert!(jobs(&mut app).is_empty());
 
         let mut app = App::empty();
@@ -1728,7 +1859,7 @@ mod tests {
         let text = "version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']";
         let loaded = crate::store::parse(text);
         let warning = loaded.notice().unwrap();
-        let mut app = App::new(None, Some("preview.png".into()), None, loaded);
+        let mut app = App::new(None, Some("preview.png".into()), None, None, loaded);
         // A save warning can be replaced before the next draw.
         saved(&mut app, text);
         save_failed(&mut app);
@@ -1748,7 +1879,13 @@ mod tests {
 
     #[test]
     fn export_success_preserves_other_sources_with_equal_text() {
-        let mut app = App::new(None, Some("preview.png".into()), None, Loaded::default());
+        let mut app = App::new(
+            None,
+            Some("preview.png".into()),
+            None,
+            None,
+            Loaded::default(),
+        );
         let error = failure(rthid_io::io::Op::Encode);
         let text = error.to_string();
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
@@ -1761,7 +1898,7 @@ mod tests {
     fn save_notices_preserve_unrelated_errors() {
         let loaded =
             crate::store::parse("version = 1\n[[palette]]\nname = 'Bad'\ncolors = ['oops']\n");
-        let mut app = App::new(None, None, None, loaded);
+        let mut app = App::new(None, None, None, None, loaded);
         assert!(app.notice().unwrap().starts_with("config:"));
         saved(&mut app, "");
         assert!(app.notice().is_none());
@@ -1920,6 +2057,7 @@ mod tests {
                 .unwrap();
             let mut app = App::new(
                 Some((PathBuf::from("test.png"), RgbaImage::new(4, 4))),
+                None,
                 None,
                 None,
                 Loaded {

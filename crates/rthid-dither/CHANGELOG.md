@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- `MassStudy` no longer implements `Eq` because it now retains fitted `f64` ellipse geometry
 - The crate-root `rasterize` was removed. Use `rthid_render::write_png` to produce images.
 
 - Move `serpentine` and `strength` from `Options` into the `Diffusion` payload of
@@ -36,6 +37,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - CPU benchmarks for every dither algorithm and the mass-study pipeline
+- Public rounded-path commands and accepted accent ellipse geometry for mass-study renderers
 - `MassStudy::rounded_rings` and `mass::RoundedRing` simplify and round traced mass-study rings
 - `MassStudy::rings`, `mass::Ring` and `mass::rasterize` trace mass-study tiers and
   rasterize them back to indices

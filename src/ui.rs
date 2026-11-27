@@ -1569,6 +1569,7 @@ mod tests {
             let mut exporting = App::new(
                 Some(("test.png".into(), RgbaImage::new(8, 8))),
                 Some("p.png".into()),
+                None,
                 Some(dpi),
                 crate::store::Loaded::default(),
             );

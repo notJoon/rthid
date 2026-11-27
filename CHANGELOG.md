@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Local CPU benchmarks and a profiling build profile, with CodSpeed simulation in CI
+- `--mass-svg PATH` exports a self-contained mass-study analysis sheet with embedded preview, vector tone layers, fitted ellipses and settings
 
 - A deterministic test guards terminal bytes per frame during mouse-drag pans at 100% and 200% zoom
 

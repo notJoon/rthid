@@ -15,16 +15,24 @@ const MAX_SOURCE_SIDE: u32 = 1024;
 const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const MAX_DECODE_SIDE: u32 = 16384;
 
-/// Rejects a companion PNG destination that resolves to the source image.
+/// Rejects export destinations that resolve to the source image.
 ///
 /// # Errors
 /// Returns [`crate::io::Cause::IsSource`] with the source path when both paths resolve
 /// to the same file. Paths that cannot be resolved are left to the file operation.
-pub fn check_not_source(source: &Path, preview: Option<&Path>) -> Result<(), crate::io::Cause> {
-    if let Some(preview) = preview
-        && let (Ok(a), Ok(b)) = (source.canonicalize(), preview.canonicalize())
-        && a == b
-    {
+pub fn check_not_source(
+    source: &Path,
+    protected: &[impl AsRef<Path>],
+) -> Result<(), crate::io::Cause> {
+    let Ok(source_path) = source.canonicalize() else {
+        return Ok(());
+    };
+    if protected.iter().any(|destination| {
+        destination
+            .as_ref()
+            .canonicalize()
+            .is_ok_and(|d| d == source_path)
+    }) {
         return Err(crate::io::Cause::IsSource(source.to_path_buf()));
     }
     Ok(())
@@ -158,10 +166,10 @@ mod tests {
         std::fs::write(&source, b"image").unwrap();
         let aliased = dir.path().join(".").join("photo.png");
         assert!(matches!(
-            check_not_source(&source, Some(&aliased)),
+            check_not_source(&source, &[&aliased]),
             Err(crate::io::Cause::IsSource(path)) if path == source
         ));
-        assert!(check_not_source(&source, Some(&dir.path().join("dots.png"))).is_ok());
-        assert!(check_not_source(&source, None).is_ok());
+        assert!(check_not_source(&source, &[&dir.path().join("dots.png")]).is_ok());
+        assert!(check_not_source(&source, &[] as &[&Path]).is_ok());
     }
 }

@@ -4,6 +4,10 @@
 use rthid_dither::dither::PaletteColor;
 use std::io;
 
+mod svg;
+
+pub use svg::{MassSheet, write_mass_svg};
+
 /// Samples dots into opaque RGBA pixels with nearest neighbor sampling.
 /// Empty output returns no bytes.
 ///
