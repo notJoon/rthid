@@ -12,10 +12,14 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const BEGIN_FRAME: &[u8] = b"\x1b[?2026h";
+const END_FRAME: &[u8] = b"\x1b[?2026l";
 
 struct Output {
     parser: vt100::Parser,
     raw: Vec<u8>,
+    /// Whether the last synchronized update is still open, so the screen holds a partial frame.
+    in_frame: bool,
 }
 
 struct Run {
@@ -58,6 +62,7 @@ impl Run {
                 100,
             ),
             raw: Vec::new(),
+            in_frame: false,
         }));
         let reader_output = Arc::clone(&output);
         thread::spawn(move || {
@@ -70,8 +75,17 @@ impl Run {
                     Err(_) => break,
                 };
                 let mut output = reader_output.lock().unwrap();
+                // Rescan the tail of earlier output too, in case a marker spans two reads.
+                let start = output.raw.len().saturating_sub(BEGIN_FRAME.len() - 1);
                 output.raw.extend_from_slice(&buffer[..count]);
                 output.parser.process(&buffer[..count]);
+                if let Some(marker) = output.raw[start..]
+                    .windows(BEGIN_FRAME.len())
+                    .rev()
+                    .find(|window| *window == BEGIN_FRAME || *window == END_FRAME)
+                {
+                    output.in_frame = marker == BEGIN_FRAME;
+                }
             }
         });
 
@@ -89,12 +103,13 @@ impl Run {
         self.writer.flush().expect("flush pty input");
     }
 
+    /// Polls `predicate` against complete frames only, as a mode 2026 terminal would show them.
     fn wait_for(&mut self, description: &str, mut predicate: impl FnMut(&Output) -> bool) {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let timeout = {
                 let output = self.output.lock().unwrap();
-                if predicate(&output) {
+                if !output.in_frame && predicate(&output) {
                     return;
                 }
                 (Instant::now() >= deadline).then(|| {
@@ -200,6 +215,16 @@ fn terminal_workflow_restores_the_terminal() {
             && screen.bracketed_paste()
             && screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
     });
+    // Without frame markers every wait would also accept partial frames.
+    assert!(
+        run.output
+            .lock()
+            .unwrap()
+            .raw
+            .windows(END_FRAME.len())
+            .any(|window| window == END_FRAME),
+        "rthid frames are not wrapped in synchronized updates"
+    );
 
     run.send(b"+");
     let mut zoomed = None;
