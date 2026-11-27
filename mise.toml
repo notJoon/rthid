@@ -8,6 +8,9 @@ run = "cargo run"
 [tasks.test]
 run = "cargo test --workspace"
 
+[tasks.bench]
+run = "cargo bench -p rthid-dither -p rthid-render -p rthid-term"
+
 [tasks.lint]
 run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings"]
 

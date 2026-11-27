@@ -1,0 +1,59 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      bench: ${{ steps.filter.outputs.bench }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            bench:
+              - 'crates/rthid-dither/**'
+              - 'crates/rthid-render/**'
+              - 'crates/rthid-term/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'mise.toml'
+              - '.github/workflows/bench.yml'
+
+  benchmarks:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.bench == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed@6.1.0
+      - name: Build benchmarks
+        run: cargo codspeed build -p rthid-dither -p rthid-render -p rthid-term
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: cargo codspeed run
