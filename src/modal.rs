@@ -81,7 +81,12 @@ pub enum Effect {
     /// Apply a fixed setting choice with the panel preview rules.
     Choose(Setting, usize),
     /// Permanently remove a layer and its stroke history after confirmation.
-    RemoveLayer(usize),
+    RemoveLayer {
+        /// Layer captured when the confirmation opened.
+        index: usize,
+        /// Document captured when the confirmation opened.
+        epoch: u64,
+    },
     /// Exit after confirming unsaved changes.
     Quit,
     /// Continue an accepted source replacement.
@@ -89,7 +94,12 @@ pub enum Effect {
     /// Replace the document with a load accepted after intervening edits.
     OpenLoaded(Box<rthid_io::io::Outcome>),
     /// Write a session after any overwrite confirmation.
-    SaveSession(PathBuf),
+    SaveSession {
+        /// Destination captured when the confirmation opened.
+        dir: PathBuf,
+        /// Document captured when the confirmation opened.
+        epoch: u64,
+    },
     /// Request a source image relative to the supplied folder without closing the dialog.
     Open(PathBuf, PathBuf),
     /// Request the entries of a directory.

@@ -9,6 +9,7 @@ use crate::{
     viewport::{Viewport, Zoom},
 };
 use image::{DynamicImage, ImageBuffer, ImageFormat, Luma, RgbaImage};
+use ratatui::layout::Rect;
 use rthid_dither::{dither::PaletteColor, mass::MassOptions};
 use rthid_io::atomic;
 use serde::{Deserialize, Serialize};
@@ -42,11 +43,9 @@ impl ViewState {
         }
     }
 
-    /// Captures document preview choices without terminal viewport preferences.
-    pub(crate) fn capture_unsaved(app: &App) -> Self {
-        let mut state = Self::capture(app);
-        state.viewport = Viewport::default();
-        state
+    /// Applies the same terminal and grid bounds as the live viewport.
+    pub(crate) fn clamp_viewport(&mut self, w: u32, h: u32, area: Rect) {
+        self.viewport.clamp(w, h, area);
     }
 
     /// Restores preview controls without changing brush controls.

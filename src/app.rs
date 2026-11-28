@@ -278,7 +278,10 @@ impl App {
                             Confirm::new(format!("Delete {}?", self.document.layers()[index].name))
                                 .detail("Its brush strokes and their undo history are lost.")
                                 .yes_label("delete"),
-                            Effect::RemoveLayer(index),
+                            Effect::RemoveLayer {
+                                index,
+                                epoch: self.document_epoch,
+                            },
                         );
                     }
                     KeyCode::Char('[' | ']') => {
@@ -454,7 +457,7 @@ impl App {
         SavedState {
             revision: self.document.revision(),
             settings: self.settings.clone(),
-            view: ViewState::capture_unsaved(self),
+            view: ViewState::capture(self),
             selected: self.document.selected(),
         }
     }
@@ -523,7 +526,10 @@ impl App {
                 ))
                 .detail("The existing session will be replaced.")
                 .yes_label("overwrite"),
-                Effect::SaveSession(dir),
+                Effect::SaveSession {
+                    dir,
+                    epoch: self.document_epoch,
+                },
             );
         } else {
             self.save_session(dir);
@@ -930,6 +936,16 @@ impl App {
         }
         let (w, h) = self.grid_size();
         self.viewport.clamp(w, h, area);
+        // Snapshots share the live clamp so a resize (or a grid-shrinking edit) never dirties.
+        if let Some(saved) = &mut self.saved {
+            saved.view.clamp_viewport(w, h, area);
+        }
+        for save in &mut self.saving {
+            save.state.view.clamp_viewport(w, h, area);
+        }
+        if let Some(request) = &mut self.open_request {
+            request.state.view.clamp_viewport(w, h, area);
+        }
     }
 
     fn refresh(&mut self, inset_mass: bool) {
@@ -1675,7 +1691,11 @@ impl App {
                 self.apply_setting(setting, self.settings.with_choice(setting, index));
             }
             Effect::Quit => self.quit = true,
-            Effect::RemoveLayer(index) => {
+            Effect::RemoveLayer { index, epoch } => {
+                if epoch != self.document_epoch {
+                    self.set_notice("layer delete skipped: another document was opened".into());
+                    return Ok(());
+                }
                 let row = self
                     .layers
                     .selected(self.document.layers().len())
@@ -1686,7 +1706,13 @@ impl App {
             }
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
             Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
-            Effect::SaveSession(dir) => self.save_session(dir),
+            Effect::SaveSession { dir, epoch } => {
+                if epoch != self.document_epoch {
+                    self.set_notice("save skipped: another document was opened".into());
+                    return Ok(());
+                }
+                self.save_session(dir);
+            }
             Effect::Open(path, dir) => self.request_open(path, Some(dir)),
             Effect::ListDir(path) => self.request_list(path),
             Effect::Notice(message) => {
@@ -2292,6 +2318,41 @@ mod tests {
     }
 
     #[test]
+    fn session_overwrite_confirmation_skips_after_another_document_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        let target = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source, RgbaImage::new(2, 3));
+        session::write(&target, snapshot(&app)).unwrap();
+        let manifest = std::fs::read(target.join("manifest.toml")).unwrap();
+
+        app.request_open("next.png".into(), None);
+        let open = done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "next.png".into(),
+                image: RgbaImage::new(4, 5),
+            })),
+        );
+        app.take_jobs();
+        ctrl(&mut app, 's');
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        app.complete(open);
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.take_jobs().is_empty());
+        assert_eq!(
+            std::fs::read(target.join("manifest.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            app.notice(),
+            Some("save skipped: another document was opened")
+        );
+    }
+
+    #[test]
     fn session_unsaved_quit_open_and_cancel_restore_the_dialog() {
         let mut app = App::builtin(RgbaImage::new(2, 3), None);
         app.settings.flip = true;
@@ -2343,7 +2404,7 @@ mod tests {
         app.viewport.x = 200;
         app.viewport.y = 300;
         app.sync(Rect::new(0, 0, 8, 4));
-        assert!(!app.modified());
+        assert!(app.modified());
         app.record_saved();
         app.document.add_layer("One".into());
         app.record_saved();
@@ -2353,6 +2414,92 @@ mod tests {
         app.document.set_visible(0, false);
         assert!(!app.document.undo(0));
         assert!(app.modified());
+    }
+
+    #[test]
+    fn session_viewport_changes_require_quit_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.save_session(temp.path().join("photo.rthid"));
+        run_session_job(&mut app);
+        assert_eq!(app.viewport.zoom, Zoom::Fit);
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+    }
+
+    // A clean session panned to the far corner of a small terminal.
+    fn panned_clean_app() -> App {
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = Zoom::In(1);
+        app.viewport.x = 100;
+        app.viewport.y = 100;
+        app.sync(Rect::new(0, 0, 20, 10));
+        app.record_saved();
+        app
+    }
+
+    // Grows the terminal the way the event loop does: clamp on resize, then sync.
+    fn grow_terminal(app: &mut App) {
+        let resized = Rect::new(0, 0, 100, 50);
+        app.clamp_viewport(resized);
+        app.sync(resized);
+    }
+
+    #[test]
+    fn terminal_resize_reclamp_does_not_modify_session() {
+        let mut app = panned_clean_app();
+
+        grow_terminal(&mut app);
+
+        assert_eq!((app.viewport.x, app.viewport.y), (20, 20));
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn terminal_resize_during_session_save_stays_clean_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut app = panned_clean_app();
+        app.save_session(dir.clone());
+        let tag = app.take_jobs().pop().unwrap().1;
+
+        grow_terminal(&mut app);
+        app.complete(session_completion(tag, &dir, true));
+
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn terminal_resize_during_open_does_not_ask_to_discard_edits() {
+        let mut app = panned_clean_app();
+        app.request_open("next.png".into(), None);
+        app.take_jobs();
+
+        grow_terminal(&mut app);
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "next.png".into(),
+                image: RgbaImage::new(4, 5),
+            })),
+        ));
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.source_path(), Some(Path::new("next.png")));
+    }
+
+    #[test]
+    fn terminal_resize_rebases_pan_while_viewport_change_is_pending() {
+        let mut app = panned_clean_app();
+        press(&mut app, KeyCode::Char('m'));
+
+        grow_terminal(&mut app);
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(!app.modified());
     }
 
     #[test]
@@ -3261,6 +3408,37 @@ mod tests {
                 assert!(app.document.can_undo(1));
             }
         }
+    }
+
+    #[test]
+    fn layer_delete_confirmation_skips_after_another_document_opens() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.document.add_layer("Old".into());
+        app.record_saved();
+        let mut next = snapshot(&app);
+        next.source_path = "next.png".into();
+        next.document.add_layer("New".into());
+
+        app.request_open("next.rthid".into(), None);
+        app.take_jobs();
+        app.focus = Focus::Layers;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        app.complete(done(
+            &app,
+            IoOutcome::Loaded(Ok(rthid_io::io::Output {
+                path: "next.rthid".into(),
+                value: Box::new(next),
+            })),
+        ));
+        let layers = app.document.layers().len();
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(app.document.layers().len(), layers);
+        assert_eq!(
+            app.notice(),
+            Some("layer delete skipped: another document was opened")
+        );
     }
 
     #[test]
