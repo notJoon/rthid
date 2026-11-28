@@ -27,9 +27,8 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         "Parameters",
         &[
             ListPicker::MOVE,
-            Hint::new("Left/h", "change / collapse group"),
-            Hint::new("Right/l", "change / expand group"),
-            Hint::new("Enter", "new seed / toggle group"),
+            Hint::new("Left/Right h/l", "change/close/open"),
+            Hint::new("Enter", "new seed/toggle"),
             Hint::new("d", "reset"),
         ],
     ),
@@ -45,23 +44,23 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         ],
     ),
     (
-        "Files",
-        &[
-            Hint::new("o", "open"),
-            Hint::new("P", "presets"),
-            Hint::new("T", "templates"),
-        ],
-    ),
-];
-
-const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
-    (
         "Image",
         &[
             Hint::new("Space", "original/dithered"),
             Hint::new("a", "mass study"),
             Hint::new("r/R", "rotate"),
             Hint::new("f", "flip"),
+        ],
+    ),
+];
+
+const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
+    (
+        "Files",
+        &[
+            Hint::new("o", "open"),
+            Hint::new("P", "presets"),
+            Hint::new("T", "templates"),
         ],
     ),
     (
@@ -392,36 +391,42 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     }
 }
 
-fn draw_key_help(frame: &mut Frame, layout: &Layout) {
-    let left = KeyHelp {
+const KEY_HELP: (KeyHelp, KeyHelp) = (
+    KeyHelp {
         sections: KEY_HELP_LEFT,
-    };
-    let right = KeyHelp {
+    },
+    KeyHelp {
         sections: KEY_HELP_RIGHT,
-    };
-    let left_size = left.size();
-    let right_size = right.size();
-    let gap = 3;
-    let dialog = Dialog {
-        title: "Keys",
-        min_width: 28,
-    };
+    },
+);
+const KEY_HELP_GAP: u16 = 3;
+const KEY_HELP_DIALOG: Dialog = Dialog {
+    title: "Keys",
+    min_width: 28,
+};
+
+fn key_help_area(layout: &Layout) -> Rect {
+    let (left, right) = (KEY_HELP.0.size(), KEY_HELP.1.size());
     let body = Rect {
         height: layout.help.y.saturating_sub(layout.screen.y),
         ..layout.screen
     };
-    let area = dialog.area(
+    KEY_HELP_DIALOG.area(
         layout.preview,
         body,
         (
-            left_size.0.saturating_add(gap).saturating_add(right_size.0),
-            left_size.1.max(right_size.1),
+            left.0.saturating_add(KEY_HELP_GAP).saturating_add(right.0),
+            left.1.max(right.1),
         ),
-    );
-    let inner = dialog.render(area, frame.buffer_mut());
+    )
+}
+
+fn draw_key_help(frame: &mut Frame, layout: &Layout) {
+    let (left, right) = KEY_HELP;
+    let inner = KEY_HELP_DIALOG.render(key_help_area(layout), frame.buffer_mut());
     let content = inner.inner(Margin::new(1, 0));
     left.render(content, frame.buffer_mut());
-    let right_offset = left_size.0.saturating_add(gap);
+    let right_offset = left.size().0.saturating_add(KEY_HELP_GAP);
     // ponytail: below 71 columns the right column clips; add a one-column reflow if needed.
     if content.width > right_offset {
         right.render(
@@ -1214,32 +1219,53 @@ mod tests {
         assert!(app.notice().is_none());
     }
 
-    #[test]
-    fn key_overlay_fits_every_reference_row_at_80_by_24() {
+    fn key_overlay_rows(width: u16, height: u16) -> Vec<String> {
         let app = hint_fixture(HintState::Keys);
         let mut renderer = Renderer::default();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let text: Vec<char> = draw_text(&mut terminal, &app, &mut renderer)
-            .chars()
-            .collect();
-        let rows: Vec<String> = text.chunks(80).map(|row| row.iter().collect()).collect();
-        for sections in [KEY_HELP_LEFT, KEY_HELP_RIGHT] {
-            for &(section, hints) in sections {
-                assert!(
-                    rows.iter().any(|row| row.contains(section)),
-                    "missing section: {section}"
-                );
-                for hint in hints {
-                    assert!(
-                        rows.iter()
-                            .any(|row| row.contains(hint.key) && row.contains(hint.label)),
-                        "missing row: {}  {}",
-                        hint.key,
-                        hint.label
-                    );
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        draw_text(&mut terminal, &app, &mut renderer);
+        let inner = Block::bordered().inner(key_help_area(&layout(Rect::new(0, 0, width, height))));
+        let buffer = terminal.backend().buffer();
+        inner
+            .rows()
+            .map(|row| {
+                row.columns()
+                    .map(|column| buffer[(column.x, row.y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Returns the first section or `key  label` row the overlay does not show in full.
+    fn key_overlay_missing(width: u16, height: u16) -> Option<String> {
+        let rows = key_overlay_rows(width, height);
+        let has = |key: &str, label: &str| {
+            rows.iter().any(|row| {
+                row.find(key)
+                    .is_some_and(|start| row[start + key.len()..].contains(label))
+            })
+        };
+        [KEY_HELP_LEFT, KEY_HELP_RIGHT]
+            .into_iter()
+            .flatten()
+            .find_map(|&(section, hints)| {
+                if !rows.iter().any(|row| row.contains(section)) {
+                    return Some(section.to_string());
                 }
-            }
-        }
+                hints
+                    .iter()
+                    .find(|hint| !has(hint.key, hint.label))
+                    .map(|hint| format!("{}  {}", hint.key, hint.label))
+            })
+    }
+
+    #[test]
+    fn key_overlay_fits_every_reference_row_at_71_by_23() {
+        assert_eq!(key_overlay_missing(71, 23), None);
+        assert!(key_overlay_missing(70, 23).is_some());
+        assert!(key_overlay_missing(71, 22).is_some());
+        assert_eq!(key_overlay_missing(80, 23), None);
+        assert_eq!(key_overlay_missing(80, 24), None);
     }
 
     #[test]
