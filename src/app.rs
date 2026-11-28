@@ -786,14 +786,17 @@ impl App {
     }
 
     /// Ends a layer reorder when an unrelated terminal event arrives.
-    pub(crate) fn end_layer_drag(&mut self) {
-        if let Some(drag) = self.layer_drag.take()
-            && drag.moved
-        {
-            self.edits.discard_if_unchanged();
-            // Drag hits follow row positions, so only later clicks see a stale layout.
-            self.panel.invalidate();
+    ///
+    /// Returns whether the drag moved a layer, which needs a redraw before the
+    /// panel accepts clicks again.
+    pub(crate) fn end_layer_drag(&mut self) -> bool {
+        if !self.layer_drag.take().is_some_and(|drag| drag.moved) {
+            return false;
         }
+        self.edits.discard_if_unchanged();
+        // Drag hits follow row positions, so only later clicks see a stale layout.
+        self.panel.invalidate();
+        true
     }
 
     /// Routes mouse input and reports whether the display needs redrawing.
@@ -813,7 +816,13 @@ impl App {
                 self.select_layer(drag.index, true);
                 ended = true;
             }
-            self.end_layer_drag();
+            let moved = self.end_layer_drag();
+            if moved && mouse.kind != MouseEventKind::Up(MouseButton::Left) {
+                // A lost release: handle this event too, and redraw for the reorder.
+                self.handle_mouse(mouse, geometry, screen);
+                return true;
+            }
+            ended |= moved;
         }
         if ended {
             return true;
@@ -1573,13 +1582,14 @@ mod tests {
         let drag = MouseEventKind::Drag(MouseButton::Left);
         app.mouse_at(drag, x, top + 1, &geometry, screen);
         app.mouse_at(drag, x, top + 2, &geometry, screen);
-        app.mouse_at(
+        // The release after a moved drag redraws so the panel accepts clicks again.
+        assert!(app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
             x,
             top + 2,
             &geometry,
             screen,
-        );
+        ));
         assert!(app.layer_drag.is_none());
         assert_eq!(app.edits.revision(), revision + 2);
         assert_eq!(app.edits.current().layers()[0].name, "Layer 3");
@@ -3901,6 +3911,28 @@ mod tests {
             ));
             assert!(app.last_drag.is_none());
         }
+    }
+
+    #[test]
+    fn event_ending_a_moved_layer_drag_is_still_handled() {
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.settings = Settings::for_pixels(120, 120);
+        app.refresh(false);
+        let area = Rect::new(2, 3, 48, 18);
+        app.viewport.zoom = Zoom::In(1);
+        app.layer_drag = Some(LayerDrag {
+            index: 0,
+            moved: true,
+            toggle: false,
+        });
+        let y = app.viewport.y;
+        assert!(app.handle_mouse(
+            mouse_event(MouseEventKind::ScrollDown, 13, 12),
+            &app.geometry(area),
+            test_layout().screen,
+        ));
+        assert!(app.layer_drag.is_none());
+        assert_ne!(app.viewport.y, y);
     }
 
     #[test]
