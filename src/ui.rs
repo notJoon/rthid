@@ -13,19 +13,23 @@ use crate::{
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Margin, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, TextInput, hint_line};
+use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Outline, Row, TextInput, hint_line};
 
-use crate::{app::App, settings::Setting};
+use crate::{
+    app::App,
+    settings::{GROUP_LENS, GROUPS, Setting},
+};
 
 const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
     (
         "Parameters",
         &[
             ListPicker::MOVE,
-            Hint::new("Left/Right h/l", "change"),
-            Hint::new("Enter", "new seed"),
+            Hint::new("Left/h", "change / collapse group"),
+            Hint::new("Right/l", "change / expand group"),
+            Hint::new("Enter", "new seed / toggle group"),
             Hint::new("d", "reset"),
         ],
     ),
@@ -41,23 +45,23 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         ],
     ),
     (
-        "Image",
+        "Files",
         &[
-            Hint::new("Space", "original/dithered"),
-            Hint::new("a", "mass study"),
-            Hint::new("r/R", "rotate"),
-            Hint::new("f", "flip"),
+            Hint::new("o", "open"),
+            Hint::new("P", "presets"),
+            Hint::new("T", "templates"),
         ],
     ),
 ];
 
 const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
     (
-        "Files",
+        "Image",
         &[
-            Hint::new("o", "open"),
-            Hint::new("P", "presets"),
-            Hint::new("T", "templates"),
+            Hint::new("Space", "original/dithered"),
+            Hint::new("a", "mass study"),
+            Hint::new("r/R", "rotate"),
+            Hint::new("f", "flip"),
         ],
     ),
     (
@@ -107,8 +111,9 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     if let Some(modal) = &app.modal {
         return modal.hints(&app.modal_ctx());
     }
-    let selected = app.selected_setting();
-    let reset = app.settings.with_default(selected, &app.library.palettes) != app.settings;
+    let reset = app
+        .selected_setting()
+        .is_some_and(|setting| app.settings.is_changed(setting, &app.library.palettes));
     let image = app.source_path().is_some();
     let overflowing = geometry.overflows();
     let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
@@ -146,32 +151,50 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
             ]
         };
     }
-    [
-        Some(ListPicker::MOVE),
-        selected
-            .is_active(&app.settings)
-            .then_some(Hint::new("Left/Right h/l", "change")),
-        app.settings
-            .can_reseed(selected)
-            .then_some(Hint::new("Enter", "new seed")),
-        reset.then_some(Hint::new("d", "reset")),
-        Some(Hint::new("Tab", "preview")),
-        Some(Hint::new("q", "quit")),
-        Some(Hint::new("o", "open")),
-        image.then_some(Hint::new("Space", "original/dithered")),
-        image.then_some(Hint::new("a", "mass study")),
-        image.then(|| zoom_hint(app, geometry)).flatten(),
-        (image && zoomed).then_some(Hint::new("0", "fit")),
-        (image && overflowing).then_some(Hint::new("m", "map")),
-        (image && mass_map).then_some(Hint::new("M", "mass map")),
-        Some(Hint::new("P", "presets")),
-        Some(Hint::new("T", "templates")),
-        image.then_some(Hint::new("r/R", "rotate")),
-        image.then_some(Hint::new("f", "flip")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    let mut result = vec![ListPicker::MOVE];
+    match app.panel.selected(&GROUP_LENS) {
+        Some(Row::Header(group)) => {
+            result.push(if app.panel.is_collapsed(group) {
+                Outline::EXPAND
+            } else {
+                Outline::COLLAPSE
+            });
+            result.push(Outline::TOGGLE);
+        }
+        Some(Row::Item(i)) => {
+            let setting = Setting::ALL[i];
+            if setting.is_active(&app.settings) {
+                result.push(Hint::new("Left/Right h/l", "change"));
+                if app.settings.can_reseed(setting) {
+                    result.push(Hint::new("Enter", "new seed"));
+                }
+                if reset {
+                    result.push(Hint::new("d", "reset"));
+                }
+            }
+        }
+        None => {}
+    }
+    result.extend(
+        [
+            Some(Hint::new("Tab", "preview")),
+            Some(Hint::new("q", "quit")),
+            Some(Hint::new("o", "open")),
+            image.then_some(Hint::new("Space", "original/dithered")),
+            image.then_some(Hint::new("a", "mass study")),
+            image.then(|| zoom_hint(app, geometry)).flatten(),
+            (image && zoomed).then_some(Hint::new("0", "fit")),
+            (image && overflowing).then_some(Hint::new("m", "map")),
+            (image && mass_map).then_some(Hint::new("M", "mass map")),
+            Some(Hint::new("P", "presets")),
+            Some(Hint::new("T", "templates")),
+            image.then_some(Hint::new("r/R", "rotate")),
+            image.then_some(Hint::new("f", "flip")),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    result
 }
 
 fn more_hint(app: &App) -> Option<Hint> {
@@ -304,20 +327,47 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
-    let labels = Setting::ALL.map(|setting| {
-        let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
-        if setting.is_active(&app.settings) {
-            label
-        } else {
-            label.style(Style::default().fg(Color::DarkGray))
+    let mut first = 0;
+    let groups = GROUPS.iter().enumerate().map(|(group, &(title, len))| {
+        let settings = &Setting::ALL[first..first + len];
+        first += len;
+        if !app.panel.is_collapsed(group) {
+            let items = settings
+                .iter()
+                .map(|&setting| {
+                    let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
+                    if setting.is_active(&app.settings) {
+                        label
+                    } else {
+                        label.style(Style::default().fg(Color::DarkGray))
+                    }
+                })
+                .collect();
+            return (Line::raw(title), items);
         }
+        let changed = settings
+            .iter()
+            .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
+            .count();
+        let title = if changed > 0 {
+            Line::from(vec![
+                Span::raw(title),
+                Span::styled(
+                    format!("  {changed} changed"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        } else {
+            Line::raw(title)
+        };
+        (title, Vec::new())
     });
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
     let highlight = Style::default().fg(Color::Black).bg(Color::Cyan);
     app.panel.render(
-        labels,
+        groups,
         Some(block),
         highlight,
         layout.panel,
@@ -735,7 +785,7 @@ mod tests {
         Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         crossterm::{
-            event::{KeyCode, MouseButton, MouseEventKind},
+            event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
             style::Colored,
         },
     };
@@ -785,6 +835,10 @@ mod tests {
         OverflowPreview,
         Seed,
         SeedPreview,
+        Header,
+        CollapsedHeader,
+        DiffusionSkip,
+        InactiveRow,
         Keys,
         OpenFile,
         Presets,
@@ -819,12 +873,13 @@ mod tests {
         };
         let row = |setting| Setting::ALL.iter().position(|s| *s == setting).unwrap();
         match state {
-            HintState::EmptyPanel => app.panel.select(row(Setting::Zoom)),
+            HintState::EmptyPanel => app.panel.select(Row::Item(row(Setting::Zoom)), &GROUP_LENS),
             HintState::EmptyPreview | HintState::FitPreview | HintState::SmallFitPreview => {
                 app.preview_focus = true
             }
             HintState::FitPanel => {
-                app.panel.select(row(Setting::Brightness));
+                app.panel
+                    .select(Row::Item(row(Setting::Brightness)), &GROUP_LENS);
                 app.settings.tone.brightness = 0.1;
             }
             HintState::OverflowPreview => {
@@ -832,11 +887,25 @@ mod tests {
                 app.viewport.zoom = viewport::Zoom::In(1);
             }
             HintState::Seed | HintState::SeedPreview => {
-                app.panel.select(row(Setting::Seed));
+                app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS);
                 app.settings.dither = Dither::Noise;
                 app.settings.seed = 7;
                 app.preview_focus = matches!(state, HintState::SeedPreview);
             }
+            HintState::Header | HintState::CollapsedHeader => {
+                app.panel.select(Row::Header(1), &GROUP_LENS);
+                if matches!(state, HintState::CollapsedHeader) {
+                    app.panel.handle_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &GROUP_LENS,
+                    );
+                }
+            }
+            HintState::DiffusionSkip => {
+                app.panel
+                    .select(Row::Item(row(Setting::Serpentine)), &GROUP_LENS);
+            }
+            HintState::InactiveRow => app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS),
             HintState::Keys => app.keys_open = true,
             HintState::OpenFile => {
                 app.modal = Some(Modal::open_file("/images".into(), 1));
@@ -963,6 +1032,10 @@ mod tests {
         HintState::OverflowPreview,
         HintState::Seed,
         HintState::SeedPreview,
+        HintState::Header,
+        HintState::CollapsedHeader,
+        HintState::DiffusionSkip,
+        HintState::InactiveRow,
         HintState::Keys,
         HintState::OpenFile,
         HintState::Presets,
@@ -1091,7 +1164,10 @@ mod tests {
                 let allowed = match key.code {
                     // Enter also rerolls an active Noise seed while preview has focus.
                     KeyCode::Enter => {
-                        app.preview_focus && app.settings.can_reseed(app.selected_setting())
+                        app.preview_focus
+                            && app
+                                .selected_setting()
+                                .is_some_and(|setting| app.settings.can_reseed(setting))
                     }
                     // = is the unshifted alias for the advertised + zoom binding.
                     KeyCode::Char('=') => true,
@@ -1918,6 +1994,23 @@ mod tests {
                 .unwrap();
         }
     }
+
+    #[test]
+    fn collapsed_group_shows_changed_count_and_hides_items() {
+        let mut renderer = Renderer::default();
+        let mut app = App::empty();
+        app.settings.tone.brightness = 0.1;
+        app.settings.tone.contrast = 0.1;
+        app.panel.select(Row::Header(2), &GROUP_LENS);
+        app.panel.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &GROUP_LENS,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(text.contains("▸ Tone  2 changed"), "{text}");
+        assert!(!text.contains("Brightness:"), "{text}");
+    }
     #[test]
     fn open_dialog_keeps_path_above_scrolled_entries() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1971,7 +2064,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
-        for _ in 0..14 {
+        for _ in 0..15 {
             app.handle_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                 &app.geometry(layout(terminal.size().unwrap()).preview),
@@ -1982,17 +2075,25 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(14));
-        assert_eq!(app.panel.offset(), 12);
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(14)));
+        let panel = layout(terminal.size().unwrap()).panel;
+        let first_panel_row = |terminal: &Terminal<TestBackend>| {
+            (panel.x + 1..panel.right() - 1)
+                .map(|x| terminal.backend().buffer()[(x, panel.y + 1)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(first_panel_row(&terminal), "▾ Tone");
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(Setting::ALL.len()), Some(13));
-        assert_eq!(app.panel.offset(), 12);
-        for label in ["Seed", "Brightness", "Contrast"] {
-            assert!(text.contains(label), "missing {label}");
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(13)));
+        assert_eq!(first_panel_row(&terminal), "▾ Tone");
+        for label in ["Tone", "Brightness", "Contrast"] {
+            assert!(text.contains(label), "missing {label}: {text}");
         }
     }
 
