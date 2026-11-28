@@ -18,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `key_hints(&[pairs])` -> `hint_line(&hints, None, width)` with `Hint` values
 - `Confirm::HINTS` -> `[Confirm::YES, Confirm::CANCEL]`
+- `picker.handle_mouse(mouse, block, area, len)` -> `picker.handle_mouse(mouse, len)` using the content area retained by `render`
 
 ## [0.2.0] - 2026-11-28
 

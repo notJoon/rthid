@@ -22,10 +22,10 @@ pub enum Row {
 
 /// Groups of items the caller owns, with headers that collapse independently.
 ///
-/// The selected visible row and retained scroll offset are managed by a
-/// [`ListPicker`]. Newly observed groups start expanded. As with `ListPicker`,
-/// collapsing near the end can leave blank rows until the cursor moves.
-/// Collapsed state follows group position (index), not group identity.
+/// The selected visible row, retained scroll offset, and last rendered content
+/// area are managed by a [`ListPicker`]. Newly observed groups start expanded.
+/// As with `ListPicker`, collapsing near the end can leave blank rows until the
+/// cursor moves. Collapsed state follows group position (index), not group identity.
 ///
 /// The cursor keeps its visible position when `lens` changes. After changing
 /// `lens`, call [`Outline::select`] with the row to keep. The item counts passed
@@ -169,21 +169,16 @@ impl Outline {
         }
     }
 
-    /// Handles mouse input inside `area` for the rows described by `lens`.
+    /// Handles mouse input inside the content area remembered by the last render.
     ///
     /// A left click on a header selects and toggles it. Item clicks and wheel
     /// movement match [`ListPicker::handle_mouse`], with item submissions
-    /// returned as flat item indices. Clicks on a block border are ignored.
-    pub fn handle_mouse(
-        &mut self,
-        mouse: MouseEvent,
-        block: Option<&Block<'_>>,
-        area: Rect,
-        lens: &[usize],
-    ) -> Outcome<usize> {
+    /// returned as flat item indices. Before the first render and outside the
+    /// remembered area, input is ignored.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, lens: &[usize]) -> Outcome<usize> {
         self.resize(lens);
         let rows = self.rows(lens);
-        let outcome = self.picker.handle_mouse(mouse, block, area, rows.len());
+        let outcome = self.picker.handle_mouse(mouse, rows.len());
         // ListPicker has selected the clicked row; a header toggles on the first click.
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && outcome != Outcome::Ignored
@@ -459,42 +454,27 @@ mod tests {
             &mut Buffer::empty(area),
         );
         let border = mouse(MouseEventKind::Down(MouseButton::Left), 3, 3);
-        assert_eq!(
-            outline.handle_mouse(border, Some(&block), area, &lens),
-            Outcome::Ignored
-        );
+        assert_eq!(outline.handle_mouse(border, &lens), Outcome::Ignored);
         let selected_header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 4);
         assert_eq!(
-            outline.handle_mouse(selected_header, Some(&block), area, &lens),
+            outline.handle_mouse(selected_header, &lens),
             Outcome::Consumed
         );
         assert!(outline.is_collapsed(0));
         assert_eq!(
-            outline.handle_mouse(selected_header, Some(&block), area, &lens),
+            outline.handle_mouse(selected_header, &lens),
             Outcome::Consumed
         );
         assert!(!outline.is_collapsed(0));
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 6);
-        assert_eq!(
-            outline.handle_mouse(header, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(header, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
         assert!(outline.is_collapsed(1));
-        let item = mouse(MouseEventKind::Down(MouseButton::Left), 3, 5);
-        assert_eq!(
-            outline.handle_mouse(item, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
-        assert_eq!(
-            outline.handle_mouse(item, Some(&block), area, &lens),
-            Outcome::Submit(0)
-        );
+        let item = mouse(MouseEventKind::Down(MouseButton::Left), area.right() - 2, 5);
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Consumed);
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Submit(0));
         let wheel = mouse(MouseEventKind::ScrollDown, 3, 4);
-        assert_eq!(
-            outline.handle_mouse(wheel, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(wheel, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
     }
 
@@ -605,19 +585,13 @@ mod tests {
         assert_eq!(buf[(0, 1)].symbol(), "▾");
 
         let item = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
-        assert_eq!(
-            outline.handle_mouse(item, None, area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Item(2)));
         outline.render(groups(), None, Style::default(), area, &mut buf);
         assert_eq!(buf[(2, 0)].symbol(), "c");
 
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 0, 1);
-        assert_eq!(
-            outline.handle_mouse(header, None, area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(header, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
         assert!(outline.is_collapsed(1));
     }

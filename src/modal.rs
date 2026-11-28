@@ -616,14 +616,11 @@ impl Modal {
     }
 
     /// Routes list mouse outcomes through the same actions as keyboard input.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &ModalLayout, ctx: Ctx<'_>) -> Step {
-        let Some(area) = layout.list else {
-            return Step::stay();
-        };
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, ctx: Ctx<'_>) -> Step {
         let rows = self.rows(&ctx);
         let outcome = match self {
             Self::OpenFile(picker) => {
-                let outcome = picker.list.handle_mouse(mouse, None, area, rows);
+                let outcome = picker.list.handle_mouse(mouse, rows);
                 if matches!(outcome, Outcome::Consumed | Outcome::Submit(_)) {
                     picker.typed = false;
                 }
@@ -632,15 +629,13 @@ impl Modal {
             Self::Presets {
                 list,
                 confirm: None,
-            } => list.handle_mouse(mouse, None, area, rows),
+            } => list.handle_mouse(mouse, rows),
             Self::Templates {
                 list,
                 prompt: None,
                 confirm: None,
-            } => list.handle_mouse(mouse, None, area, rows),
-            Self::Editor(editor) if editor.input.is_none() => {
-                editor.rows.handle_mouse(mouse, None, area, rows)
-            }
+            } => list.handle_mouse(mouse, rows),
+            Self::Editor(editor) if editor.input.is_none() => editor.rows.handle_mouse(mouse, rows),
             _ => return Step::stay(),
         };
         match outcome {
@@ -1031,42 +1026,38 @@ mod tests {
             &context(),
         );
         let area = layout.list.unwrap();
-        let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), area, row);
-        assert!(
-            modal
-                .handle_mouse(click(1), &layout, context())
-                .effect
-                .is_none()
+        let Modal::OpenFile(picker) = &modal else {
+            unreachable!()
+        };
+        picker.list.render(
+            picker.entries.iter().map(|entry| Line::raw(&entry.name)),
+            None,
+            Style::default(),
+            area,
+            &mut ratatui::buffer::Buffer::empty(area),
         );
+        let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), area, row);
+        assert!(modal.handle_mouse(click(1), context()).effect.is_none());
         assert!(
             matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(1) && !p.typed)
         );
-        let step = modal.handle_mouse(click(1), &layout, context());
+        let step = modal.handle_mouse(click(1), context());
         assert!(
             matches!(step.effect, Some(Effect::Open(path, dir)) if path == std::path::Path::new("photo.png") && dir == std::path::Path::new("/images"))
         );
-        modal.handle_mouse(mouse(MouseEventKind::ScrollUp, area, 0), &layout, context());
+        modal.handle_mouse(mouse(MouseEventKind::ScrollUp, area, 0), context());
         assert!(
             matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(0))
         );
         assert!(
-            matches!(modal.handle_mouse(click(0), &layout, context()).effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
+            matches!(modal.handle_mouse(click(0), context()).effect, Some(Effect::ListDir(path)) if path == std::path::Path::new("/images/album"))
         );
-        modal.handle_mouse(
-            mouse(MouseEventKind::ScrollDown, area, 0),
-            &layout,
-            context(),
-        );
+        modal.handle_mouse(mouse(MouseEventKind::ScrollDown, area, 0), context());
         assert!(
             matches!(&modal, Modal::OpenFile(p) if p.list.selected(p.entries.len()) == Some(1))
         );
         let outside = mouse(MouseEventKind::Down(MouseButton::Left), layout.dialog, 0);
-        assert!(
-            modal
-                .handle_mouse(outside, &layout, context())
-                .effect
-                .is_none()
-        );
+        assert!(modal.handle_mouse(outside, context()).effect.is_none());
     }
 
     #[test]
@@ -1082,18 +1073,20 @@ mod tests {
             Rect::new(0, 0, 100, 30),
             &context(),
         );
-        let click = mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            layout.list.unwrap(),
-            1,
+        let area = layout.list.unwrap();
+        let Modal::Presets { list, .. } = &modal else {
+            unreachable!()
+        };
+        list.render(
+            (0..palettes.len()).map(|_| Line::default()),
+            None,
+            Style::default(),
+            area,
+            &mut ratatui::buffer::Buffer::empty(area),
         );
-        assert!(
-            modal
-                .handle_mouse(click, &layout, context())
-                .effect
-                .is_none()
-        );
-        let step = modal.handle_mouse(click, &layout, context());
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), area, 1);
+        assert!(modal.handle_mouse(click, context()).effect.is_none());
+        let step = modal.handle_mouse(click, context());
         assert!(matches!(step.next, Next::Close));
         assert!(
             matches!(step.effect, Some(Effect::Preview(s)) if s == settings.with_preset(palettes.get(1).unwrap()))
@@ -1105,7 +1098,7 @@ mod tests {
             Confirm::new("Delete preset?"),
             OnYes::RemovePreset("Paper".into()),
         ));
-        let step = modal.handle_mouse(click, &layout, context());
+        let step = modal.handle_mouse(click, context());
         assert!(step.effect.is_none());
         assert!(matches!(step.next, Next::Stay));
         assert!(matches!(

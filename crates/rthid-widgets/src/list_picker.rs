@@ -15,10 +15,11 @@ use crate::{Hint, Outcome, outcome::is_release};
 
 /// Selection over a list of items the caller owns and passes in on each call.
 ///
-/// The picker stores only the selected index and the scroll offset of the
-/// last draw. The offset lives in a [`Cell`] so that drawing through `&self`
-/// still keeps the view from jumping between frames. Because the item count
-/// can change between calls, selection queries and drawing clamp to its current length.
+/// The picker stores the selected index, scroll offset, and content area of the
+/// last draw. The offset and area live in [`Cell`]s so that drawing through
+/// `&self` still keeps the view from jumping between frames and mouse input
+/// needs no repeated layout arguments. Because the item count can change
+/// between calls, selection queries and drawing clamp to its current length.
 ///
 /// # Examples
 ///
@@ -35,6 +36,7 @@ use crate::{Hint, Outcome, outcome::is_release};
 pub struct ListPicker {
     selected: usize,
     offset: Cell<usize>,
+    area: Cell<Rect>,
 }
 
 impl ListPicker {
@@ -81,6 +83,7 @@ impl ListPicker {
         Self {
             selected,
             offset: Cell::new(0),
+            area: Cell::new(Rect::ZERO),
         }
     }
 
@@ -150,47 +153,48 @@ impl ListPicker {
         len: usize,
     ) -> Option<usize> {
         let area = block.map_or(area, |block| block.inner(area));
-        if !area.contains(position) {
+        self.row_at(position, area, len)
+    }
+
+    fn row_at(&self, position: Position, content: Rect, len: usize) -> Option<usize> {
+        if !content.contains(position) {
             return None;
         }
         let index = self
             .offset
             .get()
-            .saturating_add(usize::from(position.y - area.y));
+            .saturating_add(usize::from(position.y - content.y));
         (index < len).then_some(index)
     }
 
     /// Selects a clicked item or submits it when already selected.
     ///
-    /// Pass the same block and outer area as drawing. Wheel events inside the
-    /// content area move one item. Borders and other events are ignored.
+    /// Uses the content area remembered by the last draw. Before the first draw,
+    /// clicks and wheel events are ignored. Wheel events inside the content area
+    /// move one item. Borders and other events are ignored.
     /// Clicking the selected item stands in for a double click in terminals.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ratatui::{layout::Rect, crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind}};
+    /// use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind}};
     /// use rthid_widgets::{ListPicker, Outcome};
     /// let mut picker = ListPicker::new(0);
+    /// let area = Rect::new(0, 0, 10, 3);
+    /// picker.render(["a", "b", "c"].map(Line::raw), None, Style::default(), area, &mut Buffer::empty(area));
     /// let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 1, modifiers: KeyModifiers::NONE };
-    /// assert_eq!(picker.handle_mouse(click, None, Rect::new(0, 0, 10, 3), 3), Outcome::Consumed);
-    /// assert_eq!(picker.handle_mouse(click, None, Rect::new(0, 0, 10, 3), 3), Outcome::Submit(1));
+    /// assert_eq!(picker.handle_mouse(click, 3), Outcome::Consumed);
+    /// assert_eq!(picker.handle_mouse(click, 3), Outcome::Submit(1));
     /// ```
-    pub fn handle_mouse(
-        &mut self,
-        mouse: MouseEvent,
-        block: Option<&Block<'_>>,
-        area: Rect,
-        len: usize,
-    ) -> Outcome<usize> {
-        let area = block.map_or(area, |block| block.inner(area));
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, len: usize) -> Outcome<usize> {
+        let area = self.area.get();
         let position = Position::new(mouse.column, mouse.row);
         if !area.contains(position) {
             return Outcome::Ignored;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(index) = self.index_at(position, None, area, len) else {
+                let Some(index) = self.row_at(position, area, len) else {
                     return Outcome::Ignored;
                 };
                 if Some(index) == self.selected(len) {
@@ -352,6 +356,8 @@ impl ListPicker {
         highlight_symbol: &'static str,
     ) {
         let items: Vec<_> = items.into_iter().collect();
+        self.area
+            .set(block.as_ref().map_or(area, |block| block.inner(area)));
         let selected = self.selected(items.len());
         let mut state = ListState::default()
             .with_selected(selected)
@@ -405,10 +411,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            picker.handle_mouse(mouse, Some(&block), area, 2),
-            Outcome::Ignored
-        );
+        assert_eq!(picker.handle_mouse(mouse, 2), Outcome::Ignored);
         assert_eq!(picker.selected(2), Some(1));
         mouse.row += 1;
         assert_eq!(
@@ -420,11 +423,20 @@ mod tests {
             ),
             Some(0)
         );
-        assert_eq!(
-            picker.handle_mouse(mouse, Some(&block), area, 2),
-            Outcome::Consumed
-        );
+        assert_eq!(picker.handle_mouse(mouse, 2), Outcome::Consumed);
         assert_eq!(picker.selected(2), Some(0));
+    }
+
+    #[test]
+    fn mouse_is_ignored_until_a_nonempty_area_is_rendered() {
+        let mut picker = ListPicker::new(0);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(picker.handle_mouse(click, 1), Outcome::Ignored);
     }
 
     #[test]
@@ -522,25 +534,22 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(picker.handle_mouse(mouse, None, area, 5), Outcome::Consumed);
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Consumed);
         assert_eq!(picker.selected(5), Some(2));
-        assert_eq!(
-            picker.handle_mouse(mouse, None, area, 5),
-            Outcome::Submit(2)
-        );
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Submit(2));
         mouse.kind = MouseEventKind::ScrollDown;
-        assert_eq!(picker.handle_mouse(mouse, None, area, 5), Outcome::Consumed);
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Consumed);
         assert_eq!(picker.selected(5), Some(3));
         mouse.kind = MouseEventKind::ScrollUp;
-        assert_eq!(picker.handle_mouse(mouse, None, area, 5), Outcome::Consumed);
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Consumed);
         assert_eq!(picker.selected(5), Some(2));
         mouse.column = 1;
-        assert_eq!(picker.handle_mouse(mouse, None, area, 5), Outcome::Ignored);
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Ignored);
         mouse.column = 2;
         mouse.row = 5;
         mouse.kind = MouseEventKind::Down(MouseButton::Left);
-        assert_eq!(picker.handle_mouse(mouse, None, area, 3), Outcome::Ignored);
-        assert_eq!(picker.handle_mouse(mouse, None, area, 0), Outcome::Ignored);
+        assert_eq!(picker.handle_mouse(mouse, 3), Outcome::Ignored);
+        assert_eq!(picker.handle_mouse(mouse, 0), Outcome::Ignored);
     }
 
     #[test]

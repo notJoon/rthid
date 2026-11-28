@@ -626,8 +626,7 @@ impl App {
             self.last_drag = None;
             let ctx = self.modal_ctx();
             let before = modal.selection(&ctx);
-            let layout = modal.layout(geometry.area, screen, &ctx);
-            let step = modal.handle_mouse(mouse, &layout, ctx);
+            let step = modal.handle_mouse(mouse, ctx);
             let changed = before != modal.selection(&self.modal_ctx())
                 || step.effect.is_some()
                 || !matches!(step.next, Next::Stay);
@@ -641,12 +640,7 @@ impl App {
             && !matches!(mouse.kind, MouseEventKind::Drag(_))
         {
             self.last_drag = None;
-            let outcome = self.panel.handle_mouse(
-                mouse,
-                Some(&ratatui::widgets::Block::bordered()),
-                panel,
-                &GROUP_LENS,
-            );
+            let outcome = self.panel.handle_mouse(mouse, &GROUP_LENS);
             let clicked = outcome != Outcome::Ignored
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
             if clicked {
@@ -2254,6 +2248,22 @@ mod tests {
         crate::ui::layout(Rect::new(0, 0, 41, 9))
     }
 
+    fn render_panel(app: &App, area: Rect) {
+        let groups = crate::settings::GROUPS.map(|(title, len)| {
+            (
+                ratatui::text::Line::raw(title),
+                vec![ratatui::text::Line::default(); len],
+            )
+        });
+        app.panel.render(
+            groups,
+            Some(ratatui::widgets::Block::bordered()),
+            ratatui::style::Style::default(),
+            area,
+            &mut ratatui::buffer::Buffer::empty(area),
+        );
+    }
+
     fn versions(app: &App) -> (u64, u64) {
         (
             app.grid_cache.grid.version(),
@@ -2779,6 +2789,7 @@ mod tests {
         let mut app = App::empty();
         let screen = Rect::new(0, 0, 80, 24);
         let layout = crate::ui::layout(screen);
+        render_panel(&app, layout.panel);
         let geometry = app.geometry(layout.preview);
         assert!(app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2792,6 +2803,7 @@ mod tests {
         let mut app = App::empty();
         app.settings.dither = Dither::Noise;
         app.settings.seed = 7;
+        render_panel(&app, layout.panel);
         let geometry = app.geometry(layout.preview);
         let seed_row = layout.panel.y + 15;
         for _ in 0..2 {
@@ -2811,6 +2823,7 @@ mod tests {
         app.refresh(false);
         app.viewport.zoom = Zoom::In(1);
         app.preview_focus = true;
+        render_panel(&app, layout.panel);
         let geometry = app.geometry(layout.preview);
         let viewport = (app.viewport.x, app.viewport.y);
         app.mouse_at(

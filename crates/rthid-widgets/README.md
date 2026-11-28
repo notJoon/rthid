@@ -66,7 +66,7 @@ open. Validate values on `Submit` before closing the component. An invalid value
 | Component | Purpose |
 | --- | --- |
 | `TextInput` | Single line text editing with a character limit and a cursor position for the caller |
-| `ListPicker` | Cursor over a list the caller owns, with scroll kept across frames |
+| `ListPicker` | Cursor over a caller-owned list, with retained scroll and mouse area |
 | `Outline` | Independently collapsible groups with a shared item indent and selection gutter |
 | `Confirm` | A yes or no question answered by y or any other key |
 | `Dialog` | Centered popup area with a cleared background and a border |
@@ -92,11 +92,12 @@ assert_eq!(picker.selected(0), None);
 `Outline::new(lens)` starts on the first item when the first group is non-empty,
 or on the first group header otherwise. Pass matching lengths to later calls.
 
-Pass the same block and outer area used by `render` to `index_at` and
-`handle_mouse`, with the block before the area. The picker computes the content
-area so borders do not select items. `selected_row(area, block, len)` returns the
-selected screen row using the last draw's offset, or `None` for an empty list or
-a selection outside the visible content area.
+Pass the same block and outer area used by `render` to `index_at`, with the block
+before the area. `handle_mouse(mouse, len)` uses the content area retained by the
+last render, so borders do not select items and input before the first render is
+ignored. `selected_row(area, block, len)` returns the selected screen row using
+the last draw's offset, or `None` for an empty list or a selection outside the
+visible content area.
 
 `ListPicker` returns `Ignored` for keys with Ctrl or Alt so the parent can handle
 shortcuts such as Ctrl+k. Shift is allowed. Releases are always consumed.
