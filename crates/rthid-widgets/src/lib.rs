@@ -65,6 +65,7 @@ mod dialog;
 mod hints;
 mod list_picker;
 mod outcome;
+mod outline;
 mod text_input;
 
 pub use confirm::Confirm;
@@ -72,4 +73,5 @@ pub use dialog::Dialog;
 pub use hints::{Hint, KeyHelp, hint_line};
 pub use list_picker::ListPicker;
 pub use outcome::Outcome;
+pub use outline::{Outline, Row};
 pub use text_input::TextInput;
