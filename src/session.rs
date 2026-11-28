@@ -228,6 +228,14 @@ pub(crate) fn is_saveable(path: &Path) -> bool {
             && only_save_leftovers(path).unwrap_or(false)
 }
 
+/// Whether `dir` would sit directly inside a session or a save's leftovers.
+pub(crate) fn nested(dir: &Path) -> bool {
+    resolve(dir)
+        .ok()
+        .and_then(|dir| dir.parent().map(is_saveable))
+        .unwrap_or(false)
+}
+
 /// Whether `dir` holds only the lock, generation files, and `atomic` temporaries.
 fn only_save_leftovers(dir: &Path) -> io::Result<bool> {
     for entry in fs::read_dir(dir)? {
@@ -473,16 +481,14 @@ fn generation_number(name: &str) -> Option<u64> {
     Some(number)
 }
 
-/// Routes a referenced source image back to its containing session.
+/// Routes a file inside a session directory back to that session.
 pub(crate) fn containing(path: &Path) -> Option<PathBuf> {
     let path = path.canonicalize().ok()?;
-    let dir = path.parent()?;
-    if !is_session(dir) {
+    if !path.is_file() {
         return None;
     }
-    let text = atomic::read_regular(&dir.join("manifest.toml")).ok()??;
-    let manifest: Manifest = toml::from_str(&text).ok()?;
-    (child(dir, &manifest.source).ok()? == path).then(|| dir.to_path_buf())
+    let dir = path.parent()?;
+    is_session(dir).then(|| dir.to_path_buf())
 }
 
 /// Writes the session, creating the directory if necessary.
