@@ -18,8 +18,8 @@ use ratatui::widgets::{Block, Paragraph};
 use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Row, TextInput, hint_line};
 
 use crate::{
-    app::App,
-    settings::{GROUP_LENS, GROUPS, Setting},
+    app::{App, PanelItem},
+    settings::{GROUPS, Setting},
 };
 
 const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
@@ -52,6 +52,17 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
             Hint::new("f", "flip"),
         ],
     ),
+    (
+        "Layers",
+        &[
+            Hint::new("n", "new layer"),
+            Hint::new("u/U", "undo/redo"),
+            Hint::new("Enter", "target"),
+            Hint::new("v", "show/hide"),
+            Hint::new("x", "delete"),
+            Hint::new("[/]", "move down/up"),
+        ],
+    ),
 ];
 
 const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
@@ -72,11 +83,14 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         ],
     ),
     (
-        "Mouse: preview",
+        "Mouse: panel/preview",
         &[
             Hint::new("minimap click/drag", "center view"),
             Hint::new("drag on preview", "move image"),
             Hint::new("wheel", "pan"),
+            Hint::new("layer click", "target"),
+            Hint::new("click on mark", "show/hide"),
+            Hint::new("layer drag", "reorder"),
         ],
     ),
     (
@@ -104,8 +118,45 @@ fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
 }
 
 fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
+    let mut result = main_hints(app, geometry);
+    if app.modal.is_none() && !app.keys_open && app.source_path().is_some() {
+        if let Some(Row::Item(item)) = app.panel.selected(&app.panel_lens())
+            && matches!(app.panel_row(item), PanelItem::Layer(_))
+        {
+            let at = usize::from(!app.preview_focus);
+            result.splice(
+                at..at,
+                [
+                    Hint::new("Enter", "target"),
+                    Hint::new("v", "show/hide"),
+                    Hint::new("x", "delete"),
+                    Hint::new("[ ]", "move"),
+                ],
+            );
+        }
+        result.push(Hint::new("n", "new layer"));
+        if app.edits.can_undo() {
+            result.push(Hint::new("u", "undo"));
+        }
+        if app.edits.can_redo() {
+            result.push(Hint::new("U", "redo"));
+        }
+    }
+    result
+}
+
+fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     if app.keys_open {
-        return vec![Hint::new("Esc/?", "close")];
+        let max = key_help_scroll_max(geometry.area.height);
+        let offset = app.keys_scroll.min(max);
+        let mut hints = vec![Hint::new("Esc/?", "close")];
+        if offset > 0 {
+            hints.push(Hint::new("Up/k", "scroll up"));
+        }
+        if offset < max {
+            hints.push(Hint::new("Down/j", "scroll down"));
+        }
+        return hints;
     }
     if let Some(modal) = &app.modal {
         return modal.hints(&app.modal_ctx());
@@ -151,11 +202,12 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         };
     }
     let mut result = vec![ListPicker::MOVE];
-    match app.panel.selected(&GROUP_LENS) {
-        Some(Row::Header(_)) => result.extend_from_slice(app.panel.hints(&GROUP_LENS)),
+    match app.panel.selected(&app.panel_lens()) {
+        Some(Row::Header(_)) => result.extend_from_slice(app.panel.hints(&app.panel_lens())),
         Some(Row::Item(i)) => {
-            let setting = Setting::ALL[i];
-            if setting.is_active(&app.settings) {
+            if let PanelItem::Setting(setting) = app.panel_row(i)
+                && setting.is_active(&app.settings)
+            {
                 result.push(Hint::new("Left/Right h/l", "change"));
                 if app.settings.can_reseed(setting) {
                     result.push(Hint::new("Enter", "new seed"));
@@ -308,6 +360,39 @@ pub fn log_minimap(
     log.flush()
 }
 
+fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
+    let doc = app.edits.current();
+    let dim = Style::default().fg(Color::DarkGray);
+    let title = if app.panel.is_collapsed(3) {
+        Line::from(vec![
+            Span::raw("Layers"),
+            Span::styled(format!("  {}", doc.layers().len()), dim),
+        ])
+    } else {
+        Line::raw("Layers")
+    };
+    let items = doc
+        .layers()
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, layer)| {
+            let line = Line::raw(format!(
+                "{} {}{}",
+                if layer.visible { "●" } else { "○" },
+                layer.name,
+                if doc.target() == Some(index) {
+                    " *"
+                } else {
+                    ""
+                }
+            ));
+            if layer.visible { line } else { line.style(dim) }
+        })
+        .collect();
+    (title, items)
+}
+
 /// Draws using a shared App borrow and retains the panel scroll offset.
 /// Expects App::sync to have run for this layout.
 pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Renderer) {
@@ -320,10 +405,14 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
     let mut first = 0;
-    let groups = GROUPS.iter().enumerate().map(|(group, &(title, len))| {
-        let settings = &Setting::ALL[first..first + len];
-        first += len;
-        if !app.panel.is_collapsed(group) {
+    let groups = GROUPS
+        .iter()
+        .enumerate()
+        .map(|(group, &(title, len))| {
+            let settings = &Setting::ALL[first..first + len];
+            first += len;
+            // Collapsed groups still pass their items so the rendered lens
+            // matches App::panel_lens and mouse input stays live.
             let items = settings
                 .iter()
                 .map(|&setting| {
@@ -335,25 +424,24 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
                     }
                 })
                 .collect();
-            return (Line::raw(title), items);
-        }
-        let changed = settings
-            .iter()
-            .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
-            .count();
-        let title = if changed > 0 {
-            Line::from(vec![
-                Span::raw(title),
-                Span::styled(
-                    format!("  {changed} changed"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        } else {
-            Line::raw(title)
-        };
-        (title, Vec::new())
-    });
+            let changed = settings
+                .iter()
+                .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
+                .count();
+            let title = if app.panel.is_collapsed(group) && changed > 0 {
+                Line::from(vec![
+                    Span::raw(title),
+                    Span::styled(
+                        format!("  {changed} changed"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            } else {
+                Line::raw(title)
+            };
+            (title, items)
+        })
+        .chain(std::iter::once(layer_group(app)));
     let block = Block::bordered()
         .title("Parameters")
         .border_style(focus_style(!app.preview_focus));
@@ -378,7 +466,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         layout.status,
     );
     if app.keys_open {
-        draw_key_help(frame, layout);
+        draw_key_help(frame, app, layout);
     } else if app.modal.is_some() {
         draw_modal(frame, app, layout);
     }
@@ -414,22 +502,50 @@ fn key_help_area(layout: &Layout) -> Rect {
     )
 }
 
-fn draw_key_help(frame: &mut Frame, layout: &Layout) {
+/// Maximum key reference offset for the available content height.
+pub(crate) fn key_help_scroll_max(height: u16) -> u16 {
+    KEY_HELP
+        .0
+        .size()
+        .1
+        .max(KEY_HELP.1.size().1)
+        .saturating_sub(height)
+}
+
+fn draw_key_help(frame: &mut Frame, app: &App, layout: &Layout) {
     let (left, right) = KEY_HELP;
-    let inner = KEY_HELP_DIALOG.render(key_help_area(layout), frame.buffer_mut());
+    let area = key_help_area(layout);
+    let inner = KEY_HELP_DIALOG.render(area, frame.buffer_mut());
     let content = inner.inner(Margin::new(1, 0));
-    left.render(content, frame.buffer_mut());
+    let height = left.size().1.max(right.size().1);
+    let max = key_help_scroll_max(content.height);
+    let offset = app.keys_scroll.min(max);
+    let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, content.width, height));
+    left.render(buffer.area, &mut buffer);
     let right_offset = left.size().0.saturating_add(KEY_HELP_GAP);
-    // ponytail: below 71 columns the right column clips; add a one-column reflow if needed.
     if content.width > right_offset {
         right.render(
-            Rect {
-                x: content.x + right_offset,
-                width: content.width - right_offset,
-                ..content
-            },
-            frame.buffer_mut(),
+            Rect::new(right_offset, 0, content.width - right_offset, height),
+            &mut buffer,
         );
+    }
+    for y in 0..content.height {
+        for x in 0..content.width {
+            frame.buffer_mut()[(content.x + x, content.y + y)] = buffer[(x, y + offset)].clone();
+        }
+    }
+    for (visible, y, label) in [
+        (offset > 0, area.y, "↑ more"),
+        (offset < max, area.bottom().saturating_sub(1), "↓ more"),
+    ] {
+        if visible && area.width >= 8 && area.height > 0 {
+            frame.buffer_mut().set_string(
+                area.right() - 8,
+                y,
+                label,
+                Style::default().fg(Color::DarkGray),
+            );
+        }
     }
 }
 
@@ -790,6 +906,57 @@ mod tests {
     use std::io::{self, BufWriter, Write};
 
     #[test]
+    fn layer_panel_renders_top_first_visibility_target_and_collapsed_count() {
+        let mut app = hint_fixture(HintState::Layer);
+        app.edits.edit(|doc| doc.set_visible(1, false));
+        let (_, items) = layer_group(&app);
+        assert_eq!(
+            items.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["● Layer 3", "○ Layer 2 *", "● Layer 1"]
+        );
+        assert_eq!(items[1].style.fg, Some(Color::DarkGray));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut renderer = Renderer::default();
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(text.contains("● Layer 3"));
+        assert!(text.contains("○ Layer 2 *"));
+        app.panel.select(Row::Header(3), &app.panel_lens());
+        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
+        let (title, _) = layer_group(&app);
+        assert_eq!(title.to_string(), "Layers  3");
+        assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(text.contains("Layers  3"));
+        assert!(!text.contains("Layer 2"));
+    }
+
+    #[test]
+    fn layer_hints_follow_source_history_row_and_modal_state() {
+        let mut app = hint_fixture(HintState::LayerRedo);
+        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40)).preview);
+        for preview in [false, true] {
+            app.preview_focus = preview;
+            let hints = hints(&app, &geometry);
+            for expected in [
+                Hint::new("n", "new layer"),
+                Hint::new("u", "undo"),
+                Hint::new("U", "redo"),
+                Hint::new("Enter", "target"),
+                Hint::new("v", "show/hide"),
+                Hint::new("x", "delete"),
+                Hint::new("[ ]", "move"),
+            ] {
+                assert!(hints.contains(&expected), "{expected:?}");
+            }
+        }
+        app.modal = Some(Modal::templates());
+        assert!(!hints(&app, &geometry).contains(&Hint::new("n", "new layer")));
+        let app = App::empty();
+        assert!(!hints(&app, &geometry).contains(&Hint::new("n", "new layer")));
+    }
+
+    #[test]
     fn ansi256_uses_nearest_cube_or_gray() {
         for (rgb, expected) in [
             ([0, 0, 0], 16),
@@ -828,6 +995,8 @@ mod tests {
         EmptyPanel,
         EmptyPreview,
         FitPanel,
+        Layer,
+        LayerRedo,
         FitPreview,
         SmallFitPreview,
         OverflowPreview,
@@ -871,13 +1040,29 @@ mod tests {
         };
         let row = |setting| Setting::ALL.iter().position(|s| *s == setting).unwrap();
         match state {
-            HintState::EmptyPanel => app.panel.select(Row::Item(row(Setting::Zoom)), &GROUP_LENS),
+            HintState::EmptyPanel => app
+                .panel
+                .select(Row::Item(row(Setting::Zoom)), &app.panel_lens()),
             HintState::EmptyPreview | HintState::FitPreview | HintState::SmallFitPreview => {
                 app.preview_focus = true
             }
+            HintState::Layer | HintState::LayerRedo => {
+                for _ in 0..3 {
+                    app.edits.edit(|doc| {
+                        doc.add_layer(format!("Layer {}", doc.layers().len() + 1));
+                    });
+                }
+                app.edits.select(Some(1));
+                if matches!(state, HintState::LayerRedo) {
+                    app.edits.edit(|doc| doc.set_visible(1, false));
+                    app.edits.undo();
+                }
+                app.panel
+                    .select(Row::Item(Setting::ALL.len() + 1), &app.panel_lens());
+            }
             HintState::FitPanel => {
                 app.panel
-                    .select(Row::Item(row(Setting::Brightness)), &GROUP_LENS);
+                    .select(Row::Item(row(Setting::Brightness)), &app.panel_lens());
                 app.settings.tone.brightness = 0.1;
             }
             HintState::OverflowPreview => {
@@ -885,25 +1070,28 @@ mod tests {
                 app.viewport.zoom = viewport::Zoom::In(1);
             }
             HintState::Seed | HintState::SeedPreview => {
-                app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS);
+                app.panel
+                    .select(Row::Item(row(Setting::Seed)), &app.panel_lens());
                 app.settings.dither = Dither::Noise;
                 app.settings.seed = 7;
                 app.preview_focus = matches!(state, HintState::SeedPreview);
             }
             HintState::Header | HintState::CollapsedHeader => {
-                app.panel.select(Row::Header(1), &GROUP_LENS);
+                app.panel.select(Row::Header(1), &app.panel_lens());
                 if matches!(state, HintState::CollapsedHeader) {
                     app.panel.handle_key(
                         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        &GROUP_LENS,
+                        &app.panel_lens(),
                     );
                 }
             }
             HintState::DiffusionSkip => {
                 app.panel
-                    .select(Row::Item(row(Setting::Serpentine)), &GROUP_LENS);
+                    .select(Row::Item(row(Setting::Serpentine)), &app.panel_lens());
             }
-            HintState::InactiveRow => app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS),
+            HintState::InactiveRow => app
+                .panel
+                .select(Row::Item(row(Setting::Seed)), &app.panel_lens()),
             HintState::Keys => app.keys_open = true,
             HintState::OpenFile => {
                 app.modal = Some(Modal::open_file("/images".into(), 1));
@@ -1025,6 +1213,8 @@ mod tests {
         HintState::EmptyPanel,
         HintState::EmptyPreview,
         HintState::FitPanel,
+        HintState::Layer,
+        HintState::LayerRedo,
         HintState::FitPreview,
         HintState::SmallFitPreview,
         HintState::OverflowPreview,
@@ -1167,6 +1357,8 @@ mod tests {
                                 .selected_setting()
                                 .is_some_and(|setting| app.settings.can_reseed(setting))
                     }
+                    KeyCode::Char('u') => !app.edits.can_undo(),
+                    KeyCode::Char('U') => !app.edits.can_redo(),
                     // = is the unshifted alias for the advertised + zoom binding.
                     KeyCode::Char('=') => true,
                     _ => false,
@@ -1253,12 +1445,65 @@ mod tests {
     }
 
     #[test]
-    fn key_overlay_fits_every_reference_row_at_71_by_23() {
-        assert_eq!(key_overlay_missing(71, 23), None);
-        assert!(key_overlay_missing(70, 23).is_some());
-        assert!(key_overlay_missing(71, 22).is_some());
-        assert_eq!(key_overlay_missing(80, 23), None);
-        assert_eq!(key_overlay_missing(80, 24), None);
+    fn key_overlay_fits_every_reference_row_at_71_by_31() {
+        assert_eq!(key_overlay_missing(71, 31), None);
+        assert!(key_overlay_missing(70, 31).is_some());
+        assert!(key_overlay_missing(71, 30).is_some());
+        assert_eq!(key_overlay_missing(80, 31), None);
+        assert_eq!(key_overlay_missing(80, 32), None);
+    }
+
+    #[test]
+    fn key_overlay_scroll_reaches_last_entry_at_80_by_24() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut app = hint_fixture(HintState::Keys);
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let geometry = app.geometry(layout(Rect::new(0, 0, 80, 24)).preview);
+        let before = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(before.contains("↓ more"));
+        assert!(!before.contains("↑ more"));
+        assert!(main_hints(&app, &geometry).contains(&Hint::new("Down/j", "scroll down")));
+        assert!(!main_hints(&app, &geometry).contains(&Hint::new("Up/k", "scroll up")));
+        for _ in 0..50 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &geometry);
+        }
+        let after = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(after.contains("move down/up"));
+        assert!(after.contains("↑ more"));
+        assert!(!after.contains("↓ more"));
+        assert!(!main_hints(&app, &geometry).contains(&Hint::new("Down/j", "scroll down")));
+        assert!(main_hints(&app, &geometry).contains(&Hint::new("Up/k", "scroll up")));
+        assert_eq!(app.keys_scroll, key_help_scroll_max(geometry.area.height));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &geometry);
+        assert_eq!(
+            app.keys_scroll,
+            key_help_scroll_max(geometry.area.height) - 1
+        );
+        for _ in 0..50 {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+                &geometry,
+            );
+        }
+        assert_eq!(app.keys_scroll, 0);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &geometry,
+        );
+        assert_eq!(app.keys_scroll, 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &geometry,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &geometry,
+        );
+        assert_eq!(app.keys_scroll, 0);
+        let large = app.geometry(layout(Rect::new(0, 0, 80, 31)).preview);
+        assert_eq!(main_hints(&app, &large), vec![Hint::new("Esc/?", "close")]);
     }
 
     #[test]
@@ -2024,17 +2269,44 @@ mod tests {
         let mut app = App::empty();
         app.settings.tone.brightness = 0.1;
         app.settings.tone.contrast = 0.1;
-        app.panel.select(Row::Header(2), &GROUP_LENS);
+        app.panel.select(Row::Header(2), &app.panel_lens());
         app.panel.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &GROUP_LENS,
+            &app.panel_lens(),
         );
-        app.panel.select(Row::Item(0), &GROUP_LENS);
+        app.panel.select(Row::Item(0), &app.panel_lens());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("▸ Tone  2 changed"), "{text}");
         assert!(text.contains("> Card: Image"), "{text}");
         assert!(!text.contains("Brightness:"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_group_header_click_expands_after_draw() {
+        let mut renderer = Renderer::default();
+        let mut app = App::empty();
+        app.panel.select(Row::Header(0), &app.panel_lens());
+        app.panel.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &app.panel_lens(),
+        );
+        assert!(app.panel.is_collapsed(0));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        draw_text(&mut terminal, &app, &mut renderer);
+        let screen = terminal.size().unwrap().into();
+        let layout = layout(screen);
+        app.handle_mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.panel.x + 2,
+                row: layout.panel.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &app.geometry(layout.preview),
+            screen,
+        );
+        assert!(!app.panel.is_collapsed(0));
     }
     #[test]
     fn open_dialog_keeps_path_above_scrolled_entries() {
@@ -2100,7 +2372,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(14)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(14)));
         let panel = layout(terminal.size().unwrap()).panel;
         let first_panel_row = |terminal: &Terminal<TestBackend>| {
             (panel.x + 1..panel.right() - 1)
@@ -2115,7 +2387,7 @@ mod tests {
             &app.geometry(layout(terminal.size().unwrap()).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(13)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(13)));
         assert_eq!(first_panel_row(&terminal), "▾ Tone");
         for label in ["Tone", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}: {text}");

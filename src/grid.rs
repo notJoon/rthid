@@ -11,7 +11,7 @@ use rthid_dither::{
 #[derive(PartialEq)]
 pub(crate) struct GridKey {
     placement: Placement,
-    /// Composed build version, `None` when the document leaves the source unchanged.
+    /// Composed generation, `None` when the document leaves the source unchanged.
     composed: Option<u64>,
 }
 
@@ -50,7 +50,9 @@ pub struct GridCache {
     /// Loaded image before scaling and rotation.
     pub(crate) source: Option<RgbaImage>,
     /// Source with visible exposure layers applied, keyed by history revision.
-    composed: Memo<u64, Option<RgbaImage>>,
+    composed: Option<RgbaImage>,
+    composed_revision: Option<u64>,
+    composed_generation: u64,
     /// Composed card image cache.
     pub(crate) grid: Memo<GridKey, RgbaImage>,
     /// Palette indices from the last requested dither.
@@ -68,7 +70,8 @@ impl GridCache {
     /// Replaces the image and invalidates all caches without resetting versions.
     pub fn set_source(&mut self, image: RgbaImage) {
         self.source = Some(image);
-        self.composed.clear();
+        self.composed = None;
+        self.composed_revision = None;
         self.grid.clear();
         self.dithered.clear();
         self.mass.clear();
@@ -96,21 +99,19 @@ impl GridCache {
         let Some(placement) = self.placement(settings) else {
             return false;
         };
-        self.composed
-            .update(edits.revision(), || edits.current().compose(source));
-        let source = self
-            .composed
-            .get()
-            .and_then(Option::as_ref)
-            .unwrap_or(source);
+        if self.composed_revision != Some(edits.revision()) {
+            let composed = edits.current().compose(source);
+            if composed != self.composed {
+                self.composed_generation += 1;
+                self.composed = composed;
+            }
+            self.composed_revision = Some(edits.revision());
+        }
+        let source = self.composed.as_ref().unwrap_or(source);
         self.grid.update(
             GridKey {
                 placement,
-                composed: self
-                    .composed
-                    .get()
-                    .and_then(Option::as_ref)
-                    .map(|_| self.composed.version()),
+                composed: self.composed.as_ref().map(|_| self.composed_generation),
             },
             || {
                 let mut grid =
@@ -364,7 +365,7 @@ mod tests {
             [200, 200, 200, 255]
         );
         let versions = (
-            cache.composed.version(),
+            cache.composed_generation,
             cache.grid_version(),
             cache.dithered.version(),
         );
@@ -372,7 +373,7 @@ mod tests {
         assert_eq!(
             versions,
             (
-                cache.composed.version(),
+                cache.composed_generation,
                 cache.grid_version(),
                 cache.dithered.version()
             )
@@ -382,9 +383,54 @@ mod tests {
         assert_eq!(cache.grid(), Some(&source));
         assert_eq!(cache.dithered(), Some(&indices));
         cache.set_source(RgbaImage::from_pixel(8, 8, Rgba([50, 50, 50, 255])));
-        assert!(cache.composed.get().is_none());
+        assert!(cache.composed.is_none());
         assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert_eq!(cache.grid().unwrap().get_pixel(0, 0).0, [50, 50, 50, 255]);
+    }
+
+    #[test]
+    fn empty_layers_above_edits_keep_grid_and_dither_versions() {
+        use crate::document::STOP;
+
+        let mut cache = cache(RgbaImage::from_pixel(8, 8, Rgba([100, 100, 100, 255])));
+        let mut edits = empty_edits(&cache);
+        let settings = Settings::for_pixels(8, 8);
+        let options = MassOptions::default();
+        edits.edit(|doc| {
+            doc.add_layer("Exposure".into());
+            doc.target_mut().unwrap().exposure.add(0, 0, STOP);
+        });
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        let grid_version = cache.grid_version();
+        let dither_version = cache.dithered.version();
+        let composed_generation = cache.composed_generation;
+
+        edits.edit(|doc| {
+            doc.add_layer("Empty".into());
+        });
+        assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid_version(), grid_version);
+        assert_eq!(cache.dithered.version(), dither_version);
+        assert_eq!(cache.composed_generation, composed_generation);
+
+        edits.edit(|doc| doc.set_visible(1, false));
+        assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid_version(), grid_version);
+        assert_eq!(cache.dithered.version(), dither_version);
+        assert_eq!(cache.composed_generation, composed_generation);
+
+        edits.edit(|doc| {
+            doc.select(Some(0));
+            doc.target_mut().unwrap().exposure.add(1, 0, STOP);
+        });
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert!(cache.grid_version() > grid_version);
+        assert!(cache.dithered.version() > dither_version);
+        assert!(cache.composed_generation > composed_generation);
+        assert_eq!(
+            cache.grid().unwrap().get_pixel(1, 0).0,
+            [200, 200, 200, 255]
+        );
     }
 
     #[test]

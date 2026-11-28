@@ -1,9 +1,11 @@
 //! Independently collapsible groups backed by [`ListPicker`].
 
+use std::cell::RefCell;
+
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
-    layout::Rect,
+    layout::{Position, Rect},
     style::Style,
     text::{Line, Span},
     widgets::Block,
@@ -29,9 +31,10 @@ pub enum Row {
 ///
 /// The cursor keeps its visible position when `lens` changes. After changing
 /// `lens`, call [`Outline::select`] with the row to keep. The item counts passed
-/// to input must match the groups passed to [`Outline::render`]; otherwise the
-/// highlight and mouse hits move onto different rows, which the widget cannot
-/// detect.
+/// to mouse input must match the last [`Outline::render`]. Mouse input with
+/// different counts is ignored until the next render. Collapsing or expanding
+/// a group, or calling [`Outline::invalidate`], also ignores mouse input until
+/// the next render.
 ///
 /// # Examples
 ///
@@ -65,6 +68,7 @@ pub enum Row {
 pub struct Outline {
     picker: ListPicker,
     collapsed: Vec<bool>,
+    rendered_lens: RefCell<Option<Vec<usize>>>,
 }
 
 impl Outline {
@@ -88,6 +92,7 @@ impl Outline {
         Self {
             picker: ListPicker::new(usize::from(lens.first().is_some_and(|&len| len > 0))),
             collapsed: Vec::new(),
+            rendered_lens: RefCell::default(),
         }
     }
 
@@ -121,7 +126,7 @@ impl Outline {
         if let Row::Item(item) = row
             && let Some(group) = item_group(item, lens)
         {
-            self.collapsed[group] = false;
+            self.set_collapsed(group, false);
         }
         let rows = self.rows(lens);
         let index = rows
@@ -159,8 +164,8 @@ impl Outline {
                     return Outcome::Ignored;
                 };
                 match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => self.collapsed[group] = true,
-                    KeyCode::Right | KeyCode::Char('l') => self.collapsed[group] = false,
+                    KeyCode::Left | KeyCode::Char('h') => self.set_collapsed(group, true),
+                    KeyCode::Right | KeyCode::Char('l') => self.set_collapsed(group, false),
                     _ => return Outcome::Ignored,
                 }
                 Outcome::Consumed
@@ -169,13 +174,44 @@ impl Outline {
         }
     }
 
+    /// Returns the row under a cell using the last render's content area and scroll.
+    /// Borders, blank space and positions before the first render return `None`.
+    /// `lens` must match the item counts of the last render or this returns `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatui::{buffer::Buffer, layout::{Position, Rect}, style::Style, text::Line};
+    /// use rthid_widgets::{Outline, Row};
+    ///
+    /// let outline = Outline::new(&[1]);
+    /// let area = Rect::new(0, 0, 12, 3);
+    /// outline.render([(Line::raw("Layers"), vec![Line::raw("Layer 1")])],
+    ///     None, Style::default(), area, &mut Buffer::empty(area));
+    /// assert_eq!(outline.row_at(Position::new(2, 1), &[1]), Some(Row::Item(0)));
+    /// assert_eq!(outline.row_at(Position::new(2, 1), &[2]), None);
+    /// ```
+    pub fn row_at(&self, position: Position, lens: &[usize]) -> Option<Row> {
+        if self.rendered_lens.borrow().as_deref() != Some(lens) {
+            return None;
+        }
+        let rows = self.rows(lens);
+        self.picker
+            .rendered_index_at(position, rows.len())
+            .map(|i| rows[i])
+    }
+
     /// Handles mouse input inside the content area remembered by the last render.
     ///
     /// A left click on a header selects and toggles it. Item clicks and wheel
     /// movement match [`ListPicker::handle_mouse`], with item submissions
     /// returned as flat item indices. Before the first render and outside the
-    /// remembered area, input is ignored.
+    /// remembered area, input is ignored. `lens` must match the item counts of
+    /// the last render or input is ignored until the next render.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, lens: &[usize]) -> Outcome<usize> {
+        if self.rendered_lens.borrow().as_deref() != Some(lens) {
+            return Outcome::Ignored;
+        }
         self.resize(lens);
         let rows = self.rows(lens);
         let outcome = self.picker.handle_mouse(mouse, rows.len());
@@ -197,7 +233,7 @@ impl Outline {
     fn activate(&mut self, row: Row) -> Outcome<usize> {
         match row {
             Row::Header(group) => {
-                self.collapsed[group] = !self.collapsed[group];
+                self.set_collapsed(group, !self.collapsed[group]);
                 Outcome::Consumed
             }
             Row::Item(item) => Outcome::Submit(item),
@@ -221,10 +257,13 @@ impl Outline {
         area: Rect,
         buf: &mut Buffer,
     ) {
+        let mut rendered = self.rendered_lens.borrow_mut();
+        let lens = rendered.insert(Vec::new());
         let lines: Vec<_> = groups
             .into_iter()
             .enumerate()
             .flat_map(|(group, (mut title, items))| {
+                lens.push(items.len());
                 let collapsed = self.is_collapsed(group);
                 title
                     .spans
@@ -248,6 +287,21 @@ impl Outline {
             });
         self.picker
             .render_with_highlight_symbol(lines, block, highlight, area, buf, "");
+    }
+
+    /// Ignores mouse input until the next render.
+    ///
+    /// Call this after the rows change position without changing `lens`,
+    /// such as reordering items, so clicks aimed at the drawn rows are dropped.
+    pub fn invalidate(&mut self) {
+        *self.rendered_lens.get_mut() = None;
+    }
+
+    fn set_collapsed(&mut self, group: usize, collapsed: bool) {
+        if self.collapsed[group] != collapsed {
+            self.collapsed[group] = collapsed;
+            self.invalidate();
+        }
     }
 
     fn resize(&mut self, lens: &[usize]) {
@@ -299,6 +353,105 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn collapse_and_invalidate_ignore_hits_until_render() {
+        let mut outline = Outline::new(&[1, 1]);
+        let area = Rect::new(0, 0, 12, 4);
+        let render = |outline: &Outline| {
+            outline.render(
+                [
+                    (Line::raw("A"), vec![Line::raw("a")]),
+                    (Line::raw("B"), vec![Line::raw("b")]),
+                ],
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+        };
+        render(&outline);
+        assert_eq!(
+            outline.row_at(Position::new(2, 2), &[1, 1]),
+            Some(Row::Header(1))
+        );
+        outline.select(Row::Header(0), &[1, 1]);
+        assert_eq!(
+            outline.handle_key(key(KeyCode::Left), &[1, 1]),
+            Outcome::Consumed
+        );
+        assert_eq!(outline.row_at(Position::new(2, 1), &[1, 1]), None);
+        render(&outline);
+        assert_eq!(
+            outline.row_at(Position::new(2, 1), &[1, 1]),
+            Some(Row::Header(1))
+        );
+        outline.invalidate();
+        assert_eq!(outline.row_at(Position::new(2, 1), &[1, 1]), None);
+    }
+
+    #[test]
+    fn hit_rows_follow_rendered_scroll_and_exclude_borders_and_blanks() {
+        let lens = [3, 0];
+        let mut outline = Outline::new(&lens);
+        assert_eq!(outline.row_at(Position::new(1, 1), &lens), None);
+        let area = Rect::new(0, 0, 10, 4);
+        outline.select(Row::Header(1), &lens);
+        outline.render(
+            [
+                (Line::raw("A"), vec![Line::raw("a"); 3]),
+                (Line::raw("B"), vec![]),
+            ],
+            Some(Block::bordered()),
+            Style::default(),
+            area,
+            &mut Buffer::empty(area),
+        );
+        assert_eq!(outline.row_at(Position::new(1, 0), &lens), None);
+        assert_eq!(outline.row_at(Position::new(0, 1), &lens), None);
+        assert_eq!(
+            outline.row_at(Position::new(1, 1), &lens),
+            Some(Row::Item(2))
+        );
+        assert_eq!(
+            outline.row_at(Position::new(1, 2), &lens),
+            Some(Row::Header(1))
+        );
+    }
+
+    #[test]
+    fn mouse_ignores_counts_that_differ_from_the_last_render() {
+        let area = Rect::new(0, 0, 12, 6);
+        let mut outline = Outline::new(&[1, 1]);
+        for lens in [[1, 1], [2, 0]] {
+            outline.render(
+                lens.map(|len| (Line::raw("Group"), vec![Line::raw("item"); len])),
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+            let position = Position::new(2, 1);
+            let other = if lens == [1, 1] { [2, 0] } else { [1, 1] };
+            let selected = outline.selected(&lens);
+            assert_eq!(outline.row_at(position, &other), None);
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::ScrollDown,
+            ] {
+                assert_eq!(
+                    outline.handle_mouse(mouse(kind, 2, 1), &other),
+                    Outcome::Ignored
+                );
+            }
+            assert_eq!(outline.selected(&lens), selected);
+            assert_eq!(outline.row_at(position, &lens), Some(Row::Item(0)));
+            assert_eq!(
+                outline.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1), &lens),
+                Outcome::Submit(0)
+            );
         }
     }
 
@@ -443,16 +596,19 @@ mod tests {
         let block = Block::bordered();
         let lens = [1, 1];
         let mut outline = Outline::new(&lens);
-        outline.render(
-            [
-                (Line::raw("A"), vec![Line::raw("a")]),
-                (Line::raw("B"), vec![Line::raw("b")]),
-            ],
-            Some(block.clone()),
-            Style::default(),
-            area,
-            &mut Buffer::empty(area),
-        );
+        let render = |outline: &Outline| {
+            outline.render(
+                [
+                    (Line::raw("A"), vec![Line::raw("a")]),
+                    (Line::raw("B"), vec![Line::raw("b")]),
+                ],
+                Some(block.clone()),
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+        };
+        render(&outline);
         let border = mouse(MouseEventKind::Down(MouseButton::Left), 3, 3);
         assert_eq!(outline.handle_mouse(border, &lens), Outcome::Ignored);
         let selected_header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 4);
@@ -463,13 +619,20 @@ mod tests {
         assert!(outline.is_collapsed(0));
         assert_eq!(
             outline.handle_mouse(selected_header, &lens),
+            Outcome::Ignored
+        );
+        render(&outline);
+        assert_eq!(
+            outline.handle_mouse(selected_header, &lens),
             Outcome::Consumed
         );
         assert!(!outline.is_collapsed(0));
+        render(&outline);
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 6);
         assert_eq!(outline.handle_mouse(header, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
         assert!(outline.is_collapsed(1));
+        render(&outline);
         let item = mouse(MouseEventKind::Down(MouseButton::Left), area.right() - 2, 5);
         assert_eq!(outline.handle_mouse(item, &lens), Outcome::Consumed);
         assert_eq!(outline.handle_mouse(item, &lens), Outcome::Submit(0));
