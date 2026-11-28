@@ -844,21 +844,36 @@ fn fit_ellipses(accent: &[bool], shadow: &[bool], w: usize, h: usize) -> (Vec<bo
 /// . . # . .
 /// ```
 fn morphology(mask: &[bool], w: usize, h: usize, radius: isize, dilate: bool) -> Vec<bool> {
+    // The half width per row keeps the shape round instead of square.
+    let extents = (-radius..=radius)
+        .map(|dy| {
+            ((radius * radius - dy * dy) as f64)
+                .sqrt()
+                .round_ties_even() as isize
+        })
+        .collect::<Vec<isize>>();
+    let stride = w + 1;
+    let mut prefix = vec![0u32; stride * h];
+    for y in 0..h {
+        let row = &mut prefix[y * stride..(y + 1) * stride];
+        let mut count = 0;
+        for x in 0..w {
+            count += u32::from(mask[y * w + x] == dilate);
+            row[x + 1] = count;
+        }
+    }
     let mut out = vec![!dilate; mask.len()];
     for y in 0..h {
         for x in 0..w {
-            'disk: for dy in -radius..=radius {
-                // Half width of the disk on this row, so the shape is round and not square.
-                let extent = ((radius * radius - dy * dy) as f64)
-                    .sqrt()
-                    .round_ties_even() as isize;
-                for dx in -extent..=extent {
-                    let nx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
-                    let ny = (y as isize + dy).clamp(0, h as isize - 1) as usize;
-                    if mask[ny * w + nx] == dilate {
-                        out[y * w + x] = dilate;
-                        break 'disk;
-                    }
+            for (dy, &extent) in (-radius..=radius).zip(&extents) {
+                let ny = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                // Repeated edge cells do not change whether the disk row contains a hit.
+                let left = (x as isize - extent).max(0) as usize;
+                let right = (x as isize + extent).min(w as isize - 1) as usize;
+                let row = &prefix[ny * stride..(ny + 1) * stride];
+                if row[right + 1] != row[left] {
+                    out[y * w + x] = dilate;
+                    break;
                 }
             }
         }
@@ -971,6 +986,63 @@ fn clean_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn morphology_naive(
+        mask: &[bool],
+        w: usize,
+        h: usize,
+        radius: isize,
+        dilate: bool,
+    ) -> Vec<bool> {
+        let mut out = vec![!dilate; mask.len()];
+        for y in 0..h {
+            for x in 0..w {
+                'disk: for dy in -radius..=radius {
+                    let extent = ((radius * radius - dy * dy) as f64)
+                        .sqrt()
+                        .round_ties_even() as isize;
+                    for dx in -extent..=extent {
+                        let nx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                        let ny = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                        if mask[ny * w + nx] == dilate {
+                            out[y * w + x] = dilate;
+                            break 'disk;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn morphology_matches_naive() {
+        let mut state = 42u32;
+        for h in 0usize..=12 {
+            for w in 0usize..=12 {
+                let big = w.max(h) as isize;
+                for density in [0, 16, 64, 128, 192, 240, 256] {
+                    for sample in 0..3 {
+                        let mask: Vec<bool> = (0..w * h)
+                            .map(|_| {
+                                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                                state >> 24 < density
+                            })
+                            .collect();
+                        for radius in (0..=6).chain([big + 1, big + 3]) {
+                            for dilate in [false, true] {
+                                assert_eq!(
+                                    morphology(&mask, w, h, radius, dilate),
+                                    morphology_naive(&mask, w, h, radius, dilate),
+                                    "{w}x{h}, density {density}, sample {sample}, radius {radius}, dilate {dilate}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn fitted(accent: &[bool], shadow: &[bool], w: usize, h: usize) -> Vec<bool> {
         fit_ellipses(accent, shadow, w, h).0
