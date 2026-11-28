@@ -278,7 +278,10 @@ impl App {
                             Confirm::new(format!("Delete {}?", self.document.layers()[index].name))
                                 .detail("Its brush strokes and their undo history are lost.")
                                 .yes_label("delete"),
-                            Effect::RemoveLayer(index),
+                            Effect::RemoveLayer {
+                                index,
+                                epoch: self.document_epoch,
+                            },
                         );
                     }
                     KeyCode::Char('[' | ']') => {
@@ -523,7 +526,10 @@ impl App {
                 ))
                 .detail("The existing session will be replaced.")
                 .yes_label("overwrite"),
-                Effect::SaveSession(dir),
+                Effect::SaveSession {
+                    dir,
+                    epoch: self.document_epoch,
+                },
             );
         } else {
             self.save_session(dir);
@@ -1675,7 +1681,11 @@ impl App {
                 self.apply_setting(setting, self.settings.with_choice(setting, index));
             }
             Effect::Quit => self.quit = true,
-            Effect::RemoveLayer(index) => {
+            Effect::RemoveLayer { index, epoch } => {
+                if epoch != self.document_epoch {
+                    self.set_notice("layer delete skipped: another document was opened".into());
+                    return Ok(());
+                }
                 let row = self
                     .layers
                     .selected(self.document.layers().len())
@@ -1686,7 +1696,13 @@ impl App {
             }
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
             Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
-            Effect::SaveSession(dir) => self.save_session(dir),
+            Effect::SaveSession { dir, epoch } => {
+                if epoch != self.document_epoch {
+                    self.set_notice("save skipped: another document was opened".into());
+                    return Ok(());
+                }
+                self.save_session(dir);
+            }
             Effect::Open(path, dir) => self.request_open(path, Some(dir)),
             Effect::ListDir(path) => self.request_list(path),
             Effect::Notice(message) => {
@@ -2289,6 +2305,41 @@ mod tests {
         press(&mut app, KeyCode::Char('y'));
         run_session_job(&mut app);
         assert_eq!(app.session.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn session_overwrite_confirmation_skips_after_another_document_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        let target = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source, RgbaImage::new(2, 3));
+        session::write(&target, snapshot(&app)).unwrap();
+        let manifest = std::fs::read(target.join("manifest.toml")).unwrap();
+
+        app.request_open("next.png".into(), None);
+        let open = done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "next.png".into(),
+                image: RgbaImage::new(4, 5),
+            })),
+        );
+        app.take_jobs();
+        ctrl(&mut app, 's');
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        app.complete(open);
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.take_jobs().is_empty());
+        assert_eq!(
+            std::fs::read(target.join("manifest.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            app.notice(),
+            Some("save skipped: another document was opened")
+        );
     }
 
     #[test]
@@ -3356,6 +3407,37 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.document.revision(), revision);
         assert!(app.document.layers().is_empty());
+    }
+
+    #[test]
+    fn layer_delete_confirmation_skips_after_another_document_opens() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.document.add_layer("Old".into());
+        app.record_saved();
+        let mut next = snapshot(&app);
+        next.source_path = "next.png".into();
+        next.document.add_layer("New".into());
+
+        app.request_open("next.rthid".into(), None);
+        app.take_jobs();
+        app.focus = Focus::Layers;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        app.complete(done(
+            &app,
+            IoOutcome::Loaded(Ok(rthid_io::io::Output {
+                path: "next.rthid".into(),
+                value: Box::new(next),
+            })),
+        ));
+        let layers = app.document.layers().len();
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(app.document.layers().len(), layers);
+        assert_eq!(
+            app.notice(),
+            Some("layer delete skipped: another document was opened")
+        );
     }
 
     #[test]

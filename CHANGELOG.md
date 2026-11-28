@@ -32,6 +32,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Up/Down navigation skips dimmed parameters while preserving a selected row
   that becomes inactive until the next move
 
+### Fixed
+
+- Overwrite-session and delete-layer confirmations are skipped with a notice if another
+  document opens before they are accepted
+
 ## [0.2.0] - 2026-11-28
 
 ### Added
