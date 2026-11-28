@@ -158,6 +158,11 @@ impl ListPicker {
         self.row_at(position, content_area(area, block, len).0, len)
     }
 
+    /// Uses the content area and scroll offset remembered by the last draw.
+    pub(crate) fn rendered_index_at(&self, position: Position, len: usize) -> Option<usize> {
+        self.row_at(position, self.area.get(), len)
+    }
+
     fn row_at(&self, position: Position, content: Rect, len: usize) -> Option<usize> {
         if !content.contains(position) {
             return None;

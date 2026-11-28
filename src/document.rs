@@ -23,7 +23,7 @@
 //!
 //! Edits use source pixel coordinates. The grid is rebuilt from the source
 //! on every zoom, pan, rotation, flip or card change.
-//! Every change bumps the history revision, which keys the composed image
+//! Every pixel change bumps the history revision, which keys the composed image
 //! cache. Caches therefore never need to be cleared by hand for edits.
 //!
 //! The planned session format for #41 is a directory with manifest.toml,
@@ -60,11 +60,19 @@ impl ExposureMap {
     }
 
     /// Source width in pixels.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
+    )]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Source height in pixels.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
+    )]
     pub fn height(&self) -> u32 {
         self.height
     }
@@ -84,6 +92,10 @@ impl ExposureMap {
     }
 
     /// Adds with saturation, ignoring coordinates outside the source.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
+    )]
     pub fn add(&mut self, x: u32, y: u32, delta: i16) {
         if x >= self.width || y >= self.height {
             return;
@@ -215,6 +227,10 @@ impl Document {
     }
 
     /// Mutable access to the layer an edit should affect.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
+    )]
     pub fn target_mut(&mut self) -> Option<&mut Layer> {
         let index = self.target()?;
         self.layers.get_mut(index)
@@ -289,7 +305,13 @@ impl History {
         &self.states[self.cursor]
     }
 
-    /// Cache key that increases on every edit, amend, reset and successful undo or redo.
+    /// Changes selection in place without adding history or bumping the pixel revision.
+    /// Selection does not change pixels, so composition and dither caches stay valid.
+    pub fn select(&mut self, index: Option<usize>) {
+        self.states[self.cursor].select(index);
+    }
+
+    /// Cache key that increases on every history change except selection.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -317,6 +339,17 @@ impl History {
         );
         f(&mut self.states[self.cursor]);
         self.revision += 1;
+    }
+
+    /// Drops the current snapshot if it equals the previous one, bumping revision only then.
+    pub fn discard_if_unchanged(&mut self) -> bool {
+        if self.cursor == 0 || self.states[self.cursor] != self.states[self.cursor - 1] {
+            return false;
+        }
+        self.states.remove(self.cursor);
+        self.cursor -= 1;
+        self.revision += 1;
+        true
     }
 
     /// Moves to the previous snapshot if one exists.
@@ -361,6 +394,43 @@ impl History {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn unchanged_snapshot_is_discarded_only_when_equal() {
+        let mut history = History::new(Document::new(1, 1));
+        assert!(!history.discard_if_unchanged());
+        assert_eq!(history.revision(), 0);
+        history.edit(|doc| {
+            doc.add_layer("Layer 1".into());
+        });
+        assert!(!history.discard_if_unchanged());
+        assert_eq!(history.revision(), 1);
+        history.edit(|_| {});
+        assert!(history.discard_if_unchanged());
+        assert_eq!(history.revision(), 3);
+        assert!(!history.can_redo());
+        assert!(!history.discard_if_unchanged());
+        assert_eq!(history.revision(), 3);
+        assert!(history.undo());
+        assert!(history.current().layers().is_empty());
+    }
+
+    #[test]
+    fn selection_changes_neither_history_nor_revision() {
+        let mut history = History::new(Document::new(1, 1));
+        history.edit(|doc| {
+            doc.add_layer("one".into());
+        });
+        let revision = history.revision();
+        history.select(None);
+        assert_eq!(history.current().selected(), None);
+        history.select(Some(0));
+        assert_eq!(history.current().selected(), Some(0));
+        assert_eq!(history.revision(), revision);
+        assert_eq!(history.states.len(), 2);
+        assert!(history.undo());
+        assert!(history.current().layers().is_empty());
+    }
 
     #[test]
     fn sparse_tiles_saturate_and_ignore_outside_coordinates() {

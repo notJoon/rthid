@@ -169,6 +169,15 @@ impl Outline {
         }
     }
 
+    /// Returns the row under a cell using the last render's content area and scroll.
+    /// Borders, blank space and positions before the first render return `None`.
+    pub fn row_at(&self, column: u16, row: u16, lens: &[usize]) -> Option<Row> {
+        let rows = self.rows(lens);
+        self.picker
+            .rendered_index_at((column, row).into(), rows.len())
+            .map(|i| rows[i])
+    }
+
     /// Handles mouse input inside the content area remembered by the last render.
     ///
     /// A left click on a header selects and toggles it. Item clicks and wheel
@@ -300,6 +309,29 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn hit_rows_follow_rendered_scroll_and_exclude_borders_and_blanks() {
+        let lens = [3, 0];
+        let mut outline = Outline::new(&lens);
+        assert_eq!(outline.row_at(1, 1, &lens), None);
+        let area = Rect::new(0, 0, 10, 4);
+        outline.select(Row::Header(1), &lens);
+        outline.render(
+            [
+                (Line::raw("A"), vec![Line::raw("a"); 3]),
+                (Line::raw("B"), vec![]),
+            ],
+            Some(Block::bordered()),
+            Style::default(),
+            area,
+            &mut Buffer::empty(area),
+        );
+        assert_eq!(outline.row_at(1, 0, &lens), None);
+        assert_eq!(outline.row_at(0, 1, &lens), None);
+        assert_eq!(outline.row_at(1, 1, &lens), Some(Row::Item(2)));
+        assert_eq!(outline.row_at(1, 2, &lens), Some(Row::Header(1)));
     }
 
     #[test]

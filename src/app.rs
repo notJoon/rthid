@@ -46,6 +46,22 @@ struct Drag {
     minimap: bool,
 }
 
+/// Meaning of a flat parameter panel item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PanelItem {
+    /// An image setting in its existing order.
+    Setting(Setting),
+    /// A document layer indexed from the bottom.
+    Layer(usize),
+}
+
+#[derive(Clone, Copy)]
+struct LayerDrag {
+    index: usize,
+    moved: bool,
+    toggle: bool,
+}
+
 enum Source {
     Export,
     Other,
@@ -81,6 +97,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Whether the full key reference is capturing input.
     pub(crate) keys_open: bool,
+    /// Retained row offset in the full key reference.
+    pub(crate) keys_scroll: u16,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
     /// Preview zoom, minimap and dot origin.
@@ -88,6 +106,7 @@ pub struct App {
     /// Whether keys go to the preview first (toggled by Tab, left with Esc).
     pub preview_focus: bool,
     last_drag: Option<Drag>,
+    layer_drag: Option<LayerDrag>,
     /// Whether the last synced preview has a visible minimap.
     minimap_visible: bool,
     /// Image processing caches.
@@ -115,11 +134,146 @@ pub struct App {
 }
 
 impl App {
-    pub(crate) fn selected_setting(&self) -> Option<Setting> {
-        match self.panel.selected(&GROUP_LENS) {
-            Some(Row::Item(i)) => Some(Setting::ALL[i]),
-            Some(Row::Header(_)) | None => None,
+    /// Counts settings and the current layer rows for the outline.
+    pub(crate) fn panel_lens(&self) -> [usize; 4] {
+        [
+            GROUP_LENS[0],
+            GROUP_LENS[1],
+            GROUP_LENS[2],
+            self.edits.current().layers().len(),
+        ]
+    }
+
+    /// Maps an item from the current panel lens, with the top layer first.
+    pub(crate) fn panel_row(&self, item: usize) -> PanelItem {
+        debug_assert!(item < self.panel_lens().iter().sum());
+        if let Some(&setting) = Setting::ALL.get(item) {
+            PanelItem::Setting(setting)
+        } else {
+            PanelItem::Layer(self.edits.current().layers().len() - 1 - (item - Setting::ALL.len()))
         }
+    }
+
+    /// Returns a setting only when the cursor is on a settings row.
+    pub(crate) fn selected_setting(&self) -> Option<Setting> {
+        match self.panel.selected(&self.panel_lens()) {
+            Some(Row::Item(i)) => match self.panel_row(i) {
+                PanelItem::Setting(setting) => Some(setting),
+                PanelItem::Layer(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn layer_row(&self, index: usize) -> Row {
+        Row::Item(Setting::ALL.len() + self.edits.current().layers().len() - 1 - index)
+    }
+
+    fn retain_panel(&mut self, row: Row) {
+        let len = self.edits.current().layers().len();
+        let row = match row {
+            Row::Item(i) if i >= Setting::ALL.len() + len => {
+                if len == 0 {
+                    Row::Header(3)
+                } else {
+                    Row::Item(Setting::ALL.len() + len - 1)
+                }
+            }
+            row => row,
+        };
+        self.panel.select(row, &self.panel_lens());
+    }
+
+    fn select_layer(&mut self, index: usize, toggle: bool) {
+        let selected = if toggle && self.edits.current().selected() == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        self.edits.select(selected);
+        self.retain_panel(self.layer_row(index));
+    }
+
+    fn toggle_layer(&mut self, index: usize) {
+        let visible = !self.edits.current().layers()[index].visible;
+        self.edits.edit(|doc| doc.set_visible(index, visible));
+        self.retain_panel(self.layer_row(index));
+    }
+
+    fn handle_layer_key(&mut self, code: KeyCode) -> bool {
+        if self.source_path().is_none() {
+            return false;
+        }
+        let row = self
+            .panel
+            .selected(&self.panel_lens())
+            .unwrap_or(Row::Header(3));
+        match code {
+            KeyCode::Char('n') => {
+                let mut k = 1;
+                while self
+                    .edits
+                    .current()
+                    .layers()
+                    .iter()
+                    .any(|layer| layer.name == format!("Layer {k}"))
+                {
+                    k += 1;
+                }
+                self.edits.edit(|doc| {
+                    doc.add_layer(format!("Layer {k}"));
+                });
+                self.retain_panel(self.layer_row(self.edits.current().layers().len() - 1));
+            }
+            KeyCode::Char('u' | 'U') => {
+                let undo = code == KeyCode::Char('u');
+                let changed = if undo {
+                    self.edits.undo()
+                } else {
+                    self.edits.redo()
+                };
+                if !changed {
+                    self.set_notice(
+                        if undo {
+                            "nothing to undo"
+                        } else {
+                            "nothing to redo"
+                        }
+                        .into(),
+                    );
+                }
+                self.retain_panel(row);
+            }
+            _ => {
+                let Row::Item(item) = row else {
+                    return false;
+                };
+                let PanelItem::Layer(index) = self.panel_row(item) else {
+                    return false;
+                };
+                match code {
+                    KeyCode::Enter => self.select_layer(index, true),
+                    KeyCode::Char('v') => self.toggle_layer(index),
+                    KeyCode::Char('x') => {
+                        self.edits.edit(|doc| doc.remove_layer(index));
+                        self.retain_panel(row);
+                    }
+                    KeyCode::Char('[' | ']') => {
+                        let to = if code == KeyCode::Char('[') {
+                            index.saturating_sub(1)
+                        } else {
+                            (index + 1).min(self.edits.current().layers().len() - 1)
+                        };
+                        if to != index {
+                            self.edits.edit(|doc| doc.move_layer(index, to));
+                            self.retain_panel(self.layer_row(to));
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     pub(crate) fn mass_inset_shown(&self, geometry: &PreviewGeometry) -> bool {
@@ -146,6 +300,7 @@ impl App {
             viewport: Viewport::default(),
             preview_focus: false,
             last_drag: None,
+            layer_drag: None,
             minimap_visible: false,
             grid_cache: GridCache::default(),
             edits: History::new(Document::new(0, 0)),
@@ -156,8 +311,9 @@ impl App {
             last_token: 0,
             modal: None,
             keys_open: false,
+            keys_scroll: 0,
             settings: Settings::default(),
-            panel: Outline::new(&GROUP_LENS),
+            panel: Outline::new(&[GROUP_LENS[0], GROUP_LENS[1], GROUP_LENS[2], 0]),
             view: View::Original,
             mass_return: View::Original,
             mass_minimap: true,
@@ -228,9 +384,15 @@ impl App {
 
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
+        let row = self
+            .panel
+            .selected(&self.panel_lens())
+            .unwrap_or(Row::Header(3));
+        self.layer_drag = None;
         self.source_path = Some(path);
         self.edits
             .reset(Document::new(image.width(), image.height()));
+        self.retain_panel(row);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
@@ -449,6 +611,7 @@ impl App {
 
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
+        self.end_layer_drag();
         self.keys_open = false;
         if let Some(modal) = &mut self.modal {
             modal.paste(text);
@@ -617,6 +780,15 @@ impl App {
         self.last_drag.is_some_and(|drag| drag.moved)
     }
 
+    /// Ends a layer reorder when an unrelated terminal event arrives.
+    pub(crate) fn end_layer_drag(&mut self) {
+        if let Some(drag) = self.layer_drag.take()
+            && drag.moved
+        {
+            self.edits.discard_if_unchanged();
+        }
+    }
+
     /// Routes mouse input and reports whether the display needs redrawing.
     pub fn handle_mouse(
         &mut self,
@@ -624,6 +796,22 @@ impl App {
         geometry: &PreviewGeometry,
         screen: Rect,
     ) -> bool {
+        let mut ended = false;
+        if mouse.kind != MouseEventKind::Drag(MouseButton::Left) {
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+                && let Some(drag) = self.layer_drag
+                && !drag.moved
+                && drag.toggle
+            {
+                self.select_layer(drag.index, true);
+                ended = true;
+            }
+            self.end_layer_drag();
+        }
+        if ended {
+            return true;
+        }
+        let active_drag = self.layer_drag.take();
         let was_dragging = self.dragging();
         if self.keys_open {
             self.last_drag = None;
@@ -642,16 +830,55 @@ impl App {
             return was_dragging || changed;
         }
         let panel = crate::ui::layout(screen).panel;
+        let lens = self.panel_lens();
+        let hit = self.panel.row_at(mouse.column, mouse.row, &lens);
+        if let Some(mut drag) = active_drag {
+            if let Some(Row::Item(item)) = hit
+                && let PanelItem::Layer(to) = self.panel_row(item)
+                && to != drag.index
+            {
+                if drag.moved {
+                    self.edits.amend(|doc| doc.move_layer(drag.index, to));
+                } else {
+                    self.edits.edit(|doc| doc.move_layer(drag.index, to));
+                }
+                drag.index = to;
+                drag.moved = true;
+                self.retain_panel(self.layer_row(to));
+                self.layer_drag = Some(drag);
+                return true;
+            }
+            self.layer_drag = Some(drag);
+            return false;
+        }
         if panel.contains((mouse.column, mouse.row).into())
             && !geometry.area.contains((mouse.column, mouse.row).into())
             && !matches!(mouse.kind, MouseEventKind::Drag(_))
         {
             self.last_drag = None;
-            let outcome = self.panel.handle_mouse(mouse, &GROUP_LENS);
+            let before = self.panel.selected(&lens);
+            let outcome = self.panel.handle_mouse(mouse, &lens);
             let clicked = outcome != Outcome::Ignored
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
             if clicked {
                 self.preview_focus = false;
+                if self.source_path().is_some()
+                    && let Some(Row::Item(item)) = hit
+                    && let PanelItem::Layer(index) = self.panel_row(item)
+                {
+                    if mouse.column == panel.x + 3 {
+                        self.toggle_layer(index);
+                    } else {
+                        if before != hit {
+                            self.select_layer(index, false);
+                        }
+                        self.layer_drag = Some(LayerDrag {
+                            index,
+                            moved: false,
+                            toggle: before == hit,
+                        });
+                    }
+                }
             }
             return was_dragging || outcome != Outcome::Ignored;
         }
@@ -760,6 +987,7 @@ impl App {
 
     /// Handles global zoom and focus keys, then preview panning or parameter edits.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
+        self.end_layer_drag();
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -769,12 +997,22 @@ impl App {
         }
         self.notice = None;
         if self.keys_open {
+            let max = crate::ui::key_help_scroll_max(geometry.area.height);
+            self.keys_scroll = self.keys_scroll.min(max);
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && matches!(key.code, KeyCode::Esc | KeyCode::Char('?'))
             {
-                self.keys_open = false;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') => self.keys_open = false,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.keys_scroll = self.keys_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.keys_scroll = self.keys_scroll.saturating_add(1).min(max);
+                    }
+                    _ => {}
+                }
             }
             return;
         }
@@ -792,6 +1030,7 @@ impl App {
         }
         if key.code == KeyCode::Char('?') {
             self.keys_open = true;
+            self.keys_scroll = 0;
             self.last_drag = None;
             return;
         }
@@ -816,6 +1055,9 @@ impl App {
         }
         if key.code == KeyCode::Tab {
             self.preview_focus = !self.preview_focus;
+            return;
+        }
+        if self.handle_layer_key(key.code) {
             return;
         }
         let preview_key = self.preview_key(key.code, geometry);
@@ -860,14 +1102,19 @@ impl App {
         }
         if self.preview_focus
             && key.code == KeyCode::Enter
-            && matches!(self.panel.selected(&GROUP_LENS), Some(Row::Header(_)))
+            && matches!(
+                self.panel.selected(&self.panel_lens()),
+                Some(Row::Header(_))
+            )
         {
             return;
         }
         match self.handle_panel_key(key) {
             Outcome::Ignored => {}
             Outcome::Submit(i) => {
-                let setting = Setting::ALL[i];
+                let PanelItem::Setting(setting) = self.panel_row(i) else {
+                    return;
+                };
                 // Enter picks a new seed on an active Seed row. The clock is read only
                 // here, Settings decides the seed and the engine stays deterministic.
                 let entropy = SystemTime::now()
@@ -898,15 +1145,15 @@ impl App {
     }
 
     fn handle_panel_key(&mut self, key: KeyEvent) -> Outcome<usize> {
-        let lens = GROUP_LENS;
+        let lens = self.panel_lens();
         if !matches!(
             key.code,
             KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j')
         ) {
             return self.panel.handle_key(key, &lens);
         }
+        // Inactive rows are skipped here, not in Outline. Move this into the widget if another list needs disabled rows.
         let start = self.panel.selected(&lens);
-        // ponytail: move this into the widget if a second list gets disabled rows.
         loop {
             let before = self.panel.selected(&lens);
             let outcome = self.panel.handle_key(key, &lens);
@@ -917,7 +1164,8 @@ impl App {
                 }
                 return outcome;
             }
-            if !matches!(after, Some(Row::Item(i)) if !Setting::ALL[i].is_active(&self.settings)) {
+            if !matches!(after, Some(Row::Item(i)) if matches!(self.panel_row(i), PanelItem::Setting(setting) if !setting.is_active(&self.settings)))
+            {
                 return outcome;
             }
         }
@@ -1087,6 +1335,240 @@ mod tests {
 
     fn jobs(app: &mut App) -> Vec<Job> {
         app.take_jobs().into_iter().map(|(job, _)| job).collect()
+    }
+
+    #[test]
+    fn layer_keys_history_targets_names_and_cursor() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.notice(), Some("nothing to undo"));
+        press(&mut app, KeyCode::Char('U'));
+        assert_eq!(app.notice(), Some("nothing to redo"));
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
+        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
+        assert_eq!(app.panel_row(Setting::ALL.len()), PanelItem::Layer(1));
+        assert_eq!(app.panel_row(Setting::ALL.len() + 1), PanelItem::Layer(0));
+        assert_eq!(app.selected_setting(), None);
+        let revision = app.edits.revision();
+        let versions = versions(&app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.edits.current().selected(), None);
+        assert_eq!(app.edits.current().target(), Some(1));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.edits.current().selected(), Some(1));
+        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(versions, self::versions(&app));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.edits.revision(), revision);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.edits.current().layers()[0].name, "Layer 2");
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(app.layer_row(0))
+        );
+        let revision = app.edits.revision();
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.edits.revision(), revision);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char('v'));
+        assert!(!app.edits.current().layers()[1].visible);
+        app.panel.select(app.layer_row(0), &app.panel_lens());
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(app.layer_row(0))
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.edits.current().layers()[1].name, "Layer 1");
+        app.preview_focus = true;
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.edits.current().layers().len(), 1);
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(app.layer_row(0))
+        );
+        press(&mut app, KeyCode::Char('U'));
+        assert_eq!(app.edits.current().layers().len(), 2);
+        app.preview_focus = false;
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
+        press(&mut app, KeyCode::Char('n'));
+        app.panel.select(Row::Item(0), &app.panel_lens());
+        app.open_image("next.png".into(), RgbaImage::new(2, 2));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(0)));
+        assert!(!app.edits.can_undo());
+    }
+
+    #[test]
+    fn layer_keys_require_source_and_modal_keeps_input() {
+        let mut app = App::empty();
+        for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        assert_eq!(app.edits.revision(), 0);
+        assert!(app.notice().is_none());
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        app.show_modal(Modal::templates());
+        let revision = app.edits.revision();
+        for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.edits.revision(), revision);
+        assert!(app.edits.current().layers().is_empty());
+    }
+
+    #[test]
+    fn layer_mouse_selects_marks_and_groups_drag_into_one_undo() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.panel);
+        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let x = layout.panel.x + 5;
+        let click = MouseEventKind::Down(MouseButton::Left);
+        app.mouse_at(click, x, top + 1, &geometry, screen);
+        assert_eq!(app.edits.current().selected(), Some(1));
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            top + 1,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(click, x, top + 1, &geometry, screen);
+        assert_eq!(app.edits.current().selected(), Some(1));
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            top + 1,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.current().selected(), None);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let mut renderer = crate::ui::Renderer::default();
+        app.sync(layout.preview);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &app, &layout, &mut renderer))
+            .unwrap();
+        let mark_x = layout.panel.x + 3;
+        assert_eq!(terminal.backend().buffer()[(mark_x, top + 1)].symbol(), "●");
+        let revision = app.edits.revision();
+        app.mouse_at(click, mark_x, top + 1, &geometry, screen);
+        assert!(!app.edits.current().layers()[1].visible);
+        assert_eq!(app.edits.current().selected(), None);
+        assert_eq!(app.edits.revision(), revision + 1);
+        assert!(app.layer_drag.is_none());
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x,
+            top + 2,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
+        assert_eq!(app.edits.revision(), revision + 1);
+        app.mouse_at(click, x, top, &geometry, screen);
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            top,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(click, x, top, &geometry, screen);
+        assert_eq!(app.edits.current().selected(), Some(2));
+        let revision = app.edits.revision();
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        app.mouse_at(drag, x, top + 1, &geometry, screen);
+        app.mouse_at(drag, x, top + 2, &geometry, screen);
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            top + 2,
+            &geometry,
+            screen,
+        );
+        assert!(app.layer_drag.is_none());
+        assert_eq!(app.edits.revision(), revision + 2);
+        assert_eq!(app.edits.current().layers()[0].name, "Layer 3");
+        assert_eq!(app.edits.current().selected(), Some(0));
+        assert_eq!(app.edits.current().target(), Some(0));
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(app.layer_row(0))
+        );
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(
+            app.edits
+                .current()
+                .layers()
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Layer 1", "Layer 2", "Layer 3"]
+        );
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.edits.current().layers()[1].visible);
+    }
+
+    #[test]
+    fn layer_drag_back_to_start_discards_undo_step() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        press(&mut app, KeyCode::Char('v'));
+        let before = app.edits.current().clone();
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.panel);
+        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let x = layout.panel.x + 5;
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            top,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x,
+            top + 1,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x,
+            top,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            top,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.current(), &before);
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.edits.current().layers()[1].visible);
     }
 
     #[test]
@@ -2252,12 +2734,18 @@ mod tests {
     }
 
     fn render_panel(app: &App, area: Rect) {
-        let groups = crate::settings::GROUPS.map(|(title, len)| {
-            (
-                ratatui::text::Line::raw(title),
-                vec![ratatui::text::Line::default(); len],
-            )
-        });
+        let groups = crate::settings::GROUPS
+            .map(|(title, len)| {
+                (
+                    ratatui::text::Line::raw(title),
+                    vec![ratatui::text::Line::default(); len],
+                )
+            })
+            .into_iter()
+            .chain(std::iter::once((
+                ratatui::text::Line::raw("Layers"),
+                vec![ratatui::text::Line::default(); app.edits.current().layers().len()],
+            )));
         app.panel.render(
             groups,
             Some(ratatui::widgets::Block::bordered()),
@@ -2288,7 +2776,7 @@ mod tests {
     fn select(app: &mut App, setting: Setting) {
         app.panel.select(
             Row::Item(Setting::ALL.iter().position(|&row| row == setting).unwrap()),
-            &GROUP_LENS,
+            &app.panel_lens(),
         );
     }
 
@@ -2384,7 +2872,7 @@ mod tests {
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.view, View::Dithered);
         assert!(!press(&mut app, KeyCode::Char(' ')));
-        app.panel = Outline::new(&GROUP_LENS);
+        app.panel = Outline::new(&app.panel_lens());
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.view, View::Original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d')] {
@@ -2738,19 +3226,16 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Setting::Card);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(0)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(0)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
         for _ in 0..Setting::ALL.len() + 2 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(app.selected_setting(), Some(Setting::Sharpen));
+        assert_eq!(app.selected_setting(), None);
         for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
             assert!(!press(&mut app, code));
-            assert_eq!(
-                app.panel.selected(&GROUP_LENS),
-                Some(Row::Item(Setting::ALL.len() - 1))
-            );
+            assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
             assert!(!app.quit);
         }
     }
@@ -2760,7 +3245,7 @@ mod tests {
         let mut app = app_at(Setting::Serpentine);
         app.settings.dither = Dither::Atkinson;
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(2)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(2)));
         press(&mut app, KeyCode::Up);
         assert_eq!(app.selected_setting(), Some(Setting::Serpentine));
 
@@ -2776,17 +3261,17 @@ mod tests {
         app.settings.dither = Dither::Atkinson;
         assert_eq!(app.selected_setting(), Some(Setting::Seed));
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(2)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(2)));
     }
 
     #[test]
     fn preview_focus_enter_does_not_toggle_a_group_header() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        app.panel.select(Row::Header(1), &GROUP_LENS);
+        app.panel.select(Row::Header(1), &app.panel_lens());
         app.preview_focus = true;
         assert!(!press(&mut app, KeyCode::Enter));
         assert!(!app.panel.is_collapsed(1));
-        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(1)));
+        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(1)));
     }
 
     #[test]

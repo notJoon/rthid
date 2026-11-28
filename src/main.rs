@@ -26,10 +26,6 @@ mod app;
 /// Cell rendering for Fit, zoom levels and the minimap.
 mod cells;
 /// Source exposure layers and document history.
-#[allow(
-    dead_code,
-    reason = "Layer editing APIs are wired into input in a later step."
-)]
 mod document;
 /// Companion PNG and mass-study SVG writers and their status.
 mod export;
@@ -387,6 +383,7 @@ fn event_loop(
                     }
                     Event::Paste(text) => app.handle_paste(text),
                     Event::Resize(width, height) => {
+                        app.end_layer_drag();
                         layout = ui::layout(ratatui::layout::Size::new(*width, *height));
                         app.clamp_viewport(layout.preview);
                     }
