@@ -633,7 +633,7 @@ pub enum Setting {
 /// Parameter groups in panel order, with their item counts.
 pub const GROUPS: [(&str, usize); 3] = [("Print", 7), ("Dither", 6), ("Tone", 6)];
 
-/// Item counts of the three settings groups, before the dynamic Layers group.
+/// Item counts of the three settings groups.
 pub const GROUP_LENS: [usize; 3] = [GROUPS[0].1, GROUPS[1].1, GROUPS[2].1];
 
 const _: () = assert!(GROUP_LENS[0] + GROUP_LENS[1] + GROUP_LENS[2] == Setting::ALL.len());

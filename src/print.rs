@@ -113,6 +113,34 @@ impl Placement {
         Ok(result)
     }
 
+    /// Maps a dot center back to the original source, excluding paper and uncovered space.
+    pub(crate) fn source_point(&self, dot: (f64, f64), source: (u32, u32)) -> Option<(f64, f64)> {
+        let x = dot.0 - f64::from(self.inset);
+        let y = dot.1 - f64::from(self.inset);
+        let (x0, y0, x1, y1) = self.covered();
+        if !(x >= f64::from(x0) && x < f64::from(x1) && y >= f64::from(y0) && y < f64::from(y1)) {
+            return None;
+        }
+        let (ew, eh) = if self.rotation.swaps_axes() {
+            (source.1, source.0)
+        } else {
+            source
+        };
+        let mut x = ((x - self.x as f64 + 0.5) * f64::from(ew) / f64::from(self.sw) - 0.5)
+            .clamp(0.0, f64::from(ew - 1));
+        let y = ((y - self.y as f64 + 0.5) * f64::from(eh) / f64::from(self.sh) - 0.5)
+            .clamp(0.0, f64::from(eh - 1));
+        if self.flip {
+            x = f64::from(ew - 1) - x;
+        }
+        Some(match self.rotation {
+            Rotation::R0 => (x, y),
+            Rotation::R90 => (y, f64::from(source.1 - 1) - x),
+            Rotation::R180 => (f64::from(source.0 - 1) - x, f64::from(source.1 - 1) - y),
+            Rotation::R270 => (f64::from(source.0 - 1) - y, x),
+        })
+    }
+
     /// Image area cells the resized source covers, as `(x0, y0, x1, y1)` with exclusive ends.
     pub fn covered(&self) -> (u32, u32, u32, u32) {
         let clip = |offset: i64, size: u32, area: u32| {

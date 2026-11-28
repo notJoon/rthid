@@ -1,6 +1,7 @@
 //! Interactive state and the key and mouse handling that changes it.
 
 use crate::{
+    brush::{Brush, BrushRow, Stroke},
     cells::{Glyphs, Pixels, View},
     document::{Document, History},
     export::{Export, MassExport},
@@ -51,6 +52,8 @@ struct Drag {
 pub(crate) enum PanelItem {
     /// An image setting in its existing order.
     Setting(Setting),
+    /// An independent brush control.
+    Brush(BrushRow),
     /// A document layer indexed from the bottom.
     Layer(usize),
 }
@@ -107,6 +110,11 @@ pub struct App {
     pub preview_focus: bool,
     last_drag: Option<Drag>,
     layer_drag: Option<LayerDrag>,
+    stroke: Option<Stroke>,
+    /// Current source pixel brush controls, independent of history.
+    pub(crate) brush: Brush,
+    /// Whether left preview drags paint exposure.
+    pub(crate) brush_on: bool,
     /// Whether the last synced preview has a visible minimap.
     minimap_visible: bool,
     /// Image processing caches.
@@ -133,13 +141,19 @@ pub struct App {
     pub quit: bool,
 }
 
+/// Outline group containing the brush controls.
+pub(crate) const BRUSH_GROUP: usize = GROUP_LENS.len();
+/// Outline group containing document layers.
+pub(crate) const LAYER_GROUP: usize = BRUSH_GROUP + 1;
+
 impl App {
-    /// Counts settings and the current layer rows for the outline.
-    pub(crate) fn panel_lens(&self) -> [usize; 4] {
+    /// Counts settings, brush controls and current layers for the outline.
+    pub(crate) fn panel_lens(&self) -> [usize; 5] {
         [
             GROUP_LENS[0],
             GROUP_LENS[1],
             GROUP_LENS[2],
+            BrushRow::ALL.len(),
             self.edits.current().layers().len(),
         ]
     }
@@ -149,8 +163,14 @@ impl App {
         debug_assert!(item < self.panel_lens().iter().sum());
         if let Some(&setting) = Setting::ALL.get(item) {
             PanelItem::Setting(setting)
+        } else if let Some(&row) = BrushRow::ALL.get(item - Setting::ALL.len()) {
+            PanelItem::Brush(row)
         } else {
-            PanelItem::Layer(self.edits.current().layers().len() - 1 - (item - Setting::ALL.len()))
+            PanelItem::Layer(
+                self.edits.current().layers().len()
+                    - 1
+                    - (item - Setting::ALL.len() - BrushRow::ALL.len()),
+            )
         }
     }
 
@@ -159,24 +179,28 @@ impl App {
         match self.panel.selected(&self.panel_lens()) {
             Some(Row::Item(i)) => match self.panel_row(i) {
                 PanelItem::Setting(setting) => Some(setting),
-                PanelItem::Layer(_) => None,
+                PanelItem::Brush(_) | PanelItem::Layer(_) => None,
             },
             _ => None,
         }
     }
 
     fn layer_row(&self, index: usize) -> Row {
-        Row::Item(Setting::ALL.len() + self.edits.current().layers().len() - 1 - index)
+        Row::Item(
+            Setting::ALL.len() + BrushRow::ALL.len() + self.edits.current().layers().len()
+                - 1
+                - index,
+        )
     }
 
     fn retain_panel(&mut self, row: Row) {
         let len = self.edits.current().layers().len();
         let row = match row {
-            Row::Item(i) if i >= Setting::ALL.len() + len => {
+            Row::Item(i) if i >= Setting::ALL.len() + BrushRow::ALL.len() + len => {
                 if len == 0 {
-                    Row::Header(3)
+                    Row::Header(LAYER_GROUP)
                 } else {
-                    Row::Item(Setting::ALL.len() + len - 1)
+                    Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + len - 1)
                 }
             }
             row => row,
@@ -207,21 +231,11 @@ impl App {
         let row = self
             .panel
             .selected(&self.panel_lens())
-            .unwrap_or(Row::Header(3));
+            .unwrap_or(Row::Header(LAYER_GROUP));
         match code {
             KeyCode::Char('n') => {
-                let mut k = 1;
-                while self
-                    .edits
-                    .current()
-                    .layers()
-                    .iter()
-                    .any(|layer| layer.name == format!("Layer {k}"))
-                {
-                    k += 1;
-                }
                 self.edits.edit(|doc| {
-                    doc.add_layer(format!("Layer {k}"));
+                    doc.add_layer(doc.next_layer_name());
                 });
                 self.panel.invalidate();
                 self.retain_panel(self.layer_row(self.edits.current().layers().len() - 1));
@@ -306,6 +320,9 @@ impl App {
             preview_focus: false,
             last_drag: None,
             layer_drag: None,
+            stroke: None,
+            brush: Brush::default(),
+            brush_on: false,
             minimap_visible: false,
             grid_cache: GridCache::default(),
             edits: History::new(Document::new(0, 0)),
@@ -318,7 +335,13 @@ impl App {
             keys_open: false,
             keys_scroll: 0,
             settings: Settings::default(),
-            panel: Outline::new(&[GROUP_LENS[0], GROUP_LENS[1], GROUP_LENS[2], 0]),
+            panel: Outline::new(&[
+                GROUP_LENS[0],
+                GROUP_LENS[1],
+                GROUP_LENS[2],
+                BrushRow::ALL.len(),
+                0,
+            ]),
             view: View::Original,
             mass_return: View::Original,
             mass_minimap: true,
@@ -392,8 +415,9 @@ impl App {
         let row = self
             .panel
             .selected(&self.panel_lens())
-            .unwrap_or(Row::Header(3));
+            .unwrap_or(Row::Header(LAYER_GROUP));
         self.layer_drag = None;
+        self.stroke = None;
         self.source_path = Some(path);
         self.edits
             .reset(Document::new(image.width(), image.height()));
@@ -617,6 +641,7 @@ impl App {
     /// Inserts pasted text into the active field or requests a dropped image.
     pub fn handle_paste(&mut self, text: &str) {
         self.end_layer_drag();
+        self.end_stroke();
         self.keys_open = false;
         if let Some(modal) = &mut self.modal {
             modal.paste(text);
@@ -799,6 +824,52 @@ impl App {
         true
     }
 
+    /// Ends the current exposure stroke before unrelated input changes its context.
+    pub(crate) fn end_stroke(&mut self) {
+        if self.stroke.take().is_some() {
+            self.edits.discard_if_unchanged();
+        }
+    }
+
+    fn source_point(
+        &self,
+        geometry: &PreviewGeometry,
+        column: u16,
+        row: u16,
+    ) -> Option<(f64, f64)> {
+        if geometry
+            .minimap
+            .is_some_and(|map| map.frame.contains((column, row).into()))
+        {
+            return None;
+        }
+        self.grid_cache
+            .placement(&self.settings)?
+            .source_point(geometry.dot_at(column, row)?, self.source_size())
+    }
+
+    fn start_stroke(&mut self, point: (f64, f64)) -> bool {
+        let doc = self.edits.current();
+        if doc.target().is_some_and(|i| !doc.layers()[i].visible) {
+            self.set_notice("target layer is hidden".into());
+            return true;
+        }
+        self.notice = None;
+        let brush = self.brush;
+        self.edits.edit(|doc| {
+            if doc.layers().is_empty() {
+                doc.add_layer(doc.next_layer_name());
+            }
+            brush.dab(
+                &mut doc.target_mut().expect("stroke target").exposure,
+                point,
+            );
+        });
+        self.stroke = Some(Stroke::new(point, brush));
+        self.last_drag = None;
+        true
+    }
+
     /// Routes mouse input and reports whether the display needs redrawing.
     pub fn handle_mouse(
         &mut self,
@@ -816,6 +887,7 @@ impl App {
                 self.select_layer(drag.index, true);
                 ended = true;
             }
+            self.end_stroke();
             let moved = self.end_layer_drag();
             if moved && mouse.kind != MouseEventKind::Up(MouseButton::Left) {
                 // A lost release: handle this event too, and redraw for the reorder.
@@ -844,6 +916,23 @@ impl App {
             self.modal = Some(modal);
             self.apply_step(step);
             return was_dragging || changed;
+        }
+        if let Some(mut stroke) = self.stroke.take() {
+            let point = self.source_point(geometry, mouse.column, mouse.row);
+            let brush = self.brush;
+            let mut centers = Vec::new();
+            stroke.advance(point, brush, |point| centers.push(point));
+            let painted = !centers.is_empty();
+            if painted {
+                self.edits.amend(|doc| {
+                    let map = &mut doc.target_mut().expect("stroke target").exposure;
+                    for point in centers {
+                        brush.dab(map, point);
+                    }
+                });
+            }
+            self.stroke = Some(stroke);
+            return painted;
         }
         let panel = crate::ui::layout(screen).panel;
         let lens = self.panel_lens();
@@ -901,6 +990,25 @@ impl App {
         if self.source_path().is_none() {
             self.last_drag = None;
             return was_dragging;
+        }
+        if self.brush_on {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some(point) = self.source_point(geometry, mouse.column, mouse.row)
+            {
+                return self.start_stroke(point);
+            }
+            let minimap = geometry
+                .minimap
+                .is_some_and(|map| map.frame.contains((mouse.column, mouse.row).into()));
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+            ) && !minimap
+                && !self.last_drag.is_some_and(|drag| drag.minimap)
+            {
+                self.last_drag = None;
+                return false;
+            }
         }
         let before = (self.viewport.x, self.viewport.y);
         let prev = self.last_drag.take();
@@ -1004,6 +1112,7 @@ impl App {
     /// Handles global zoom and focus keys, then preview panning or parameter edits.
     pub fn handle_key(&mut self, key: KeyEvent, geometry: &PreviewGeometry) {
         self.end_layer_drag();
+        self.end_stroke();
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -1071,6 +1180,13 @@ impl App {
         }
         if key.code == KeyCode::Tab {
             self.preview_focus = !self.preview_focus;
+            return;
+        }
+        if key.code == KeyCode::Char('b') {
+            if self.source_path().is_some() {
+                self.brush_on = !self.brush_on;
+                self.last_drag = None;
+            }
             return;
         }
         if self.handle_layer_key(key.code) {
@@ -1141,6 +1257,20 @@ impl App {
                 return;
             }
             Outcome::Consumed | Outcome::Cancel => return,
+        }
+        if let Some(Row::Item(i)) = self.panel.selected(&self.panel_lens())
+            && let PanelItem::Brush(row) = self.panel_row(i)
+        {
+            let direction = match key.code {
+                KeyCode::Char('d') => Some(0),
+                KeyCode::Left | KeyCode::Char('h') => Some(-1),
+                KeyCode::Right | KeyCode::Char('l') => Some(1),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                row.adjust(&mut self.brush, direction);
+                return;
+            }
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -1354,6 +1484,395 @@ mod tests {
     }
 
     #[test]
+    fn brush_rows_adjust_reset_and_leave_layers_addressable() {
+        let mut app = App::empty();
+        press(&mut app, KeyCode::Char('b'));
+        assert!(!app.brush_on);
+        for (index, row) in BrushRow::ALL.into_iter().enumerate() {
+            let item = Setting::ALL.len() + index;
+            assert_eq!(app.panel_row(item), PanelItem::Brush(row));
+            app.panel.select(Row::Item(item), &app.panel_lens());
+            assert_eq!(app.selected_setting(), None);
+            press(&mut app, KeyCode::Char('h'));
+            assert!(row.changed(app.brush));
+            press(&mut app, KeyCode::Char('l'));
+            if row != BrushRow::Mode {
+                assert!(!row.changed(app.brush));
+            }
+            press(&mut app, KeyCode::Right);
+            assert!(row.changed(app.brush));
+            press(&mut app, KeyCode::Char('d'));
+            assert!(!row.changed(app.brush));
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Char('d'));
+        }
+        assert_eq!(app.brush, Brush::default());
+        assert!(!app.edits.can_undo());
+        app.open_image("source.png".into(), RgbaImage::new(10, 10));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.panel_row(Setting::ALL.len() + 3), PanelItem::Layer(0));
+    }
+
+    #[test]
+    fn brush_stroke_is_one_undo_and_rebuilds_brighter_grid() {
+        let mut app = App::builtin(
+            RgbaImage::from_pixel(128, 128, image::Rgba([100, 100, 100, 255])),
+            None,
+        );
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen);
+        app.viewport.zoom = Zoom::In(1);
+        app.sync(layout.preview);
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.brush_on);
+        let geometry = app.geometry(layout.preview);
+        let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
+        let center = app.source_point(&geometry, x, y).unwrap();
+        let before = app.edits.current().clone();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_some());
+        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
+        let version = app.grid_cache.grid_version();
+        app.sync(layout.preview);
+        assert!(app.grid_cache.grid_version() > version);
+        let grid = app.grid_cache.grid().unwrap();
+        assert!(grid.get_pixel(center.0.round() as u32, center.1.round() as u32)[0] > 100);
+        for offset in [3, 7, 15] {
+            app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                x + offset,
+                y,
+                &geometry,
+                screen,
+            );
+            app.sync(layout.preview);
+        }
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x + 15,
+            y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_none());
+        assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
+        let painted = app.edits.current().clone();
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.edits.current(), &before);
+        assert!(!app.edits.can_undo());
+        press(&mut app, KeyCode::Char('U'));
+        assert_eq!(app.edits.current(), &painted);
+        assert!(app.brush_on);
+        app.sync(layout.preview);
+        let before = app.edits.current().clone();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x + 5,
+            y + 2,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x + 5,
+            y + 2,
+            &geometry,
+            screen,
+        );
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.edits.current(), &before);
+    }
+
+    #[test]
+    fn brush_drag_without_a_dab_keeps_revision() {
+        let mut app = App::builtin(RgbaImage::new(128, 128), None);
+        let screen = Rect::new(0, 0, 100, 40);
+        let area = crate::ui::layout(screen).preview;
+        app.viewport.zoom = Zoom::In(1);
+        app.brush_on = true;
+        app.brush.radius = 256;
+        let geometry = app.geometry(area);
+        let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        let revision = app.edits.revision();
+        assert!(!app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x + 1,
+            y,
+            &geometry,
+            screen,
+        ));
+        assert_eq!(app.edits.revision(), revision);
+    }
+
+    #[test]
+    fn brush_drag_across_margin_does_not_join_exit_and_entry() {
+        let mut app = App::builtin(RgbaImage::new(128, 128), None);
+        let screen = Rect::new(0, 0, 100, 40);
+        let area = crate::ui::layout(screen).preview;
+        app.viewport.zoom = Zoom::In(1);
+        app.brush_on = true;
+        app.brush.radius = 1;
+        app.brush.strength = 100;
+        let geometry = app.geometry(area);
+        let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        let before = app.edits.current().clone();
+        let outside = geometry.target.x - 1;
+        assert!(app.source_point(&geometry, outside, y).is_none());
+        assert!(!app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            outside,
+            y,
+            &geometry,
+            screen,
+        ));
+        assert!(app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            x + 24,
+            y,
+            &geometry,
+            screen,
+        ));
+        let entry = app.source_point(&geometry, x + 24, y).unwrap();
+        let map = &app.edits.current().layers()[0].exposure;
+        assert!(map.get(entry.0.round() as u32, entry.1.round() as u32) > 0);
+        for column in x + 2..x + 23 {
+            let point = app.source_point(&geometry, column, y).unwrap();
+            let (px, py) = (point.0.round() as u32, point.1.round() as u32);
+            assert_eq!(map.get(px, py), before.layers()[0].exposure.get(px, py));
+        }
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x + 24,
+            y,
+            &geometry,
+            screen,
+        );
+        assert!(app.edits.undo());
+        assert!(app.edits.current().layers().is_empty());
+        assert!(!app.edits.can_undo());
+    }
+
+    #[test]
+    fn saturated_stroke_does_not_add_an_undo_step() {
+        for can_undo in [false, true] {
+            let mut app = App::builtin(RgbaImage::new(128, 128), None);
+            let mut document = Document::new(128, 128);
+            document.add_layer(document.next_layer_name());
+            let map = &mut document.target_mut().unwrap().exposure;
+            for y in 0..128 {
+                for x in 0..128 {
+                    map.add(x, y, i16::MAX);
+                }
+            }
+            if can_undo {
+                app.edits.edit(|doc| *doc = document.clone());
+            } else {
+                app.edits = History::new(document.clone());
+            }
+            let screen = Rect::new(0, 0, 100, 40);
+            let area = crate::ui::layout(screen).preview;
+            app.viewport.zoom = Zoom::In(1);
+            app.brush_on = true;
+            let geometry = app.geometry(area);
+            let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                &geometry,
+                screen,
+            );
+            app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                x + 8,
+                y,
+                &geometry,
+                screen,
+            );
+            app.mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                x + 8,
+                y,
+                &geometry,
+                screen,
+            );
+            assert_eq!(app.edits.current(), &document);
+            assert_eq!(app.edits.can_undo(), can_undo);
+            let revision = app.edits.revision();
+            app.end_stroke();
+            assert_eq!(app.edits.revision(), revision);
+            if can_undo {
+                assert!(app.edits.undo());
+                assert!(app.edits.current().layers().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn brush_rejects_hidden_target_and_minimap_and_paper_presses() {
+        let mut app = App::builtin(RgbaImage::new(128, 128), None);
+        let screen = Rect::new(0, 0, 100, 40);
+        let area = crate::ui::layout(screen).preview;
+        app.viewport.zoom = Zoom::In(1);
+        app.brush_on = true;
+        let geometry = app.geometry(area);
+        let map = geometry.minimap.unwrap();
+        let revision = app.edits.revision();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            map.map.x,
+            map.map.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_none());
+        assert!(app.edits.current().layers().is_empty());
+        assert_eq!(app.edits.revision(), revision);
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            map.map.right() - 1,
+            map.map.bottom() - 1,
+            &geometry,
+            screen,
+        );
+        assert!(app.viewport.x > 0 || app.viewport.y > 0);
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            map.map.x,
+            map.map.y,
+            &geometry,
+            screen,
+        );
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('v'));
+        let revision = app.edits.revision();
+        let geometry = app.geometry(area);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y + 4,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.notice(), Some("target layer is hidden"));
+        assert!(app.stroke.is_none());
+        app.mouse_at(
+            MouseEventKind::Drag(MouseButton::Left),
+            geometry.target.x + 4,
+            geometry.target.y + 4,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.revision(), revision);
+        assert!(app.edits.current().layers()[0].exposure.is_empty());
+        app.settings.margin = 10;
+        app.viewport = Viewport::default();
+        let geometry = app.geometry(area);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_none());
+        assert_eq!(app.edits.revision(), revision);
+    }
+
+    #[test]
+    fn stroke_ends_on_unrelated_input_and_paints_at_fit() {
+        let mut app = App::builtin(RgbaImage::new(128, 128), None);
+        let screen = Rect::new(0, 0, 100, 40);
+        let area = crate::ui::layout(screen).preview;
+        app.brush_on = true;
+        let geometry = app.geometry(area);
+        let (x, y) = (geometry.target.x + 2, geometry.target.y + 2);
+        for event in 0..6 {
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                &geometry,
+                screen,
+            );
+            assert!(app.stroke.is_some());
+            match event {
+                0 => {
+                    app.mouse_at(MouseEventKind::Moved, x, y, &geometry, screen);
+                }
+                1 => {
+                    app.mouse_at(
+                        MouseEventKind::Drag(MouseButton::Right),
+                        x,
+                        y,
+                        &geometry,
+                        screen,
+                    );
+                }
+                2 => app.handle_key(
+                    KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+                    &geometry,
+                ),
+                3 => app.handle_paste("text"),
+                4 => app.end_stroke(),
+                _ => app.handle_key(
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('z'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Release,
+                    ),
+                    &geometry,
+                ),
+            }
+            assert!(app.stroke.is_none());
+            let revision = app.edits.revision();
+            app.mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                x + 2,
+                y,
+                &geometry,
+                screen,
+            );
+            assert_eq!(app.edits.revision(), revision);
+            assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
+        }
+        app.viewport.zoom = Zoom::In(1);
+        app.preview_focus = true;
+        let geometry = app.geometry(area);
+        let revision = app.edits.revision();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &geometry);
+        assert!(app.viewport.x > 0);
+        assert_eq!(app.edits.revision(), revision);
+    }
+
+    #[test]
     fn layer_keys_history_targets_names_and_cursor() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         press(&mut app, KeyCode::Char('u'));
@@ -1365,8 +1884,14 @@ mod tests {
         }
         assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
         assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
-        assert_eq!(app.panel_row(Setting::ALL.len()), PanelItem::Layer(1));
-        assert_eq!(app.panel_row(Setting::ALL.len() + 1), PanelItem::Layer(0));
+        assert_eq!(
+            app.panel_row(Setting::ALL.len() + BrushRow::ALL.len()),
+            PanelItem::Layer(1)
+        );
+        assert_eq!(
+            app.panel_row(Setting::ALL.len() + BrushRow::ALL.len() + 1),
+            PanelItem::Layer(0)
+        );
         assert_eq!(app.selected_setting(), None);
         let revision = app.edits.revision();
         let versions = versions(&app);
@@ -1411,9 +1936,15 @@ mod tests {
         app.preview_focus = false;
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(Row::Header(LAYER_GROUP))
+        );
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
+        assert_eq!(
+            app.panel.selected(&app.panel_lens()),
+            Some(Row::Header(LAYER_GROUP))
+        );
         press(&mut app, KeyCode::Char('n'));
         app.panel.select(Row::Item(0), &app.panel_lens());
         app.open_image("next.png".into(), RgbaImage::new(2, 2));
@@ -1522,7 +2053,7 @@ mod tests {
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
         render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let x = layout.panel.x + 5;
         let click = MouseEventKind::Down(MouseButton::Left);
         app.mouse_at(click, x, top + 1, &geometry, screen);
@@ -1626,7 +2157,7 @@ mod tests {
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
         render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let x = layout.panel.x + 5;
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2835,6 +3366,10 @@ mod tests {
             })
             .into_iter()
             .chain(std::iter::once((
+                ratatui::text::Line::raw("Brush"),
+                vec![ratatui::text::Line::default(); BrushRow::ALL.len()],
+            )))
+            .chain(std::iter::once((
                 ratatui::text::Line::raw("Layers"),
                 vec![ratatui::text::Line::default(); app.edits.current().layers().len()],
             )));
@@ -3321,13 +3856,16 @@ mod tests {
         assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
         assert!(!press(&mut app, KeyCode::Up));
         assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
-        for _ in 0..Setting::ALL.len() + 2 {
+        for _ in 0..Setting::ALL.len() + BrushRow::ALL.len() + 4 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
         assert_eq!(app.selected_setting(), None);
         for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
             assert!(!press(&mut app, code));
-            assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(3)));
+            assert_eq!(
+                app.panel.selected(&app.panel_lens()),
+                Some(Row::Header(LAYER_GROUP))
+            );
             assert!(!app.quit);
         }
     }

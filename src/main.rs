@@ -23,6 +23,8 @@
 
 /// Interactive state and input handling.
 mod app;
+/// Source pixel brush controls and strokes.
+mod brush;
 /// Cell rendering for Fit, zoom levels and the minimap.
 mod cells;
 /// Source exposure layers and document history.
@@ -384,6 +386,7 @@ fn event_loop(
                     Event::Paste(text) => app.handle_paste(text),
                     Event::Resize(width, height) => {
                         app.end_layer_drag();
+                        app.end_stroke();
                         layout = ui::layout(ratatui::layout::Size::new(*width, *height));
                         app.clamp_viewport(layout.preview);
                     }

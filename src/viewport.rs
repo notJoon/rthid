@@ -231,6 +231,26 @@ pub struct PreviewGeometry {
 }
 
 impl PreviewGeometry {
+    /// Grid dot under the cell center, excluding cells outside the preview target.
+    pub(crate) fn dot_at(&self, column: u16, row: u16) -> Option<(f64, f64)> {
+        if !self.target.contains((column, row).into()) {
+            return None;
+        }
+        let (dx, dy) = if self.zoom == Zoom::Fit {
+            (
+                f64::from(self.grid.0) / f64::from(self.target.width),
+                f64::from(self.grid.1) / f64::from(self.target.height),
+            )
+        } else {
+            self.zoom.dots_per_cell(self.grid, self.area)
+        };
+        Some((
+            (f64::from(self.origin.0) + (f64::from(column - self.target.x) + 0.5) * dx - 0.5)
+                .max(0.0),
+            (f64::from(self.origin.1) + (f64::from(row - self.target.y) + 0.5) * dy - 0.5).max(0.0),
+        ))
+    }
+
     /// Whether any image dots lie outside the visible region.
     pub fn overflows(&self) -> bool {
         self.grid.0 > self.visible.0 || self.grid.1 > self.visible.1
@@ -422,6 +442,35 @@ mod tests {
         Zoom::In(3),
         Zoom::In(4),
     ];
+
+    #[test]
+    fn cell_centers_map_to_dots_at_fit_out_and_in() {
+        let area = Rect::new(3, 5, 20, 10);
+        for (zoom, target, first, second) in [
+            (
+                Zoom::Fit,
+                Rect::new(3, 6, 20, 8),
+                (2.0, 5.125),
+                (7.0, 16.375),
+            ),
+            (Zoom::Out(2), area, (12.5, 9.75), (14.5, 14.25)),
+            (Zoom::In(2), area, (11.75, 8.0), (12.25, 9.0)),
+        ] {
+            let viewport = Viewport {
+                zoom,
+                x: 12,
+                y: 8,
+                ..Viewport::default()
+            };
+            let g = geometry(&viewport, (100, 90), area);
+            assert_eq!(g.target, target);
+            assert_eq!(g.dot_at(target.x, target.y), Some(first));
+            assert_eq!(g.dot_at(target.x + 1, target.y + 1), Some(second));
+            assert_eq!(g.dot_at(target.x - 1, target.y), None);
+            assert_eq!(g.dot_at(target.right(), target.y), None);
+            assert_eq!(g.dot_at(target.x, target.bottom()), None);
+        }
+    }
 
     #[test]
     fn partial_edge_dots_remain_reachable() {
