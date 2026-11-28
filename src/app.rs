@@ -153,7 +153,7 @@ impl App {
             modal: None,
             keys_open: false,
             settings: Settings::default(),
-            panel: Outline::new(),
+            panel: Outline::new(&GROUP_LENS),
             layer: Layer::Original,
             mass_return: Layer::Original,
             mass_minimap: true,
@@ -161,7 +161,6 @@ impl App {
             mass_tones: None,
             quit: false,
         };
-        app.panel.select(Row::Item(0), &GROUP_LENS);
         if let Some((path, image)) = source {
             app.open_image(path, image);
         }
@@ -642,25 +641,18 @@ impl App {
             && !matches!(mouse.kind, MouseEventKind::Drag(_))
         {
             self.last_drag = None;
-            let preview_focus = self.preview_focus;
-            let before = self.panel.selected(&GROUP_LENS);
             let outcome = self.panel.handle_mouse(
                 mouse,
                 Some(&ratatui::widgets::Block::bordered()),
                 panel,
                 &GROUP_LENS,
             );
-            let after = self.panel.selected(&GROUP_LENS);
             let clicked = outcome != Outcome::Ignored
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
             if clicked {
                 self.preview_focus = false;
             }
-            let toggled = clicked && matches!(after, Some(Row::Header(_)));
-            return was_dragging
-                || before != after
-                || toggled
-                || preview_focus != self.preview_focus;
+            return was_dragging || outcome != Outcome::Ignored;
         }
         if self.source_path().is_none() {
             self.last_drag = None;
@@ -2377,8 +2369,7 @@ mod tests {
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.layer, Layer::Dithered);
         assert!(!press(&mut app, KeyCode::Char(' ')));
-        app.panel = Outline::new();
-        app.panel.select(Row::Item(0), &GROUP_LENS);
+        app.panel = Outline::new(&GROUP_LENS);
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.layer, Layer::Original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d')] {

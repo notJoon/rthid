@@ -50,11 +50,12 @@ pub enum Row {
 ///     (Line::raw("Print"), vec![Line::raw("copies")]),
 ///     (Line::raw("Tone"), vec![Line::raw("gamma")]),
 /// ];
-/// let mut outline = Outline::new();
+/// let mut outline = Outline::new(&[1, 1]);
 /// let mut buffer = Buffer::empty(area);
 /// outline.render(groups(), None, Style::default(), area, &mut buffer);
 /// assert_eq!(buffer[(2, 1)].symbol(), "c");
 ///
+/// outline.select(rthid_widgets::Row::Header(0), &[1, 1]);
 /// let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
 /// assert_eq!(outline.handle_key(left, &[1, 1]), Outcome::Consumed);
 /// assert!(outline.is_collapsed(0));
@@ -76,10 +77,16 @@ impl Outline {
     /// Enter toggles the selected group header.
     pub const TOGGLE: Hint = Hint::new("Enter", "toggle");
 
-    /// Creates an outline with its cursor on the first row and every group expanded.
-    pub fn new() -> Self {
+    const EXPANDED_HINTS: [Hint; 2] = [Self::COLLAPSE, Self::TOGGLE];
+    const COLLAPSED_HINTS: [Hint; 2] = [Self::EXPAND, Self::TOGGLE];
+
+    /// Creates an outline with every group expanded.
+    ///
+    /// The cursor starts on the first item when group zero has items, or the
+    /// first header otherwise.
+    pub fn new(lens: &[usize]) -> Self {
         Self {
-            picker: ListPicker::new(0),
+            picker: ListPicker::new(usize::from(lens.first().is_some_and(|&len| len > 0))),
             collapsed: Vec::new(),
         }
     }
@@ -92,6 +99,18 @@ impl Outline {
     pub fn selected(&self, lens: &[usize]) -> Option<Row> {
         let rows = self.rows(lens);
         self.picker.selected(rows.len()).map(|index| rows[index])
+    }
+
+    /// Returns the keys owned by the selected group header.
+    ///
+    /// Expanded headers offer collapse and toggle; collapsed headers offer
+    /// expand and toggle. Items and empty outlines return no hints.
+    pub fn hints(&self, lens: &[usize]) -> &'static [Hint] {
+        match self.selected(lens) {
+            Some(Row::Header(group)) if self.is_collapsed(group) => &Self::COLLAPSED_HINTS,
+            Some(Row::Header(_)) => &Self::EXPANDED_HINTS,
+            Some(Row::Item(_)) | None => &[],
+        }
     }
 
     /// Selects `row`, clamping an out-of-range row to the last visible row.
@@ -256,12 +275,6 @@ impl Outline {
     }
 }
 
-impl Default for Outline {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn item_group(item: usize, lens: &[usize]) -> Option<usize> {
     let mut first = 0usize;
     for (group, &len) in lens.iter().enumerate() {
@@ -296,15 +309,9 @@ mod tests {
 
     #[test]
     fn navigation_moves_through_headers_and_items_without_wrapping() {
-        let mut outline = Outline::new();
         let lens = [2, 1];
-        let expected = [
-            Row::Header(0),
-            Row::Item(0),
-            Row::Item(1),
-            Row::Header(1),
-            Row::Item(2),
-        ];
+        let mut outline = Outline::new(&lens);
+        let expected = [Row::Item(0), Row::Item(1), Row::Header(1), Row::Item(2)];
         for row in expected {
             assert_eq!(outline.selected(&lens), Some(row));
             assert_eq!(
@@ -332,8 +339,9 @@ mod tests {
 
     #[test]
     fn header_keys_toggle_and_follow_modifier_rules() {
-        let mut outline = Outline::new();
         let lens = [1];
+        let mut outline = Outline::new(&lens);
+        outline.select(Row::Header(0), &lens);
         for code in [KeyCode::Left, KeyCode::Char('h')] {
             assert_eq!(outline.handle_key(key(code), &lens), Outcome::Consumed);
             assert!(outline.is_collapsed(0));
@@ -374,9 +382,8 @@ mod tests {
 
     #[test]
     fn item_keys_submit_cancel_or_fall_through() {
-        let mut outline = Outline::new();
         let lens = [1];
-        outline.handle_key(key(KeyCode::Down), &lens);
+        let mut outline = Outline::new(&lens);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &lens),
             Outcome::Submit(0)
@@ -396,9 +403,30 @@ mod tests {
     }
 
     #[test]
+    fn new_starts_on_the_first_item_or_first_header() {
+        let outline = Outline::new(&[2, 1]);
+        assert_eq!(outline.selected(&[2, 1]), Some(Row::Item(0)));
+
+        let outline = Outline::new(&[0, 1]);
+        assert_eq!(outline.selected(&[0, 1]), Some(Row::Header(0)));
+    }
+
+    #[test]
+    fn hints_are_owned_only_for_the_selected_header_state() {
+        let lens = [1];
+        let mut outline = Outline::new(&lens);
+        assert_eq!(outline.hints(&lens), &[]);
+        outline.select(Row::Header(0), &lens);
+        assert_eq!(outline.hints(&lens), &[Outline::COLLAPSE, Outline::TOGGLE]);
+        outline.handle_key(key(KeyCode::Left), &lens);
+        assert_eq!(outline.hints(&lens), &[Outline::EXPAND, Outline::TOGGLE]);
+        assert_eq!(Outline::new(&[]).hints(&[]), &[]);
+    }
+
+    #[test]
     fn collapsing_and_expanding_keeps_the_cursor_on_its_header() {
-        let mut outline = Outline::new();
         let lens = [2, 1];
+        let mut outline = Outline::new(&lens);
         outline.select(Row::Header(1), &lens);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &lens),
@@ -419,7 +447,7 @@ mod tests {
         let area = Rect::new(2, 3, 12, 5);
         let block = Block::bordered();
         let lens = [1, 1];
-        let mut outline = Outline::new();
+        let mut outline = Outline::new(&lens);
         outline.render(
             [
                 (Line::raw("A"), vec![Line::raw("a")]),
@@ -485,7 +513,7 @@ mod tests {
                 (Line::raw("B"), vec![Line::raw("b")]),
             ]
         };
-        let mut outline = Outline::new();
+        let mut outline = Outline::new(&[1, 1]);
         outline.select(Row::Header(1), &[1, 1]);
         outline.handle_key(key(KeyCode::Left), &[1, 1]);
         let mut buf = Buffer::empty(area);
@@ -520,7 +548,7 @@ mod tests {
 
     #[test]
     fn empty_and_changing_groups_are_safe_and_selection_expands_items() {
-        let mut outline = Outline::new();
+        let mut outline = Outline::new(&[]);
         assert_eq!(outline.selected(&[]), None);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &[]),
@@ -568,8 +596,8 @@ mod tests {
                 (Line::raw("B"), vec![]),
             ]
         };
-        let mut outline = Outline::new();
         let lens = [3, 0];
+        let mut outline = Outline::new(&lens);
         outline.select(Row::Header(1), &lens);
         let mut buf = Buffer::empty(area);
         outline.render(groups(), None, Style::default(), area, &mut buf);

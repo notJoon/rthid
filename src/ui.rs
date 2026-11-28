@@ -15,7 +15,7 @@ use ratatui::layout::{Constraint, Layout as Split, Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Outline, Row, TextInput, hint_line};
+use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Row, TextInput, hint_line};
 
 use crate::{
     app::App,
@@ -152,14 +152,7 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     }
     let mut result = vec![ListPicker::MOVE];
     match app.panel.selected(&GROUP_LENS) {
-        Some(Row::Header(group)) => {
-            result.push(if app.panel.is_collapsed(group) {
-                Outline::EXPAND
-            } else {
-                Outline::COLLAPSE
-            });
-            result.push(Outline::TOGGLE);
-        }
+        Some(Row::Header(_)) => result.extend_from_slice(app.panel.hints(&GROUP_LENS)),
         Some(Row::Item(i)) => {
             let setting = Setting::ALL[i];
             if setting.is_active(&app.settings) {

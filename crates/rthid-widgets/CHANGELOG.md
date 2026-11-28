@@ -8,8 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `Outline` and `Row` provide independently collapsible groups with an unindented
-  header, a shared item/selection gutter, and the `EXPAND`, `COLLAPSE`, and
-  `TOGGLE` hint constants
+  header, a shared item/selection gutter, first-item startup from the constructor's
+  lens, and header actions through `hints`, `EXPAND`, `COLLAPSE`, and `TOGGLE`
 - `Hint`, width-aware `hint_line`, and key hint constants on input widgets
 - `KeyHelp` renders titled groups of display-width-aligned key references
 - `ListPicker` mouse hint constants for click, repeated click, and wheel actions

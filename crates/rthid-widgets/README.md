@@ -89,6 +89,9 @@ assert_eq!(picker.selected(items.len()), Some(1));
 assert_eq!(picker.selected(0), None);
 ```
 
+`Outline::new(lens)` starts on the first item when the first group is non-empty,
+or on the first group header otherwise. Pass matching lengths to later calls.
+
 Pass the same block and outer area used by `render` to `index_at` and
 `handle_mouse`, with the block before the area. The picker computes the content
 area so borders do not select items. `selected_row(area, block, len)` returns the
