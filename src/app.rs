@@ -526,7 +526,7 @@ impl App {
             .saving
             .iter()
             .any(|save| save.dir == dir && save.epoch == self.document_epoch);
-        if !own_pending && dir.exists() && !session::is_session(&dir) {
+        if !own_pending && dir.exists() && !session::is_saveable(&dir) {
             self.set_notice(format!("{}: not a session directory", dir.display()));
         } else if !own_pending && self.session.is_none() && dir.exists() {
             self.confirm(
@@ -546,6 +546,8 @@ impl App {
             return;
         };
         let token = self.next_token();
+        // IO reports only the newest save per directory, so older entries never complete.
+        self.saving.retain(|save| save.dir != dir);
         self.saving.push(SessionSave {
             token,
             epoch: self.document_epoch,
@@ -1786,9 +1788,11 @@ mod tests {
         Done::new(tag, std::time::Duration::ZERO, IoOutcome::Saved(result))
     }
 
+    // IO reports only the newest save per directory, so the first completion
+    // is ignored even when it arrives.
     #[test]
     fn overlapping_session_saves_keep_the_newest_successful_baseline() {
-        for (newest_first, second_succeeds) in [(false, false), (false, true), (true, true)] {
+        for second_succeeds in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path().join("photo.rthid");
             let mut app = App::builtin(RgbaImage::new(2, 3), None);
@@ -1796,24 +1800,18 @@ mod tests {
             app.settings.flip = true;
             ctrl(&mut app, 's');
             let first = app.take_jobs().pop().unwrap().1;
-            session::write(&dir, snapshot(&app)).unwrap();
             app.settings.flip = false;
             ctrl(&mut app, 's');
             assert!(app.modal.is_none());
+            assert_eq!(app.saving.len(), 1);
             let second = app.take_jobs().pop().unwrap().1;
-            if newest_first {
-                app.complete(session_completion(second, &dir, second_succeeds));
-                app.complete(session_completion(first, &dir, true));
-            } else {
-                app.complete(session_completion(first, &dir, true));
-                app.complete(session_completion(second, &dir, second_succeeds));
-            }
-            assert_eq!(app.session.as_ref(), Some(&dir));
-            assert_eq!(app.modified(), !second_succeeds);
+            assert!(!app.complete(session_completion(first, &dir, true)));
+            app.complete(session_completion(second, &dir, second_succeeds));
+            assert_eq!(app.session.as_ref(), second_succeeds.then_some(&dir));
+            // A failed second save leaves the opened state, which also has no flip.
+            assert!(!app.modified());
             if !second_succeeds {
                 assert!(app.notice().unwrap().contains("injected save failure"));
-                app.settings.flip = true;
-                assert!(!app.modified());
             }
         }
     }
@@ -1981,8 +1979,10 @@ mod tests {
         assert!(app.take_jobs().is_empty());
         std::fs::remove_file(&target).unwrap();
         std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("notes.txt"), b"unrelated").unwrap();
         ctrl(&mut app, 's');
         assert!(app.notice().unwrap().contains("not a session directory"));
+        std::fs::remove_file(target.join("notes.txt")).unwrap();
         std::fs::remove_dir(&target).unwrap();
         ctrl(&mut app, 's');
         run_session_job(&mut app);
@@ -2114,6 +2114,21 @@ mod tests {
         run_session_job(&mut app);
         assert!(app.session.is_none());
         assert!(app.modified());
+    }
+
+    #[test]
+    fn failed_first_save_leftovers_ask_to_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        let source = temp.path().join("photo.png");
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        let dir = session::default_path(&source);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("source-1.png"), b"partial").unwrap();
+        ctrl(&mut app, 's');
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { question, .. }) if question.message() == "Overwrite photo.rthid?")
+        );
     }
 
     #[test]

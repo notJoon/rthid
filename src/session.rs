@@ -220,6 +220,33 @@ pub(crate) fn is_session(path: &Path) -> bool {
         && path.join("manifest.toml").is_file()
 }
 
+/// Recognizes a directory a save may write: a session, or what a failed or
+/// interrupted first save left before its manifest.
+pub(crate) fn is_saveable(path: &Path) -> bool {
+    is_session(path)
+        || path.extension().is_some_and(|ext| ext == "rthid")
+            && only_save_leftovers(path).unwrap_or(false)
+}
+
+/// Whether `dir` holds only the lock, generation files, and `atomic` temporaries.
+fn only_save_leftovers(dir: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == ".lock" {
+            continue;
+        }
+        let owned = name.to_str().is_some_and(|name| {
+            generation_number(name).is_some()
+                || name.starts_with(".rthid-") && name.ends_with(".tmp")
+        });
+        if !(owned && entry.file_type()?.is_file()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Uses the source stem beside the original image.
 pub(crate) fn default_path(source: &Path) -> PathBuf {
     source.with_extension("rthid")
@@ -391,9 +418,15 @@ pub(crate) fn containing(path: &Path) -> Option<PathBuf> {
     (child(dir, &manifest.source).ok()? == path).then(|| dir.to_path_buf())
 }
 
-/// Creates the session directory if missing and commits pixel files before the manifest.
-/// Deletes unreferenced source and exposure files whose names the generation parser accepts.
-/// Refuses non empty directories without a manifest and broken or unsupported manifests.
+/// Writes the session, creating the directory if necessary.
+/// Commits pixel files before the manifest and removes unreferenced
+/// source and exposure files with valid generation names.
+///
+/// # Errors
+///
+/// Returns an error if the directory has no manifest and contains
+/// files other than recognized generation files, or if the existing
+/// manifest is invalid or unsupported.
 pub(crate) fn write(dir: &Path, session: Session) -> io::Result<()> {
     write_before_manifest(dir, session, || Ok(()))
 }
@@ -427,12 +460,9 @@ fn write_before_manifest(
     let previous = atomic::read_regular(&manifest_path)?
         .map(|text| parse_manifest(&manifest_path, &text))
         .transpose()?;
-    if previous.is_none() {
-        for entry in fs::read_dir(dir)? {
-            if entry?.file_name() != ".lock" {
-                return Err(named(dir, "not a session directory, save elsewhere"));
-            }
-        }
+    // Leftovers of a failed first save are reused, and the cleanup below removes them.
+    if previous.is_none() && !only_save_leftovers(dir)? {
+        return Err(named(dir, "not a session directory, save elsewhere"));
     }
     let mut generation = 0u64;
     let names = previous.iter().flat_map(|m| {
@@ -917,6 +947,25 @@ mod tests {
             exposure_files(temp.path()),
             ["exposure-3-0.png", "exposure-3-2.png"]
         );
+    }
+
+    #[test]
+    fn failed_first_save_leaves_a_directory_the_next_save_reuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let result = write_before_manifest(&dir, fixture(), || Err(io::Error::other("injected")));
+        assert!(result.is_err());
+        assert!(dir.join("source-1.png").exists());
+        // A crash during a pixel write leaves an atomic temporary behind.
+        fs::write(dir.join(".rthid-crash.tmp"), b"partial").unwrap();
+        assert!(!is_session(&dir));
+        assert!(is_saveable(&dir));
+        write(&dir, fixture()).unwrap();
+        assert_equal(&fixture(), &read(&dir).unwrap());
+        assert!(!dir.join("source-1.png").exists());
+        fs::create_dir(dir.join("source-9.png")).unwrap();
+        fs::remove_file(dir.join("manifest.toml")).unwrap();
+        assert!(!is_saveable(&dir));
     }
 
     #[test]
