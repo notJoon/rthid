@@ -494,12 +494,14 @@ impl App {
 
     /// Whether document, processing or preview state differs from the last saved snapshot.
     pub(crate) fn modified(&self) -> bool {
+        let current = self.current_state();
         self.source_path.is_some()
             && (self.save_uncertain
                 || self
-                    .saved
-                    .as_ref()
-                    .is_some_and(|saved| *saved != self.current_state()))
+                    .saving
+                    .iter()
+                    .any(|save| save.epoch == self.document_epoch && save.state != current)
+                || self.saved.as_ref().is_some_and(|saved| *saved != current))
     }
 
     /// Replaces source, settings and layers with a validated session and fresh history.
@@ -582,10 +584,14 @@ impl App {
             settings: self.settings.clone(),
             view: ViewState::capture(self),
         };
+        let protect = self.protected_exports();
         self.outbox.push((
             Job::Save {
                 dir,
-                write: Box::new(move |dir| session::write(dir, snapshot)),
+                write: Box::new(move |dir| {
+                    session::check_exports(dir, &protect)?;
+                    session::write(dir, snapshot)
+                }),
             },
             token,
         ));
@@ -848,6 +854,19 @@ impl App {
         }
     }
 
+    fn protected_exports(&self) -> Vec<PathBuf> {
+        self.export
+            .as_ref()
+            .map(|export| export.path().to_path_buf())
+            .into_iter()
+            .chain(
+                self.mass_export
+                    .as_ref()
+                    .map(|export| export.path().to_path_buf()),
+            )
+            .collect()
+    }
+
     fn start_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         let token = self.next_token();
         self.open_request = Some(OpenRequest {
@@ -865,17 +884,7 @@ impl App {
         self.notice = None;
         let resolved = Self::resolve_open(&path, dir.as_deref());
         let resolved = session::containing(&resolved).unwrap_or(resolved);
-        let protect: Vec<_> = self
-            .export
-            .as_ref()
-            .map(|export| export.path().to_path_buf())
-            .into_iter()
-            .chain(
-                self.mass_export
-                    .as_ref()
-                    .map(|export| export.path().to_path_buf()),
-            )
-            .collect();
+        let protect = self.protected_exports();
         let job = if session::is_session(&resolved)
             || (resolved.is_dir() && resolved.extension().is_some_and(|ext| ext == "rthid"))
         {
@@ -1881,6 +1890,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_session_save_requires_quit_confirmation_after_reverting() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        ctrl(&mut app, 's');
+        assert_eq!(app.saving.len(), 1);
+        app.settings.flip = false;
+        assert!(
+            app.saved
+                .as_ref()
+                .is_some_and(|saved| *saved == app.current_state())
+        );
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+    }
+
+    #[test]
     fn superseded_save_failure_stays_modified_until_success() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("photo.rthid");
@@ -1951,6 +1978,73 @@ mod tests {
                 press(&mut app, KeyCode::Char(if accept { 'y' } else { 'n' }));
                 assert_eq!(app.document.layers().len(), usize::from(!accept));
                 assert!(app.open_request.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn session_load_preserves_edits_made_with_a_source_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("stored.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        assert!(!app.modified());
+        app.request_open(dir, None);
+        assert!(app.modal.is_none());
+        let (job, tag) = app.take_jobs().pop().unwrap();
+        let Job::Load { path, read } = job else {
+            panic!("expected session load")
+        };
+        app.document.add_layer("Keep".into());
+        let value = read(&path).unwrap();
+        app.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Loaded(Ok(rthid_io::io::Output { path, value })),
+        ));
+        let Some(Modal::Confirm { question, .. }) = &app.modal else {
+            panic!("expected confirmation")
+        };
+        assert_eq!(question.message(), "Discard unsaved changes?");
+        assert_eq!(app.document.layers().len(), 1);
+        assert_eq!(app.document.layers()[0].name, "Keep");
+    }
+
+    #[test]
+    fn session_save_rejects_exports_inside_the_directory_without_changing_files() {
+        for existing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("photo.png");
+            let dir = session::default_path(&source);
+            let destination = dir.join("source-0.png");
+            let mut app = App::builtin(RgbaImage::new(2, 3), Some(destination.clone()));
+            app.open_image(source, RgbaImage::new(2, 3));
+            app.take_jobs();
+            let manifest = if existing {
+                session::write(&dir, snapshot(&app)).unwrap();
+                std::fs::write(&destination, b"keep export").unwrap();
+                app.session = Some(dir.clone());
+                Some(std::fs::read(dir.join("manifest.toml")).unwrap())
+            } else {
+                None
+            };
+            let saved = app.saved.clone();
+            app.settings.flip = true;
+            ctrl(&mut app, 's');
+            run_session_job(&mut app);
+            assert!(
+                app.notice()
+                    .unwrap()
+                    .contains("export destination is inside the session directory")
+            );
+            assert!(app.saved == saved);
+            assert!(app.modified());
+            if let Some(manifest) = manifest {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"keep export");
+                assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), manifest);
+            } else {
+                assert!(!dir.exists());
             }
         }
     }
