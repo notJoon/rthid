@@ -5,7 +5,7 @@
 //! graphics while the panel retains its own scroll offset.
 
 use crate::{
-    cells::{self, Layer},
+    cells::{self, View},
     graphics,
     modal::{Modal, editor_prefix, editor_rows, preset_rows, swatch_span, template_rows},
     viewport,
@@ -650,7 +650,7 @@ fn draw_preview(
     let image_mode = app.modal.is_none()
         && !app.keys_open
         && renderer.graphics.is_some()
-        && app.layer == Layer::Original
+        && app.view == View::Original
         && geometry.zoom == viewport::Zoom::Fit
         && !geometry.area.is_empty();
     let approximate = if image_mode {
@@ -739,7 +739,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     let displayed = if let Some(name) = report.graphics_name {
         format!("Original ({name})")
     } else {
-        app.layer.name().into()
+        app.view.name().into()
     };
     report.graphics_error.unwrap_or_else(|| {
         format!(
@@ -1348,10 +1348,10 @@ mod tests {
         const FRAMES: usize = 60;
         // See scripts/profile/results/2026-11-26.md for why bytes per frame bound pan speed.
         let cases = [
-            (1, Layer::Original, 103_000),
-            (1, Layer::Dithered, 56_000),
-            (2, Layer::Original, 40_000),
-            (2, Layer::Dithered, 25_500),
+            (1, View::Original, 103_000),
+            (1, View::Dithered, 56_000),
+            (2, View::Original, 40_000),
+            (2, View::Dithered, 25_500),
         ];
         let source = rthid_io::image::load_image(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1365,7 +1365,7 @@ mod tests {
         println!(
             "case                         first bytes   avg bytes/frame   budget   avg writes/frame"
         );
-        for (k, layer, budget) in cases {
+        for (k, view, budget) in cases {
             let zoom = viewport::Zoom::In(k);
             let mut app = App::builtin(source.clone(), None);
             let mut renderer = Renderer::new(None);
@@ -1381,7 +1381,7 @@ mod tests {
             .unwrap();
             let layout = layout(AREA);
             app.viewport.set_zoom(zoom, &app.geometry(layout.preview));
-            app.layer = layer;
+            app.view = view;
             app.sync(layout.preview);
 
             let geometry = app.geometry(layout.preview);
@@ -1431,7 +1431,7 @@ mod tests {
             let bytes = writer.bytes - first_bytes;
             let writes = writer.writes - first_writes;
             let average = bytes.div_ceil(FRAMES);
-            let name = format!("{} {:?}", layer.name(), zoom);
+            let name = format!("{} {:?}", view.name(), zoom);
             println!(
                 "{name:<28} {first_bytes:>11} {average:>17} {budget:>8} {:>18.2}",
                 writes as f64 / FRAMES as f64,
@@ -1459,10 +1459,10 @@ mod tests {
         ] {
             for original in [true, false] {
                 app.viewport.zoom = viewport::Zoom::In(1);
-                app.layer = if original {
-                    Layer::Original
+                app.view = if original {
+                    View::Original
                 } else {
-                    Layer::Dithered
+                    View::Dithered
                 };
                 app.sync(area);
                 let g = app.geometry(area);
@@ -1908,15 +1908,15 @@ mod tests {
         assert!(matches!(
             app.inset(),
             Some(cells::Pixels::Rgb {
-                layer: Layer::Mass,
+                view: View::Mass,
                 ..
             })
         ));
         let report = PreviewReport::default;
         assert!(status(&app, &geometry, report()).ends_with(" | map Mass"));
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         assert!(!status(&app, &geometry, report()).contains("map Mass"));
-        app.layer = Layer::Original;
+        app.view = View::Original;
         app.mass_minimap = false;
         assert!(!status(&app, &geometry, report()).contains("map Mass"));
         app.mass_minimap = true;
@@ -1969,7 +1969,7 @@ mod tests {
         let mut app = App::builtin(RgbaImage::from_pixel(3, 3, image::Rgba([255; 4])), None);
         app.settings.card = BUSINESS_CARD;
         app.sync(Rect::new(0, 0, 180, 30));
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
@@ -2127,7 +2127,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(8, 12), None);
         app.settings = crate::settings::Settings::for_pixels(8, 12);
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
@@ -2141,7 +2141,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!(text.contains("100% x 1-8 y 1-12"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Mass | 100%"));
@@ -2177,10 +2177,10 @@ mod tests {
                         crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
                     })
                     .unwrap();
-                app.layer = if exact {
-                    Layer::Original
+                app.view = if exact {
+                    View::Original
                 } else {
-                    Layer::Dithered
+                    View::Dithered
                 };
                 app.viewport.zoom = if exact {
                     viewport::Zoom::In(1)
@@ -2238,8 +2238,8 @@ mod tests {
             let mut renderer = Renderer::new(Some(graphics::Graphics::new(picker)));
             let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
             let mut app = App::builtin(RgbaImage::new(400, 400), None);
-            for layer in [Layer::Original, Layer::Dithered, Layer::Mass] {
-                app.layer = layer;
+            for view in [View::Original, View::Dithered, View::Mass] {
+                app.view = view;
                 app.sync(layout(terminal.size().unwrap()).preview);
                 for zoom in [
                     viewport::Zoom::Fit,
@@ -2258,7 +2258,7 @@ mod tests {
                             let report = draw_preview(frame, &app, &g, &mut renderer);
                             assert_eq!(
                                 report.graphics_name.is_some(),
-                                layer == Layer::Original && zoom == viewport::Zoom::Fit
+                                view == View::Original && zoom == viewport::Zoom::Fit
                             );
                         })
                         .unwrap();

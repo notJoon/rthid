@@ -778,7 +778,7 @@ impl Setting {
         self.clamp((value * steps).round() / steps)
     }
 
-    /// Geometry controls retain the selected preview layer.
+    /// Geometry controls retain the selected view.
     pub fn shows_dithered(self) -> bool {
         !matches!(
             self,

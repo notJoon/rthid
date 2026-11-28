@@ -70,7 +70,7 @@ impl GridCache {
         Placement::new(self.source.as_ref()?.dimensions(), settings).ok()
     }
 
-    /// Rebuilds the grid and requested layers when their inputs change.
+    /// Rebuilds the grid and requested preview pixels when their inputs change.
     /// Returns true when new dithered indices were built.
     pub fn refresh(
         &mut self,
