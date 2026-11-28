@@ -232,7 +232,8 @@ pub struct PreviewGeometry {
 
 impl PreviewGeometry {
     /// Grid dot under the cell center, excluding cells outside the preview target.
-    /// Integer coordinates are dot centers.
+    /// Integer coordinates are dot centers. A trailing partial cell maps to the
+    /// last dot it draws.
     pub(crate) fn dot_at(&self, column: u16, row: u16) -> Option<(f64, f64)> {
         if !self.target.contains((column, row).into()) {
             return None;
@@ -245,10 +246,12 @@ impl PreviewGeometry {
         } else {
             self.zoom.dots_per_cell(self.grid, self.area)
         };
+        let last = |len: u32| f64::from(len.saturating_sub(1));
         Some((
             (f64::from(self.origin.0) + (f64::from(column - self.target.x) + 0.5) * dx - 0.5)
-                .max(0.0),
-            (f64::from(self.origin.1) + (f64::from(row - self.target.y) + 0.5) * dy - 0.5).max(0.0),
+                .clamp(0.0, last(self.grid.0)),
+            (f64::from(self.origin.1) + (f64::from(row - self.target.y) + 0.5) * dy - 0.5)
+                .clamp(0.0, last(self.grid.1)),
         ))
     }
 
@@ -470,6 +473,19 @@ mod tests {
             assert_eq!(g.dot_at(target.x - 1, target.y), None);
             assert_eq!(g.dot_at(target.right(), target.y), None);
             assert_eq!(g.dot_at(target.x, target.bottom()), None);
+        }
+    }
+
+    #[test]
+    fn trailing_partial_cells_map_to_the_last_dot() {
+        let viewport = Viewport {
+            zoom: Zoom::In(1),
+            ..Viewport::default()
+        };
+        let area = Rect::new(0, 0, 20, 10);
+        for (grid, row, y) in [((10, 1), 0, 0.0), ((10, 3), 1, 2.0)] {
+            let g = geometry(&viewport, grid, area);
+            assert_eq!(g.dot_at(g.target.x, g.target.y + row), Some((0.0, y)));
         }
     }
 

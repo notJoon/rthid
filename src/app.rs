@@ -2082,7 +2082,7 @@ mod tests {
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
         render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('['));
         let revision = app.edits.revision();

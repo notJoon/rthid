@@ -373,32 +373,27 @@ pub fn log_minimap(
 }
 
 fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
-    if app.panel.is_collapsed(BRUSH_GROUP) {
-        let changed = BrushRow::ALL
-            .into_iter()
-            .filter(|row| row.changed(app.brush))
-            .count();
-        let title = if changed == 0 {
-            Line::raw("Brush")
-        } else {
-            Line::from(vec![
-                Span::raw("Brush"),
-                Span::styled(
-                    format!("  {changed} changed"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        };
-        (title, Vec::new())
+    let changed = BrushRow::ALL
+        .into_iter()
+        .filter(|row| row.changed(app.brush))
+        .count();
+    let title = if app.panel.is_collapsed(BRUSH_GROUP) && changed > 0 {
+        Line::from(vec![
+            Span::raw("Brush"),
+            Span::styled(
+                format!("  {changed} changed"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
-        (
-            Line::raw("Brush"),
-            BrushRow::ALL
-                .into_iter()
-                .map(|row| Line::raw(row.label(app.brush)))
-                .collect(),
-        )
-    }
+        Line::raw("Brush")
+    };
+    // Collapsed items are still passed so the rendered lens matches App::panel_lens.
+    let items = BrushRow::ALL
+        .into_iter()
+        .map(|row| Line::raw(row.label(app.brush)))
+        .collect();
+    (title, items)
 }
 
 fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
@@ -977,7 +972,8 @@ mod tests {
         let (title, rows) = brush_group(&app);
         assert_eq!(title.to_string(), "Brush  2 changed");
         assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
-        assert!(rows.is_empty());
+        // Outline hides collapsed rows, so the group still passes all of them.
+        assert_eq!(rows.len(), BrushRow::ALL.len());
         app.brush_on = true;
         assert!(status(&app, &geometry, PreviewReport::default()).contains("Brush Dodge 24px 25%"));
         let context = main_hints(&app, &geometry);
@@ -2383,12 +2379,14 @@ mod tests {
     fn collapsed_group_header_click_expands_after_draw() {
         let mut renderer = Renderer::default();
         let mut app = App::empty();
-        app.panel.select(Row::Header(0), &app.panel_lens());
-        app.panel.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &app.panel_lens(),
-        );
-        assert!(app.panel.is_collapsed(0));
+        for group in [BRUSH_GROUP, 0] {
+            app.panel.select(Row::Header(group), &app.panel_lens());
+            app.panel.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &app.panel_lens(),
+            );
+            assert!(app.panel.is_collapsed(group));
+        }
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         draw_text(&mut terminal, &app, &mut renderer);
         let screen = terminal.size().unwrap().into();
