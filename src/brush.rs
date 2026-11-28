@@ -95,8 +95,10 @@ impl BrushRow {
             Self::Radius => {
                 let index = RADII
                     .iter()
-                    .position(|&r| r == brush.radius)
-                    .expect("brush radius step");
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.abs_diff(brush.radius))
+                    .map(|(index, _)| index)
+                    .unwrap();
                 brush.radius = if direction == 0 {
                     default.radius
                 } else {
@@ -115,6 +117,11 @@ impl BrushRow {
 }
 
 impl Brush {
+    /// Distance between dabs in source pixels.
+    pub(crate) fn spacing(self) -> u32 {
+        (self.radius / 4).max(1)
+    }
+
     /// Adds a smooth dab clipped to the source, with saturation in the exposure map.
     pub(crate) fn dab(self, map: &mut ExposureMap, center: (f64, f64)) {
         let radius = f64::from(self.radius);
@@ -147,6 +154,8 @@ impl Brush {
 pub(crate) struct Stroke {
     point: Option<(f64, f64)>,
     remaining: f64,
+    /// Removes the automatically added layer if the stroke leaves it untouched.
+    pub(crate) created_layer: bool,
 }
 
 impl Stroke {
@@ -154,7 +163,8 @@ impl Stroke {
     pub(crate) fn new(point: (f64, f64), brush: Brush) -> Self {
         Self {
             point: Some(point),
-            remaining: f64::from((brush.radius / 4).max(1)),
+            remaining: f64::from(brush.spacing()),
+            created_layer: false,
         }
     }
 
@@ -172,7 +182,7 @@ impl Stroke {
         };
         let Some(previous) = previous else {
             dab(point);
-            self.remaining = f64::from((brush.radius / 4).max(1));
+            self.remaining = f64::from(brush.spacing());
             return;
         };
         let dx = point.0 - previous.0;
@@ -184,7 +194,7 @@ impl Stroke {
                 previous.0 + dx * distance / length,
                 previous.1 + dy * distance / length,
             ));
-            distance += f64::from((brush.radius / 4).max(1));
+            distance += f64::from(brush.spacing());
         }
         self.remaining = distance - length;
     }
@@ -210,6 +220,25 @@ mod tests {
         assert_eq!(centers, [(100.0, 0.0)]);
         stroke.advance(Some((104.0, 0.0)), brush, |point| centers.push(point));
         assert_eq!(centers, [(100.0, 0.0), (104.0, 0.0)]);
+    }
+
+    #[test]
+    fn radius_adjustment_snaps_arbitrary_values_before_stepping() {
+        for (radius, direction, expected) in [
+            (0, -1, 1),
+            (5, 1, 6),
+            (11, -1, 8),
+            (17, 1, 24),
+            (u32::MAX, 1, 256),
+            (u32::MAX, 0, 16),
+        ] {
+            let mut brush = Brush {
+                radius,
+                ..Brush::default()
+            };
+            BrushRow::Radius.adjust(&mut brush, direction);
+            assert_eq!(brush.radius, expected);
+        }
     }
 
     #[test]
@@ -283,7 +312,7 @@ mod tests {
                 radius,
                 ..Brush::default()
             };
-            let spacing = f64::from((radius / 4).max(1));
+            let spacing = f64::from(brush.spacing());
             let mut long = Stroke::new((0.0, 0.0), brush);
             let mut expected = Vec::new();
             long.advance(Some((512.0, 0.0)), brush, |p| expected.push(p));

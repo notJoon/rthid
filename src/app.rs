@@ -826,7 +826,10 @@ impl App {
 
     /// Ends the current exposure stroke before unrelated input changes its context.
     pub(crate) fn end_stroke(&mut self) {
-        if self.stroke.take().is_some() {
+        if let Some(stroke) = self.stroke.take() {
+            if stroke.created_layer && self.edits.current().layers()[0].exposure.is_empty() {
+                self.edits.amend(|doc| doc.remove_layer(0));
+            }
             self.edits.discard_if_unchanged();
         }
     }
@@ -856,6 +859,7 @@ impl App {
         }
         self.notice = None;
         let brush = self.brush;
+        let created_layer = doc.layers().is_empty();
         self.edits.edit(|doc| {
             if doc.layers().is_empty() {
                 doc.add_layer(doc.next_layer_name());
@@ -865,7 +869,9 @@ impl App {
                 point,
             );
         });
-        self.stroke = Some(Stroke::new(point, brush));
+        let mut stroke = Stroke::new(point, brush);
+        stroke.created_layer = created_layer;
+        self.stroke = Some(stroke);
         self.last_drag = None;
         true
     }
@@ -1680,6 +1686,63 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_strokes_restore_redo_with_and_without_a_layer() {
+        for has_layer in [false, true] {
+            let mut app = App::builtin(RgbaImage::new(8, 8), None);
+            if has_layer {
+                let mut document = Document::new(8, 8);
+                document.add_layer(document.next_layer_name());
+                for y in 0..8 {
+                    for x in 0..8 {
+                        document.target_mut().unwrap().exposure.add(x, y, i16::MAX);
+                    }
+                }
+                app.edits = History::new(document);
+            } else {
+                app.brush.strength = 0;
+            }
+            let before = app.edits.current().clone();
+            app.edits.edit(|doc| {
+                doc.add_layer("Redo".into());
+            });
+            let redo = app.edits.current().clone();
+            assert!(app.edits.undo());
+            app.start_stroke((4.0, 4.0));
+            app.end_stroke();
+            assert_eq!(app.edits.current(), &before);
+            assert!(!app.edits.can_undo());
+            assert!(app.edits.redo());
+            assert_eq!(app.edits.current(), &redo);
+        }
+    }
+
+    #[test]
+    fn brush_at_fit_paints_source_pixels_at_the_drawn_edge() {
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
+        let screen = Rect::new(0, 0, 100, 40);
+        app.brush_on = true;
+        app.brush.radius = 1;
+        let geometry = app.geometry(crate::ui::layout(screen).preview);
+        assert_eq!(geometry.zoom, Zoom::Fit);
+        let (x, y) = (geometry.target.right() - 1, geometry.target.bottom() - 1);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        app.mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            y,
+            &geometry,
+            screen,
+        );
+        assert!(app.edits.current().layers()[0].exposure.get(15, 15) > 0);
+    }
+
+    #[test]
     fn saturated_stroke_does_not_add_an_undo_step() {
         for can_undo in [false, true] {
             let mut app = App::builtin(RgbaImage::new(128, 128), None);
@@ -1979,7 +2042,7 @@ mod tests {
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
         render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('n'));
         let revision = app.edits.revision();

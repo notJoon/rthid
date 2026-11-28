@@ -122,8 +122,8 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
 /// 8     b b b b              . . . .     . . . .
 /// ```
 ///
-/// With Original at Fit and a graphics backend, the preview is drawn as a real
-/// image and none of these cells are painted.
+/// With Original at Fit, a graphics backend and the brush off, the preview is drawn
+/// as a real image and none of these cells are painted.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Zoom {
     /// The whole grid fitted to the preview with the cell aspect preserved.
@@ -232,6 +232,7 @@ pub struct PreviewGeometry {
 
 impl PreviewGeometry {
     /// Grid dot under the cell center, excluding cells outside the preview target.
+    /// Integer coordinates are dot centers.
     pub(crate) fn dot_at(&self, column: u16, row: u16) -> Option<(f64, f64)> {
         if !self.target.contains((column, row).into()) {
             return None;

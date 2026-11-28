@@ -784,7 +784,7 @@ fn rgb_to_ansi256(rgb: [u8; 3]) -> u8 {
     }
 }
 
-// Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
+// Uses terminal graphics only for Original at Fit with the brush off.
 // Calls present every frame so a hidden image is cleared.
 fn draw_preview(
     frame: &mut Frame,
@@ -807,6 +807,7 @@ fn draw_preview(
     };
     let image_mode = app.modal.is_none()
         && !app.keys_open
+        && !app.brush_on
         && renderer.graphics.is_some()
         && app.view == View::Original
         && geometry.zoom == viewport::Zoom::Fit
@@ -2518,7 +2519,11 @@ mod tests {
     fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
         use ratatui::buffer::CellDiffOption;
         use ratatui_image::picker::ProtocolType;
-        for exact in [false, true] {
+        for (view, zoom, brush_on) in [
+            (View::Dithered, viewport::Zoom::Fit, false),
+            (View::Original, viewport::Zoom::In(1), false),
+            (View::Original, viewport::Zoom::Fit, true),
+        ] {
             for protocol in [
                 ProtocolType::Kitty,
                 ProtocolType::Iterm2,
@@ -2545,16 +2550,9 @@ mod tests {
                         crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
                     })
                     .unwrap();
-                app.view = if exact {
-                    View::Original
-                } else {
-                    View::Dithered
-                };
-                app.viewport.zoom = if exact {
-                    viewport::Zoom::In(1)
-                } else {
-                    viewport::Zoom::Fit
-                };
+                app.view = view;
+                app.viewport.zoom = zoom;
+                app.brush_on = brush_on;
                 app.sync(layout(terminal.size().unwrap()).preview);
                 let completed = terminal
                     .draw(|frame| {
@@ -2620,16 +2618,21 @@ mod tests {
                     viewport::Zoom::In(4),
                 ] {
                     app.viewport.zoom = zoom;
-                    terminal
-                        .draw(|frame| {
-                            let g = app.geometry(layout(frame.area()).preview);
-                            let report = draw_preview(frame, &app, &g, &mut renderer);
-                            assert_eq!(
-                                report.graphics_name.is_some(),
-                                view == View::Original && zoom == viewport::Zoom::Fit
-                            );
-                        })
-                        .unwrap();
+                    for brush_on in [false, true, false] {
+                        app.brush_on = brush_on;
+                        terminal
+                            .draw(|frame| {
+                                let g = app.geometry(layout(frame.area()).preview);
+                                let report = draw_preview(frame, &app, &g, &mut renderer);
+                                assert_eq!(
+                                    report.graphics_name.is_some(),
+                                    !brush_on
+                                        && view == View::Original
+                                        && zoom == viewport::Zoom::Fit
+                                );
+                            })
+                            .unwrap();
+                    }
                 }
             }
         }
