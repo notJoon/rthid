@@ -242,6 +242,7 @@ fn run() -> io::Result<()> {
             session::read(&path)
                 .and_then(|session| {
                     let protected: Vec<_> = preview_png.iter().chain(&mass_svg).collect();
+                    session::check_exports(&path, &protected)?;
                     for source in [&session.source_path, &path.join("manifest.toml")] {
                         check_not_source(source, &protected)
                             .map_err(|cause| io::Error::other(cause.to_string()))?;

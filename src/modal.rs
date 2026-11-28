@@ -81,6 +81,8 @@ pub enum Effect {
     Quit,
     /// Continue an accepted source replacement.
     OpenConfirmed(PathBuf, Option<PathBuf>),
+    /// Replace the document with a load accepted after intervening edits.
+    OpenLoaded(Box<rthid_io::io::Outcome>),
     /// Write a session after any overwrite confirmation.
     SaveSession(PathBuf),
     /// Request a source image relative to the supplied folder without closing the dialog.

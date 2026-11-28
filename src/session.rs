@@ -290,18 +290,68 @@ fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
     toml::from_str(text).map_err(|e| broken(&e))
 }
 
+/// Rejects exports whose destination or resolved parent is inside the session.
+pub(crate) fn check_exports(dir: &Path, exports: &[impl AsRef<Path>]) -> io::Result<()> {
+    let dir = dir.canonicalize()?;
+    for export in exports {
+        let path = export.as_ref();
+        let inside = path.canonicalize().is_ok_and(|path| path.starts_with(&dir))
+            || path
+                .ancestors()
+                .skip(1)
+                .find_map(|parent| {
+                    let parent = if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    };
+                    parent.canonicalize().ok()
+                })
+                .is_some_and(|parent| parent.starts_with(&dir));
+        if inside {
+            return Err(named(
+                path,
+                "export destination is inside the session directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates the manifest and pixel files before returning a complete session.
 pub(crate) fn read(dir: &Path) -> io::Result<Session> {
+    read_with(dir, || {})
+}
+
+fn read_with(dir: &Path, mut after_manifest: impl FnMut()) -> io::Result<Session> {
+    for attempt in 0..3 {
+        match read_once(dir, &mut after_manifest) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && attempt < 2 => continue,
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+fn pixel_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Session> {
     let path = dir.join("manifest.toml");
     let text = atomic::read_regular(&path)
         .map_err(|e| named(&path, e))?
         .ok_or_else(|| named(&path, "missing manifest"))?;
     let manifest = parse_manifest(&path, &text)?;
+    after_manifest();
     if manifest.layers.len() > 256 {
         return Err(named(&path, "at most 256 layers are allowed"));
     }
     let source_path = child(dir, &manifest.source)?;
-    let source = rthid_io::image::load_image(&source_path).map_err(|e| named(&source_path, e))?;
+    let source = rthid_io::image::load_image(&source_path).map_err(|error| match error {
+        image::ImageError::IoError(error) => pixel_error(&source_path, error),
+        error => named(&source_path, error),
+    })?;
     let (width, height) = source.dimensions();
     let mut layers = Vec::new();
     if (width, height) != (manifest.source_width, manifest.source_height)
@@ -322,7 +372,7 @@ pub(crate) fn read(dir: &Path) -> io::Result<Session> {
             let mut reader = image::ImageReader::with_format(
                 io::BufReader::new(
                     rthid_io::image::open_regular(&layer_path)
-                        .map_err(|e| named(&layer_path, e))?,
+                        .map_err(|e| pixel_error(&layer_path, e))?,
                 ),
                 ImageFormat::Png,
             );
@@ -436,10 +486,38 @@ fn write_before_manifest(
     session: Session,
     before_manifest: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    write_with_sync(dir, session, before_manifest, atomic::sync_dir)
+}
+
+fn create_session_dir(
+    dir: &Path,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_session_dir(parent, sync)?;
+    match fs::create_dir(dir) {
+        Ok(()) => sync(parent),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_with_sync(
+    dir: &Path,
+    session: Session,
+    before_manifest: impl FnOnce() -> io::Result<()>,
+    mut sync: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     if session.document.layers().len() > 256 {
         return Err(io::Error::other("at most 256 layers are allowed"));
     }
-    fs::create_dir_all(dir)?;
+    create_session_dir(dir, &mut sync)?;
     let _lock =
         atomic::lock(&dir.join(".lock"), std::time::Duration::from_secs(2)).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
@@ -480,9 +558,23 @@ fn write_before_manifest(
     {
         generation = generation.max(value);
     }
-    let generation = generation
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("session generation exhausted"))?;
+    let entries = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<std::collections::HashSet<_>>>()?;
+    let generation = loop {
+        generation = generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session generation exhausted"))?;
+        if !entries.contains(std::ffi::OsStr::new(&format!("source-{generation}.png")))
+            && (0..session.document.layers().len()).all(|index| {
+                !entries.contains(std::ffi::OsStr::new(&format!(
+                    "exposure-{generation}-{index}.png"
+                )))
+            })
+        {
+            break generation;
+        }
+    };
     let reusable = previous.filter(|m| {
         m.source_width == width
             && m.source_height == height
@@ -550,17 +642,19 @@ fn write_before_manifest(
     };
     let text = toml::to_string_pretty(&manifest).map_err(io::Error::other)?;
     before_manifest()?;
-    atomic::sync_dir(dir)?;
+    sync(dir)?;
     atomic::replace(&dir.join("manifest.toml"), |file| {
         file.write_all(text.as_bytes())?;
         file.sync_all()
     })?;
-    cleanup(dir, &manifest);
+    // Keep previous pixels until the manifest entry is durable.
+    if sync(dir).is_ok() {
+        cleanup(dir, &manifest);
+    }
     Ok(())
 }
 
 fn cleanup(dir: &Path, manifest: &Manifest) {
-    let _ = atomic::sync_dir(dir);
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -658,6 +752,153 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn read_retries_only_missing_pixels_with_a_fresh_manifest() {
+        for missing_source in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            write(temp.path(), fixture()).unwrap();
+            let mut attempts = 0;
+            let loaded = read_with(temp.path(), || {
+                attempts += 1;
+                if attempts == 1 {
+                    let mut next = fixture();
+                    if missing_source {
+                        next.source.put_pixel(0, 0, Rgba([1; 4]));
+                    }
+                    write(temp.path(), next).unwrap();
+                }
+            })
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                loaded.source.get_pixel(0, 0),
+                if missing_source {
+                    &Rgba([1; 4])
+                } else {
+                    &Rgba([23, 64, 96, 200])
+                }
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        fs::remove_file(temp.path().join("source-1.png")).unwrap();
+        let mut attempts = 0;
+        assert!(
+            read_with(temp.path(), || {
+                attempts += 1;
+            })
+            .is_err()
+        );
+        assert_eq!(attempts, 3);
+        fs::write(temp.path().join("source-1.png"), b"broken").unwrap();
+        attempts = 0;
+        assert!(
+            read_with(temp.path(), || {
+                attempts += 1;
+            })
+            .is_err()
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn first_save_syncs_each_created_directory_parent_and_propagates_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("parent/photo.rthid");
+        let mut synced = Vec::new();
+        write_with_sync(
+            &dir,
+            fixture(),
+            || Ok(()),
+            |path| {
+                synced.push(path.to_path_buf());
+                atomic::sync_dir(path)
+            },
+        )
+        .unwrap();
+        assert_eq!(synced, [temp.path(), dir.parent().unwrap(), &dir, &dir]);
+        synced.clear();
+        write_with_sync(
+            &dir,
+            fixture(),
+            || Ok(()),
+            |path| {
+                synced.push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(synced, [dir.as_path(), dir.as_path()]);
+        let failed = temp.path().join("failed/photo.rthid");
+        let error = write_with_sync(
+            &failed,
+            fixture(),
+            || Ok(()),
+            |_| Err(io::Error::other("parent sync failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "parent sync failed");
+        assert!(!failed.join("manifest.toml").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generation_collision_never_follows_existing_pixel_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        fs::write(temp.path().join("source-4294967295.png"), b"stray").unwrap();
+        let link = temp.path().join("exposure-4294967296-0.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let manifest_path = temp.path().join("manifest.toml");
+        let mut manifest: Manifest =
+            toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.layers[0].exposure = Some("exposure-4294967295-0.png".into());
+        fs::write(manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
+        write(temp.path(), fixture()).unwrap();
+        assert_eq!(fs::read(outside).unwrap(), b"keep");
+        assert!(temp.path().join("exposure-4294967297-0.png").exists());
+        assert_equal(&fixture(), &read(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn failed_manifest_directory_sync_preserves_both_generations_until_next_save() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        let previous = fs::read(temp.path().join("manifest.toml")).unwrap();
+        let mut changed = fixture();
+        changed.source.put_pixel(0, 0, Rgba([1; 4]));
+        let mut calls = 0;
+        write_with_sync(
+            temp.path(),
+            changed,
+            || Ok(()),
+            |_| {
+                calls += 1;
+                if calls == 2 {
+                    Err(io::Error::other("manifest sync failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(temp.path().join("source-1.png").exists());
+        assert!(temp.path().join("exposure-1-0.png").exists());
+        assert!(temp.path().join("source-2.png").exists());
+        assert_eq!(
+            read(temp.path()).unwrap().source.get_pixel(0, 0),
+            &Rgba([1; 4])
+        );
+        fs::write(temp.path().join("manifest.toml"), previous).unwrap();
+        assert_equal(&fixture(), &read(temp.path()).unwrap());
+        write(temp.path(), fixture()).unwrap();
+        assert!(!temp.path().join("exposure-1-0.png").exists());
+        assert!(!temp.path().join("source-2.png").exists());
     }
 
     #[test]

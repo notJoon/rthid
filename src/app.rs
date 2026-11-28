@@ -44,9 +44,12 @@ struct SessionSave {
     epoch: u64,
     dir: PathBuf,
     state: SavedState,
+    superseded: bool,
 }
 
 struct OpenRequest {
+    state: SavedState,
+    epoch: u64,
     /// Tag the result echoes, unique to this request.
     token: u64,
     /// Generation of the dialog that asked, if any.
@@ -110,6 +113,7 @@ pub struct App {
     pub(crate) session: Option<PathBuf>,
     saved: Option<SavedState>,
     saved_token: u64,
+    save_uncertain: bool,
     saving: Vec<SessionSave>,
     document_epoch: u64,
     notice: Option<Notice>,
@@ -340,6 +344,7 @@ impl App {
             session: None,
             saved: None,
             saved_token: 0,
+            save_uncertain: false,
             saving: Vec::new(),
             document_epoch: 0,
             glyphs: Glyphs::default(),
@@ -453,6 +458,7 @@ impl App {
         self.stroke = None;
         self.document_epoch += 1;
         self.saved_token = 0;
+        self.save_uncertain = false;
         self.source_path = Some(path);
         self.session = None;
         self.edits
@@ -483,10 +489,11 @@ impl App {
     /// Whether document, processing or preview state differs from the last saved snapshot.
     pub(crate) fn modified(&self) -> bool {
         self.source_path.is_some()
-            && self
-                .saved
-                .as_ref()
-                .is_some_and(|saved| *saved != self.current_state())
+            && (self.save_uncertain
+                || self
+                    .saved
+                    .as_ref()
+                    .is_some_and(|saved| *saved != self.current_state()))
     }
 
     /// Replaces source, settings and layers with a validated session and fresh history.
@@ -549,12 +556,14 @@ impl App {
         };
         let token = self.next_token();
         // IO reports only the newest save per directory, so older entries never complete.
+        let superseded = self.saving.iter().any(|save| save.dir == dir);
         self.saving.retain(|save| save.dir != dir);
         self.saving.push(SessionSave {
             token,
             epoch: self.document_epoch,
             dir: dir.clone(),
             state: self.current_state(),
+            superseded,
         });
         self.set_notice(format!(
             "saving {}",
@@ -635,6 +644,7 @@ impl App {
     /// Applies a finished job and reports whether the display changed.
     pub fn complete(&mut self, done: Done) -> bool {
         let mut changed = false;
+        let mut edited_during_open = false;
         // Dialog that asked for the result. Listings always come from one.
         let mut requester = Some(done.tag);
         let opened = matches!(done.outcome, IoOutcome::Opened(_) | IoOutcome::Loaded(_));
@@ -648,6 +658,8 @@ impl App {
             else {
                 return false;
             };
+            edited_during_open =
+                request.epoch != self.document_epoch || request.state != self.current_state();
             requester = request.dialog;
             changed = true;
         }
@@ -662,6 +674,7 @@ impl App {
                         if self.document_epoch == save.epoch && save.token > self.saved_token =>
                     {
                         self.saved_token = save.token;
+                        self.save_uncertain = false;
                         self.session = Some(dir.clone());
                         self.saved = Some(save.state);
                         self.set_notice(format!(
@@ -671,28 +684,28 @@ impl App {
                     }
                     Ok(_) => return false,
                     Err(error) => {
+                        if save.superseded && self.document_epoch == save.epoch {
+                            self.save_uncertain = true;
+                        }
                         self.set_notice(error.to_string());
                     }
                 }
                 changed = true;
             }
-            IoOutcome::Loaded(Ok(output)) => {
+            outcome @ (IoOutcome::Loaded(Ok(_)) | IoOutcome::Opened(Ok(Opened::Image { .. }))) => {
                 if requester.is_some() && requester == self.dialog() {
                     self.modal = None;
                 }
-                match output.downcast::<Session>() {
-                    Ok((path, session)) => self.open_session(path, session),
-                    Err(error) => {
-                        self.set_notice(error.to_string());
-                    }
+                if edited_during_open {
+                    self.confirm(
+                        Confirm::new("Discard unsaved changes?")
+                            .detail("Edits made while loading will be lost.")
+                            .yes_label("discard changes"),
+                        Effect::OpenLoaded(Box::new(outcome)),
+                    );
+                } else {
+                    self.replace_open(outcome);
                 }
-                changed = true;
-            }
-            IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
-                if requester.is_some() && requester == self.dialog() {
-                    self.modal = None;
-                }
-                self.open_image(path, image);
                 changed = true;
             }
             IoOutcome::Opened(Ok(Opened::Dir(listing))) | IoOutcome::Listed(Ok(listing)) => {
@@ -816,9 +829,24 @@ impl App {
         }
     }
 
+    fn replace_open(&mut self, outcome: IoOutcome) {
+        match outcome {
+            IoOutcome::Loaded(Ok(output)) => match output.downcast::<Session>() {
+                Ok((path, session)) => self.open_session(path, session),
+                Err(error) => {
+                    self.set_notice(error.to_string());
+                }
+            },
+            IoOutcome::Opened(Ok(Opened::Image { path, image })) => self.open_image(path, image),
+            _ => unreachable!("only successful document loads can be accepted"),
+        }
+    }
+
     fn start_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         let token = self.next_token();
         self.open_request = Some(OpenRequest {
+            state: self.current_state(),
+            epoch: self.document_epoch,
             token,
             dialog: self.dialog(),
             label: format!(
@@ -847,6 +875,7 @@ impl App {
         {
             Job::load(resolved, move |dir| {
                 let session = session::read(dir)?;
+                session::check_exports(dir, &protect)?;
                 for source in [&session.source_path, &dir.join("manifest.toml")] {
                     rthid_io::image::check_not_source(source, &protect)
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1612,6 +1641,7 @@ impl App {
         match effect {
             Effect::Quit => self.quit = true,
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
+            Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
             Effect::SaveSession(dir) => self.save_session(dir),
             Effect::Open(path, dir) => self.request_open(path, Some(dir)),
             Effect::ListDir(path) => self.request_list(path),
@@ -1834,11 +1864,119 @@ mod tests {
             assert!(!app.complete(session_completion(first, &dir, true)));
             app.complete(session_completion(second, &dir, second_succeeds));
             assert_eq!(app.session.as_ref(), second_succeeds.then_some(&dir));
-            // A failed second save leaves the opened state, which also has no flip.
-            assert!(!app.modified());
+            assert_eq!(app.modified(), !second_succeeds);
             if !second_succeeds {
                 assert!(app.notice().unwrap().contains("injected save failure"));
             }
+        }
+    }
+
+    #[test]
+    fn superseded_save_failure_stays_modified_until_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        app.save_session(dir.clone());
+        let first = app.take_jobs().pop().unwrap().1;
+        app.complete(session_completion(first, &dir, false));
+        assert!(!app.modified());
+        app.settings.flip = true;
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        app.settings.flip = false;
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        assert!(!app.modified());
+        app.settings.flip = true;
+        app.save_session(dir.clone());
+        run_session_job_without_completion(&mut app);
+        app.settings.flip = false;
+        app.save_session(dir.clone());
+        let latest = app.take_jobs().pop().unwrap().1;
+        assert_eq!(app.saving.len(), 1);
+        app.complete(session_completion(latest, &dir, false));
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        app.request_open("next.png".into(), None);
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        assert!(!app.modified());
+    }
+
+    fn run_session_job_without_completion(app: &mut App) {
+        let (job, _) = app.take_jobs().pop().unwrap();
+        let Job::Save { dir, write } = job else {
+            panic!("expected save")
+        };
+        write(&dir).unwrap();
+    }
+
+    #[test]
+    fn edits_during_load_require_confirmation_for_sessions_and_images() {
+        for session_load in [false, true] {
+            for accept in [false, true] {
+                let mut app = App::builtin(RgbaImage::new(2, 3), None);
+                let loaded = snapshot(&app);
+                app.request_open("next.png".into(), None);
+                let tag = app.open_request.as_ref().unwrap().token;
+                app.edits.edit(|doc| {
+                    doc.add_layer("Keep".into());
+                });
+                let outcome = if session_load {
+                    IoOutcome::Loaded(Ok(rthid_io::io::Output {
+                        path: "next.rthid".into(),
+                        value: Box::new(loaded),
+                    }))
+                } else {
+                    IoOutcome::Opened(Ok(Opened::Image {
+                        path: "next.png".into(),
+                        image: RgbaImage::new(2, 3),
+                    }))
+                };
+                app.complete(Done::new(tag, std::time::Duration::ZERO, outcome));
+                assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+                assert_eq!(app.edits.current().layers().len(), 1);
+                press(&mut app, KeyCode::Char(if accept { 'y' } else { 'n' }));
+                assert_eq!(app.edits.current().layers().len(), usize::from(!accept));
+                assert!(app.open_request.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn session_load_rejects_exports_anywhere_inside_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        for name in [
+            "source-1.png",
+            "exposure-1-0.png",
+            "new.png",
+            "nested/new.png",
+        ] {
+            let destination = dir.join(name);
+            assert!(session::check_exports(&dir, &[&destination]).is_err());
+            let mut app = App::builtin(RgbaImage::new(2, 3), Some(destination));
+            app.take_jobs();
+            app.request_open(dir.clone(), None);
+            let (job, _) = app.take_jobs().pop().unwrap();
+            let Job::Load { path, read } = job else {
+                panic!("expected load")
+            };
+            assert!(read(&path).is_err());
+        }
+        assert!(session::check_exports(&dir, &[temp.path().join("preview.png")]).is_ok());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&dir, &alias).unwrap();
+            assert!(session::check_exports(&dir, &[alias.join("new.png")]).is_err());
         }
     }
 

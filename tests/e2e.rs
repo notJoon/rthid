@@ -330,6 +330,38 @@ fn sessions_save_restore_from_cli_and_flush_at_quit() {
 }
 
 #[test]
+fn cli_rejects_exports_inside_sessions_before_starting_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("photo.png");
+    image::RgbaImage::new(8, 12).save(&source).unwrap();
+    let session = home.path().join("photo.rthid");
+    let mut run = Run::spawn(home.path(), &source);
+    run.wait_for_screen("Dots 8x12 ");
+    run.send(b"n\x13");
+    run.wait_for_screen("saved photo.rthid");
+    run.quit();
+    assert!(run.wait_for_exit().success());
+    let source_before = std::fs::read(session.join("source-1.png")).unwrap();
+    for option in ["--preview-png", "--mass-svg"] {
+        for name in ["source-1.png", "exposure-1-0.png", "new.png"] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_rthid"))
+                .arg(&session)
+                .arg(option)
+                .arg(session.join(name))
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("inside the session directory"), "{error}");
+        }
+    }
+    assert_eq!(
+        std::fs::read(session.join("source-1.png")).unwrap(),
+        source_before
+    );
+}
+
+#[test]
 fn cli_reports_invalid_sessions_before_starting_the_terminal() {
     let home = tempfile::tempdir().unwrap();
     let session = home.path().join("broken.rthid");
