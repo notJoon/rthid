@@ -67,6 +67,7 @@ open. Validate values on `Submit` before closing the component. An invalid value
 | --- | --- |
 | `TextInput` | Single line text editing with a character limit and a cursor position for the caller |
 | `ListPicker` | Cursor over a list the caller owns, with scroll kept across frames |
+| `Outline` | Independently collapsible groups of caller-owned list items |
 | `Confirm` | A yes or no question answered by y or any other key |
 | `Dialog` | Centered popup area with a cleared background and a border |
 | `Hint` | One key and what it does now |
