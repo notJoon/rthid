@@ -1468,8 +1468,10 @@ impl App {
         }
         if key.code == KeyCode::Char('o') {
             let start = self
-                .source_path()
-                .and_then(|path| path.parent())
+                .session
+                .as_deref()
+                .and_then(Path::parent)
+                .or_else(|| self.source_path().and_then(Path::parent))
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
@@ -2184,6 +2186,24 @@ mod tests {
         assert!(protected.session.is_none());
         assert!(protected.notice().unwrap().contains("manifest.toml"));
         assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), before);
+    }
+
+    #[test]
+    fn open_dialog_after_session_starts_in_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+        app.open_session(dir.clone(), session::read(&dir).unwrap());
+
+        press(&mut app, KeyCode::Char('o'));
+
+        let Some(Modal::OpenFile(picker)) = &app.modal else {
+            panic!("open dialog expected")
+        };
+        assert_eq!(picker.dir, temp.path());
+        assert!(matches!(&app.outbox[0].0, Job::List(path) if path == temp.path()));
     }
 
     #[test]

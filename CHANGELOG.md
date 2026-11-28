@@ -32,6 +32,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Up/Down navigation skips dimmed parameters while preserving a selected row
   that becomes inactive until the next move
 
+### Fixed
+
+- After a session is opened, `o` starts in the folder that holds the session instead of
+  inside it
+
 ## [0.2.0] - 2026-11-28
 
 ### Added
