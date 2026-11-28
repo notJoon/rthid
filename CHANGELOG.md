@@ -8,11 +8,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `?` opens a full keyboard and mouse reference outside dialogs
+- Parameter settings are grouped into collapsible Print, Dither, and Tone sections;
+  collapsed groups summarize how many active settings differ from defaults
+- The parameter panel supports mouse selection and group toggling, including
+  before an image is opened
+- Lists show a scrollbar when their rows do not fit
 
 ### Changed
 
 - The help line shows only currently usable keys, fits the terminal width, and
   puts Enter and Esc first in dialogs
+- Up/Down navigation skips dimmed parameters while preserving a selected row
+  that becomes inactive until the next move
 
 ## [0.2.0] - 2026-11-28
 

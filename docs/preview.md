@@ -107,6 +107,9 @@ and ends with `?: keys` outside dialogs. It drops the least specific keys first
 to fit the width.
 
 The parameter panel has focus initially. A cyan border marks the focused panel.
+Parameters are grouped under Print, Dither, and Tone headers. A collapsed group
+shows `N changed` when any of its settings differ from their defaults. Headers
+start at the panel edge; an item's two-column indent becomes `> ` when selected.
 
 | Context | Key | Action |
 | --- | --- | --- |
@@ -122,6 +125,8 @@ The parameter panel has focus initially. A cyan border marks the focused panel.
 | Any | `d` | Reset selected parameter |
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
+| Parameter group header | `←` / `→`, `h` / `l` | Collapse / expand group |
+| Parameter group header | `Enter` | Toggle group |
 | Parameters, Seed row with Noise | `Enter` | Draw a new noise pattern |
 | Parameters | `←` / `→`, `h` / `l` | Change value |
 | Any | `+` / `=` / `-` | Zoom in / in / out |
@@ -208,7 +213,8 @@ Algorithm names: `atkinson`, `floyd-steinberg`, `jarvis-judice-ninke`,
 `stucki`, `sierra-lite`, `bayer2`, `bayer4`, `bayer8`, `noise`.
 
 Strength and Serpentine apply to diffusion algorithms. Seed applies to Noise.
-Unused rows stay visible and dimmed, and their values survive algorithm changes.
+Unused rows stay visible and dimmed and keep their values across algorithm changes.
+Up/Down skip them; a row that becomes unused while selected stays selected until you move.
 
 Templates keep their own colors, card, dot size, margin and bleed, so later
 preset edits or removal do not alter them. Card ids are `image`, `business-portrait`,
@@ -224,6 +230,8 @@ zoom regardless of keyboard focus.
 
 | Input | Action |
 | --- | --- |
+| Left click on a parameter | Select it |
+| Left click on a parameter group header | Select and toggle it |
 | Left click or drag on the minimap image | Center the viewport there; a drag that leaves the map pauses until it returns |
 | Left drag on the main preview | Move the image with the pointer, including over the minimap |
 | Wheel or horizontal trackpad scroll | Pan six cells worth of dots per step in the scroll direction |

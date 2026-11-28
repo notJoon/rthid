@@ -22,10 +22,10 @@ pub enum Row {
 
 /// Groups of items the caller owns, with headers that collapse independently.
 ///
-/// The selected visible row and retained scroll offset are managed by a
-/// [`ListPicker`]. Newly observed groups start expanded. As with `ListPicker`,
-/// collapsing near the end can leave blank rows until the cursor moves.
-/// Collapsed state follows group position (index), not group identity.
+/// The selected visible row, retained scroll offset, and last rendered content
+/// area are managed by a [`ListPicker`]. Newly observed groups start expanded.
+/// As with `ListPicker`, collapsing near the end can leave blank rows until the
+/// cursor moves. Collapsed state follows group position (index), not group identity.
 ///
 /// The cursor keeps its visible position when `lens` changes. After changing
 /// `lens`, call [`Outline::select`] with the row to keep. The item counts passed
@@ -50,16 +50,17 @@ pub enum Row {
 ///     (Line::raw("Print"), vec![Line::raw("copies")]),
 ///     (Line::raw("Tone"), vec![Line::raw("gamma")]),
 /// ];
-/// let mut outline = Outline::new();
+/// let mut outline = Outline::new(&[1, 1]);
 /// let mut buffer = Buffer::empty(area);
 /// outline.render(groups(), None, Style::default(), area, &mut buffer);
-/// assert_eq!(buffer[(4, 1)].symbol(), "c");
+/// assert_eq!(buffer[(2, 1)].symbol(), "c");
 ///
+/// outline.select(rthid_widgets::Row::Header(0), &[1, 1]);
 /// let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
 /// assert_eq!(outline.handle_key(left, &[1, 1]), Outcome::Consumed);
 /// assert!(outline.is_collapsed(0));
 /// outline.render(groups(), None, Style::default(), area, &mut buffer);
-/// assert_eq!(buffer[(2, 1)].symbol(), "▾");
+/// assert_eq!(buffer[(0, 0)].symbol(), "▸");
 /// ```
 pub struct Outline {
     picker: ListPicker,
@@ -76,10 +77,16 @@ impl Outline {
     /// Enter toggles the selected group header.
     pub const TOGGLE: Hint = Hint::new("Enter", "toggle");
 
-    /// Creates an outline with its cursor on the first row and every group expanded.
-    pub fn new() -> Self {
+    const EXPANDED_HINTS: [Hint; 2] = [Self::COLLAPSE, Self::TOGGLE];
+    const COLLAPSED_HINTS: [Hint; 2] = [Self::EXPAND, Self::TOGGLE];
+
+    /// Creates an outline with every group expanded.
+    ///
+    /// The cursor starts on the first item when group zero has items, or the
+    /// first header otherwise.
+    pub fn new(lens: &[usize]) -> Self {
         Self {
-            picker: ListPicker::new(0),
+            picker: ListPicker::new(usize::from(lens.first().is_some_and(|&len| len > 0))),
             collapsed: Vec::new(),
         }
     }
@@ -92,6 +99,18 @@ impl Outline {
     pub fn selected(&self, lens: &[usize]) -> Option<Row> {
         let rows = self.rows(lens);
         self.picker.selected(rows.len()).map(|index| rows[index])
+    }
+
+    /// Returns the keys owned by the selected group header.
+    ///
+    /// Expanded headers offer collapse and toggle; collapsed headers offer
+    /// expand and toggle. Items and empty outlines return no hints.
+    pub fn hints(&self, lens: &[usize]) -> &'static [Hint] {
+        match self.selected(lens) {
+            Some(Row::Header(group)) if self.is_collapsed(group) => &Self::COLLAPSED_HINTS,
+            Some(Row::Header(_)) => &Self::EXPANDED_HINTS,
+            Some(Row::Item(_)) | None => &[],
+        }
     }
 
     /// Selects `row`, clamping an out-of-range row to the last visible row.
@@ -150,21 +169,16 @@ impl Outline {
         }
     }
 
-    /// Handles mouse input inside `area` for the rows described by `lens`.
+    /// Handles mouse input inside the content area remembered by the last render.
     ///
     /// A left click on a header selects and toggles it. Item clicks and wheel
     /// movement match [`ListPicker::handle_mouse`], with item submissions
-    /// returned as flat item indices. Clicks on a block border are ignored.
-    pub fn handle_mouse(
-        &mut self,
-        mouse: MouseEvent,
-        block: Option<&Block<'_>>,
-        area: Rect,
-        lens: &[usize],
-    ) -> Outcome<usize> {
+    /// returned as flat item indices. Before the first render and outside the
+    /// remembered area, input is ignored.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, lens: &[usize]) -> Outcome<usize> {
         self.resize(lens);
         let rows = self.rows(lens);
-        let outcome = self.picker.handle_mouse(mouse, block, area, rows.len());
+        let outcome = self.picker.handle_mouse(mouse, rows.len());
         // ListPicker has selected the clicked row; a header toggles on the first click.
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && outcome != Outcome::Ignored
@@ -194,7 +208,9 @@ impl Outline {
     ///
     /// Each group is a `(title, items)` pair. Its item count must match the
     /// corresponding `lens` entry passed to input (see [`Outline`]).
-    /// Caller-provided line and span styles are preserved.
+    /// Headers start at the content edge. Items use a two-column selection
+    /// gutter: `> ` when selected and two spaces otherwise. Caller-provided
+    /// line and span styles are preserved.
     /// Collapsed items are omitted, and selection, highlighting, block layout,
     /// and retained scrolling match [`ListPicker::render`].
     pub fn render<'a>(
@@ -205,7 +221,7 @@ impl Outline {
         area: Rect,
         buf: &mut Buffer,
     ) {
-        let lines = groups
+        let lines: Vec<_> = groups
             .into_iter()
             .enumerate()
             .flat_map(|(group, (mut title, items))| {
@@ -214,12 +230,24 @@ impl Outline {
                     .spans
                     .insert(0, Span::raw(if collapsed { "▸ " } else { "▾ " }));
                 let items = if collapsed { Vec::new() } else { items };
-                std::iter::once(title).chain(items.into_iter().map(|mut item| {
-                    item.spans.insert(0, Span::raw("  "));
-                    item
-                }))
+                std::iter::once((title, false)).chain(items.into_iter().map(|item| (item, true)))
+            })
+            .collect();
+        let selected = self.picker.selected(lines.len());
+        let lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (mut line, item))| {
+                if item {
+                    line.spans.insert(
+                        0,
+                        Span::raw(if selected == Some(index) { "> " } else { "  " }),
+                    );
+                }
+                line
             });
-        self.picker.render(lines, block, highlight, area, buf);
+        self.picker
+            .render_with_highlight_symbol(lines, block, highlight, area, buf, "");
     }
 
     fn resize(&mut self, lens: &[usize]) {
@@ -239,12 +267,6 @@ impl Outline {
             item = item.saturating_add(len);
         }
         rows
-    }
-}
-
-impl Default for Outline {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -282,15 +304,9 @@ mod tests {
 
     #[test]
     fn navigation_moves_through_headers_and_items_without_wrapping() {
-        let mut outline = Outline::new();
         let lens = [2, 1];
-        let expected = [
-            Row::Header(0),
-            Row::Item(0),
-            Row::Item(1),
-            Row::Header(1),
-            Row::Item(2),
-        ];
+        let mut outline = Outline::new(&lens);
+        let expected = [Row::Item(0), Row::Item(1), Row::Header(1), Row::Item(2)];
         for row in expected {
             assert_eq!(outline.selected(&lens), Some(row));
             assert_eq!(
@@ -318,8 +334,9 @@ mod tests {
 
     #[test]
     fn header_keys_toggle_and_follow_modifier_rules() {
-        let mut outline = Outline::new();
         let lens = [1];
+        let mut outline = Outline::new(&lens);
+        outline.select(Row::Header(0), &lens);
         for code in [KeyCode::Left, KeyCode::Char('h')] {
             assert_eq!(outline.handle_key(key(code), &lens), Outcome::Consumed);
             assert!(outline.is_collapsed(0));
@@ -360,9 +377,8 @@ mod tests {
 
     #[test]
     fn item_keys_submit_cancel_or_fall_through() {
-        let mut outline = Outline::new();
         let lens = [1];
-        outline.handle_key(key(KeyCode::Down), &lens);
+        let mut outline = Outline::new(&lens);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &lens),
             Outcome::Submit(0)
@@ -382,9 +398,30 @@ mod tests {
     }
 
     #[test]
+    fn new_starts_on_the_first_item_or_first_header() {
+        let outline = Outline::new(&[2, 1]);
+        assert_eq!(outline.selected(&[2, 1]), Some(Row::Item(0)));
+
+        let outline = Outline::new(&[0, 1]);
+        assert_eq!(outline.selected(&[0, 1]), Some(Row::Header(0)));
+    }
+
+    #[test]
+    fn hints_are_owned_only_for_the_selected_header_state() {
+        let lens = [1];
+        let mut outline = Outline::new(&lens);
+        assert_eq!(outline.hints(&lens), &[]);
+        outline.select(Row::Header(0), &lens);
+        assert_eq!(outline.hints(&lens), &[Outline::COLLAPSE, Outline::TOGGLE]);
+        outline.handle_key(key(KeyCode::Left), &lens);
+        assert_eq!(outline.hints(&lens), &[Outline::EXPAND, Outline::TOGGLE]);
+        assert_eq!(Outline::new(&[]).hints(&[]), &[]);
+    }
+
+    #[test]
     fn collapsing_and_expanding_keeps_the_cursor_on_its_header() {
-        let mut outline = Outline::new();
         let lens = [2, 1];
+        let mut outline = Outline::new(&lens);
         outline.select(Row::Header(1), &lens);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &lens),
@@ -405,7 +442,7 @@ mod tests {
         let area = Rect::new(2, 3, 12, 5);
         let block = Block::bordered();
         let lens = [1, 1];
-        let mut outline = Outline::new();
+        let mut outline = Outline::new(&lens);
         outline.render(
             [
                 (Line::raw("A"), vec![Line::raw("a")]),
@@ -417,53 +454,34 @@ mod tests {
             &mut Buffer::empty(area),
         );
         let border = mouse(MouseEventKind::Down(MouseButton::Left), 3, 3);
-        assert_eq!(
-            outline.handle_mouse(border, Some(&block), area, &lens),
-            Outcome::Ignored
-        );
+        assert_eq!(outline.handle_mouse(border, &lens), Outcome::Ignored);
         let selected_header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 4);
         assert_eq!(
-            outline.handle_mouse(selected_header, Some(&block), area, &lens),
+            outline.handle_mouse(selected_header, &lens),
             Outcome::Consumed
         );
         assert!(outline.is_collapsed(0));
         assert_eq!(
-            outline.handle_mouse(selected_header, Some(&block), area, &lens),
+            outline.handle_mouse(selected_header, &lens),
             Outcome::Consumed
         );
         assert!(!outline.is_collapsed(0));
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 3, 6);
-        assert_eq!(
-            outline.handle_mouse(header, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(header, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
         assert!(outline.is_collapsed(1));
-        let item = mouse(MouseEventKind::Down(MouseButton::Left), 3, 5);
-        assert_eq!(
-            outline.handle_mouse(item, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
-        assert_eq!(
-            outline.handle_mouse(item, Some(&block), area, &lens),
-            Outcome::Submit(0)
-        );
+        let item = mouse(MouseEventKind::Down(MouseButton::Left), area.right() - 2, 5);
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Consumed);
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Submit(0));
         let wheel = mouse(MouseEventKind::ScrollDown, 3, 4);
-        assert_eq!(
-            outline.handle_mouse(wheel, Some(&block), area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(wheel, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
     }
 
     #[test]
     fn render_preserves_styles_indents_and_hides_collapsed_items() {
         let area = Rect::new(0, 0, 12, 4);
-        let mut outline = Outline::new();
-        outline.select(Row::Header(1), &[1, 1]);
-        outline.handle_key(key(KeyCode::Left), &[1, 1]);
-        let mut buf = Buffer::empty(area);
-        outline.render(
+        let groups = || {
             [
                 (
                     Line::from(Span::styled("A", Style::default().fg(Color::Red))),
@@ -473,25 +491,44 @@ mod tests {
                     ))],
                 ),
                 (Line::raw("B"), vec![Line::raw("b")]),
-            ],
+            ]
+        };
+        let mut outline = Outline::new(&[1, 1]);
+        outline.select(Row::Header(1), &[1, 1]);
+        outline.handle_key(key(KeyCode::Left), &[1, 1]);
+        let mut buf = Buffer::empty(area);
+        outline.render(
+            groups(),
             None,
             Style::default().bg(Color::Green),
             area,
             &mut buf,
         );
-        assert_eq!(buf[(2, 0)].symbol(), "▾");
-        assert_eq!(buf[(4, 0)].fg, Color::Red);
-        assert_eq!(buf[(4, 1)].symbol(), "a");
-        assert_eq!(buf[(4, 1)].fg, Color::Blue);
-        assert_eq!(buf[(0, 2)].symbol(), ">");
-        assert_eq!(buf[(2, 2)].symbol(), "▸");
-        assert_eq!(buf[(2, 2)].bg, Color::Green);
-        assert_eq!(buf[(4, 3)].symbol(), " ");
+        assert_eq!(buf[(0, 0)].symbol(), "▾");
+        assert_eq!(buf[(2, 0)].fg, Color::Red);
+        assert_eq!(buf[(2, 1)].symbol(), "a");
+        assert_eq!(buf[(2, 1)].fg, Color::Blue);
+        assert_eq!(buf[(0, 2)].symbol(), "▸");
+        assert_eq!(buf[(0, 2)].bg, Color::Green);
+        assert_eq!(buf[(2, 3)].symbol(), " ");
+
+        outline.select(Row::Item(0), &[1, 1]);
+        outline.render(
+            groups(),
+            None,
+            Style::default().bg(Color::Green),
+            area,
+            &mut buf,
+        );
+        assert_eq!(buf[(0, 1)].symbol(), ">");
+        assert_eq!(buf[(2, 1)].symbol(), "a");
+        assert_eq!(buf[(2, 1)].fg, Color::Blue);
+        assert_eq!(buf[(2, 1)].bg, Color::Green);
     }
 
     #[test]
     fn empty_and_changing_groups_are_safe_and_selection_expands_items() {
-        let mut outline = Outline::new();
+        let mut outline = Outline::new(&[]);
         assert_eq!(outline.selected(&[]), None);
         assert_eq!(
             outline.handle_key(key(KeyCode::Enter), &[]),
@@ -539,28 +576,22 @@ mod tests {
                 (Line::raw("B"), vec![]),
             ]
         };
-        let mut outline = Outline::new();
         let lens = [3, 0];
+        let mut outline = Outline::new(&lens);
         outline.select(Row::Header(1), &lens);
         let mut buf = Buffer::empty(area);
         outline.render(groups(), None, Style::default(), area, &mut buf);
-        assert_eq!(buf[(4, 0)].symbol(), "c");
-        assert_eq!(buf[(2, 1)].symbol(), "▾");
+        assert_eq!(buf[(2, 0)].symbol(), "c");
+        assert_eq!(buf[(0, 1)].symbol(), "▾");
 
         let item = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
-        assert_eq!(
-            outline.handle_mouse(item, None, area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(item, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Item(2)));
         outline.render(groups(), None, Style::default(), area, &mut buf);
-        assert_eq!(buf[(4, 0)].symbol(), "c");
+        assert_eq!(buf[(2, 0)].symbol(), "c");
 
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 0, 1);
-        assert_eq!(
-            outline.handle_mouse(header, None, area, &lens),
-            Outcome::Consumed
-        );
+        assert_eq!(outline.handle_mouse(header, &lens), Outcome::Consumed);
         assert_eq!(outline.selected(&lens), Some(Row::Header(1)));
         assert!(outline.is_collapsed(1));
     }

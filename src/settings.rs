@@ -630,6 +630,14 @@ pub enum Setting {
     Sharpen,
 }
 
+/// Parameter groups in panel order, with their item counts.
+pub const GROUPS: [(&str, usize); 3] = [("Print", 7), ("Dither", 6), ("Tone", 6)];
+
+/// Item counts of [`GROUPS`], the `lens` for every panel `Outline` call.
+pub const GROUP_LENS: [usize; 3] = [GROUPS[0].1, GROUPS[1].1, GROUPS[2].1];
+
+const _: () = assert!(GROUP_LENS[0] + GROUP_LENS[1] + GROUP_LENS[2] == Setting::ALL.len());
+
 impl Setting {
     /// Parameter panel order.
     pub const ALL: [Self; 19] = [
@@ -998,6 +1006,11 @@ impl Settings {
         self.zoom = 100;
         self.pan_x = 0;
         self.pan_y = 0;
+    }
+
+    /// Whether resetting `setting` would change these settings.
+    pub fn is_changed(&self, setting: Setting, palettes: &Palettes) -> bool {
+        self.with_default(setting, palettes) != *self
     }
 
     /// Returns settings with one parameter restored to its default.
