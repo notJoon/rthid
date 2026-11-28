@@ -2,6 +2,7 @@
 
 use crate::{
     cells::{Glyphs, Pixels, View},
+    document::{Document, History},
     export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
@@ -91,6 +92,8 @@ pub struct App {
     minimap_visible: bool,
     /// Image processing caches.
     pub grid_cache: GridCache,
+    /// Source exposure layers and their undo history.
+    pub edits: History,
     /// Named configuration lists and their pending saves.
     pub library: Library,
     /// Current image settings.
@@ -145,6 +148,7 @@ impl App {
             last_drag: None,
             minimap_visible: false,
             grid_cache: GridCache::default(),
+            edits: History::new(Document::new(0, 0)),
             library: Library::new(loaded),
             notice: None,
             outbox: Vec::new(),
@@ -225,6 +229,8 @@ impl App {
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.source_path = Some(path);
+        self.edits
+            .reset(Document::new(image.width(), image.height()));
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
@@ -497,6 +503,7 @@ impl App {
             mass::tones_from_palette(self.settings.palette.colors(), &self.mass)
         });
         let changed = self.grid_cache.refresh(
+            &self.edits,
             &self.settings,
             need_dither,
             self.view == View::Mass || inset_mass || self.mass_export.is_some(),
@@ -2323,6 +2330,8 @@ mod tests {
         );
         let before = versions(&app);
         let replacement = RgbaImage::from_pixel(20, 10, image::Rgba([255, 255, 255, 255]));
+        app.edits
+            .reset(Document::new(replacement.width(), replacement.height()));
         app.grid_cache.set_source(replacement);
         assert!(app.grid_cache.grid().is_none());
         assert!(app.grid_cache.dithered().is_none());

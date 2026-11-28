@@ -25,6 +25,12 @@
 mod app;
 /// Cell rendering for Fit, zoom levels and the minimap.
 mod cells;
+/// Source exposure layers and document history.
+#[allow(
+    dead_code,
+    reason = "Layer editing APIs are wired into input in a later step."
+)]
+mod document;
 /// Companion PNG and mass-study SVG writers and their status.
 mod export;
 /// Terminal image detection, placement and cleanup (Kitty, iTerm2, Sixel) for Original at Fit.
