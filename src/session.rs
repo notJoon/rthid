@@ -266,10 +266,7 @@ fn child(dir: &Path, name: &str) -> io::Result<PathBuf> {
 
 fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
     let broken = |error: &dyn std::fmt::Display| {
-        named(
-            path,
-            format!("broken manifest, restore it or save elsewhere: {error}"),
-        )
+        named(path, format!("broken manifest, restore it: {error}"))
     };
     let value: toml::Value = toml::from_str(text).map_err(|e| broken(&e))?;
     let version = value
@@ -284,7 +281,7 @@ fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
         };
         return Err(named(
             path,
-            format!("{reason} (version {version}), upgrade rthid or save elsewhere"),
+            format!("{reason} (version {version}), upgrade rthid"),
         ));
     }
     toml::from_str(text).map_err(|e| broken(&e))
@@ -557,7 +554,7 @@ fn write_with_sync(
         .transpose()?;
     // Leftovers of a failed first save are reused, and the cleanup below removes them.
     if previous.is_none() && !only_save_leftovers(dir)? {
-        return Err(named(dir, "not a session directory, save elsewhere"));
+        return Err(named(dir, "not a session directory"));
     }
     let mut generation = 0u64;
     let names = previous.iter().flat_map(|m| {
@@ -983,6 +980,27 @@ mod tests {
             after.sort();
             assert_eq!(after, names);
         }
+    }
+
+    #[test]
+    fn session_errors_never_suggest_saving_elsewhere() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        let manifest = temp.path().join("manifest.toml");
+        for text in ["version = 2", "version = 0", "[broken"] {
+            fs::write(&manifest, text).unwrap();
+            for error in [
+                read(temp.path()).err().unwrap(),
+                write(temp.path(), fixture()).unwrap_err(),
+            ] {
+                assert!(!error.to_string().contains("elsewhere"), "{error}");
+            }
+        }
+
+        let unrecognized = tempfile::tempdir().unwrap();
+        fs::write(unrecognized.path().join("keep"), b"keep").unwrap();
+        let error = write(unrecognized.path(), fixture()).unwrap_err();
+        assert!(!error.to_string().contains("elsewhere"), "{error}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Session errors no longer suggest saving elsewhere, which rthid cannot do
 - The right column is split into Parameters, Brush and Layers blocks with their own focus
   and scroll. Tab and BackTab cycle the preview and the three blocks, and keys go only to
   the focused block
