@@ -727,21 +727,6 @@ fn draw_key_help(frame: &mut Frame, app: &App, layout: &Layout) {
             frame.buffer_mut()[(content.x + x, content.y + y)] = buffer[(x, y + offset)].clone();
         }
     }
-    let hint = if app.keys_all {
-        "? this region"
-    } else {
-        "? all keys"
-    };
-    let hint_width = hint.len() as u16;
-    let more_width = if offset < max { 9 } else { 1 };
-    if area.height > 1 && area.width >= hint_width + more_width + 3 {
-        frame.buffer_mut().set_string(
-            area.x + 2,
-            area.bottom() - 1,
-            hint,
-            Style::default().fg(Color::DarkGray),
-        );
-    }
     for (visible, y, label) in [
         (offset > 0, area.y, "↑ more"),
         (offset < max, area.bottom().saturating_sub(1), "↓ more"),
@@ -2031,7 +2016,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
             let text = draw_text(&mut terminal, &app, &mut Renderer::default());
             assert!(text.contains(title));
-            assert!(text.contains("? all keys"));
+            assert!(text.contains("?: all keys"));
         }
     }
 
@@ -2058,7 +2043,7 @@ mod tests {
             assert_eq!(app.focus, Focus::Layers);
             let text = draw_text(&mut terminal, &app, &mut renderer);
             assert!(text.contains(if all { "Keys · All" } else { "Keys · Layers" }));
-            assert!(text.contains(if all { "? this region" } else { "? all keys" }));
+            assert!(text.contains(if all { "?: this region" } else { "?: all keys" }));
             if all {
                 assert!(key_help_scroll_max(&app, geometry.area.height) >= focused_max);
                 assert!(
