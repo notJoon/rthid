@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::cells::Layer;
+use crate::cells::View;
 
 use crate::settings::{
     MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
@@ -30,7 +30,7 @@ pub struct Ctx<'a> {
     /// Current preview settings.
     pub settings: &'a Settings,
     /// Preview selection to restore when editing is cancelled.
-    pub layer: Layer,
+    pub view: View,
 }
 
 /// A modal transition and its optional application change.
@@ -90,7 +90,7 @@ pub enum Effect {
         /// Captured processing settings.
         settings: Settings,
         /// Captured preview selection.
-        layer: Layer,
+        view: View,
     },
     /// Persist and select the draft using the captured base settings.
     SavePreset {
@@ -244,7 +244,7 @@ pub struct Editor {
     /// Uncommitted name or hex text.
     pub input: Option<TextInput>,
     original: Settings,
-    layer: Layer,
+    view: View,
 }
 
 impl Editor {
@@ -257,7 +257,7 @@ impl Editor {
             rows,
             input: None,
             original: ctx.settings.clone(),
-            layer: ctx.layer,
+            view: ctx.view,
         }
     }
 
@@ -357,7 +357,7 @@ impl Editor {
                     Next::Close,
                     Effect::Restore {
                         settings: self.original.clone(),
-                        layer: self.layer,
+                        view: self.view,
                     },
                 );
             }
@@ -1247,7 +1247,7 @@ mod tests {
             palettes,
             templates,
             settings,
-            layer: Layer::Original,
+            view: View::Original,
         }
     }
 
@@ -1361,7 +1361,7 @@ mod tests {
         let step = press(&mut modal, KeyCode::Esc, &palettes, &templates, &original);
         assert!(matches!(step.next, Next::Close));
         assert!(
-            matches!(step.effect, Some(Effect::Restore { settings, layer: Layer::Original }) if settings == original)
+            matches!(step.effect, Some(Effect::Restore { settings, view: View::Original }) if settings == original)
         );
     }
 

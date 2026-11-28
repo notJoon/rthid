@@ -16,11 +16,11 @@ use ratatui::{
 };
 use rthid_dither::dither::PaletteColor;
 
-/// Layer, build version, visible region, zoom and target size for averaged RGB cells.
+/// View, build version, visible region, zoom and target size for averaged RGB cells.
 #[derive(PartialEq)]
 pub struct OverviewKey {
     grid: u64,
-    layer: Layer,
+    view: View,
     cols: u16,
     rows: u16,
     origin: (u32, u32),
@@ -44,7 +44,7 @@ pub struct OverviewCaches {
 
 /// Which pixels the preview shows.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Layer {
+pub enum View {
     /// Composed card pixels.
     #[default]
     Original,
@@ -54,7 +54,7 @@ pub enum Layer {
     Mass,
 }
 
-impl Layer {
+impl View {
     /// Label used in preview status text.
     pub fn name(self) -> &'static str {
         match self {
@@ -65,10 +65,10 @@ impl Layer {
     }
 }
 
-/// Borrowed pixels of the selected preview layer.
+/// Borrowed pixels of the selected view.
 #[derive(Clone, Copy)]
 pub enum Pixels<'a> {
-    /// Dithered layer as palette indices and their colors.
+    /// Dithered pixels as palette indices and their colors.
     Indexed {
         /// One palette index per grid pixel.
         indices: &'a [u8],
@@ -82,7 +82,7 @@ pub enum Pixels<'a> {
         /// Build count of the source cache.
         version: u64,
         /// Distinguishes caches with equal build counts.
-        layer: Layer,
+        view: View,
     },
 }
 
@@ -291,9 +291,9 @@ fn render_overview(
         Pixels::Rgb {
             image,
             version,
-            layer,
+            view,
         } => {
-            render_overview_rgb(image, version, layer, geometry, buffer, cache);
+            render_overview_rgb(image, version, view, geometry, buffer, cache);
             false
         }
         Pixels::Indexed { indices, palette } => {
@@ -302,12 +302,12 @@ fn render_overview(
     }
 }
 
-/// Draws averaged half blocks for RGB layers, see the Original column on [`Zoom`].
-/// Colors rebuild when the layer, build version or preview geometry changes.
+/// Draws averaged half blocks for RGB views, see the Original column on [`Zoom`].
+/// Colors rebuild when the view, build version or preview geometry changes.
 fn render_overview_rgb(
     pixels: &RgbaImage,
     version: u64,
-    layer: Layer,
+    view: View,
     geometry: &PreviewGeometry,
     buffer: &mut Buffer,
     cache: &mut OverviewCache,
@@ -316,7 +316,7 @@ fn render_overview_rgb(
     let colors = cache.get_or_build(
         OverviewKey {
             grid: version,
-            layer,
+            view,
             cols: target.width,
             rows: target.height,
             origin: geometry.origin,
@@ -747,12 +747,12 @@ mod tests {
                 Pixels::Rgb {
                     image: &pixels,
                     version,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
                 Pixels::Rgb {
                     image: &pixels,
                     version,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
@@ -766,12 +766,12 @@ mod tests {
             Pixels::Rgb {
                 image: &pixels,
                 version: 2,
-                layer: Layer::Original,
+                view: View::Original,
             },
             Pixels::Rgb {
                 image: &pixels,
                 version: 2,
-                layer: Layer::Original,
+                view: View::Original,
             },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
@@ -785,12 +785,12 @@ mod tests {
             Pixels::Rgb {
                 image: &updated,
                 version: 3,
-                layer: Layer::Original,
+                view: View::Original,
             },
             Pixels::Rgb {
                 image: &updated,
                 version: 3,
-                layer: Layer::Original,
+                view: View::Original,
             },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn rgb_overview_distinguishes_layers_with_equal_versions() {
+    fn rgb_overview_distinguishes_views_with_equal_versions() {
         let original = rgb(8, 8, &[[0; 3]; 64]);
         let mass = rgb(8, 8, &[[255; 3]; 64]);
         let area = Rect::new(0, 0, 2, 2);
@@ -817,7 +817,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &original,
                     version: 1,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
                 Glyphs::default(),
                 &geometry,
@@ -829,7 +829,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &mass,
                     version: 1,
-                    layer: Layer::Mass,
+                    view: View::Mass,
                 },
                 Glyphs::default(),
                 &geometry,
@@ -875,7 +875,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &pixels,
                     version: 1,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
             ] {
                 render_with_new_caches(source, Glyphs::default(), &before, &mut buffer);
@@ -897,7 +897,7 @@ mod tests {
             Pixels::Rgb {
                 image: &pixels,
                 version: 1,
-                layer: Layer::Original
+                view: View::Original
             },
             Glyphs::default(),
             &crate::viewport::geometry(
@@ -927,7 +927,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &rgb(4, 4, &pixels),
                     version: 1,
-                    layer: Layer::Original
+                    view: View::Original
                 },
                 Glyphs::default(),
                 &crate::viewport::geometry(&Viewport::default(), (4, 4), area),
@@ -959,7 +959,7 @@ mod tests {
             Pixels::Rgb {
                 image: &rgb(1, 4, &pixels),
                 version: 1,
-                layer: Layer::Original
+                view: View::Original
             },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 4), area),
@@ -979,7 +979,7 @@ mod tests {
             Pixels::Rgb {
                 image: &rgb(1, 2, &pixels),
                 version: 1,
-                layer: Layer::Original
+                view: View::Original
             },
             Glyphs::default(),
             &crate::viewport::geometry(&Viewport::default(), (1, 2), area),
@@ -1041,12 +1041,12 @@ mod tests {
             Pixels::Rgb {
                 image: &original,
                 version: 1,
-                layer: Layer::Original,
+                view: View::Original,
             },
             Pixels::Rgb {
                 image: &inset,
                 version: 1,
-                layer: Layer::Mass,
+                view: View::Mass,
             },
             Glyphs::default(),
             &geometry,
@@ -1121,12 +1121,12 @@ mod tests {
                     Pixels::Rgb {
                         image: &pixels,
                         version,
-                        layer: Layer::Original,
+                        view: View::Original,
                     },
                     Pixels::Rgb {
                         image: &pixels,
                         version,
-                        layer: Layer::Original,
+                        view: View::Original,
                     },
                     Glyphs::default(),
                     &geometry(&viewport, pixels.dimensions(), area),
@@ -1155,7 +1155,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &pixels,
                     version: 1,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
             ] {
                 let mut buffer = Buffer::empty(area);
@@ -1192,7 +1192,7 @@ mod tests {
             Pixels::Rgb {
                 image: &pixels,
                 version: 1,
-                layer: Layer::Original,
+                view: View::Original,
             },
             indexed(&indices, &palette),
         ] {
@@ -1241,7 +1241,7 @@ mod tests {
                 Pixels::Rgb {
                     image: &pixels,
                     version: 1,
-                    layer: Layer::Original,
+                    view: View::Original,
                 },
                 indexed(&indices, &palette),
             ] {

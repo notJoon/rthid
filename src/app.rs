@@ -1,7 +1,8 @@
 //! Interactive state and the key and mouse handling that changes it.
 
 use crate::{
-    cells::{Glyphs, Layer, Pixels},
+    cells::{Glyphs, Pixels, View},
+    document::{Document, History},
     export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
@@ -91,17 +92,19 @@ pub struct App {
     minimap_visible: bool,
     /// Image processing caches.
     pub grid_cache: GridCache,
+    /// Source exposure layers and their undo history.
+    pub edits: History,
     /// Named configuration lists and their pending saves.
     pub library: Library,
     /// Current image settings.
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
     pub panel: Outline,
-    /// Selected preview layer, initially Original.
-    pub layer: Layer,
-    /// Layer that `a` returns to from the mass study.
-    pub mass_return: Layer,
-    /// Whether the minimap shows the mass study instead of the main layer.
+    /// Selected view, initially Original.
+    pub view: View,
+    /// View that `a` returns to from the mass study.
+    pub mass_return: View,
+    /// Whether the minimap shows the mass study instead of the main view.
     pub mass_minimap: bool,
     /// Geometry controls for the mass study.
     pub mass: MassOptions,
@@ -124,7 +127,7 @@ impl App {
     }
 
     pub(crate) fn mass_map_available(&self, geometry: &PreviewGeometry) -> bool {
-        geometry.minimap.is_some() && self.layer != Layer::Mass
+        geometry.minimap.is_some() && self.view != View::Mass
     }
 
     /// Builds the source grid and queues requested companion exports.
@@ -145,6 +148,7 @@ impl App {
             last_drag: None,
             minimap_visible: false,
             grid_cache: GridCache::default(),
+            edits: History::new(Document::new(0, 0)),
             library: Library::new(loaded),
             notice: None,
             outbox: Vec::new(),
@@ -154,8 +158,8 @@ impl App {
             keys_open: false,
             settings: Settings::default(),
             panel: Outline::new(&GROUP_LENS),
-            layer: Layer::Original,
-            mass_return: Layer::Original,
+            view: View::Original,
+            mass_return: View::Original,
             mass_minimap: true,
             mass: MassOptions::default(),
             mass_tones: None,
@@ -225,12 +229,14 @@ impl App {
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
         self.source_path = Some(path);
+        self.edits
+            .reset(Document::new(image.width(), image.height()));
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
         self.settings.reset_composition();
-        self.layer = Layer::Original;
-        self.mass_return = Layer::Original;
+        self.view = View::Original;
+        self.mass_return = View::Original;
         self.refresh(false);
     }
 
@@ -255,7 +261,7 @@ impl App {
             .or_else(|| self.notice.as_ref().map(|notice| notice.text.as_str()))
             .or_else(|| self.settings.dimensions(self.source_size()).err())
             .or_else(|| {
-                (self.layer == Layer::Mass || (self.mass_minimap && self.minimap_visible))
+                (self.view == View::Mass || (self.mass_minimap && self.minimap_visible))
                     .then(|| self.grid_cache.mass_error().map(|(_, text)| text))
                     .flatten()
             })
@@ -458,7 +464,7 @@ impl App {
             .map_or((0, 0), |p| (p.width, p.height))
     }
 
-    /// Rebuilds the grid and requested layers, sends a new dither to the
+    /// Rebuilds the grid and requested preview pixels, sends a new dither to the
     /// companion PNG and clamps the viewport to the preview area. Call before each draw.
     /// Returns whether the grid, dither or mass study was rebuilt.
     pub fn sync(&mut self, preview: Rect) -> bool {
@@ -492,14 +498,15 @@ impl App {
     }
 
     fn refresh(&mut self, inset_mass: bool) {
-        let need_dither = self.layer == Layer::Dithered || self.has_export();
+        let need_dither = self.view == View::Dithered || self.has_export();
         let tones = self.mass_tones.unwrap_or_else(|| {
             mass::tones_from_palette(self.settings.palette.colors(), &self.mass)
         });
         let changed = self.grid_cache.refresh(
+            &self.edits,
             &self.settings,
             need_dither,
-            self.layer == Layer::Mass || inset_mass || self.mass_export.is_some(),
+            self.view == View::Mass || inset_mass || self.mass_export.is_some(),
             &self.mass,
             &tones,
         );
@@ -559,23 +566,23 @@ impl App {
 
     /// Selected preview pixels after sync, or None without a source.
     ///
-    /// Panics if the selected processed layer was never built.
+    /// Panics if the selected processed view was never built.
     pub fn displayed(&self) -> Option<Pixels<'_>> {
         let grid = self.grid_cache.grid()?;
-        Some(match self.layer {
-            Layer::Original => Pixels::Rgb {
+        Some(match self.view {
+            View::Original => Pixels::Rgb {
                 image: grid,
                 version: self.grid_cache.grid_version(),
-                layer: Layer::Original,
+                view: View::Original,
             },
-            Layer::Dithered => Pixels::Indexed {
+            View::Dithered => Pixels::Indexed {
                 indices: self.grid_cache.dithered().expect("dithered grid"),
                 palette: self.settings.palette.colors(),
             },
-            Layer::Mass => Pixels::Rgb {
+            View::Mass => Pixels::Rgb {
                 image: self.grid_cache.mass().expect("mass grid"),
                 version: self.grid_cache.mass_version(),
-                layer: Layer::Mass,
+                view: View::Mass,
             },
         })
     }
@@ -588,7 +595,7 @@ impl App {
             return Some(Pixels::Rgb {
                 image,
                 version: self.grid_cache.mass_version(),
-                layer: Layer::Mass,
+                view: View::Mass,
             });
         }
         self.displayed()
@@ -732,7 +739,7 @@ impl App {
             palettes: &self.library.palettes,
             templates: &self.library.templates,
             settings: &self.settings,
-            layer: self.layer,
+            view: self.view,
         }
     }
 
@@ -823,18 +830,18 @@ impl App {
         if let Some(preview_key) = preview_key {
             match preview_key {
                 PreviewKey::ToggleOriginal => {
-                    self.layer = if self.layer == Layer::Dithered {
-                        Layer::Original
+                    self.view = if self.view == View::Dithered {
+                        View::Original
                     } else {
-                        Layer::Dithered
+                        View::Dithered
                     };
                 }
                 PreviewKey::ToggleMass => {
-                    if self.layer == Layer::Mass {
-                        self.layer = self.mass_return;
+                    if self.view == View::Mass {
+                        self.view = self.mass_return;
                     } else {
-                        self.mass_return = self.layer;
-                        self.layer = Layer::Mass;
+                        self.mass_return = self.view;
+                        self.view = View::Mass;
                     }
                 }
                 PreviewKey::ToggleMinimap => {
@@ -882,7 +889,7 @@ impl App {
                     return;
                 };
                 let next = self.settings.with_default(setting, &self.library.palettes);
-                let _ = self.set_settings(next, self.layer);
+                let _ = self.set_settings(next, self.view);
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
@@ -942,10 +949,10 @@ impl App {
                 self.set_notice(message);
             }
             Effect::Preview(settings) => {
-                self.set_settings(settings, self.edit_layer())?;
+                self.set_settings(settings, self.edit_view())?;
             }
-            Effect::Restore { settings, layer } => {
-                self.set_settings(settings, layer)?;
+            Effect::Restore { settings, view } => {
+                self.set_settings(settings, view)?;
             }
             Effect::SavePreset { preset, base } => {
                 let name = preset.name.clone();
@@ -978,30 +985,30 @@ impl App {
         self.apply_setting(setting, next);
     }
 
-    fn set_settings(&mut self, settings: Settings, layer: Layer) -> Result<(), String> {
+    fn set_settings(&mut self, settings: Settings, view: View) -> Result<(), String> {
         settings.dimensions(self.source_size())?;
         self.settings = settings;
-        self.layer = layer;
+        self.view = view;
         Ok(())
     }
 
-    fn edit_layer(&self) -> Layer {
-        if self.layer == Layer::Mass {
-            Layer::Mass
+    fn edit_view(&self) -> View {
+        if self.view == View::Mass {
+            View::Mass
         } else {
-            Layer::Dithered
+            View::Dithered
         }
     }
 
     // Enter and arrow keys share the preview rule and preserve it for rejected edits.
     // The mass study stays selected because palette edits recolor its tones.
     fn apply_setting(&mut self, setting: Setting, next: Settings) {
-        let layer = if next != self.settings && setting.shows_dithered() {
-            self.edit_layer()
+        let view = if next != self.settings && setting.shows_dithered() {
+            self.edit_view()
         } else {
-            self.layer
+            self.view
         };
-        let _ = self.set_settings(next, layer);
+        let _ = self.set_settings(next, view);
     }
 }
 
@@ -1095,7 +1102,7 @@ mod tests {
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
             (60, 40)
         );
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         app.refresh(false);
         assert!(jobs(&mut app).is_empty());
         let before = versions(&app);
@@ -1104,7 +1111,7 @@ mod tests {
         app.refresh(false);
         assert_eq!(versions(&app), before);
         assert_eq!(app.grid_cache.mass_version(), mass_version);
-        assert_eq!(app.layer, Layer::Mass);
+        assert_eq!(app.view, View::Mass);
         assert_eq!(app.grid_size(), (30, 20));
         assert_eq!(
             encoded_export(jobs(&mut app).pop().unwrap()).1.dimensions(),
@@ -1365,7 +1372,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(app.settings == original);
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
 
         for outcome in [listing(), image()] {
             app.open_dialog("/images".into());
@@ -1493,7 +1500,7 @@ mod tests {
         app.settings.dot = 10;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         assert!(app.sync(preview));
         assert!(!app.sync(preview));
         app.settings.strength = 0.5;
@@ -1654,7 +1661,7 @@ mod tests {
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
             assert!(!app.viewport.hide_minimap);
             assert!(app.last_drag.is_none());
-            assert_eq!(app.layer, Layer::Original);
+            assert_eq!(app.view, View::Original);
             assert_eq!(versions(&app), (0, 0));
         }
         app.preview_focus = false;
@@ -1667,7 +1674,7 @@ mod tests {
         app.open_image(PathBuf::from("first.png"), RgbaImage::new(20, 10));
         assert_eq!(app.grid_size(), (450, 250));
         assert!(app.displayed().is_some());
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         assert_eq!(versions(&app), (1, 0));
     }
 
@@ -1688,7 +1695,7 @@ mod tests {
         app.settings.pan_x = 25;
         app.settings.pan_y = -40;
         app.settings.flip = true;
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.refresh(false);
         let settings = app.settings.clone();
         let before = versions(&app);
@@ -1707,7 +1714,7 @@ mod tests {
         assert_eq!(app.viewport.zoom, Zoom::Fit);
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
         assert!(!app.viewport.hide_minimap);
-        assert!(app.last_drag.is_none() && app.layer == Layer::Original);
+        assert!(app.last_drag.is_none() && app.view == View::Original);
         assert_eq!(app.settings.rotation, Rotation::R0);
         assert!(!app.settings.flip);
         assert_eq!(
@@ -1751,9 +1758,7 @@ mod tests {
         assert!(app.settings.flip);
         assert_eq!(app.settings.rotation, Rotation::R90);
         assert!(
-            app.layer == Layer::Dithered
-                && app.modal.is_none()
-                && take_changes(&mut app).is_empty()
+            app.view == View::Dithered && app.modal.is_none() && take_changes(&mut app).is_empty()
         );
     }
 
@@ -1785,9 +1790,7 @@ mod tests {
         assert_eq!(app.settings.palette.name(), "Z");
         assert!(app.library.palettes.find("Z").is_some());
         assert!(
-            app.modal.is_none()
-                && !take_changes(&mut app).is_empty()
-                && app.layer == Layer::Dithered
+            app.modal.is_none() && !take_changes(&mut app).is_empty() && app.view == View::Dithered
         );
     }
 
@@ -2300,7 +2303,7 @@ mod tests {
         let mut app = business_app(RgbaImage::new(20, 10), None);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 0);
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.dithered.version(), 1);
         app.sync(test_layout().preview);
@@ -2310,13 +2313,13 @@ mod tests {
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 1);
         assert_eq!(app.grid_cache.dithered.version(), 2);
-        app.layer = Layer::Original;
+        app.view = View::Original;
         app.settings.rotation = Rotation::R180;
         app.settings.dot = 19;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.grid.version(), 2);
         assert_eq!(app.grid_cache.dithered.version(), 2);
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.sync(test_layout().preview);
         assert_eq!(app.grid_cache.dithered.version(), 3);
         assert_eq!(app.grid_size(), (263, 474));
@@ -2327,6 +2330,8 @@ mod tests {
         );
         let before = versions(&app);
         let replacement = RgbaImage::from_pixel(20, 10, image::Rgba([255, 255, 255, 255]));
+        app.edits
+            .reset(Document::new(replacement.width(), replacement.height()));
         app.grid_cache.set_source(replacement);
         assert!(app.grid_cache.grid().is_none());
         assert!(app.grid_cache.dithered().is_none());
@@ -2365,35 +2370,35 @@ mod tests {
     fn preview_toggle_and_adjustments_select_view_without_extra_redithering() {
         let mut app = App::builtin(RgbaImage::new(20, 10), None);
         select(&mut app, Setting::Strength);
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
             app.preview_focus = focus;
             assert_eq!(press(&mut app, KeyCode::Char(' ')), rebuilt);
-            assert_eq!(app.layer, Layer::Dithered);
+            assert_eq!(app.view, View::Dithered);
             assert!(!press(&mut app, KeyCode::Char(' ')));
-            assert_eq!(app.layer, Layer::Original);
+            assert_eq!(app.view, View::Original);
         }
         app.preview_focus = false;
         assert!(!press(&mut app, KeyCode::Right));
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         assert!(press(&mut app, KeyCode::Left));
-        assert_eq!(app.layer, Layer::Dithered);
+        assert_eq!(app.view, View::Dithered);
         assert!(!press(&mut app, KeyCode::Char(' ')));
         app.panel = Outline::new(&GROUP_LENS);
         assert!(press(&mut app, KeyCode::Left));
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d')] {
             assert!(press(&mut app, code));
-            assert_eq!(app.layer, Layer::Original);
+            assert_eq!(app.view, View::Original);
         }
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         select(&mut app, Setting::Strength);
         let strength = app.settings.strength;
         press(&mut app, KeyCode::Left);
         assert_ne!(app.settings.strength, strength);
-        assert_eq!(app.layer, Layer::Mass);
+        assert_eq!(app.view, View::Mass);
         app.apply(Effect::Preview(app.settings.clone())).unwrap();
-        assert_eq!(app.layer, Layer::Mass);
+        assert_eq!(app.view, View::Mass);
     }
 
     #[test]
@@ -2410,14 +2415,14 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
                 &app.geometry(area),
             );
-            assert_eq!(app.layer, Layer::Mass);
+            assert_eq!(app.view, View::Mass);
             assert!(app.sync(area));
             assert_eq!(app.grid_cache.grid_version(), grid_version);
             assert_eq!(app.grid_cache.dithered.version(), 0);
             let Some(Pixels::Rgb {
                 image,
                 version,
-                layer: Layer::Mass,
+                view: View::Mass,
             }) = app.displayed()
             else {
                 panic!("expected mass RGB pixels");
@@ -2426,19 +2431,19 @@ mod tests {
             assert_eq!(version, app.grid_cache.mass_version());
             assert!(!app.sync(area));
             assert!(!press(&mut app, KeyCode::Char('a')));
-            assert_eq!(app.layer, Layer::Original);
+            assert_eq!(app.view, View::Original);
             press(&mut app, KeyCode::Char('a'));
             press(&mut app, KeyCode::Char(' '));
-            assert_eq!(app.layer, Layer::Dithered);
+            assert_eq!(app.view, View::Dithered);
             press(&mut app, KeyCode::Char('a'));
-            assert_eq!(app.layer, Layer::Mass);
+            assert_eq!(app.view, View::Mass);
             press(&mut app, KeyCode::Char('a'));
-            assert_eq!(app.layer, Layer::Dithered);
+            assert_eq!(app.view, View::Dithered);
             press(&mut app, KeyCode::Char('a'));
             app.open_image(PathBuf::from("next.png"), RgbaImage::new(20, 10));
             assert_eq!(
-                (app.layer, app.mass_return),
-                (Layer::Original, Layer::Original)
+                (app.view, app.mass_return),
+                (View::Original, View::Original)
             );
         }
     }
@@ -2486,11 +2491,11 @@ mod tests {
     }
 
     #[test]
-    fn mass_error_notice_follows_layer_and_minimap_visibility() {
+    fn mass_error_notice_follows_view_and_minimap_visibility() {
         let mut app = App::builtin(RgbaImage::new(400, 400), None);
         let area = Rect::new(0, 0, 69, 36);
         app.mass.sigma = -1.0;
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         app.sync(area);
         let expected = format!("mass study: {}", app.grid_cache.mass_error().unwrap().0);
         assert_eq!(app.notice(), Some(expected.as_str()));
@@ -2501,7 +2506,7 @@ mod tests {
         app.notice = None;
         assert_eq!(app.notice(), Some(expected.as_str()));
 
-        app.layer = Layer::Original;
+        app.view = View::Original;
         app.sync(area);
         assert!(app.notice().is_none());
         app.viewport.zoom = Zoom::In(2);
@@ -2515,7 +2520,7 @@ mod tests {
         app.sync(area);
         assert!(app.notice().is_none());
 
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         app.mass = MassOptions::default();
         app.sync(area);
         assert!(app.notice().is_none());
@@ -2531,7 +2536,7 @@ mod tests {
         assert!(matches!(
             app.inset(),
             Some(Pixels::Rgb {
-                layer: Layer::Original,
+                view: View::Original,
                 ..
             })
         ));
@@ -2546,14 +2551,14 @@ mod tests {
         assert!(matches!(
             app.inset(),
             Some(Pixels::Rgb {
-                layer: Layer::Mass,
+                view: View::Mass,
                 ..
             })
         ));
         assert!(matches!(
             app.displayed(),
             Some(Pixels::Rgb {
-                layer: Layer::Original,
+                view: View::Original,
                 ..
             })
         ));
@@ -2566,7 +2571,7 @@ mod tests {
         assert!(matches!(
             app.inset(),
             Some(Pixels::Rgb {
-                layer: Layer::Mass,
+                view: View::Mass,
                 ..
             })
         ));
@@ -2574,11 +2579,11 @@ mod tests {
         assert!(matches!(
             app.inset(),
             Some(Pixels::Rgb {
-                layer: Layer::Original,
+                view: View::Original,
                 ..
             })
         ));
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.sync(area);
         assert!(matches!(app.inset(), Some(Pixels::Indexed { .. })));
         assert!(matches!(app.displayed(), Some(Pixels::Indexed { .. })));
@@ -2594,7 +2599,7 @@ mod tests {
         assert!(app.sync(area));
         let Some(Pixels::Rgb {
             image,
-            layer: Layer::Mass,
+            view: View::Mass,
             ..
         }) = app.inset()
         else {
@@ -2624,7 +2629,7 @@ mod tests {
                 assert_eq!(versions(&app), before);
                 assert_eq!(app.grid_cache.mass_version(), 1);
                 assert!(!app.viewport.hide_minimap);
-                assert_eq!(app.layer, Layer::Original);
+                assert_eq!(app.view, View::Original);
             }
         }
     }
@@ -2701,7 +2706,7 @@ mod tests {
     fn mass_tones_follow_palette_changes() {
         let mut app = App::builtin(RgbaImage::new(20, 10), None);
         assert_eq!(app.mass_tones, None);
-        app.layer = Layer::Mass;
+        app.view = View::Mass;
         let area = test_layout().preview;
         app.sync(area);
         let version = app.grid_cache.mass_version();
@@ -2868,7 +2873,7 @@ mod tests {
         app.settings.dither = Dither::Bayer4;
         app.settings.seed = 42;
         app.sync(test_layout().preview);
-        app.layer = Layer::Original;
+        app.view = View::Original;
         for setting in [Setting::Strength, Setting::Serpentine] {
             select(&mut app, setting);
             for key in [
@@ -2880,11 +2885,11 @@ mod tests {
                 let before = app.settings.clone();
                 assert!(!press(&mut app, key));
                 assert!(app.settings == before);
-                assert_eq!(app.layer, Layer::Original);
+                assert_eq!(app.view, View::Original);
             }
         }
         select(&mut app, Setting::Dither);
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         assert!(press(&mut app, KeyCode::Char('d')));
         assert_eq!(app.settings.dither, Dither::Atkinson);
         assert_eq!(app.settings.strength, 0.9);
@@ -2898,19 +2903,19 @@ mod tests {
         let before = app.settings.clone();
         assert!(!press(&mut app, KeyCode::Enter));
         assert!(app.settings == before);
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         app.settings.dither = Dither::Noise;
         app.settings.seed = 0;
         assert!(!press(&mut app, KeyCode::Left));
         assert_eq!(app.settings.seed, 0);
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!(app.settings.seed, 1);
         let seed = app.settings.seed;
-        app.layer = Layer::Original;
+        app.view = View::Original;
         assert!(press(&mut app, KeyCode::Enter));
         assert_ne!(app.settings.seed, seed);
-        assert_eq!(app.layer, Layer::Dithered);
+        assert_eq!(app.view, View::Dithered);
         assert!(press(&mut app, KeyCode::Char('d')));
         assert_eq!(app.settings.seed, 0);
     }
@@ -2979,7 +2984,7 @@ mod tests {
             app.sync(test_layout().preview);
             if !setting.is_active(&app.settings) {
                 let before = app.settings.clone();
-                app.layer = Layer::Original;
+                app.view = View::Original;
                 for key in [
                     KeyCode::Left,
                     KeyCode::Right,
@@ -2988,7 +2993,7 @@ mod tests {
                 ] {
                     assert!(!press(&mut app, key));
                     assert!(app.settings == before);
-                    assert_eq!(app.layer, Layer::Original);
+                    assert_eq!(app.view, View::Original);
                 }
                 continue;
             }
@@ -3064,21 +3069,21 @@ mod tests {
     }
 
     #[test]
-    fn flip_toggles_in_both_focuses_and_layers_and_rebuilds_once() {
+    fn flip_toggles_in_both_focuses_and_views_and_rebuilds_once() {
         for focus in [false, true] {
-            for layer in [Layer::Original, Layer::Dithered, Layer::Mass] {
+            for view in [View::Original, View::Dithered, View::Mass] {
                 let mut app = App::builtin(RgbaImage::new(16, 12), None);
                 app.settings = Settings::for_pixels(16, 12);
                 app.preview_focus = focus;
-                app.layer = layer;
+                app.view = view;
                 app.refresh(false);
                 assert!(!app.settings.flip);
                 for expected in [true, false] {
                     let before = versions(&app);
                     assert!(press(&mut app, KeyCode::Char('f')));
                     assert_eq!(app.settings.flip, expected);
-                    assert_eq!(app.layer, layer);
-                    let after = (before.0 + 1, before.1 + u64::from(layer == Layer::Dithered));
+                    assert_eq!(app.view, view);
+                    let after = (before.0 + 1, before.1 + u64::from(view == View::Dithered));
                     assert_eq!(versions(&app), after);
                     app.refresh(false);
                     assert_eq!(versions(&app), after);
@@ -3093,7 +3098,7 @@ mod tests {
     #[test]
     fn rotation_keeps_the_actual_dither_grid() {
         let mut app = business_app(RgbaImage::new(256, 128), None);
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         let size = app.grid_size();
         for (rotation, degrees, swaps_axes) in [
             (Rotation::R0, 0, false),
@@ -3513,16 +3518,16 @@ mod tests {
     }
 
     #[test]
-    fn print_controls_rebuild_once_and_preserve_the_layer() {
+    fn print_controls_rebuild_once_and_preserve_the_view() {
         let mut app = business_app(RgbaImage::new(20, 10), None);
         select(&mut app, Setting::Dot);
         let before = versions(&app);
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!(app.grid_size(), (238, 429));
         assert_eq!(versions(&app), (before.0 + 1, before.1));
-        assert_eq!(app.layer, Layer::Original);
+        assert_eq!(app.view, View::Original);
         assert!(!app.sync(test_layout().preview));
-        app.layer = Layer::Dithered;
+        app.view = View::Dithered;
         app.refresh(false);
         for (setting, key) in [
             (Setting::Zoom, KeyCode::Right),
@@ -3533,7 +3538,7 @@ mod tests {
             let before = versions(&app);
             assert!(press(&mut app, key));
             assert_eq!(versions(&app), (before.0 + 1, before.1 + 1));
-            assert_eq!(app.layer, Layer::Dithered);
+            assert_eq!(app.view, View::Dithered);
             assert!(!app.sync(test_layout().preview));
         }
         for setting in [Setting::Zoom, Setting::PanX, Setting::PanY] {

@@ -1,13 +1,19 @@
 //! Source image, print grid and processed preview caches.
 
-use crate::{memo::Memo, print::Placement, settings::Settings};
+use crate::{document::History, memo::Memo, print::Placement, settings::Settings};
 use image::{Rgba, RgbaImage, imageops};
 use rthid_dither::{
     dither::{self, Options, PaletteColor},
     mass::{self, MassError, MassOptions},
 };
 
-type GridKey = Placement;
+/// Placement and source composition used to build the card grid.
+#[derive(PartialEq)]
+pub(crate) struct GridKey {
+    placement: Placement,
+    /// Composed build version, `None` when the document leaves the source unchanged.
+    composed: Option<u64>,
+}
 
 /// Grid build version and the settings the indices were dithered with.
 ///
@@ -43,6 +49,8 @@ pub(crate) struct MassBuild {
 pub struct GridCache {
     /// Loaded image before scaling and rotation.
     pub(crate) source: Option<RgbaImage>,
+    /// Source with visible exposure layers applied, keyed by history revision.
+    composed: Memo<u64, Option<RgbaImage>>,
     /// Composed card image cache.
     pub(crate) grid: Memo<GridKey, RgbaImage>,
     /// Palette indices from the last requested dither.
@@ -60,6 +68,7 @@ impl GridCache {
     /// Replaces the image and invalidates all caches without resetting versions.
     pub fn set_source(&mut self, image: RgbaImage) {
         self.source = Some(image);
+        self.composed.clear();
         self.grid.clear();
         self.dithered.clear();
         self.mass.clear();
@@ -70,10 +79,11 @@ impl GridCache {
         Placement::new(self.source.as_ref()?.dimensions(), settings).ok()
     }
 
-    /// Rebuilds the grid and requested layers when their inputs change.
+    /// Rebuilds the grid and requested preview pixels when their inputs change.
     /// Returns true when new dithered indices were built.
     pub fn refresh(
         &mut self,
+        edits: &History,
         settings: &Settings,
         need_dither: bool,
         need_mass: bool,
@@ -86,31 +96,48 @@ impl GridCache {
         let Some(placement) = self.placement(settings) else {
             return false;
         };
-        self.grid.update(placement, || {
-            let mut grid =
-                RgbaImage::from_pixel(placement.width, placement.height, image::Rgba([255; 4]));
-            if placement.aw > 0 {
-                let mut rotated = placement.rotation.apply(source.clone());
-                if placement.flip {
-                    imageops::flip_horizontal_in_place(&mut rotated);
+        self.composed
+            .update(edits.revision(), || edits.current().compose(source));
+        let source = self
+            .composed
+            .get()
+            .and_then(Option::as_ref)
+            .unwrap_or(source);
+        self.grid.update(
+            GridKey {
+                placement,
+                composed: self
+                    .composed
+                    .get()
+                    .and_then(Option::as_ref)
+                    .map(|_| self.composed.version()),
+            },
+            || {
+                let mut grid =
+                    RgbaImage::from_pixel(placement.width, placement.height, image::Rgba([255; 4]));
+                if placement.aw > 0 {
+                    let mut rotated = placement.rotation.apply(source.clone());
+                    if placement.flip {
+                        imageops::flip_horizontal_in_place(&mut rotated);
+                    }
+                    let (x0, y0, x1, y1) = placement.covered();
+                    let left = (i64::from(x0) - placement.x) as u32;
+                    let top = (i64::from(y0) - placement.y) as u32;
+                    let resized = resize_region(
+                        &rotated,
+                        (placement.sw, placement.sh),
+                        (left, top, x1 - x0, y1 - y0),
+                    );
+                    imageops::replace(
+                        &mut grid,
+                        &resized,
+                        i64::from(placement.inset + x0),
+                        i64::from(placement.inset + y0),
+                    );
                 }
-                let (x0, y0, x1, y1) = placement.covered();
-                let left = (i64::from(x0) - placement.x) as u32;
-                let top = (i64::from(y0) - placement.y) as u32;
-                let resized = resize_region(
-                    &rotated,
-                    (placement.sw, placement.sh),
-                    (left, top, x1 - x0, y1 - y0),
-                );
-                imageops::replace(
-                    &mut grid,
-                    &resized,
-                    i64::from(placement.inset + x0),
-                    i64::from(placement.inset + y0),
-                );
-            }
-            grid
-        });
+                grid
+            },
+        );
         let grid = self.grid.get().expect("processed grid");
         let (w, h) = grid.dimensions();
         let version = self.grid_version();
@@ -296,7 +323,7 @@ fn triangle_weights(input: u32, output: u32, position: u32) -> (u32, Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Rotation;
+    use crate::{document::Document, settings::Rotation};
 
     fn cache(source: RgbaImage) -> GridCache {
         GridCache {
@@ -305,10 +332,63 @@ mod tests {
         }
     }
 
+    fn empty_edits(cache: &GridCache) -> History {
+        let source = cache.source.as_ref().unwrap();
+        History::new(Document::new(source.width(), source.height()))
+    }
+
+    #[test]
+    fn edits_rebuild_grid_and_indices_only_when_revision_changes() {
+        use crate::document::STOP;
+
+        let source = RgbaImage::from_pixel(8, 8, Rgba([100, 100, 100, 255]));
+        let mut cache = cache(source.clone());
+        let mut edits = empty_edits(&cache);
+        let settings = Settings::for_pixels(8, 8);
+        let options = MassOptions::default();
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid(), Some(&source));
+        let before = cache.grid_version();
+        let indices = cache.dithered().unwrap().clone();
+        edits.edit(|doc| {
+            doc.add_layer("Exposure".into());
+        });
+        assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid_version(), before);
+        edits.amend(|doc| doc.target_mut().unwrap().exposure.add(0, 0, STOP));
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert!(cache.grid_version() > before);
+        assert_ne!(cache.dithered().unwrap(), &indices);
+        assert_eq!(
+            cache.grid().unwrap().get_pixel(0, 0).0,
+            [200, 200, 200, 255]
+        );
+        let versions = (
+            cache.composed.version(),
+            cache.grid_version(),
+            cache.dithered.version(),
+        );
+        assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(
+            versions,
+            (
+                cache.composed.version(),
+                cache.grid_version(),
+                cache.dithered.version()
+            )
+        );
+        assert!(edits.undo());
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid(), Some(&source));
+        assert_eq!(cache.dithered(), Some(&indices));
+        cache.set_source(RgbaImage::from_pixel(8, 8, Rgba([50, 50, 50, 255])));
+        assert!(cache.composed.get().is_none());
+        assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
+        assert_eq!(cache.grid().unwrap().get_pixel(0, 0).0, [50, 50, 50, 255]);
+    }
+
     #[test]
     fn image_card_preserves_every_source_pixel_at_each_rotation() {
-        use crate::settings::Rotation;
-
         for (w, h) in [(30, 20), (1, 2)] {
             let source = RgbaImage::from_fn(w, h, |x, y| Rgba([x as u8, y as u8, 0, 255]));
             for rotation in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
@@ -318,6 +398,7 @@ mod tests {
                 };
                 let mut cache = cache(source.clone());
                 cache.refresh(
+                    &empty_edits(&cache),
                     &settings,
                     false,
                     false,
@@ -329,6 +410,7 @@ mod tests {
                 settings.pan_x = 100;
                 settings.pan_y = -100;
                 cache.refresh(
+                    &empty_edits(&cache),
                     &settings,
                     false,
                     false,
@@ -344,8 +426,6 @@ mod tests {
 
     #[test]
     fn flip_mirrors_rotated_pixels_before_cover_and_pan() {
-        use crate::settings::Rotation;
-
         let source = RgbaImage::from_fn(16, 12, |x, y| Rgba([x as u8, y as u8, 0, 255]));
         for rotation in [Rotation::R0, Rotation::R90] {
             for cropped in [false, true] {
@@ -364,6 +444,7 @@ mod tests {
                 };
                 let mut cache = cache(source.clone());
                 cache.refresh(
+                    &empty_edits(&cache),
                     &settings,
                     false,
                     false,
@@ -395,7 +476,14 @@ mod tests {
         settings.tone.brightness = -0.5;
         settings.tone.contrast = 1.0;
         let mut cache = cache(RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255])));
-        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
+        assert!(cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            true,
+            false,
+            &MassOptions::default(),
+            &mass::MONO
+        ));
         let p = cache.placement(&settings).unwrap();
         assert_eq!(
             (p.inset, p.aw, p.ah, p.sw, p.sh, p.x, p.y),
@@ -420,12 +508,26 @@ mod tests {
             }
         }
         settings.margin = 100;
-        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
+        assert!(cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            true,
+            false,
+            &MassOptions::default(),
+            &mass::MONO
+        ));
         assert!(cache.grid().unwrap().pixels().all(|p| p.0 == [255; 4]));
         assert!(cache.dithered().unwrap().iter().all(|&i| i == 1));
         settings.palette = crate::settings::Palette::custom(&["#000", "#777", "#fff"]);
         let version = cache.grid_version();
-        assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
+        assert!(cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            true,
+            false,
+            &MassOptions::default(),
+            &mass::MONO
+        ));
         assert_eq!(cache.grid_version(), version);
         assert!(cache.dithered().unwrap().iter().all(|&i| i == 2));
     }
@@ -469,7 +571,14 @@ mod tests {
             let mut cache = cache(source);
             settings.pan_x = 100;
             settings.pan_y = -100;
-            assert!(cache.refresh(&settings, true, false, &MassOptions::default(), &mass::MONO));
+            assert!(cache.refresh(
+                &empty_edits(&cache),
+                &settings,
+                true,
+                false,
+                &MassOptions::default(),
+                &mass::MONO
+            ));
             assert_eq!(cache.grid().unwrap().dimensions(), (250, 450));
             assert!(cache.dithered().unwrap().iter().all(|&i| i == 0));
         }
@@ -481,25 +590,60 @@ mod tests {
         let mut settings = Settings::for_pixels(8, 12);
         let mut options = MassOptions::default();
         cache.set_source(RgbaImage::new(8, 4));
-        cache.refresh(&settings, false, false, &options, &mass::MONO);
+        cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            false,
+            false,
+            &options,
+            &mass::MONO,
+        );
         assert!(cache.mass().is_none());
         for (tones, expected) in [(mass::MONO, 1), (mass::MONO, 1), (mass::WARM, 2)] {
-            assert!(!cache.refresh(&settings, false, true, &options, &tones));
+            assert!(!cache.refresh(
+                &empty_edits(&cache),
+                &settings,
+                false,
+                true,
+                &options,
+                &tones
+            ));
             assert_eq!(cache.mass_version(), expected);
             assert_eq!(cache.mass().unwrap().dimensions(), (8, 12));
             assert_eq!(cache.mass().unwrap().get_pixel(0, 0).0[..3], tones[0].rgb);
         }
         options.invert = true;
-        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
         assert_eq!(cache.mass_version(), 3);
         settings.rotation = Rotation::R90;
-        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
         assert_eq!(cache.mass_version(), 4);
         assert_eq!(cache.mass().unwrap().dimensions(), (8, 12));
         assert!(cache.dithered().is_none());
         cache.set_source(RgbaImage::new(2, 3));
         assert!(cache.mass().is_none());
-        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
         assert_eq!(cache.mass_version(), 5);
     }
 
@@ -512,7 +656,14 @@ mod tests {
         };
         let mut cache = cache(RgbaImage::from_pixel(16, 12, Rgba([0, 0, 0, 255])));
         let options = MassOptions::default();
-        cache.refresh(&settings, false, true, &options, &mass::WARM);
+        cache.refresh(
+            &empty_edits(&cache),
+            &settings,
+            false,
+            true,
+            &options,
+            &mass::WARM,
+        );
         let grid = cache.grid().unwrap();
         assert_eq!(grid.dimensions(), (16, 12));
         assert_eq!(grid.get_pixel(0, 0).0, [255; 4]);
@@ -535,6 +686,7 @@ mod tests {
             ..MassOptions::default()
         };
         cache.refresh(
+            &empty_edits(&cache),
             &Settings::for_pixels(8, 8),
             false,
             true,
@@ -550,6 +702,7 @@ mod tests {
         );
         assert_eq!(cache.mass_version(), 1);
         cache.refresh(
+            &empty_edits(&cache),
             &Settings::for_pixels(8, 8),
             false,
             true,
@@ -562,6 +715,7 @@ mod tests {
         );
         assert_eq!(cache.mass_version(), 1);
         cache.refresh(
+            &empty_edits(&cache),
             &Settings::for_pixels(8, 8),
             false,
             true,
