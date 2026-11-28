@@ -240,20 +240,14 @@ impl Document {
         index
     }
 
-    /// Removes a valid layer and adjusts or clears its selection.
+    /// Removes a valid layer and selects the layer below it, or the one above.
     pub fn remove_layer(&mut self, index: usize) {
         if index >= self.layers.len() {
             return;
         }
         self.layers.remove(index);
         self.revision += 1;
-        self.selected = self.selected.and_then(|selected| {
-            if selected == index {
-                None
-            } else {
-                Some(selected - usize::from(selected > index))
-            }
-        });
+        self.selected = (!self.layers.is_empty()).then(|| index.saturating_sub(1));
     }
 
     /// Changes visibility when the layer exists.
@@ -599,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_operations_preserve_selection_and_target_fallback() {
+    fn layer_operations_update_selection_and_target_fallback() {
         let mut doc = Document::new(1, 1);
         assert_eq!(doc.target(), None);
         assert!(doc.target_mut().is_none());
@@ -620,10 +614,10 @@ mod tests {
         assert_eq!(doc.selected(), Some(0));
         doc.select(Some(2));
         doc.remove_layer(0);
-        assert_eq!(doc.selected(), Some(1));
+        assert_eq!(doc.selected(), Some(0));
         doc.remove_layer(8);
         doc.remove_layer(1);
-        assert_eq!(doc.selected(), None);
+        assert_eq!(doc.selected(), Some(0));
         assert_eq!(doc.target(), Some(0));
         doc.add_layer("d".into());
         doc.select(None);

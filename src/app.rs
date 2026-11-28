@@ -1676,13 +1676,13 @@ impl App {
             }
             Effect::Quit => self.quit = true,
             Effect::RemoveLayer(index) => {
-                let row = self
-                    .layers
-                    .selected(self.document.layers().len())
-                    .unwrap_or(0);
                 self.document.remove_layer(index);
                 self.layers.invalidate();
-                self.layers.select(row);
+                if let Some(index) = self.document.selected() {
+                    self.select_layer_row(index);
+                } else {
+                    self.layers.select(0);
+                }
             }
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
             Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
@@ -3261,6 +3261,78 @@ mod tests {
                 assert!(app.document.can_undo(1));
             }
         }
+    }
+
+    /// Asserts the cursor row, selection and edit target are the named layer.
+    fn assert_cursor_targets(app: &App, name: &str) {
+        let row = app.layers.selected(app.document.layers().len()).unwrap();
+        let index = app.layer_index(row).unwrap();
+        assert_eq!(app.document.layers()[index].name, name);
+        assert_eq!(app.document.selected(), Some(index));
+        assert_eq!(app.document.target(), Some(index));
+    }
+
+    #[test]
+    fn deleting_bottom_layer_targets_layer_above_at_cursor() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        app.focus = Focus::Layers;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(
+            app.document
+                .layers()
+                .iter()
+                .rev()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Layer 3", "Layer 1", "Layer 2"]
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_cursor_targets(&app, "Layer 1");
+    }
+
+    #[test]
+    fn deleting_middle_layer_targets_layer_below_at_cursor() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        app.focus = Focus::Layers;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_cursor_targets(&app, "Layer 1");
+    }
+
+    #[test]
+    fn deleting_non_target_layer_targets_layer_below_at_cursor() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        app.focus = Focus::Layers;
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.document.layers()[app.document.target().unwrap()].name,
+            "Layer 1"
+        );
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_cursor_targets(&app, "Layer 2");
     }
 
     #[test]
