@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ListPicker::invalidate` drops mouse hits until the next render
 - `Outline::selected_row` returns the selected row rectangle from the last render
 - `Dialog::anchored_area` places a popup below or above an anchor rectangle, on the side with more room,
   clamped to the screen
