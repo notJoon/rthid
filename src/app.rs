@@ -840,6 +840,8 @@ impl App {
     }
 
     fn start_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
+        let resolved = Self::resolve_open(&path, dir.as_deref());
+        let resolved = session::containing(&resolved).unwrap_or(resolved);
         let token = self.next_token();
         self.open_request = Some(OpenRequest {
             state: self.current_state(),
@@ -848,14 +850,13 @@ impl App {
             dialog: self.dialog(),
             label: format!(
                 "Loading {}",
-                path.file_name()
-                    .unwrap_or(path.as_os_str())
+                resolved
+                    .file_name()
+                    .unwrap_or(resolved.as_os_str())
                     .to_string_lossy()
             ),
         });
         self.notice = None;
-        let resolved = Self::resolve_open(&path, dir.as_deref());
-        let resolved = session::containing(&resolved).unwrap_or(resolved);
         let protect = self.protected_exports();
         let job = if session::is_session(&resolved)
             || (resolved.is_dir() && resolved.extension().is_some_and(|ext| ext == "rthid"))
@@ -2204,6 +2205,72 @@ mod tests {
         };
         assert_eq!(picker.dir, temp.path());
         assert!(matches!(&app.outbox[0].0, Job::List(path) if path == temp.path()));
+    }
+
+    #[test]
+    fn session_exposure_paths_route_to_the_containing_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
+        let mut stored = App::builtin(RgbaImage::new(2, 3), None);
+        stored.document.add_layer("Stored".into());
+        stored.document.target_mut().unwrap().exposure.add(0, 0, 1);
+        session::write(&dir, snapshot(&stored)).unwrap();
+        let exposure = dir.join("exposure-1-0.png");
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+
+        app.request_open(exposure, None);
+
+        assert_eq!(app.notice(), Some("Loading photo.rthid"));
+        assert!(matches!(&app.outbox[0].0, Job::Load { path, .. } if path == &dir));
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(app.document.layers()[0].name, "Stored");
+    }
+
+    #[test]
+    fn session_containing_does_not_route_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        app.settings.flip = true;
+
+        app.request_open(dir.join(".."), None);
+
+        assert!(app.modal.is_none());
+        assert!(matches!(&app.outbox[0].0, Job::Open { path, .. } if path == &dir.join("..")));
+    }
+
+    #[test]
+    fn nested_session_directories_open_as_themselves() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().canonicalize().unwrap().join("outer.rthid");
+        let app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&outer, snapshot(&app)).unwrap();
+        let nested = outer.join("exposure-1-0.rthid");
+        session::write(&nested, snapshot(&app)).unwrap();
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+
+        app.request_open(nested.clone(), None);
+
+        assert!(matches!(&app.outbox[0].0, Job::Load { path, .. } if path == &nested));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_to_session_files_route_to_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
+        let app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        let source = session::read(&dir).unwrap().source_path;
+        let alias = temp.path().join("pic.png");
+        std::os::unix::fs::symlink(source, &alias).unwrap();
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+
+        app.request_open(alias, None);
+
+        assert!(matches!(&app.outbox[0].0, Job::Load { path, .. } if path == &dir));
     }
 
     #[test]

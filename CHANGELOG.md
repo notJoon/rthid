@@ -36,6 +36,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - After a session is opened, `o` starts in the folder that holds the session instead of
   inside it
+- Files inside a session directory open that session instead of being opened as images
 
 ## [0.2.0] - 2026-11-28
 
