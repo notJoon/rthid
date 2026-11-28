@@ -831,7 +831,7 @@ impl App {
         }
         let panel = crate::ui::layout(screen).panel;
         let lens = self.panel_lens();
-        let hit = self.panel.row_at(mouse.column, mouse.row, &lens);
+        let hit = self.panel.row_at((mouse.column, mouse.row).into(), &lens);
         if let Some(mut drag) = active_drag {
             if let Some(Row::Item(item)) = hit
                 && let PanelItem::Layer(to) = self.panel_row(item)
@@ -1425,6 +1425,45 @@ mod tests {
     }
 
     #[test]
+    fn layer_click_after_adding_without_redraw_ignores_stale_layout() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        press(&mut app, KeyCode::Char('n'));
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.panel);
+        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let mark_x = layout.panel.x + 3;
+        press(&mut app, KeyCode::Char('n'));
+        let revision = app.edits.revision();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            mark_x,
+            top,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.revision(), revision);
+        assert!(
+            app.edits
+                .current()
+                .layers()
+                .iter()
+                .all(|layer| layer.visible)
+        );
+        render_panel(&app, layout.panel);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            mark_x,
+            top,
+            &geometry,
+            screen,
+        );
+        assert!(app.edits.current().layers()[0].visible);
+        assert!(!app.edits.current().layers()[1].visible);
+    }
+
+    #[test]
     fn layer_mouse_selects_marks_and_groups_drag_into_one_undo() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..3 {
@@ -1531,6 +1570,7 @@ mod tests {
             press(&mut app, KeyCode::Char('n'));
         }
         press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('u'));
         let before = app.edits.current().clone();
         let screen = Rect::new(0, 0, 100, 40);
         let layout = crate::ui::layout(screen);
@@ -1567,6 +1607,8 @@ mod tests {
             screen,
         );
         assert_eq!(app.edits.current(), &before);
+        press(&mut app, KeyCode::Char('U'));
+        assert!(!app.edits.current().layers()[1].visible);
         press(&mut app, KeyCode::Char('u'));
         assert!(app.edits.current().layers()[1].visible);
     }

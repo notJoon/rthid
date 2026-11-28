@@ -215,6 +215,7 @@ impl Document {
     }
 
     /// Sets or clears selection, ignoring invalid indices.
+    /// Callers holding a [`History`] should use [`History::select`] or select inside `edit`.
     pub fn select(&mut self, index: Option<usize>) {
         if index.is_none_or(|index| index < self.layers.len()) {
             self.selected = index;
@@ -288,6 +289,8 @@ pub struct History {
     states: Vec<Document>,
     cursor: usize,
     revision: u64,
+    redo_tail: Vec<Document>,
+    dropped_oldest: Option<Document>,
 }
 
 impl History {
@@ -297,6 +300,8 @@ impl History {
             states: vec![document],
             cursor: 0,
             revision: 0,
+            redo_tail: Vec::new(),
+            dropped_oldest: None,
         }
     }
 
@@ -307,6 +312,7 @@ impl History {
 
     /// Changes selection in place without adding history or bumping the pixel revision.
     /// Selection does not change pixels, so composition and dither caches stay valid.
+    /// Undo restores the selection stored in older snapshots.
     pub fn select(&mut self, index: Option<usize>) {
         self.states[self.cursor].select(index);
     }
@@ -316,14 +322,16 @@ impl History {
         self.revision
     }
 
-    /// Adds a snapshot and discards redo states and excess oldest states.
+    /// Adds a snapshot, keeping removed redo and oldest states until the next change.
+    /// `discard_if_unchanged` can restore them if this edit is reversed by `amend`.
     pub fn edit(&mut self, f: impl FnOnce(&mut Document)) {
         let mut document = self.current().clone();
         f(&mut document);
-        self.states.truncate(self.cursor + 1);
+        self.redo_tail = self.states.split_off(self.cursor + 1);
+        self.dropped_oldest = None;
         self.states.push(document);
         if self.states.len() > HISTORY_LIMIT {
-            self.states.remove(0);
+            self.dropped_oldest = Some(self.states.remove(0));
         }
         self.cursor = self.states.len() - 1;
         self.revision += 1;
@@ -341,19 +349,28 @@ impl History {
         self.revision += 1;
     }
 
-    /// Drops the current snapshot if it equals the previous one, bumping revision only then.
+    /// Drops an unchanged snapshot and restores states removed by its `edit`.
+    /// Revision increases only when a snapshot is dropped. Amend keeps the removed
+    /// states available, while another edit, undo, redo or reset forgets them.
     pub fn discard_if_unchanged(&mut self) -> bool {
         if self.cursor == 0 || self.states[self.cursor] != self.states[self.cursor - 1] {
             return false;
         }
         self.states.remove(self.cursor);
         self.cursor -= 1;
+        if let Some(oldest) = self.dropped_oldest.take() {
+            self.states.insert(0, oldest);
+            self.cursor += 1;
+        }
+        self.states.append(&mut self.redo_tail);
         self.revision += 1;
         true
     }
 
     /// Moves to the previous snapshot if one exists.
     pub fn undo(&mut self) -> bool {
+        self.redo_tail.clear();
+        self.dropped_oldest = None;
         if !self.can_undo() {
             return false;
         }
@@ -364,6 +381,8 @@ impl History {
 
     /// Moves to the next snapshot if one exists.
     pub fn redo(&mut self) -> bool {
+        self.redo_tail.clear();
+        self.dropped_oldest = None;
         if !self.can_redo() {
             return false;
         }
@@ -384,6 +403,8 @@ impl History {
 
     /// Replaces history for a newly loaded source without resetting the revision.
     pub fn reset(&mut self, document: Document) {
+        self.redo_tail.clear();
+        self.dropped_oldest = None;
         self.states = vec![document];
         self.cursor = 0;
         self.revision += 1;
@@ -413,6 +434,68 @@ mod tests {
         assert_eq!(history.revision(), 3);
         assert!(history.undo());
         assert!(history.current().layers().is_empty());
+    }
+
+    #[test]
+    fn returning_drag_restores_redo_and_oldest_states() {
+        for at_cap in [false, true] {
+            let mut doc = Document::new(1, 1);
+            doc.add_layer("one".into());
+            doc.add_layer("two".into());
+            let mut history = History::new(doc);
+            let edits = if at_cap { HISTORY_LIMIT - 1 } else { 2 };
+            for index in 0..edits {
+                history.edit(|doc| doc.layers[0].name = index.to_string());
+            }
+            // Exercise restoration of the oldest state when there is no redo tail.
+            let states = history.states.clone();
+            let cursor = history.cursor;
+            history.edit(|doc| doc.move_layer(1, 0));
+            history.amend(|doc| doc.move_layer(0, 1));
+            assert!(history.discard_if_unchanged());
+            assert_eq!(history.states, states);
+            assert_eq!(history.cursor, cursor);
+
+            assert!(history.undo());
+            let states = history.states.clone();
+            let cursor = history.cursor;
+            history.edit(|doc| doc.move_layer(1, 0));
+            history.amend(|doc| doc.move_layer(0, 1));
+            assert!(history.discard_if_unchanged());
+            assert_eq!(history.states, states);
+            assert_eq!(history.cursor, cursor);
+            assert!(history.redo());
+            assert_eq!(history.current().layers()[0].name, (edits - 1).to_string());
+        }
+    }
+
+    #[test]
+    fn another_history_operation_forgets_removed_states() {
+        for operation in ["edit", "undo", "redo", "reset"] {
+            let mut history = History::new(Document::new(1, 1));
+            history.edit(|doc| {
+                doc.add_layer("one".into());
+            });
+            history.edit(|doc| {
+                doc.add_layer("two".into());
+            });
+            history.undo();
+            history.edit(|_| {});
+            assert!(!history.redo_tail.is_empty());
+            match operation {
+                "edit" => history.edit(|_| {}),
+                "undo" => {
+                    history.undo();
+                }
+                "redo" => {
+                    history.redo();
+                }
+                "reset" => history.reset(Document::new(1, 1)),
+                _ => unreachable!(),
+            }
+            assert!(history.redo_tail.is_empty());
+            assert!(history.dropped_oldest.is_none());
+        }
     }
 
     #[test]
