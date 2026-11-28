@@ -290,25 +290,30 @@ fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
     toml::from_str(text).map_err(|e| broken(&e))
 }
 
-/// Rejects exports whose destination or resolved parent is inside the session.
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    loop {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match existing.canonicalize() {
+            Ok(resolved) => return Ok(resolved.join(path.strip_prefix(ancestor).unwrap())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Rejects exports whose resolved destination is inside the session.
 pub(crate) fn check_exports(dir: &Path, exports: &[impl AsRef<Path>]) -> io::Result<()> {
-    let dir = dir.canonicalize()?;
+    let dir = resolve(dir)?;
     for export in exports {
         let path = export.as_ref();
-        let inside = path.canonicalize().is_ok_and(|path| path.starts_with(&dir))
-            || path
-                .ancestors()
-                .skip(1)
-                .find_map(|parent| {
-                    let parent = if parent.as_os_str().is_empty() {
-                        Path::new(".")
-                    } else {
-                        parent
-                    };
-                    parent.canonicalize().ok()
-                })
-                .is_some_and(|parent| parent.starts_with(&dir));
-        if inside {
+        if resolve(path)?.starts_with(&dir) {
             return Err(named(
                 path,
                 "export destination is inside the session directory",
@@ -337,6 +342,17 @@ fn pixel_error(path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
+fn reject_symlink(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path)
+        .map_err(|error| pixel_error(path, error))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(named(path, "session files must not be symlinks"));
+    }
+    Ok(())
+}
+
 fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Session> {
     let path = dir.join("manifest.toml");
     let text = atomic::read_regular(&path)
@@ -348,6 +364,7 @@ fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Sessio
         return Err(named(&path, "at most 256 layers are allowed"));
     }
     let source_path = child(dir, &manifest.source)?;
+    reject_symlink(&source_path)?;
     let source = rthid_io::image::load_image(&source_path).map_err(|error| match error {
         image::ImageError::IoError(error) => pixel_error(&source_path, error),
         error => named(&source_path, error),
@@ -369,6 +386,7 @@ fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Sessio
         }
         let exposure = if let Some(name) = layer.exposure {
             let layer_path = child(dir, &name)?;
+            reject_symlink(&layer_path)?;
             let mut reader = image::ImageReader::with_format(
                 io::BufReader::new(
                     rthid_io::image::open_regular(&layer_path)
@@ -392,11 +410,10 @@ fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Sessio
         } else {
             ExposureMap::new(width, height)
         };
-        layers.push(Layer {
-            name: layer.name,
-            visible: layer.visible,
-            exposure,
-        });
+        let mut restored = Layer::new(layer.name, width, height);
+        restored.visible = layer.visible;
+        restored.exposure = exposure;
+        layers.push(restored);
     }
     let document = Document::from_layers(width, height, layers, manifest.selected)
         .map_err(|e| named(&path, e))?;
@@ -679,20 +696,35 @@ mod tests {
     use crate::settings::{BUSINESS_CARD, Dither, Palette};
     use image::{GrayImage, Rgba};
 
+    #[test]
+    fn check_exports_handles_missing_session_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("missing/photo.rthid");
+        for name in ["preview.png", "nested/preview.png"] {
+            let error = check_exports(&dir, &[dir.join(name)]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("export destination is inside the session directory")
+            );
+        }
+        assert!(check_exports(&dir, &[dir.with_file_name("preview.png")]).is_ok());
+        assert!(!dir.exists());
+    }
+
     fn fixture() -> Session {
         let mut app = App::builtin(RgbaImage::from_pixel(67, 65, Rgba([23, 64, 96, 200])), None);
-        app.edits.edit(|doc| {
-            doc.add_layer("Bottom".into());
-            let map = &mut doc.target_mut().unwrap().exposure;
-            map.add(0, 0, i16::MIN);
-            map.add(66, 64, i16::MAX);
-            map.add(64, 0, -512);
-            doc.add_layer("Empty".into());
-            doc.add_layer("Hidden".into());
-            doc.target_mut().unwrap().exposure.add(1, 1, 256);
-            doc.set_visible(2, false);
-            doc.select(Some(0));
-        });
+        app.document.add_layer("Bottom".into());
+        let map = &mut app.document.target_mut().unwrap().exposure;
+        map.add(0, 0, i16::MIN);
+        map.add(66, 64, i16::MAX);
+        map.add(64, 0, -512);
+        app.document.add_layer("Empty".into());
+        app.document.add_layer("Hidden".into());
+        app.document.target_mut().unwrap().exposure.add(1, 1, 256);
+        app.document.set_visible(2, false);
+        app.document.select(Some(0));
+        app.document.commit_stroke(0, ExposureMap::new(67, 65));
         app.settings.card = BUSINESS_CARD;
         app.settings.dot = 25;
         app.settings.margin = 10;
@@ -731,7 +763,7 @@ mod tests {
         Session {
             source_path: PathBuf::new(),
             source: app.grid_cache.source.clone().unwrap(),
-            document: app.edits.current().clone(),
+            document: app.document.clone(),
             settings: app.settings.clone(),
             view: ViewState::capture(&app),
         }
@@ -739,7 +771,7 @@ mod tests {
 
     fn assert_equal(a: &Session, b: &Session) {
         assert_eq!(a.source, b.source);
-        assert_eq!(a.document, b.document);
+        crate::document::assert_same_content(&a.document, &b.document);
         assert!(a.settings == b.settings);
         assert!(a.view == b.view);
     }
@@ -1137,7 +1169,12 @@ mod tests {
         assert_eq!(default_path(&temp.path().join("photo.png")), dir);
         write(&dir, fixture()).unwrap();
         assert!(is_session(&dir));
-        assert_equal(&fixture(), &read(&dir).unwrap());
+        let loaded = read(&dir).unwrap();
+        assert_equal(&fixture(), &loaded);
+        for index in 0..loaded.document.layers().len() {
+            assert!(!loaded.document.can_undo(index));
+            assert!(!loaded.document.can_redo(index));
+        }
         assert_eq!(
             exposure_files(&dir),
             ["exposure-1-0.png", "exposure-1-2.png"]
@@ -1268,6 +1305,24 @@ mod tests {
                 .to_string()
                 .contains("exposure-1-0.png")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reading_session_rejects_symlinked_pixel_files() {
+        for name in ["source-1.png", "exposure-1-0.png"] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("photo.rthid");
+            write(&dir, fixture()).unwrap();
+            let path = dir.join(name);
+            let outside = temp.path().join("outside.png");
+            fs::copy(&path, &outside).unwrap();
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            let error = read(&dir).err().unwrap().to_string();
+            assert!(error.contains("session files must not be symlinks"));
+            assert!(error.contains(name));
+        }
     }
 
     #[test]
