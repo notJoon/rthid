@@ -1,6 +1,10 @@
-//! Confirmation input with a message for the caller to display.
+//! Confirmation input and visible choices for a caller supplied dialog.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
 
 use crate::{Hint, Outcome, outcome::is_release};
 
@@ -8,7 +12,7 @@ use crate::{Hint, Outcome, outcome::is_release};
 ///
 /// Defaulting to cancel keeps destructive actions safe from stray keys. The
 /// component holds the message so the caller can show it, for example as a
-/// [`Dialog`](crate::Dialog) title, but draws nothing itself.
+/// [`Dialog`](crate::Dialog) title, with [`Self::lines`] as its body.
 ///
 /// # Examples
 ///
@@ -23,6 +27,8 @@ use crate::{Hint, Outcome, outcome::is_release};
 /// ```
 pub struct Confirm {
     message: String,
+    yes_label: &'static str,
+    detail: Option<String>,
 }
 
 impl Confirm {
@@ -52,7 +58,61 @@ impl Confirm {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            yes_label: "yes",
+            detail: None,
         }
+    }
+
+    /// Names the action in the choices and hints.
+    ///
+    /// ```
+    /// use rthid_widgets::Confirm;
+    /// let confirm = Confirm::new("Delete?").yes_label("delete");
+    /// assert_eq!(confirm.hints()[0].label, "delete");
+    /// ```
+    pub fn yes_label(mut self, label: &'static str) -> Self {
+        self.yes_label = label;
+        self
+    }
+
+    /// Adds context above the choices.
+    ///
+    /// ```
+    /// use rthid_widgets::Confirm;
+    /// let confirm = Confirm::new("Delete?").detail("This cannot be undone.");
+    /// assert_eq!(confirm.lines()[0].to_string(), "This cannot be undone.");
+    /// ```
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Describes the same actions shown inside the dialog.
+    pub fn hints(&self) -> [Hint; 2] {
+        [Hint::new("y", self.yes_label), Self::CANCEL]
+    }
+
+    /// Body rows with bold keys, separated from optional context by a blank row.
+    ///
+    /// ```
+    /// use rthid_widgets::Confirm;
+    /// let confirm = Confirm::new("Continue?");
+    /// assert_eq!(confirm.lines()[1].to_string(), "y  yes     Esc / other key  cancel");
+    /// ```
+    pub fn lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(detail) = &self.detail {
+            lines.push(Line::raw(detail.clone()));
+        }
+        lines.push(Line::default());
+        let key = Style::default().add_modifier(Modifier::BOLD);
+        lines.push(Line::from(vec![
+            Span::styled("y", key),
+            Span::raw(format!("  {}     ", self.yes_label)),
+            Span::styled("Esc / other key", key),
+            Span::raw("  cancel"),
+        ]));
+        lines
     }
 
     /// Returns the message given at creation.
@@ -102,6 +162,34 @@ impl Confirm {
 mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
+
+    #[test]
+    fn body_has_detail_action_and_bold_keys() {
+        let confirm = Confirm::new("Discard?")
+            .detail("Edits will be lost.")
+            .yes_label("discard changes");
+        let lines = confirm.lines();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].to_string(), "Edits will be lost.");
+        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(
+            lines[2].to_string(),
+            "y  discard changes     Esc / other key  cancel"
+        );
+        for index in [0, 2] {
+            assert!(
+                lines[2].spans[index]
+                    .style
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+        }
+        assert_eq!(
+            confirm.hints(),
+            [Hint::new("y", "discard changes"), Confirm::CANCEL]
+        );
+        assert_eq!(Confirm::new("Continue?").lines().len(), 2);
+    }
 
     #[test]
     fn confirms_only_y() {

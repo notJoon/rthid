@@ -15,20 +15,19 @@
 //! untouched layer allocates no pixel storage. Writes use Arc::make_mut,
 //! copying only tiles shared with a history state.
 //!
-//! Undo uses a capped linear history of document snapshots. Cloning a
-//! document copies tile handles rather than pixels. Undo and redo move a
-//! cursor, and a new edit drops redo states. Command replay was rejected
-//! because undo cost grows with history and old sessions would change
-//! when the brush algorithm changes.
+//! Undo belongs to each layer because independent exposure maps should keep
+//! Ctrl+Z on the layer being painted. Structure changes are not undoable and
+//! deletion asks first. This replaces linear document snapshots, which rewound
+//! other layers and removed newly created layers unexpectedly.
 //!
 //! Edits use source pixel coordinates. The grid is rebuilt from the source
 //! on every zoom, pan, rotation, flip or card change.
-//! Every pixel change bumps the history revision, which keys the composed image
+//! Every pixel change bumps the document revision, which keys the composed image
 //! cache. Caches therefore never need to be cleared by hand for edits.
 //!
-//! The planned session format for #41 is a directory with manifest.toml,
-//! a copy of the shrunk source, and one exposure PNG per layer.
-//! Ctrl+S will save the session and never overwrite the source image.
+//! Sessions use a directory with manifest.toml,
+//! a copy of the shrunk source, and one exposure PNG per nonempty layer.
+//! Ctrl+S saves the session and never overwrites the source image.
 
 use std::sync::Arc;
 
@@ -38,10 +37,12 @@ use image::RgbaImage;
 pub const TILE: u32 = 64;
 /// Offset that doubles a channel value.
 pub const STOP: i16 = 256;
-/// Maximum number of history states kept, including the current one.
+/// PNG value representing a zero exposure offset.
+pub(crate) const LUMA16_MIDPOINT: u16 = 32768;
+/// Maximum number of undo entries kept per layer.
 pub const HISTORY_LIMIT: usize = 100;
 
-/// Sparse exposure offsets shared between document snapshots.
+/// Sparse exposure offsets shared with stroke snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExposureMap {
     width: u32,
@@ -94,6 +95,36 @@ impl ExposureMap {
         tile[pixel] = tile[pixel].saturating_add(delta);
     }
 
+    /// Encodes signed offsets around the PNG midpoint.
+    pub fn to_luma16(&self) -> Vec<u16> {
+        let mut pixels = Vec::with_capacity(self.width as usize * self.height as usize);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                pixels.push((i32::from(self.get(x, y)) + i32::from(LUMA16_MIDPOINT)) as u16);
+            }
+        }
+        pixels
+    }
+
+    /// Restores offsets while leaving tiles containing only zero offsets absent.
+    ///
+    /// # Panics
+    /// Panics if the pixel count does not equal width times height.
+    pub fn from_luma16(width: u32, height: u32, pixels: &[u16]) -> Self {
+        assert_eq!(pixels.len(), width as usize * height as usize);
+        let mut map = Self::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (i32::from(pixels[(y * width + x) as usize])
+                    - i32::from(LUMA16_MIDPOINT)) as i16;
+                if offset != 0 {
+                    map.add(x, y, offset);
+                }
+            }
+        }
+        map
+    }
+
     /// Whether every tile is absent.
     pub fn is_empty(&self) -> bool {
         self.tiles.iter().all(Option::is_none)
@@ -109,6 +140,8 @@ pub struct Layer {
     pub visible: bool,
     /// Offsets in source pixel coordinates.
     pub exposure: ExposureMap,
+    undo: Vec<ExposureMap>,
+    redo: Vec<ExposureMap>,
 }
 
 impl Layer {
@@ -118,6 +151,8 @@ impl Layer {
             name,
             visible: true,
             exposure: ExposureMap::new(width, height),
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 }
@@ -129,6 +164,7 @@ pub struct Document {
     height: u32,
     layers: Vec<Layer>,
     selected: Option<usize>,
+    revision: u64,
 }
 
 impl Document {
@@ -139,7 +175,37 @@ impl Document {
             height,
             layers: Vec::new(),
             selected: None,
+            revision: 0,
         }
+    }
+
+    /// Restores layers with empty stroke stacks after validating dimensions and selection.
+    pub fn from_layers(
+        width: u32,
+        height: u32,
+        mut layers: Vec<Layer>,
+        selected: Option<usize>,
+    ) -> Result<Self, &'static str> {
+        if selected.is_some_and(|index| index >= layers.len()) {
+            return Err("invalid layer selection");
+        }
+        if layers
+            .iter()
+            .any(|layer| (layer.exposure.width(), layer.exposure.height()) != (width, height))
+        {
+            return Err("layer dimensions differ from source");
+        }
+        for layer in &mut layers {
+            layer.undo.clear();
+            layer.redo.clear();
+        }
+        Ok(Self {
+            width,
+            height,
+            layers,
+            selected,
+            revision: 0,
+        })
     }
 
     /// Layers in composition order, bottom first.
@@ -168,6 +234,7 @@ impl Document {
     /// Adds a layer at the top and selects it.
     pub fn add_layer(&mut self, name: String) -> usize {
         self.layers.push(Layer::new(name, self.width, self.height));
+        self.revision += 1;
         let index = self.layers.len() - 1;
         self.selected = Some(index);
         index
@@ -179,6 +246,7 @@ impl Document {
             return;
         }
         self.layers.remove(index);
+        self.revision += 1;
         self.selected = self.selected.and_then(|selected| {
             if selected == index {
                 None
@@ -190,16 +258,20 @@ impl Document {
 
     /// Changes visibility when the layer exists.
     pub fn set_visible(&mut self, index: usize, visible: bool) {
-        if let Some(layer) = self.layers.get_mut(index) {
+        if let Some(layer) = self.layers.get_mut(index)
+            && layer.visible != visible
+        {
             layer.visible = visible;
+            self.revision += 1;
         }
     }
 
     /// Reorders valid layers while preserving the selected layer.
     pub fn move_layer(&mut self, from: usize, to: usize) {
-        if from >= self.layers.len() || to >= self.layers.len() {
+        if from >= self.layers.len() || to >= self.layers.len() || from == to {
             return;
         }
+        self.revision += 1;
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
         self.selected = self.selected.map(|selected| {
@@ -216,7 +288,6 @@ impl Document {
     }
 
     /// Sets or clears selection, ignoring invalid indices.
-    /// Callers holding a [`History`] should use [`History::select`] or select inside `edit`.
     pub fn select(&mut self, index: Option<usize>) {
         if index.is_none_or(|index| index < self.layers.len()) {
             self.selected = index;
@@ -228,10 +299,80 @@ impl Document {
         self.selected.or_else(|| self.layers.len().checked_sub(1))
     }
 
-    /// Mutable access to the layer an edit should affect.
+    /// Mutable access for building test fixtures before painting.
+    #[cfg(test)]
     pub fn target_mut(&mut self) -> Option<&mut Layer> {
         let index = self.target()?;
         self.layers.get_mut(index)
+    }
+
+    /// Cache key for pixel and structure changes, excluding selection.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Paints in place after the caller clones the map and before `commit_stroke`.
+    pub fn paint(&mut self, index: usize, paint: impl FnOnce(&mut ExposureMap)) {
+        if let Some(layer) = self.layers.get_mut(index) {
+            paint(&mut layer.exposure);
+            self.revision += 1;
+        }
+    }
+
+    /// Ends painting, saving the map captured before the first dab only if it changed.
+    pub fn commit_stroke(&mut self, index: usize, before: ExposureMap) -> bool {
+        let Some(layer) = self.layers.get_mut(index) else {
+            return false;
+        };
+        if layer.exposure == before {
+            return false;
+        }
+        if layer.undo.len() == HISTORY_LIMIT {
+            layer.undo.remove(0);
+        }
+        layer.undo.push(before);
+        layer.redo.clear();
+        true
+    }
+
+    /// Restores the preceding stroke map without changing layer structure.
+    pub fn undo(&mut self, index: usize) -> bool {
+        let Some(layer) = self.layers.get_mut(index) else {
+            return false;
+        };
+        let Some(map) = layer.undo.pop() else {
+            return false;
+        };
+        layer.redo.push(std::mem::replace(&mut layer.exposure, map));
+        self.revision += 1;
+        true
+    }
+
+    /// Restores the next stroke map without changing layer structure.
+    pub fn redo(&mut self, index: usize) -> bool {
+        let Some(layer) = self.layers.get_mut(index) else {
+            return false;
+        };
+        let Some(map) = layer.redo.pop() else {
+            return false;
+        };
+        layer.undo.push(std::mem::replace(&mut layer.exposure, map));
+        self.revision += 1;
+        true
+    }
+
+    /// Whether the layer has a preceding stroke map.
+    pub fn can_undo(&self, index: usize) -> bool {
+        self.layers
+            .get(index)
+            .is_some_and(|layer| !layer.undo.is_empty())
+    }
+
+    /// Whether the layer has a next stroke map.
+    pub fn can_redo(&self, index: usize) -> bool {
+        self.layers
+            .get(index)
+            .is_some_and(|layer| !layer.redo.is_empty())
     }
 
     /// Applies summed visible offsets, avoiding a copy when no map contributes.
@@ -281,130 +422,19 @@ impl Document {
     }
 }
 
-/// Capped document snapshots with a monotonic cache revision.
-pub struct History {
-    states: Vec<Document>,
-    cursor: usize,
-    revision: u64,
-    redo_tail: Vec<Document>,
-    dropped_oldest: Option<Document>,
-}
-
-impl History {
-    /// Starts history with a single document.
-    pub fn new(document: Document) -> Self {
-        Self {
-            states: vec![document],
-            cursor: 0,
-            revision: 0,
-            redo_tail: Vec::new(),
-            dropped_oldest: None,
-        }
-    }
-
-    /// Snapshot at the undo cursor.
-    pub fn current(&self) -> &Document {
-        &self.states[self.cursor]
-    }
-
-    /// Changes selection in place without adding history or bumping the pixel revision.
-    /// Selection does not change pixels, so composition and dither caches stay valid.
-    /// Undo restores the selection stored in older snapshots.
-    pub fn select(&mut self, index: Option<usize>) {
-        self.states[self.cursor].select(index);
-    }
-
-    /// Cache key that increases on every history change except selection.
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Adds a snapshot, keeping removed redo and oldest states until the next change.
-    /// `discard_if_unchanged` can restore them if this edit is reversed by `amend`.
-    pub fn edit(&mut self, f: impl FnOnce(&mut Document)) {
-        let mut document = self.current().clone();
-        f(&mut document);
-        self.redo_tail = self.states.split_off(self.cursor + 1);
-        self.dropped_oldest = None;
-        self.states.push(document);
-        if self.states.len() > HISTORY_LIMIT {
-            self.dropped_oldest = Some(self.states.remove(0));
-        }
-        self.cursor = self.states.len() - 1;
-        self.revision += 1;
-    }
-
-    /// Updates the current stroke without adding a snapshot.
-    /// Valid only during a gesture begun with `edit` at the current cursor,
-    /// with no undo, redo or reset in between.
-    pub fn amend(&mut self, f: impl FnOnce(&mut Document)) {
-        debug_assert!(
-            !self.can_redo() && self.cursor > 0,
-            "amend requires a gesture begun with edit at the current cursor"
+#[cfg(test)]
+/// Compares persisted document content independently of caches and stroke stacks.
+pub(crate) fn assert_same_content(actual: &Document, expected: &Document) {
+    assert_eq!(
+        (actual.width, actual.height, actual.selected),
+        (expected.width, expected.height, expected.selected)
+    );
+    assert_eq!(actual.layers.len(), expected.layers.len());
+    for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!(
+            (&actual.name, actual.visible, &actual.exposure),
+            (&expected.name, expected.visible, &expected.exposure)
         );
-        f(&mut self.states[self.cursor]);
-        self.revision += 1;
-    }
-
-    /// Drops an unchanged snapshot and restores states removed by its `edit`.
-    /// Revision increases only when a snapshot is dropped. Amend keeps the removed
-    /// states available, while another edit, undo, redo or reset forgets them.
-    pub fn discard_if_unchanged(&mut self) -> bool {
-        if self.cursor == 0 || self.states[self.cursor] != self.states[self.cursor - 1] {
-            return false;
-        }
-        self.states.remove(self.cursor);
-        self.cursor -= 1;
-        if let Some(oldest) = self.dropped_oldest.take() {
-            self.states.insert(0, oldest);
-            self.cursor += 1;
-        }
-        self.states.append(&mut self.redo_tail);
-        self.revision += 1;
-        true
-    }
-
-    /// Moves to the previous snapshot if one exists.
-    pub fn undo(&mut self) -> bool {
-        self.redo_tail.clear();
-        self.dropped_oldest = None;
-        if !self.can_undo() {
-            return false;
-        }
-        self.cursor -= 1;
-        self.revision += 1;
-        true
-    }
-
-    /// Moves to the next snapshot if one exists.
-    pub fn redo(&mut self) -> bool {
-        self.redo_tail.clear();
-        self.dropped_oldest = None;
-        if !self.can_redo() {
-            return false;
-        }
-        self.cursor += 1;
-        self.revision += 1;
-        true
-    }
-
-    /// Whether an older snapshot is available.
-    pub fn can_undo(&self) -> bool {
-        self.cursor > 0
-    }
-
-    /// Whether a newer snapshot is available.
-    pub fn can_redo(&self) -> bool {
-        self.cursor + 1 < self.states.len()
-    }
-
-    /// Replaces history for a newly loaded source without resetting the revision.
-    pub fn reset(&mut self, document: Document) {
-        self.redo_tail.clear();
-        self.dropped_oldest = None;
-        self.states = vec![document];
-        self.cursor = 0;
-        self.revision += 1;
     }
 }
 
@@ -412,6 +442,128 @@ impl History {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    fn stroke(doc: &mut Document, index: usize, delta: i16) {
+        let before = doc.layers()[index].exposure.clone();
+        doc.paint(index, |map| map.add(0, 0, delta));
+        assert!(doc.commit_stroke(index, before));
+    }
+
+    #[test]
+    fn stroke_stacks_are_independent_and_structure_is_not_undoable() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("Layer 1".into());
+        stroke(&mut doc, 0, STOP);
+        doc.add_layer("Layer 2".into());
+        stroke(&mut doc, 1, STOP * 2);
+        assert!(doc.undo(1));
+        assert!(!doc.undo(1));
+        assert_eq!(doc.layers()[0].exposure.get(0, 0), STOP);
+        assert!(doc.undo(0));
+        assert!(doc.can_redo(0));
+        assert!(doc.can_redo(1));
+        stroke(&mut doc, 1, STOP);
+        assert!(doc.can_redo(0));
+        assert!(!doc.can_redo(1));
+        doc.move_layer(1, 0);
+        doc.set_visible(0, false);
+        let revision = doc.revision();
+        doc.select(None);
+        doc.select(Some(0));
+        assert_eq!(doc.revision(), revision);
+        assert!(doc.undo(0));
+        assert_eq!(doc.layers().len(), 2);
+        assert_eq!(doc.layers()[0].name, "Layer 2");
+        assert!(!doc.layers()[0].visible);
+        assert_eq!(doc.selected(), Some(0));
+        assert!(doc.can_redo(1));
+    }
+
+    #[test]
+    fn saturated_stroke_keeps_redo_and_loading_clears_stacks() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("Layer 1".into());
+        stroke(&mut doc, 0, i16::MAX);
+        stroke(&mut doc, 0, -1);
+        assert!(doc.undo(0));
+        let before = doc.layers()[0].exposure.clone();
+        doc.paint(0, |map| map.add(0, 0, 1));
+        assert!(!doc.commit_stroke(0, before));
+        assert!(doc.can_redo(0));
+        assert_eq!(doc.layers[0].undo.len(), 1);
+        let loaded = Document::from_layers(1, 1, doc.layers.clone(), Some(0)).unwrap();
+        assert_same_content(&loaded, &doc);
+        assert!(!loaded.can_undo(0));
+        assert!(!loaded.can_redo(0));
+    }
+
+    #[test]
+    fn each_layer_keeps_the_newest_hundred_strokes() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("Layer 1".into());
+        doc.add_layer("Layer 2".into());
+        for _ in 0..HISTORY_LIMIT + 5 {
+            for index in 0..2 {
+                stroke(&mut doc, index, 1);
+            }
+        }
+        for index in 0..2 {
+            assert_eq!(doc.layers[index].undo.len(), HISTORY_LIMIT);
+            for _ in 0..HISTORY_LIMIT {
+                assert!(doc.undo(index));
+            }
+            assert!(!doc.undo(index));
+            assert_eq!(doc.layers()[index].exposure.get(0, 0), 5);
+            for _ in 0..HISTORY_LIMIT {
+                assert!(doc.redo(index));
+            }
+            assert!(!doc.redo(index));
+            assert_eq!(doc.layers()[index].exposure.get(0, 0), 105);
+        }
+    }
+
+    #[test]
+    fn stroke_snapshots_share_unwritten_tiles() {
+        let mut doc = Document::new(128, 64);
+        doc.add_layer("Layer 1".into());
+        doc.paint(0, |map| {
+            map.add(0, 0, STOP);
+            map.add(64, 0, STOP);
+        });
+        let before = doc.layers()[0].exposure.clone();
+        doc.paint(0, |map| map.add(0, 0, STOP));
+        doc.paint(0, |map| map.add(1, 0, STOP));
+        assert!(doc.commit_stroke(0, before));
+        let before = &doc.layers[0].undo[0];
+        let after = &doc.layers[0].exposure;
+        assert_eq!(before.get(0, 0), STOP);
+        assert_eq!(before.get(1, 0), 0);
+        assert_eq!(after.get(0, 0), STOP * 2);
+        assert!(!Arc::ptr_eq(
+            before.tiles[0].as_ref().unwrap(),
+            after.tiles[0].as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            before.tiles[1].as_ref().unwrap(),
+            after.tiles[1].as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn exposure_png_conversion_preserves_offsets_and_sparse_zero_tiles() {
+        let pixels = vec![32768; 130 * 65];
+        let empty = ExposureMap::from_luma16(130, 65, &pixels);
+        assert!(empty.is_empty());
+        assert_eq!(empty.to_luma16(), pixels);
+        let mut map = ExposureMap::new(130, 65);
+        map.add(129, 64, i16::MIN);
+        map.add(0, 0, i16::MAX);
+        let restored = ExposureMap::from_luma16(130, 65, &map.to_luma16());
+        assert_eq!(restored, map);
+        assert!(restored.tiles[1].is_none());
+        assert!(Document::from_layers(1, 1, Vec::new(), Some(0)).is_err());
+        assert!(Document::from_layers(1, 1, vec![Layer::new("wrong".into(), 2, 2)], None).is_err());
+    }
 
     #[test]
     fn layer_names_fill_the_first_available_number() {
@@ -423,105 +575,6 @@ mod tests {
         assert_eq!(document.next_layer_name(), "Layer 4");
         document.remove_layer(1);
         assert_eq!(document.next_layer_name(), "Layer 2");
-    }
-
-    #[test]
-    fn unchanged_snapshot_is_discarded_only_when_equal() {
-        let mut history = History::new(Document::new(1, 1));
-        assert!(!history.discard_if_unchanged());
-        assert_eq!(history.revision(), 0);
-        history.edit(|doc| {
-            doc.add_layer("Layer 1".into());
-        });
-        assert!(!history.discard_if_unchanged());
-        assert_eq!(history.revision(), 1);
-        history.edit(|_| {});
-        assert!(history.discard_if_unchanged());
-        assert_eq!(history.revision(), 3);
-        assert!(!history.can_redo());
-        assert!(!history.discard_if_unchanged());
-        assert_eq!(history.revision(), 3);
-        assert!(history.undo());
-        assert!(history.current().layers().is_empty());
-    }
-
-    #[test]
-    fn returning_drag_restores_redo_and_oldest_states() {
-        for at_cap in [false, true] {
-            let mut doc = Document::new(1, 1);
-            doc.add_layer("one".into());
-            doc.add_layer("two".into());
-            let mut history = History::new(doc);
-            let edits = if at_cap { HISTORY_LIMIT - 1 } else { 2 };
-            for index in 0..edits {
-                history.edit(|doc| doc.layers[0].name = index.to_string());
-            }
-            // Exercise restoration of the oldest state when there is no redo tail.
-            let states = history.states.clone();
-            let cursor = history.cursor;
-            history.edit(|doc| doc.move_layer(1, 0));
-            history.amend(|doc| doc.move_layer(0, 1));
-            assert!(history.discard_if_unchanged());
-            assert_eq!(history.states, states);
-            assert_eq!(history.cursor, cursor);
-
-            assert!(history.undo());
-            let states = history.states.clone();
-            let cursor = history.cursor;
-            history.edit(|doc| doc.move_layer(1, 0));
-            history.amend(|doc| doc.move_layer(0, 1));
-            assert!(history.discard_if_unchanged());
-            assert_eq!(history.states, states);
-            assert_eq!(history.cursor, cursor);
-            assert!(history.redo());
-            assert_eq!(history.current().layers()[0].name, (edits - 1).to_string());
-        }
-    }
-
-    #[test]
-    fn another_history_operation_forgets_removed_states() {
-        for operation in ["edit", "undo", "redo", "reset"] {
-            let mut history = History::new(Document::new(1, 1));
-            history.edit(|doc| {
-                doc.add_layer("one".into());
-            });
-            history.edit(|doc| {
-                doc.add_layer("two".into());
-            });
-            history.undo();
-            history.edit(|_| {});
-            assert!(!history.redo_tail.is_empty());
-            match operation {
-                "edit" => history.edit(|_| {}),
-                "undo" => {
-                    history.undo();
-                }
-                "redo" => {
-                    history.redo();
-                }
-                "reset" => history.reset(Document::new(1, 1)),
-                _ => unreachable!(),
-            }
-            assert!(history.redo_tail.is_empty());
-            assert!(history.dropped_oldest.is_none());
-        }
-    }
-
-    #[test]
-    fn selection_changes_neither_history_nor_revision() {
-        let mut history = History::new(Document::new(1, 1));
-        history.edit(|doc| {
-            doc.add_layer("one".into());
-        });
-        let revision = history.revision();
-        history.select(None);
-        assert_eq!(history.current().selected(), None);
-        history.select(Some(0));
-        assert_eq!(history.current().selected(), Some(0));
-        assert_eq!(history.revision(), revision);
-        assert_eq!(history.states.len(), 2);
-        assert!(history.undo());
-        assert!(history.current().layers().is_empty());
     }
 
     #[test]
@@ -543,96 +596,6 @@ mod tests {
         }
         assert!(!map.is_empty());
         assert_eq!(map.get(65, 64), 0);
-    }
-
-    #[test]
-    fn snapshots_copy_only_written_tiles() {
-        let mut document = Document::new(128, 64);
-        document.add_layer("Exposure".into());
-        let map = &mut document.target_mut().unwrap().exposure;
-        map.add(0, 0, STOP);
-        map.add(64, 0, STOP);
-        let mut history = History::new(document);
-        history.edit(|doc| doc.target_mut().unwrap().exposure.add(0, 0, STOP));
-        history.amend(|doc| doc.target_mut().unwrap().exposure.add(1, 0, STOP));
-        let before = &history.states[0].layers[0].exposure;
-        let after = &history.current().layers[0].exposure;
-        assert_eq!(before.get(0, 0), STOP);
-        assert_eq!(before.get(1, 0), 0);
-        assert_eq!(after.get(0, 0), STOP * 2);
-        assert!(!Arc::ptr_eq(
-            before.tiles[0].as_ref().unwrap(),
-            after.tiles[0].as_ref().unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            before.tiles[1].as_ref().unwrap(),
-            after.tiles[1].as_ref().unwrap()
-        ));
-    }
-
-    #[test]
-    fn history_moves_branches_amends_and_resets_with_increasing_revisions() {
-        let mut history = History::new(Document::new(1, 1));
-        assert!(!history.undo());
-        assert!(!history.redo());
-        assert_eq!(history.revision(), 0);
-        history.edit(|doc| {
-            doc.add_layer("one".into());
-        });
-        assert_eq!(history.revision(), 1);
-        history.amend(|doc| {
-            doc.add_layer("two".into());
-        });
-        assert_eq!(history.states.len(), 2);
-        assert_eq!(history.revision(), 2);
-        assert!(history.undo());
-        assert_eq!(history.revision(), 3);
-        assert!(history.current().layers().is_empty());
-        assert!(history.redo());
-        assert_eq!(history.revision(), 4);
-        assert_eq!(history.current().layers().len(), 2);
-        assert!(!history.redo());
-        assert_eq!(history.revision(), 4);
-        assert!(history.undo());
-        history.edit(|doc| {
-            doc.add_layer("branch".into());
-        });
-        assert_eq!(history.revision(), 6);
-        assert!(!history.can_redo());
-        assert!(!history.redo());
-        history.reset(Document::new(2, 2));
-        assert_eq!(history.revision(), 7);
-        assert!(!history.can_undo());
-        assert!(!history.can_redo());
-        assert_eq!(history.states.len(), 1);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "amend requires a gesture begun with edit at the current cursor")]
-    fn amend_after_undo_is_invalid() {
-        let mut history = History::new(Document::new(1, 1));
-        history.edit(|_| {});
-        history.edit(|_| {});
-        assert!(history.undo());
-        history.amend(|_| {});
-    }
-
-    #[test]
-    fn history_cap_keeps_the_newest_states() {
-        let mut history = History::new(Document::new(0, 0));
-        for index in 0..HISTORY_LIMIT + 5 {
-            history.edit(|doc| {
-                doc.add_layer(index.to_string());
-            });
-        }
-        assert_eq!(history.states.len(), HISTORY_LIMIT);
-        assert_eq!(history.current().layers().len(), HISTORY_LIMIT + 5);
-        for _ in 1..HISTORY_LIMIT {
-            assert!(history.undo());
-        }
-        assert!(!history.undo());
-        assert_eq!(history.current().layers().len(), 6);
     }
 
     #[test]

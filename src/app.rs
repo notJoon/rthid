@@ -3,10 +3,11 @@
 use crate::{
     brush::{Brush, BrushRow, Stroke},
     cells::{Glyphs, Pixels, View},
-    document::{Document, History},
+    document::{Document, ExposureMap},
     export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
+    session::{self, Session, ViewState},
     settings::{GROUP_LENS, Setting, Settings, Template},
     store::{Change, Library, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
@@ -24,13 +25,31 @@ use rthid_io::{
     dir::Entry,
     io::{Done, Job, Opened, Outcome as IoOutcome},
 };
-use rthid_widgets::{Outcome, Outline, Row};
+use rthid_widgets::{Confirm, Outcome, Outline, Row};
 use std::{
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, PartialEq)]
+struct SavedState {
+    revision: u64,
+    settings: Settings,
+    view: ViewState,
+    selected: Option<usize>,
+}
+
+struct SessionSave {
+    token: u64,
+    epoch: u64,
+    dir: PathBuf,
+    state: SavedState,
+    superseded: bool,
+}
+
 struct OpenRequest {
+    state: SavedState,
+    epoch: u64,
     /// Tag the result echoes, unique to this request.
     token: u64,
     /// Generation of the dialog that asked, if any.
@@ -56,6 +75,12 @@ pub(crate) enum PanelItem {
     Brush(BrushRow),
     /// A document layer indexed from the bottom.
     Layer(usize),
+}
+
+struct Painting {
+    stroke: Stroke,
+    index: usize,
+    before: ExposureMap,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +115,13 @@ pub struct App {
     export: Option<Export>,
     mass_export: Option<MassExport>,
     source_path: Option<PathBuf>,
+    /// Directory used when saving the current editing session.
+    pub(crate) session: Option<PathBuf>,
+    saved: Option<SavedState>,
+    saved_token: u64,
+    save_uncertain: bool,
+    saving: Vec<SessionSave>,
+    document_epoch: u64,
     notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
     open_request: Option<OpenRequest>,
@@ -110,7 +142,7 @@ pub struct App {
     pub preview_focus: bool,
     last_drag: Option<Drag>,
     layer_drag: Option<LayerDrag>,
-    stroke: Option<Stroke>,
+    stroke: Option<Painting>,
     /// Current source pixel brush controls, independent of history.
     pub(crate) brush: Brush,
     /// Whether left preview drags paint exposure.
@@ -120,7 +152,7 @@ pub struct App {
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Source exposure layers and their undo history.
-    pub edits: History,
+    pub document: Document,
     /// Named configuration lists and their pending saves.
     pub library: Library,
     /// Current image settings.
@@ -154,7 +186,7 @@ impl App {
             GROUP_LENS[1],
             GROUP_LENS[2],
             BrushRow::ALL.len(),
-            self.edits.current().layers().len(),
+            self.document.layers().len(),
         ]
     }
 
@@ -167,7 +199,7 @@ impl App {
             PanelItem::Brush(row)
         } else {
             PanelItem::Layer(
-                self.edits.current().layers().len()
+                self.document.layers().len()
                     - 1
                     - (item - Setting::ALL.len() - BrushRow::ALL.len()),
             )
@@ -187,14 +219,12 @@ impl App {
 
     fn layer_row(&self, index: usize) -> Row {
         Row::Item(
-            Setting::ALL.len() + BrushRow::ALL.len() + self.edits.current().layers().len()
-                - 1
-                - index,
+            Setting::ALL.len() + BrushRow::ALL.len() + self.document.layers().len() - 1 - index,
         )
     }
 
     fn retain_panel(&mut self, row: Row) {
-        let len = self.edits.current().layers().len();
+        let len = self.document.layers().len();
         let row = match row {
             Row::Item(i) if i >= Setting::ALL.len() + BrushRow::ALL.len() + len => {
                 if len == 0 {
@@ -209,18 +239,18 @@ impl App {
     }
 
     fn select_layer(&mut self, index: usize, toggle: bool) {
-        let selected = if toggle && self.edits.current().selected() == Some(index) {
+        let selected = if toggle && self.document.selected() == Some(index) {
             None
         } else {
             Some(index)
         };
-        self.edits.select(selected);
+        self.document.select(selected);
         self.retain_panel(self.layer_row(index));
     }
 
     fn toggle_layer(&mut self, index: usize) {
-        let visible = !self.edits.current().layers()[index].visible;
-        self.edits.edit(|doc| doc.set_visible(index, visible));
+        let visible = !self.document.layers()[index].visible;
+        self.document.set_visible(index, visible);
         self.retain_panel(self.layer_row(index));
     }
 
@@ -234,31 +264,31 @@ impl App {
             .unwrap_or(Row::Header(LAYER_GROUP));
         match code {
             KeyCode::Char('n') => {
-                self.edits.edit(|doc| {
-                    doc.add_layer(doc.next_layer_name());
-                });
+                self.document.add_layer(self.document.next_layer_name());
                 self.panel.invalidate();
-                self.retain_panel(self.layer_row(self.edits.current().layers().len() - 1));
+                self.retain_panel(self.layer_row(self.document.layers().len() - 1));
             }
             KeyCode::Char('u' | 'U') => {
-                let undo = code == KeyCode::Char('u');
-                let changed = if undo {
-                    self.edits.undo()
+                let action = if code == KeyCode::Char('u') {
+                    "undo"
                 } else {
-                    self.edits.redo()
+                    "redo"
                 };
-                // Undo and redo can reorder layers without changing the lens.
-                self.panel.invalidate();
-                if !changed {
-                    self.set_notice(
-                        if undo {
-                            "nothing to undo"
-                        } else {
-                            "nothing to redo"
-                        }
-                        .into(),
-                    );
-                }
+                let target = self.document.target();
+                let changed = target.is_some_and(|index| {
+                    if action == "undo" {
+                        self.document.undo(index)
+                    } else {
+                        self.document.redo(index)
+                    }
+                });
+                let prefix = target.map_or_else(String::new, |index| {
+                    format!("{}: ", self.document.layers()[index].name)
+                });
+                self.set_notice(format!(
+                    "{prefix}{}{action}",
+                    if changed { "" } else { "nothing to " }
+                ));
                 self.retain_panel(row);
             }
             _ => {
@@ -272,18 +302,21 @@ impl App {
                     KeyCode::Enter => self.select_layer(index, true),
                     KeyCode::Char('v') => self.toggle_layer(index),
                     KeyCode::Char('x') => {
-                        self.edits.edit(|doc| doc.remove_layer(index));
-                        self.panel.invalidate();
-                        self.retain_panel(row);
+                        self.confirm(
+                            Confirm::new(format!("Delete {}?", self.document.layers()[index].name))
+                                .detail("Its brush strokes and their undo history are lost.")
+                                .yes_label("delete"),
+                            Effect::RemoveLayer(index),
+                        );
                     }
                     KeyCode::Char('[' | ']') => {
                         let to = if code == KeyCode::Char('[') {
                             index.saturating_sub(1)
                         } else {
-                            (index + 1).min(self.edits.current().layers().len() - 1)
+                            (index + 1).min(self.document.layers().len() - 1)
                         };
                         if to != index {
-                            self.edits.edit(|doc| doc.move_layer(index, to));
+                            self.document.move_layer(index, to);
                             self.panel.invalidate();
                             self.retain_panel(self.layer_row(to));
                         }
@@ -315,6 +348,12 @@ impl App {
             export: preview_png.map(|path| Export::new(path, dpi)),
             mass_export: mass_svg.map(MassExport::new),
             source_path: None,
+            session: None,
+            saved: None,
+            saved_token: 0,
+            save_uncertain: false,
+            saving: Vec::new(),
+            document_epoch: 0,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
             preview_focus: false,
@@ -325,7 +364,7 @@ impl App {
             brush_on: false,
             minimap_visible: false,
             grid_cache: GridCache::default(),
-            edits: History::new(Document::new(0, 0)),
+            document: Document::new(0, 0),
             library: Library::new(loaded),
             notice: None,
             outbox: Vec::new(),
@@ -412,15 +451,24 @@ impl App {
 
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
+        self.set_image(path, image);
+        self.refresh(false);
+        self.record_saved();
+    }
+
+    fn set_image(&mut self, path: PathBuf, image: RgbaImage) {
         let row = self
             .panel
             .selected(&self.panel_lens())
             .unwrap_or(Row::Header(LAYER_GROUP));
         self.layer_drag = None;
         self.stroke = None;
+        self.document_epoch += 1;
+        self.saved_token = 0;
+        self.save_uncertain = false;
         self.source_path = Some(path);
-        self.edits
-            .reset(Document::new(image.width(), image.height()));
+        self.session = None;
+        self.document = Document::new(image.width(), image.height());
         self.retain_panel(row);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
@@ -428,7 +476,125 @@ impl App {
         self.settings.reset_composition();
         self.view = View::Original;
         self.mass_return = View::Original;
+    }
+
+    fn current_state(&self) -> SavedState {
+        SavedState {
+            revision: self.document.revision(),
+            settings: self.settings.clone(),
+            view: ViewState::capture_unsaved(self),
+            selected: self.document.selected(),
+        }
+    }
+
+    /// Records the current document as the initial saved state.
+    pub(crate) fn record_saved(&mut self) {
+        self.saved = Some(self.current_state());
+    }
+
+    /// Whether document, processing or preview state differs from the last saved snapshot.
+    pub(crate) fn modified(&self) -> bool {
+        let current = self.current_state();
+        self.source_path.is_some()
+            && (self.save_uncertain
+                || self
+                    .saving
+                    .iter()
+                    .any(|save| save.epoch == self.document_epoch && save.state != current)
+                || self.saved.as_ref().is_some_and(|saved| *saved != current))
+    }
+
+    /// Replaces source, settings and layers with a validated session and fresh history.
+    pub(crate) fn open_session(&mut self, dir: PathBuf, session: Session) {
+        let row = self
+            .panel
+            .selected(&self.panel_lens())
+            .unwrap_or(Row::Header(LAYER_GROUP));
+        self.set_image(session.source_path, session.source);
+        self.document = session.document;
+        self.retain_panel(row);
+        self.settings = session.settings;
+        session.view.restore(self);
+        self.session = Some(dir);
         self.refresh(false);
+        self.record_saved();
+    }
+
+    fn confirm(&mut self, question: Confirm, effect: Effect) {
+        let back = self.modal.take().map(Box::new);
+        self.show_modal(Modal::Confirm {
+            question,
+            action: Some(Box::new(effect)),
+            back,
+        });
+    }
+
+    fn request_session_save(&mut self) {
+        let Some(source) = self.source_path() else {
+            return;
+        };
+        let dir = self
+            .session
+            .clone()
+            .unwrap_or_else(|| session::default_path(source));
+        let own_pending = self
+            .saving
+            .iter()
+            .any(|save| save.dir == dir && save.epoch == self.document_epoch);
+        if !own_pending && dir.exists() && !session::is_saveable(&dir) {
+            self.set_notice(format!("{}: not a session directory", dir.display()));
+        } else if !own_pending && self.session.is_none() && dir.exists() {
+            self.confirm(
+                Confirm::new(format!(
+                    "Overwrite {}?",
+                    dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                ))
+                .detail("The existing session will be replaced.")
+                .yes_label("overwrite"),
+                Effect::SaveSession(dir),
+            );
+        } else {
+            self.save_session(dir);
+        }
+    }
+
+    fn save_session(&mut self, dir: PathBuf) {
+        let Some(source) = self.grid_cache.source.clone() else {
+            return;
+        };
+        let token = self.next_token();
+        // IO reports only the newest save per directory, so older entries never complete.
+        let superseded = self.saving.iter().any(|save| save.dir == dir);
+        self.saving.retain(|save| save.dir != dir);
+        self.saving.push(SessionSave {
+            token,
+            epoch: self.document_epoch,
+            dir: dir.clone(),
+            state: self.current_state(),
+            superseded,
+        });
+        self.set_notice(format!(
+            "saving {}",
+            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+        ));
+        let snapshot = Session {
+            source_path: self.source_path.clone().unwrap(),
+            source,
+            document: self.document.clone(),
+            settings: self.settings.clone(),
+            view: ViewState::capture(self),
+        };
+        let protect = self.protected_exports();
+        self.outbox.push((
+            Job::Save {
+                dir,
+                write: Box::new(move |dir| {
+                    session::check_exports(dir, &protect)?;
+                    session::write(dir, snapshot)
+                }),
+            },
+            token,
+        ));
     }
 
     /// Supplies directory entries to the open dialog if it is still open.
@@ -490,9 +656,10 @@ impl App {
     /// Applies a finished job and reports whether the display changed.
     pub fn complete(&mut self, done: Done) -> bool {
         let mut changed = false;
+        let mut edited_during_open = false;
         // Dialog that asked for the result. Listings always come from one.
         let mut requester = Some(done.tag);
-        let opened = matches!(done.outcome, IoOutcome::Opened(_));
+        let opened = matches!(done.outcome, IoOutcome::Opened(_) | IoOutcome::Loaded(_));
         if matches!(done.outcome, IoOutcome::Listed(_)) && self.dialog() != Some(done.tag) {
             return false;
         }
@@ -503,15 +670,54 @@ impl App {
             else {
                 return false;
             };
+            edited_during_open =
+                request.epoch != self.document_epoch || request.state != self.current_state();
             requester = request.dialog;
             changed = true;
         }
         match done.outcome {
-            IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
+            IoOutcome::Saved(result) => {
+                let Some(index) = self.saving.iter().position(|save| save.token == done.tag) else {
+                    return false;
+                };
+                let save = self.saving.remove(index);
+                match result {
+                    Ok(dir)
+                        if self.document_epoch == save.epoch && save.token > self.saved_token =>
+                    {
+                        self.saved_token = save.token;
+                        self.save_uncertain = false;
+                        self.session = Some(dir.clone());
+                        self.saved = Some(save.state);
+                        self.set_notice(format!(
+                            "saved {}",
+                            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                        ));
+                    }
+                    Ok(_) => return false,
+                    Err(error) => {
+                        if save.superseded && self.document_epoch == save.epoch {
+                            self.save_uncertain = true;
+                        }
+                        self.set_notice(error.to_string());
+                    }
+                }
+                changed = true;
+            }
+            outcome @ (IoOutcome::Loaded(Ok(_)) | IoOutcome::Opened(Ok(Opened::Image { .. }))) => {
                 if requester.is_some() && requester == self.dialog() {
                     self.modal = None;
                 }
-                self.open_image(path, image);
+                if edited_during_open {
+                    self.confirm(
+                        Confirm::new("Discard unsaved changes?")
+                            .detail("Edits made while loading will be lost.")
+                            .yes_label("discard changes"),
+                        Effect::OpenLoaded(Box::new(outcome)),
+                    );
+                } else {
+                    self.replace_open(outcome);
+                }
                 changed = true;
             }
             IoOutcome::Opened(Ok(Opened::Dir(listing))) | IoOutcome::Listed(Ok(listing)) => {
@@ -570,7 +776,9 @@ impl App {
                 }
                 changed = true;
             }
-            IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
+            IoOutcome::Opened(Err(error))
+            | IoOutcome::Listed(Err(error))
+            | IoOutcome::Loaded(Err(error)) => {
                 changed |= self.set_notice(error.to_string());
             }
         }
@@ -603,8 +811,67 @@ impl App {
 
     /// Queues an image load and shows its file name while loading.
     pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
+        let resolved = Self::resolve_open(&path, dir.as_deref());
+        if self.modified() && !(resolved.is_dir() && !session::is_session(&resolved)) {
+            self.confirm(
+                Confirm::new("Discard unsaved changes?")
+                    .detail("Edits since the last Ctrl+S will be lost.")
+                    .yes_label("discard changes"),
+                Effect::OpenConfirmed(path, dir),
+            );
+        } else {
+            self.start_open(path, dir);
+        }
+    }
+
+    fn resolve_open(path: &Path, dir: Option<&Path>) -> PathBuf {
+        let expanded = path.to_str().map_or_else(
+            || path.to_path_buf(),
+            |text| {
+                rthid_io::path::expand_tilde(
+                    text,
+                    std::env::var_os("HOME").as_deref().map(Path::new),
+                )
+            },
+        );
+        if expanded.is_relative() {
+            dir.map_or_else(|| expanded.clone(), |dir| dir.join(&expanded))
+        } else {
+            expanded
+        }
+    }
+
+    fn replace_open(&mut self, outcome: IoOutcome) {
+        match outcome {
+            IoOutcome::Loaded(Ok(output)) => match output.downcast::<Session>() {
+                Ok((path, session)) => self.open_session(path, session),
+                Err(error) => {
+                    self.set_notice(error.to_string());
+                }
+            },
+            IoOutcome::Opened(Ok(Opened::Image { path, image })) => self.open_image(path, image),
+            _ => unreachable!("only successful document loads can be accepted"),
+        }
+    }
+
+    fn protected_exports(&self) -> Vec<PathBuf> {
+        self.export
+            .as_ref()
+            .map(|export| export.path().to_path_buf())
+            .into_iter()
+            .chain(
+                self.mass_export
+                    .as_ref()
+                    .map(|export| export.path().to_path_buf()),
+            )
+            .collect()
+    }
+
+    fn start_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         let token = self.next_token();
         self.open_request = Some(OpenRequest {
+            state: self.current_state(),
+            epoch: self.document_epoch,
             token,
             dialog: self.dialog(),
             label: format!(
@@ -615,20 +882,23 @@ impl App {
             ),
         });
         self.notice = None;
-        let job = Job::Open {
-            path,
-            dir,
-            protect: self
-                .export
-                .as_ref()
-                .map(|export| export.path().to_path_buf())
-                .into_iter()
-                .chain(
-                    self.mass_export
-                        .as_ref()
-                        .map(|export| export.path().to_path_buf()),
-                )
-                .collect(),
+        let resolved = Self::resolve_open(&path, dir.as_deref());
+        let resolved = session::containing(&resolved).unwrap_or(resolved);
+        let protect = self.protected_exports();
+        let job = if session::is_session(&resolved)
+            || (resolved.is_dir() && resolved.extension().is_some_and(|ext| ext == "rthid"))
+        {
+            Job::load(resolved, move |dir| {
+                let session = session::read(dir)?;
+                session::check_exports(dir, &protect)?;
+                for source in [&session.source_path, &dir.join("manifest.toml")] {
+                    rthid_io::image::check_not_source(source, &protect)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                }
+                Ok(session)
+            })
+        } else {
+            Job::Open { path, dir, protect }
         };
         self.outbox.push((job, token));
     }
@@ -696,7 +966,7 @@ impl App {
             mass::tones_from_palette(self.settings.palette.colors(), &self.mass)
         });
         let changed = self.grid_cache.refresh(
-            &self.edits,
+            &self.document,
             &self.settings,
             need_dither,
             self.view == View::Mass || inset_mass || self.mass_export.is_some(),
@@ -818,7 +1088,6 @@ impl App {
         if !self.layer_drag.take().is_some_and(|drag| drag.moved) {
             return false;
         }
-        self.edits.discard_if_unchanged();
         // Drag hits follow row positions, so only later clicks see a stale layout.
         self.panel.invalidate();
         true
@@ -826,11 +1095,8 @@ impl App {
 
     /// Ends the current exposure stroke before unrelated input changes its context.
     pub(crate) fn end_stroke(&mut self) {
-        if let Some(stroke) = self.stroke.take() {
-            if stroke.created_layer && self.edits.current().layers()[0].exposure.is_empty() {
-                self.edits.amend(|doc| doc.remove_layer(0));
-            }
-            self.edits.discard_if_unchanged();
+        if let Some(painting) = self.stroke.take() {
+            self.document.commit_stroke(painting.index, painting.before);
         }
     }
 
@@ -852,26 +1118,27 @@ impl App {
     }
 
     fn start_stroke(&mut self, point: (f64, f64)) -> bool {
-        let doc = self.edits.current();
-        if doc.target().is_some_and(|i| !doc.layers()[i].visible) {
+        if self
+            .document
+            .target()
+            .is_some_and(|i| !self.document.layers()[i].visible)
+        {
             self.set_notice("target layer is hidden".into());
             return true;
         }
         self.notice = None;
+        if self.document.layers().is_empty() {
+            self.document.add_layer(self.document.next_layer_name());
+        }
+        let index = self.document.target().expect("stroke target");
+        let before = self.document.layers()[index].exposure.clone();
         let brush = self.brush;
-        let created_layer = doc.layers().is_empty();
-        self.edits.edit(|doc| {
-            if doc.layers().is_empty() {
-                doc.add_layer(doc.next_layer_name());
-            }
-            brush.dab(
-                &mut doc.target_mut().expect("stroke target").exposure,
-                point,
-            );
+        self.document.paint(index, |map| brush.dab(map, point));
+        self.stroke = Some(Painting {
+            stroke: Stroke::new(point, brush),
+            index,
+            before,
         });
-        let mut stroke = Stroke::new(point, brush);
-        stroke.created_layer = created_layer;
-        self.stroke = Some(stroke);
         self.last_drag = None;
         true
     }
@@ -927,11 +1194,12 @@ impl App {
             let point = self.source_point(geometry, mouse.column, mouse.row);
             let brush = self.brush;
             let mut centers = Vec::new();
-            stroke.advance(point, brush, |point| centers.push(point));
+            stroke
+                .stroke
+                .advance(point, brush, |point| centers.push(point));
             let painted = !centers.is_empty();
             if painted {
-                self.edits.amend(|doc| {
-                    let map = &mut doc.target_mut().expect("stroke target").exposure;
+                self.document.paint(stroke.index, |map| {
                     for point in centers {
                         brush.dab(map, point);
                     }
@@ -948,11 +1216,7 @@ impl App {
                 && let PanelItem::Layer(to) = self.panel_row(item)
                 && to != drag.index
             {
-                if drag.moved {
-                    self.edits.amend(|doc| doc.move_layer(drag.index, to));
-                } else {
-                    self.edits.edit(|doc| doc.move_layer(drag.index, to));
-                }
+                self.document.move_layer(drag.index, to);
                 drag.index = to;
                 drag.moved = true;
                 self.retain_panel(self.layer_row(to));
@@ -1100,7 +1364,14 @@ impl App {
         }
     }
 
-    fn apply_step(&mut self, step: Step) {
+    fn apply_step(&mut self, mut step: Step) {
+        if matches!(self.modal, Some(Modal::Confirm { .. })) && step.effect.is_some() {
+            match std::mem::replace(&mut step.next, Next::Stay) {
+                Next::Stay => {}
+                Next::Close => self.modal = None,
+                Next::Replace(modal) => self.show_modal(modal),
+            }
+        }
         if let Some(effect) = step.effect {
             self.notice = None;
             if let Err(error) = self.apply(effect) {
@@ -1144,6 +1415,23 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('s') {
+            if self.modal.is_none() {
+                self.request_session_save();
+            }
+            return;
+        }
+        if (key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('z' | 'y')))
+            || (key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char('z' | 'Z')))
+        {
+            if self.modal.is_none() {
+                let undo =
+                    key.code == KeyCode::Char('z') && !key.modifiers.contains(KeyModifiers::SHIFT);
+                self.handle_layer_key(KeyCode::Char(if undo { 'u' } else { 'U' }));
             }
             return;
         }
@@ -1192,6 +1480,12 @@ impl App {
             if self.source_path().is_some() {
                 self.brush_on = !self.brush_on;
                 self.last_drag = None;
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('B') {
+            if self.source_path().is_some() {
+                BrushRow::Mode.adjust(&mut self.brush, 1);
             }
             return;
         }
@@ -1279,7 +1573,18 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if self.modified() {
+                    self.confirm(
+                        Confirm::new("Discard unsaved changes?")
+                            .detail("Edits since the last Ctrl+S will be lost.")
+                            .yes_label("discard changes"),
+                        Effect::Quit,
+                    );
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Char('f') => self.settings.flip = !self.settings.flip,
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
@@ -1343,6 +1648,19 @@ impl App {
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
+            Effect::Quit => self.quit = true,
+            Effect::RemoveLayer(index) => {
+                let row = self
+                    .panel
+                    .selected(&self.panel_lens())
+                    .unwrap_or(Row::Header(LAYER_GROUP));
+                self.document.remove_layer(index);
+                self.panel.invalidate();
+                self.retain_panel(row);
+            }
+            Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
+            Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
+            Effect::SaveSession(dir) => self.save_session(dir),
             Effect::Open(path, dir) => self.request_open(path, Some(dir)),
             Effect::ListDir(path) => self.request_list(path),
             Effect::Notice(message) => {
@@ -1489,6 +1807,593 @@ mod tests {
         app.take_jobs().into_iter().map(|(job, _)| job).collect()
     }
 
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            &app.geometry(test_layout().preview),
+        );
+    }
+
+    fn run_session_job(app: &mut App) {
+        let jobs = app.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        let (job, tag) = jobs.into_iter().next().unwrap();
+        let outcome = match job {
+            Job::Save { dir, write } => {
+                let result =
+                    write(&dir)
+                        .map(|()| dir.clone())
+                        .map_err(|error| rthid_io::io::IoError {
+                            op: rthid_io::io::Op::Save,
+                            path: dir,
+                            cause: rthid_io::io::Cause::Io(error),
+                        });
+                IoOutcome::Saved(result)
+            }
+            Job::Load { path, read } => {
+                let value = read(&path).unwrap();
+                IoOutcome::Loaded(Ok(rthid_io::io::Output { path, value }))
+            }
+            _ => panic!("expected session job"),
+        };
+        app.complete(Done::new(tag, std::time::Duration::ZERO, outcome));
+    }
+
+    fn snapshot(app: &App) -> Session {
+        Session {
+            source: app.grid_cache.source.clone().unwrap(),
+            source_path: app.source_path.clone().unwrap(),
+            document: app.document.clone(),
+            settings: app.settings.clone(),
+            view: ViewState::capture(app),
+        }
+    }
+
+    fn session_completion(tag: u64, dir: &Path, succeeds: bool) -> Done {
+        let result = if succeeds {
+            Ok(dir.to_path_buf())
+        } else {
+            Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Save,
+                path: dir.to_path_buf(),
+                cause: rthid_io::io::Cause::Io(std::io::Error::other("injected save failure")),
+            })
+        };
+        Done::new(tag, std::time::Duration::ZERO, IoOutcome::Saved(result))
+    }
+
+    // IO reports only the newest save per directory, so the first completion
+    // is ignored even when it arrives.
+    #[test]
+    fn overlapping_session_saves_keep_the_newest_successful_baseline() {
+        for second_succeeds in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("photo.rthid");
+            let mut app = App::builtin(RgbaImage::new(2, 3), None);
+            app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+            app.settings.flip = true;
+            ctrl(&mut app, 's');
+            let first = app.take_jobs().pop().unwrap().1;
+            app.settings.flip = false;
+            ctrl(&mut app, 's');
+            assert!(app.modal.is_none());
+            assert_eq!(app.saving.len(), 1);
+            let second = app.take_jobs().pop().unwrap().1;
+            assert!(!app.complete(session_completion(first, &dir, true)));
+            app.complete(session_completion(second, &dir, second_succeeds));
+            assert_eq!(app.session.as_ref(), second_succeeds.then_some(&dir));
+            assert_eq!(app.modified(), !second_succeeds);
+            if !second_succeeds {
+                assert!(app.notice().unwrap().contains("injected save failure"));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_session_save_requires_quit_confirmation_after_reverting() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        ctrl(&mut app, 's');
+        assert_eq!(app.saving.len(), 1);
+        app.settings.flip = false;
+        assert!(
+            app.saved
+                .as_ref()
+                .is_some_and(|saved| *saved == app.current_state())
+        );
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+    }
+
+    #[test]
+    fn superseded_save_failure_stays_modified_until_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        app.save_session(dir.clone());
+        let first = app.take_jobs().pop().unwrap().1;
+        app.complete(session_completion(first, &dir, false));
+        assert!(!app.modified());
+        app.settings.flip = true;
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        app.settings.flip = false;
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        assert!(!app.modified());
+        app.settings.flip = true;
+        app.save_session(dir.clone());
+        run_session_job_without_completion(&mut app);
+        app.settings.flip = false;
+        app.save_session(dir.clone());
+        let latest = app.take_jobs().pop().unwrap().1;
+        assert_eq!(app.saving.len(), 1);
+        app.complete(session_completion(latest, &dir, false));
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        app.request_open("next.png".into(), None);
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        app.save_session(dir.clone());
+        run_session_job(&mut app);
+        assert!(!app.modified());
+    }
+
+    fn run_session_job_without_completion(app: &mut App) {
+        let (job, _) = app.take_jobs().pop().unwrap();
+        let Job::Save { dir, write } = job else {
+            panic!("expected save")
+        };
+        write(&dir).unwrap();
+    }
+
+    #[test]
+    fn edits_during_load_require_confirmation_for_sessions_and_images() {
+        for session_load in [false, true] {
+            for accept in [false, true] {
+                let mut app = App::builtin(RgbaImage::new(2, 3), None);
+                let loaded = snapshot(&app);
+                app.request_open("next.png".into(), None);
+                let tag = app.open_request.as_ref().unwrap().token;
+                app.document.add_layer("Keep".into());
+                let outcome = if session_load {
+                    IoOutcome::Loaded(Ok(rthid_io::io::Output {
+                        path: "next.rthid".into(),
+                        value: Box::new(loaded),
+                    }))
+                } else {
+                    IoOutcome::Opened(Ok(Opened::Image {
+                        path: "next.png".into(),
+                        image: RgbaImage::new(2, 3),
+                    }))
+                };
+                app.complete(Done::new(tag, std::time::Duration::ZERO, outcome));
+                assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+                assert_eq!(app.document.layers().len(), 1);
+                press(&mut app, KeyCode::Char(if accept { 'y' } else { 'n' }));
+                assert_eq!(app.document.layers().len(), usize::from(!accept));
+                assert!(app.open_request.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn session_load_preserves_edits_made_with_a_source_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("stored.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        assert!(!app.modified());
+        app.request_open(dir, None);
+        assert!(app.modal.is_none());
+        let (job, tag) = app.take_jobs().pop().unwrap();
+        let Job::Load { path, read } = job else {
+            panic!("expected session load")
+        };
+        app.document.add_layer("Keep".into());
+        let value = read(&path).unwrap();
+        app.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Loaded(Ok(rthid_io::io::Output { path, value })),
+        ));
+        let Some(Modal::Confirm { question, .. }) = &app.modal else {
+            panic!("expected confirmation")
+        };
+        assert_eq!(question.message(), "Discard unsaved changes?");
+        assert_eq!(app.document.layers().len(), 1);
+        assert_eq!(app.document.layers()[0].name, "Keep");
+    }
+
+    #[test]
+    fn session_save_rejects_exports_inside_the_directory_without_changing_files() {
+        for existing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("photo.png");
+            let dir = session::default_path(&source);
+            let destination = dir.join("source-0.png");
+            let mut app = App::builtin(RgbaImage::new(2, 3), Some(destination.clone()));
+            app.open_image(source, RgbaImage::new(2, 3));
+            app.take_jobs();
+            let manifest = if existing {
+                session::write(&dir, snapshot(&app)).unwrap();
+                std::fs::write(&destination, b"keep export").unwrap();
+                app.session = Some(dir.clone());
+                Some(std::fs::read(dir.join("manifest.toml")).unwrap())
+            } else {
+                None
+            };
+            let saved = app.saved.clone();
+            app.settings.flip = true;
+            ctrl(&mut app, 's');
+            run_session_job(&mut app);
+            assert!(
+                app.notice()
+                    .unwrap()
+                    .contains("export destination is inside the session directory")
+            );
+            assert!(app.saved == saved);
+            assert!(app.modified());
+            if let Some(manifest) = manifest {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"keep export");
+                assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), manifest);
+            } else {
+                assert!(!dir.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn session_load_rejects_exports_anywhere_inside_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        for name in [
+            "source-1.png",
+            "exposure-1-0.png",
+            "new.png",
+            "nested/new.png",
+        ] {
+            let destination = dir.join(name);
+            assert!(session::check_exports(&dir, &[&destination]).is_err());
+            let mut app = App::builtin(RgbaImage::new(2, 3), Some(destination));
+            app.take_jobs();
+            app.request_open(dir.clone(), None);
+            let (job, _) = app.take_jobs().pop().unwrap();
+            let Job::Load { path, read } = job else {
+                panic!("expected load")
+            };
+            assert!(read(&path).is_err());
+        }
+        assert!(session::check_exports(&dir, &[temp.path().join("preview.png")]).is_ok());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&dir, &alias).unwrap();
+            assert!(session::check_exports(&dir, &[alias.join("new.png")]).is_err());
+        }
+    }
+
+    #[test]
+    fn late_save_failure_is_reported_for_a_different_document() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        ctrl(&mut app, 's');
+        let tag = app.take_jobs().pop().unwrap().1;
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        assert!(app.complete(session_completion(tag, Path::new("photo.rthid"), false)));
+        assert!(app.notice().unwrap().contains("injected save failure"));
+        assert!(app.session.is_none());
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn confirmed_open_failure_restores_the_dialog() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.settings.flip = true;
+        app.open_dialog(".".into());
+        let dialog = app.dialog();
+        app.request_open("missing.png".into(), Some(".".into()));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.dialog(), dialog);
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        app.take_jobs();
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Err(failure(rthid_io::io::Op::Decode))),
+        ));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert!(app.notice().is_some());
+        app.request_open("photo.png".into(), Some(".".into()));
+        press(&mut app, KeyCode::Char('y'));
+        app.take_jobs();
+        app.complete(done(&app, opened_photo()));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn session_source_paths_route_to_sessions_and_protect_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.document.add_layer("Stored".into());
+        session::write(&dir, snapshot(&app)).unwrap();
+        let source = session::read(&dir).unwrap().source_path;
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        app.request_open(source.clone(), None);
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(app.document.layers()[0].name, "Stored");
+        app.open_dialog(dir.clone());
+        app.request_open(
+            PathBuf::from(source.file_name().unwrap()),
+            Some(dir.clone()),
+        );
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        let before = std::fs::read(dir.join("manifest.toml")).unwrap();
+        let mut protected = App::builtin(RgbaImage::new(1, 1), Some(dir.join("manifest.toml")));
+        protected.take_jobs();
+        protected.request_open(dir.clone(), None);
+        let (job, tag) = protected.take_jobs().pop().unwrap();
+        let Job::Load { path, read } = job else {
+            panic!("expected session load")
+        };
+        let error = read(&path).err().unwrap();
+        protected.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Loaded(Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Decode,
+                path,
+                cause: rthid_io::io::Cause::Io(error),
+            })),
+        ));
+        assert!(protected.session.is_none());
+        assert!(protected.notice().unwrap().contains("manifest.toml"));
+        assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), before);
+    }
+
+    #[test]
+    fn session_open_refreshes_once_with_restored_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut stored = App::builtin(RgbaImage::new(2, 3), None);
+        stored.settings.flip = true;
+        stored.settings.rotation = Rotation::R90;
+        session::write(&dir, snapshot(&stored)).unwrap();
+        let mut app = App::builtin(RgbaImage::new(1, 1), Some(temp.path().join("preview.png")));
+        app.take_jobs();
+        let before = app.grid_cache.grid_version();
+        app.open_session(dir.clone(), session::read(&dir).unwrap());
+        assert_eq!(app.grid_cache.grid_version(), before + 1);
+        assert!(app.settings == stored.settings);
+        assert!(matches!(
+            app.take_jobs().as_slice(),
+            [(Job::Export { .. }, _)]
+        ));
+        app.sync(Rect::new(0, 0, 1, 1));
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn session_save_default_path_tracks_submitted_snapshot_and_writes_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        RgbaImage::new(2, 3).save(&source).unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        assert!(!app.modified());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.modified());
+        ctrl(&mut app, 's');
+        app.settings.flip = true;
+        app.document.add_layer("Later".into());
+        run_session_job(&mut app);
+        let dir = temp.path().join("photo.rthid");
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(app.notice(), Some("saved photo.rthid"));
+        assert_eq!(session::read(&dir).unwrap().document.layers().len(), 1);
+        assert!(app.modified());
+        ctrl(&mut app, 's');
+        run_session_job(&mut app);
+        assert!(!app.modified());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let document = app.document.clone();
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        assert!(app.session.is_none());
+        assert!(!app.modified());
+        app.request_open(dir.clone(), None);
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(
+            app.source_path(),
+            Some(session::read(&dir).unwrap().source_path.as_path())
+        );
+        crate::document::assert_same_content(&app.document, &document);
+        assert!(app.settings.flip);
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
+        assert!(!app.modified());
+        ctrl(&mut app, 's');
+        assert!(matches!(&app.outbox[0].0, Job::Save { dir: target, .. } if target == &dir));
+        run_session_job(&mut app);
+        assert!(!dir.join("source.rthid").exists());
+    }
+
+    #[test]
+    fn session_overwrite_confirmation_refuses_other_targets_and_can_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        let target = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        std::fs::write(&target, b"unrelated").unwrap();
+        ctrl(&mut app, 's');
+        assert!(app.notice().unwrap().contains("not a session directory"));
+        assert!(app.take_jobs().is_empty());
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("notes.txt"), b"unrelated").unwrap();
+        ctrl(&mut app, 's');
+        assert!(app.notice().unwrap().contains("not a session directory"));
+        std::fs::remove_file(target.join("notes.txt")).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        ctrl(&mut app, 's');
+        run_session_job(&mut app);
+        app.open_image(source, RgbaImage::new(2, 3));
+        ctrl(&mut app, 's');
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { question, .. }) if question.message() == "Overwrite photo.rthid?")
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.modal.is_none());
+        assert!(app.take_jobs().is_empty());
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('y'));
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn session_unsaved_quit_open_and_cancel_restore_the_dialog() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.settings.flip = true;
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.quit);
+        app.quit = false;
+        app.request_open("next.png".into(), None);
+        assert!(app.take_jobs().is_empty());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.take_jobs().is_empty());
+        app.open_dialog(".".into());
+        app.apply(Effect::Open("next.png".into(), ".".into()))
+            .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        app.apply(Effect::Open("next.png".into(), ".".into()))
+            .unwrap();
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            app.take_jobs().as_slice(),
+            [(Job::Open { .. }, _)]
+        ));
+        app.complete(done(&app, opened_photo()));
+        assert!(!app.modified());
+        app.settings.flip = true;
+        ctrl(&mut app, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn session_modified_tracks_view_and_selection_but_excludes_brush_controls() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.brush_on = true;
+        app.brush.radius += 1;
+        assert!(!app.modified());
+        app.mass_minimap = !app.mass_minimap;
+        assert!(app.modified());
+        app.mass_minimap = !app.mass_minimap;
+        assert!(!app.modified());
+        app.viewport.hide_minimap = true;
+        app.viewport.zoom = Zoom::In(2);
+        app.viewport.x = 200;
+        app.viewport.y = 300;
+        app.sync(Rect::new(0, 0, 8, 4));
+        assert!(!app.modified());
+        app.record_saved();
+        app.document.add_layer("One".into());
+        app.record_saved();
+        app.document.select(None);
+        assert!(app.modified());
+        app.record_saved();
+        app.document.set_visible(0, false);
+        assert!(!app.document.undo(0));
+        assert!(app.modified());
+    }
+
+    #[test]
+    fn session_save_ignores_modal_overlay_and_absent_source() {
+        let mut app = App::empty();
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        app.open_image("photo.png".into(), RgbaImage::new(2, 3));
+        app.keys_open = true;
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        app.keys_open = false;
+        app.open_dialog(".".into());
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        assert!(app.modal.is_some());
+        ctrl(&mut app, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn session_failed_save_and_late_completion_never_mark_new_document_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        let source = temp.path().join("photo.png");
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        ctrl(&mut app, 's');
+        let (job, tag) = app.take_jobs().pop().unwrap();
+        let Job::Save { dir, .. } = job else {
+            panic!("expected save")
+        };
+        app.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Saved(Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Save,
+                path: dir,
+                cause: rthid_io::io::Cause::Io(std::io::Error::other("injected failure")),
+            })),
+        ));
+        assert!(app.modified());
+        assert!(app.session.is_none());
+        assert!(app.notice().unwrap().contains("injected failure"));
+        ctrl(&mut app, 's');
+        app.open_image(source, RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        run_session_job(&mut app);
+        assert!(app.session.is_none());
+        assert!(app.modified());
+    }
+
+    #[test]
+    fn failed_first_save_leftovers_ask_to_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        let source = temp.path().join("photo.png");
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        let dir = session::default_path(&source);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("source-1.png"), b"partial").unwrap();
+        ctrl(&mut app, 's');
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { question, .. }) if question.message() == "Overwrite photo.rthid?")
+        );
+    }
+
     #[test]
     fn brush_rows_adjust_reset_and_leave_layers_addressable() {
         let mut app = App::empty();
@@ -1513,7 +2418,11 @@ mod tests {
             press(&mut app, KeyCode::Char('d'));
         }
         assert_eq!(app.brush, Brush::default());
-        assert!(!app.edits.can_undo());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
         app.open_image("source.png".into(), RgbaImage::new(10, 10));
         press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.panel_row(Setting::ALL.len() + 3), PanelItem::Layer(0));
@@ -1534,7 +2443,8 @@ mod tests {
         let geometry = app.geometry(layout.preview);
         let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
         let center = app.source_point(&geometry, x, y).unwrap();
-        let before = app.edits.current().clone();
+        app.document.add_layer("Layer 1".into());
+        let before = app.document.clone();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             x,
@@ -1543,7 +2453,7 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_some());
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
+        assert_eq!(app.document.layers()[0].name, "Layer 1");
         let version = app.grid_cache.grid_version();
         app.sync(layout.preview);
         assert!(app.grid_cache.grid_version() > version);
@@ -1568,15 +2478,19 @@ mod tests {
         );
         assert!(app.stroke.is_none());
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
-        let painted = app.edits.current().clone();
+        let painted = app.document.clone();
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current(), &before);
-        assert!(!app.edits.can_undo());
+        crate::document::assert_same_content(&app.document, &before);
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
         press(&mut app, KeyCode::Char('U'));
-        assert_eq!(app.edits.current(), &painted);
+        crate::document::assert_same_content(&app.document, &painted);
         assert!(app.brush_on);
         app.sync(layout.preview);
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             x,
@@ -1599,7 +2513,7 @@ mod tests {
             screen,
         );
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current(), &before);
+        crate::document::assert_same_content(&app.document, &before);
     }
 
     #[test]
@@ -1619,7 +2533,7 @@ mod tests {
             &geometry,
             screen,
         );
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         assert!(!app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
             x + 1,
@@ -1627,7 +2541,7 @@ mod tests {
             &geometry,
             screen,
         ));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
     }
 
     #[test]
@@ -1648,7 +2562,7 @@ mod tests {
             &geometry,
             screen,
         );
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         let outside = geometry.target.x - 1;
         assert!(app.source_point(&geometry, outside, y).is_none());
         assert!(!app.mouse_at(
@@ -1666,7 +2580,7 @@ mod tests {
             screen,
         ));
         let entry = app.source_point(&geometry, x + 24, y).unwrap();
-        let map = &app.edits.current().layers()[0].exposure;
+        let map = &app.document.layers()[0].exposure;
         assert!(map.get(entry.0.round() as u32, entry.1.round() as u32) > 0);
         for column in x + 2..x + 23 {
             let point = app.source_point(&geometry, column, y).unwrap();
@@ -1680,40 +2594,113 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.undo());
-        assert!(app.edits.current().layers().is_empty());
-        assert!(!app.edits.can_undo());
+        assert!(app.document.undo(0));
+        assert!(app.document.layers()[0].exposure.is_empty());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
     }
 
     #[test]
-    fn unchanged_strokes_restore_redo_with_and_without_a_layer() {
-        for has_layer in [false, true] {
-            let mut app = App::builtin(RgbaImage::new(8, 8), None);
-            if has_layer {
-                let mut document = Document::new(8, 8);
-                document.add_layer(document.next_layer_name());
-                for y in 0..8 {
-                    for x in 0..8 {
-                        document.target_mut().unwrap().exposure.add(x, y, i16::MAX);
-                    }
-                }
-                app.edits = History::new(document);
-            } else {
-                app.brush.strength = 0;
-            }
-            let before = app.edits.current().clone();
-            app.edits.edit(|doc| {
-                doc.add_layer("Redo".into());
-            });
-            let redo = app.edits.current().clone();
-            assert!(app.edits.undo());
-            app.start_stroke((4.0, 4.0));
-            app.end_stroke();
-            assert_eq!(app.edits.current(), &before);
-            assert!(!app.edits.can_undo());
-            assert!(app.edits.redo());
-            assert_eq!(app.edits.current(), &redo);
+    fn unchanged_strokes_keep_redo_and_auto_created_layer() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.brush.strength = 0;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert_eq!(app.document.layers().len(), 1);
+        assert!(!app.document.can_undo(0));
+        app.brush.strength = 50;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert!(app.document.undo(0));
+        app.brush.strength = 0;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert!(app.document.can_redo(0));
+        assert!(app.document.redo(0));
+    }
+
+    #[test]
+    fn brush_toggle_ends_stroke_and_history_chords_undo_and_redo_it() {
+        let mut empty = App::empty();
+        press(&mut empty, KeyCode::Char('B'));
+        assert_eq!(empty.brush.mode.name(), "Dodge");
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.brush.mode.name(), "Burn");
+        assert!(!app.brush_on);
+        app.brush_on = true;
+        let screen = Rect::new(0, 0, 100, 40);
+        let geometry = app.geometry(crate::ui::layout(screen).preview);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_some());
+        press(&mut app, KeyCode::Char('B'));
+        assert!(app.stroke.is_none());
+        assert_eq!(app.brush.mode.name(), "Dodge");
+        let painted = app.document.clone();
+        ctrl(&mut app, 'z');
+        assert!(app.document.layers()[0].exposure.is_empty());
+        for redo in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            app.handle_key(redo, &geometry);
+            crate::document::assert_same_content(&app.document, &painted);
+            ctrl(&mut app, 'z');
         }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &geometry,
+        );
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_some());
+        ctrl(&mut app, 'z');
+        assert!(app.stroke.is_none());
+        crate::document::assert_same_content(&app.document, &painted);
+        for overlay in [false, true] {
+            app.keys_open = overlay;
+            app.modal = (!overlay).then(Modal::templates);
+            let revision = app.document.revision();
+            for c in ['z', 'y'] {
+                ctrl(&mut app, c);
+            }
+            assert_eq!(app.document.revision(), revision);
+        }
+        app.keys_open = false;
+        app.modal = None;
+        ctrl(&mut app, 'z');
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 1: nothing to undo"));
+        while app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_redo(index))
+        {
+            ctrl(&mut app, 'y');
+        }
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("Layer 1: nothing to redo"));
     }
 
     #[test]
@@ -1739,7 +2726,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.current().layers()[0].exposure.get(15, 15) > 0);
+        assert!(app.document.layers()[0].exposure.get(15, 15) > 0);
     }
 
     #[test]
@@ -1754,10 +2741,9 @@ mod tests {
                     map.add(x, y, i16::MAX);
                 }
             }
+            app.document = document.clone();
             if can_undo {
-                app.edits.edit(|doc| *doc = document.clone());
-            } else {
-                app.edits = History::new(document.clone());
+                app.document.commit_stroke(0, ExposureMap::new(128, 128));
             }
             let screen = Rect::new(0, 0, 100, 40);
             let area = crate::ui::layout(screen).preview;
@@ -1786,14 +2772,19 @@ mod tests {
                 &geometry,
                 screen,
             );
-            assert_eq!(app.edits.current(), &document);
-            assert_eq!(app.edits.can_undo(), can_undo);
-            let revision = app.edits.revision();
+            crate::document::assert_same_content(&app.document, &document);
+            assert_eq!(
+                app.document
+                    .target()
+                    .is_some_and(|index| app.document.can_undo(index)),
+                can_undo
+            );
+            let revision = app.document.revision();
             app.end_stroke();
-            assert_eq!(app.edits.revision(), revision);
+            assert_eq!(app.document.revision(), revision);
             if can_undo {
-                assert!(app.edits.undo());
-                assert!(app.edits.current().layers().is_empty());
+                assert!(app.document.undo(0));
+                assert!(app.document.layers()[0].exposure.is_empty());
             }
         }
     }
@@ -1807,7 +2798,7 @@ mod tests {
         app.brush_on = true;
         let geometry = app.geometry(area);
         let map = geometry.minimap.unwrap();
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             map.map.x,
@@ -1816,8 +2807,8 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_none());
-        assert!(app.edits.current().layers().is_empty());
-        assert_eq!(app.edits.revision(), revision);
+        assert!(app.document.layers().is_empty());
+        assert_eq!(app.document.revision(), revision);
         app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
             map.map.right() - 1,
@@ -1835,7 +2826,7 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('v'));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         let geometry = app.geometry(area);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -1853,8 +2844,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
-        assert!(app.edits.current().layers()[0].exposure.is_empty());
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers()[0].exposure.is_empty());
         app.settings.margin = 10;
         app.viewport = Viewport::default();
         let geometry = app.geometry(area);
@@ -1866,7 +2857,7 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_none());
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
     }
 
     #[test]
@@ -1915,7 +2906,7 @@ mod tests {
                 ),
             }
             assert!(app.stroke.is_none());
-            let revision = app.edits.revision();
+            let revision = app.document.revision();
             app.mouse_at(
                 MouseEventKind::Drag(MouseButton::Left),
                 x + 2,
@@ -1923,16 +2914,88 @@ mod tests {
                 &geometry,
                 screen,
             );
-            assert_eq!(app.edits.revision(), revision);
+            assert_eq!(app.document.revision(), revision);
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
         }
         app.viewport.zoom = Zoom::In(1);
         app.preview_focus = true;
         let geometry = app.geometry(area);
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &geometry);
         assert!(app.viewport.x > 0);
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
+    }
+
+    #[test]
+    fn undo_keys_stay_on_the_target_layer_and_name_it() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        let first = app.document.layers()[0].exposure.clone();
+        press(&mut app, KeyCode::Char('n'));
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        app.document.select(None);
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 2: undo"));
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 2: nothing to undo"));
+        assert_eq!(app.document.layers()[0].exposure, first);
+        assert!(app.document.layers()[1].exposure.is_empty());
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("Layer 2: redo"));
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("Layer 2: nothing to redo"));
+        app.document.select(Some(0));
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 1: undo"));
+        assert!(app.document.layers()[0].exposure.is_empty());
+        assert!(!app.document.layers()[1].exposure.is_empty());
+    }
+
+    #[test]
+    fn layer_delete_requires_y_and_cannot_be_undone() {
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Char('x'),
+            KeyCode::Char('Y'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('y'),
+        ] {
+            let mut app = App::builtin(RgbaImage::new(8, 8), None);
+            press(&mut app, KeyCode::Char('n'));
+            app.start_stroke((4.0, 4.0));
+            app.end_stroke();
+            press(&mut app, KeyCode::Char('n'));
+            app.start_stroke((4.0, 4.0));
+            app.end_stroke();
+            let before = app.document.clone();
+            let revision = app.document.revision();
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.document.revision(), revision);
+            let Some(Modal::Confirm { question, .. }) = &app.modal else {
+                panic!("missing confirmation")
+            };
+            assert_eq!(question.message(), "Delete Layer 2?");
+            assert_eq!(
+                question.lines()[0].to_string(),
+                "Its brush strokes and their undo history are lost."
+            );
+            assert_eq!(question.hints()[0].label, "delete");
+            press(&mut app, key);
+            assert!(app.modal.is_none());
+            if key == KeyCode::Char('y') {
+                assert_eq!(app.document.layers().len(), 1);
+                assert_eq!(app.document.revision(), revision + 1);
+                ctrl(&mut app, 'z');
+                assert_eq!(app.document.layers().len(), 1);
+                assert_eq!(app.notice(), Some("Layer 1: undo"));
+            } else {
+                assert_eq!(app.document, before);
+                assert!(app.document.can_undo(1));
+            }
+        }
     }
 
     #[test]
@@ -1945,8 +3008,8 @@ mod tests {
         for _ in 0..2 {
             press(&mut app, KeyCode::Char('n'));
         }
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
+        assert_eq!(app.document.layers()[0].name, "Layer 1");
+        assert_eq!(app.document.layers()[1].name, "Layer 2");
         assert_eq!(
             app.panel_row(Setting::ALL.len() + BrushRow::ALL.len()),
             PanelItem::Layer(1)
@@ -1956,49 +3019,53 @@ mod tests {
             PanelItem::Layer(0)
         );
         assert_eq!(app.selected_setting(), None);
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         let versions = versions(&app);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.current().selected(), None);
-        assert_eq!(app.edits.current().target(), Some(1));
+        assert_eq!(app.document.selected(), None);
+        assert_eq!(app.document.target(), Some(1));
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.current().selected(), Some(1));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.selected(), Some(1));
+        assert_eq!(app.document.revision(), revision);
         assert_eq!(versions, self::versions(&app));
         press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 2");
+        assert_eq!(app.document.layers()[0].name, "Layer 2");
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         press(&mut app, KeyCode::Char(']'));
         press(&mut app, KeyCode::Char('v'));
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
         app.panel.select(app.layer_row(0), &app.panel_lens());
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 1");
+        assert_eq!(app.document.layers()[1].name, "Layer 1");
         app.preview_focus = true;
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current().layers().len(), 1);
+        assert_eq!(app.document.layers().len(), 2);
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(0))
+            Some(app.layer_row(1))
         );
         press(&mut app, KeyCode::Char('U'));
-        assert_eq!(app.edits.current().layers().len(), 2);
+        assert_eq!(app.document.layers().len(), 2);
         app.preview_focus = false;
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        app.panel.select(app.layer_row(0), &app.panel_lens());
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(Row::Header(LAYER_GROUP))
@@ -2012,7 +3079,11 @@ mod tests {
         app.panel.select(Row::Item(0), &app.panel_lens());
         app.open_image("next.png".into(), RgbaImage::new(2, 2));
         assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(0)));
-        assert!(!app.edits.can_undo());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
     }
 
     #[test]
@@ -2021,17 +3092,17 @@ mod tests {
         for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
             press(&mut app, KeyCode::Char(code));
         }
-        assert_eq!(app.edits.revision(), 0);
+        assert_eq!(app.document.revision(), 0);
         assert!(app.notice().is_none());
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         app.show_modal(Modal::templates());
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
             press(&mut app, KeyCode::Char(code));
         }
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.revision(), revision);
-        assert!(app.edits.current().layers().is_empty());
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers().is_empty());
     }
 
     #[test]
@@ -2045,7 +3116,7 @@ mod tests {
         let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('n'));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -2053,14 +3124,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
-        assert!(
-            app.edits
-                .current()
-                .layers()
-                .iter()
-                .all(|layer| layer.visible)
-        );
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers().iter().all(|layer| layer.visible));
         render_panel(&app, layout.panel);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2069,8 +3134,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.current().layers()[0].visible);
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(app.document.layers()[0].visible);
+        assert!(!app.document.layers()[1].visible);
     }
 
     #[test]
@@ -2085,7 +3150,7 @@ mod tests {
         let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('['));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -2093,7 +3158,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         render_panel(&app, layout.panel);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2102,12 +3167,12 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(!app.edits.current().layers()[1].visible);
-        assert!(app.edits.current().layers()[0].visible);
+        assert!(!app.document.layers()[1].visible);
+        assert!(app.document.layers()[0].visible);
     }
 
     #[test]
-    fn layer_mouse_selects_marks_and_groups_drag_into_one_undo() {
+    fn layer_mouse_selects_marks_and_drag_does_not_undo() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..3 {
             press(&mut app, KeyCode::Char('n'));
@@ -2120,7 +3185,7 @@ mod tests {
         let x = layout.panel.x + 5;
         let click = MouseEventKind::Down(MouseButton::Left);
         app.mouse_at(click, x, top + 1, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(1));
+        assert_eq!(app.document.selected(), Some(1));
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
             x,
@@ -2129,7 +3194,7 @@ mod tests {
             screen,
         );
         app.mouse_at(click, x, top + 1, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(1));
+        assert_eq!(app.document.selected(), Some(1));
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
             x,
@@ -2137,7 +3202,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current().selected(), None);
+        assert_eq!(app.document.selected(), None);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
         let mut renderer = crate::ui::Renderer::default();
@@ -2147,11 +3212,11 @@ mod tests {
             .unwrap();
         let mark_x = layout.panel.x + 3;
         assert_eq!(terminal.backend().buffer()[(mark_x, top + 1)].symbol(), "●");
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(click, mark_x, top + 1, &geometry, screen);
-        assert!(!app.edits.current().layers()[1].visible);
-        assert_eq!(app.edits.current().selected(), None);
-        assert_eq!(app.edits.revision(), revision + 1);
+        assert!(!app.document.layers()[1].visible);
+        assert_eq!(app.document.selected(), None);
+        assert_eq!(app.document.revision(), revision + 1);
         assert!(app.layer_drag.is_none());
         app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
@@ -2160,8 +3225,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
-        assert_eq!(app.edits.revision(), revision + 1);
+        assert_eq!(app.document.layers()[1].name, "Layer 2");
+        assert_eq!(app.document.revision(), revision + 1);
         app.mouse_at(click, x, top, &geometry, screen);
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
@@ -2171,8 +3236,8 @@ mod tests {
             screen,
         );
         app.mouse_at(click, x, top, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(2));
-        let revision = app.edits.revision();
+        assert_eq!(app.document.selected(), Some(2));
+        let revision = app.document.revision();
         let drag = MouseEventKind::Drag(MouseButton::Left);
         app.mouse_at(drag, x, top + 1, &geometry, screen);
         app.mouse_at(drag, x, top + 2, &geometry, screen);
@@ -2185,37 +3250,36 @@ mod tests {
             screen,
         ));
         assert!(app.layer_drag.is_none());
-        assert_eq!(app.edits.revision(), revision + 2);
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 3");
-        assert_eq!(app.edits.current().selected(), Some(0));
-        assert_eq!(app.edits.current().target(), Some(0));
+        assert_eq!(app.document.revision(), revision + 2);
+        assert_eq!(app.document.layers()[0].name, "Layer 3");
+        assert_eq!(app.document.selected(), Some(0));
+        assert_eq!(app.document.target(), Some(0));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(
-            app.edits
-                .current()
+            app.document
                 .layers()
                 .iter()
                 .map(|l| l.name.as_str())
                 .collect::<Vec<_>>(),
-            ["Layer 1", "Layer 2", "Layer 3"]
+            ["Layer 3", "Layer 1", "Layer 2"]
         );
         press(&mut app, KeyCode::Char('u'));
-        assert!(app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[2].visible);
     }
 
     #[test]
-    fn layer_drag_back_to_start_discards_undo_step() {
+    fn layer_drag_back_to_start_keeps_visibility() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..2 {
             press(&mut app, KeyCode::Char('n'));
         }
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('u'));
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         let screen = Rect::new(0, 0, 100, 40);
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
@@ -2250,11 +3314,11 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current(), &before);
+        crate::document::assert_same_content(&app.document, &before);
         press(&mut app, KeyCode::Char('U'));
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
         press(&mut app, KeyCode::Char('u'));
-        assert!(app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
     }
 
     #[test]
@@ -2489,7 +3553,9 @@ mod tests {
                 app.request_open("failed.png".into(), None);
             }
             let expected = match &outcome {
-                IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => error.to_string(),
+                IoOutcome::Opened(Err(error))
+                | IoOutcome::Listed(Err(error))
+                | IoOutcome::Loaded(Err(error)) => error.to_string(),
                 _ => unreachable!(),
             };
             assert!(app.complete(done(&app, outcome)));
@@ -2631,7 +3697,7 @@ mod tests {
         assert_eq!(app.notice(), Some(error.as_str()));
         assert!(app.export_result().is_err());
         let grid_version = app.grid_cache.grid.version();
-        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+        for code in [KeyCode::Char('r'), KeyCode::Char('q'), KeyCode::Char('y')] {
             app.handle_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
                 &app.geometry(test_layout().preview),
@@ -3272,7 +4338,7 @@ mod tests {
         let mut preset_confirm = Modal::Presets {
             list: rthid_widgets::ListPicker::new(0),
             confirm: Some((
-                rthid_widgets::Confirm::new("Delete preset?"),
+                rthid_widgets::Confirm::new("Delete preset?").yes_label("delete"),
                 crate::modal::OnYes::RemovePreset("Selected".into()),
             )),
         };
@@ -3280,7 +4346,7 @@ mod tests {
             list: rthid_widgets::ListPicker::new(0),
             prompt: None,
             confirm: Some((
-                rthid_widgets::Confirm::new("Delete template?"),
+                rthid_widgets::Confirm::new("Delete template?").yes_label("delete"),
                 crate::modal::OnYes::RemoveTemplate("Zine".into()),
             )),
         };
@@ -3434,7 +4500,7 @@ mod tests {
             )))
             .chain(std::iter::once((
                 ratatui::text::Line::raw("Layers"),
-                vec![ratatui::text::Line::default(); app.edits.current().layers().len()],
+                vec![ratatui::text::Line::default(); app.document.layers().len()],
             )));
         app.panel.render(
             groups,
@@ -3508,8 +4574,7 @@ mod tests {
         );
         let before = versions(&app);
         let replacement = RgbaImage::from_pixel(20, 10, image::Rgba([255, 255, 255, 255]));
-        app.edits
-            .reset(Document::new(replacement.width(), replacement.height()));
+        app.document = Document::new(replacement.width(), replacement.height());
         app.grid_cache.set_source(replacement);
         assert!(app.grid_cache.grid().is_none());
         assert!(app.grid_cache.dithered().is_none());
@@ -4368,7 +5433,9 @@ mod tests {
         }
         assert!(app.dragging());
         assert!(app.modal.is_none());
-        app.request_open("/images".into(), None);
+        let temp = tempfile::tempdir().unwrap();
+        app.request_open(temp.path().to_path_buf(), None);
+        assert!(!matches!(app.modal, Some(Modal::Confirm { .. })));
         let outcome = IoOutcome::Opened(Ok(Opened::Dir(rthid_io::dir::Listing {
             dir: "/images".into(),
             entries: vec![],

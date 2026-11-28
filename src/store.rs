@@ -345,7 +345,7 @@ struct FilePreset {
 /// seed load as Atkinson with seed 0.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
-struct FileTemplate {
+pub(crate) struct FileTemplate {
     name: String,
     palette: String,
     colors: Vec<String>,

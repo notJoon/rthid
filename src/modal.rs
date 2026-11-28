@@ -77,6 +77,16 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
+    /// Permanently remove a layer and its stroke history after confirmation.
+    RemoveLayer(usize),
+    /// Exit after confirming unsaved changes.
+    Quit,
+    /// Continue an accepted source replacement.
+    OpenConfirmed(PathBuf, Option<PathBuf>),
+    /// Replace the document with a load accepted after intervening edits.
+    OpenLoaded(Box<rthid_io::io::Outcome>),
+    /// Write a session after any overwrite confirmation.
+    SaveSession(PathBuf),
     /// Request a source image relative to the supplied folder without closing the dialog.
     Open(PathBuf, PathBuf),
     /// Request the entries of a directory.
@@ -117,28 +127,17 @@ pub enum OnYes {
     OverwriteTemplate(String),
 }
 
-impl OnYes {
-    // Names the action instead of a generic yes.
-    fn hints(&self) -> Vec<Hint> {
-        let (yes, cancel) = match self {
-            Self::RemovePreset(_) | Self::RemoveTemplate(_) => ("delete", "cancel"),
-            Self::OverwriteTemplate(_) => ("overwrite", "return to name"),
-        };
-        vec![
-            Hint {
-                label: yes,
-                ..Confirm::YES
-            },
-            Hint {
-                label: cancel,
-                ..Confirm::CANCEL
-            },
-        ]
-    }
-}
-
 /// Dialogs that capture all input except quitting with Ctrl+C.
 pub enum Modal {
+    /// Confirmation with the previous dialog retained for cancellation.
+    Confirm {
+        /// Question shown as the dialog title.
+        question: Confirm,
+        /// Action taken when accepted.
+        action: Option<Box<Effect>>,
+        /// Dialog restored when cancelled.
+        back: Option<Box<Modal>>,
+    },
     /// Directory listing and editable image path.
     OpenFile(Box<FilePicker>),
     /// Palette selection and optional removal confirmation.
@@ -181,6 +180,8 @@ pub struct FilePicker {
     pub dir: PathBuf,
     /// Visible directories and supported image files.
     pub entries: Vec<Entry>,
+    /// Session flags computed when the listing arrives.
+    pub sessions: Vec<bool>,
     /// Whether Enter submits the field instead of the selected entry.
     pub typed: bool,
     /// Number the app gave this dialog when it opened, matched against IO results.
@@ -192,6 +193,10 @@ impl FilePicker {
     pub fn set_listing(&mut self, dir: PathBuf, entries: Vec<Entry>) {
         self.input = TextInput::new(dir.join("").to_string_lossy(), PATH_MAX_CHARS);
         self.list = ListPicker::new(usize::from(entries.len() > 1 && entries[0].name == ".."));
+        self.sessions = entries
+            .iter()
+            .map(|entry| entry.dir && crate::session::is_session(&dir.join(&entry.file_name)))
+            .collect();
         self.dir = dir;
         self.entries = entries;
         self.typed = false;
@@ -213,15 +218,15 @@ impl FilePicker {
                 );
             }
             Outcome::Submit(()) => {
-                if let Some(entry) = self
+                if let Some((index, entry)) = self
                     .list
                     .selected(self.entries.len())
-                    .and_then(|i| self.entries.get(i))
+                    .map(|i| (i, &self.entries[i]))
                 {
                     let path = self.dir.join(&entry.file_name);
                     return Step::effect(
                         Next::Stay,
-                        if entry.dir {
+                        if entry.dir && !self.sessions[index] {
                             Effect::ListDir(path)
                         } else {
                             Effect::Open(PathBuf::from(&entry.file_name), self.dir.clone())
@@ -498,12 +503,36 @@ impl Modal {
     /// Computes dialog and content rectangles without changing selection or scroll.
     pub fn layout(&self, preview: Rect, screen: Rect, ctx: &Ctx<'_>) -> ModalLayout {
         let (title, width, height) = match self {
+            Self::Confirm { question, .. }
+            | Self::Presets {
+                confirm: Some((question, _)),
+                ..
+            }
+            | Self::Templates {
+                confirm: Some((question, _)),
+                ..
+            } => {
+                let lines = question.lines();
+                (
+                    question.message(),
+                    lines.iter().map(Line::width).max().unwrap_or(0),
+                    lines.len(),
+                )
+            }
             Self::OpenFile(picker) => (
                 "Open image",
                 picker
                     .entries
                     .iter()
-                    .map(|entry| Line::raw(&entry.name).width() + usize::from(entry.dir))
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        Line::raw(&entry.name).width()
+                            + if picker.sessions[index] {
+                                " [session]".len()
+                            } else {
+                                usize::from(entry.dir)
+                            }
+                    })
                     .chain([Line::raw(picker.input.text()).width()])
                     .max()
                     .unwrap_or(0),
@@ -567,6 +596,13 @@ impl Modal {
             );
             let inner = Block::bordered().inner(dialog);
             let (field, list) = match self {
+                Self::Confirm { .. }
+                | Self::Presets {
+                    confirm: Some(_), ..
+                }
+                | Self::Templates {
+                    confirm: Some(_), ..
+                } => (None, None),
                 Self::OpenFile(_) => {
                     let [field, list] =
                         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
@@ -608,6 +644,7 @@ impl Modal {
 
     fn rows(&self, ctx: &Ctx<'_>) -> usize {
         match self {
+            Self::Confirm { .. } => 0,
             Self::OpenFile(picker) => picker.entries.len(),
             Self::Presets { .. } => ctx.palettes.len(),
             Self::Templates { .. } => ctx.templates.len(),
@@ -619,6 +656,7 @@ impl Modal {
     pub(crate) fn selection(&self, ctx: &Ctx<'_>) -> (Option<usize>, bool) {
         let rows = self.rows(ctx);
         match self {
+            Self::Confirm { .. } => (None, false),
             Self::OpenFile(picker) => (picker.list.selected(rows), picker.typed),
             Self::Presets { list, .. } | Self::Templates { list, .. } => {
                 (list.selected(rows), false)
@@ -673,6 +711,7 @@ impl Modal {
             list: ListPicker::new(0),
             dir: start,
             entries: Vec::new(),
+            sessions: Vec::new(),
             typed: false,
             generation,
         }))
@@ -733,6 +772,7 @@ impl Modal {
     /// Key descriptions for the component currently receiving input.
     pub fn hints(&self, ctx: &Ctx<'_>) -> Vec<Hint> {
         match self {
+            Self::Confirm { question, .. } => question.hints().to_vec(),
             Self::OpenFile(picker) => {
                 let listed = !picker.entries.is_empty();
                 [
@@ -746,13 +786,13 @@ impl Modal {
                 .collect()
             }
             Self::Presets {
-                confirm: Some((_, on_yes)),
+                confirm: Some((question, _)),
                 ..
             }
             | Self::Templates {
-                confirm: Some((_, on_yes)),
+                confirm: Some((question, _)),
                 ..
-            } => on_yes.hints(),
+            } => question.hints().to_vec(),
             Self::Presets { .. } => vec![
                 Hint {
                     label: "apply",
@@ -835,10 +875,32 @@ impl Modal {
         if key.kind == KeyEventKind::Release {
             return Step::stay();
         }
+        if let Self::Confirm {
+            question,
+            action,
+            back,
+        } = self
+        {
+            return match question.handle_key(key) {
+                Outcome::Submit(()) => Step::effect(
+                    back.take()
+                        .map_or(Next::Close, |modal| Next::Replace(*modal)),
+                    *action.take().unwrap(),
+                ),
+                Outcome::Cancel => Step {
+                    next: back
+                        .take()
+                        .map_or(Next::Close, |modal| Next::Replace(*modal)),
+                    effect: None,
+                },
+                _ => Step::stay(),
+            };
+        }
         let confirm = match self {
             Self::OpenFile(picker) => return picker.handle_key(key),
             Self::Presets { confirm, .. } | Self::Templates { confirm, .. } => confirm,
             Self::Editor(editor) => return editor.handle_key(key, &ctx),
+            Self::Confirm { .. } => unreachable!(),
         };
         if let Some((question, _)) = confirm {
             match question.handle_key(key) {
@@ -911,7 +973,7 @@ impl Modal {
                             return Step::notice("built-in presets cannot be removed".into());
                         }
                         *confirm = Some((
-                            Confirm::new("Delete preset?"),
+                            Confirm::new("Delete preset?").yes_label("delete"),
                             OnYes::RemovePreset(preset.name.clone()),
                         ));
                     }
@@ -933,7 +995,7 @@ impl Modal {
                             }
                             if ctx.templates.find(input.text()).is_some() {
                                 *confirm = Some((
-                                    Confirm::new("Overwrite template?"),
+                                    Confirm::new("Overwrite template?").yes_label("overwrite"),
                                     OnYes::OverwriteTemplate(input.text().into()),
                                 ));
                             } else {
@@ -970,7 +1032,7 @@ impl Modal {
                                     return Step::stay();
                                 };
                                 *confirm = Some((
-                                    Confirm::new("Delete template?"),
+                                    Confirm::new("Delete template?").yes_label("delete"),
                                     OnYes::RemoveTemplate(template.name.clone()),
                                 ));
                             }
@@ -980,7 +1042,7 @@ impl Modal {
                     }
                 }
             }
-            Self::Editor(_) | Self::OpenFile(_) => unreachable!(),
+            Self::Editor(_) | Self::OpenFile(_) | Self::Confirm { .. } => unreachable!(),
         }
         Step::stay()
     }
@@ -1003,6 +1065,62 @@ mod tests {
             row: area.y + row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn session_directories_open_on_enter_and_click() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("photo.rthid");
+        std::fs::create_dir(&session).unwrap();
+        std::fs::write(session.join("manifest.toml"), "version = 1").unwrap();
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let settings = Settings::default();
+        let context = || ctx(&palettes, &templates, &settings);
+        let mut modal = Modal::open_file(temp.path().to_path_buf(), 1);
+        let Modal::OpenFile(picker) = &mut modal else {
+            unreachable!()
+        };
+        picker.set_listing(
+            temp.path().to_path_buf(),
+            vec![Entry {
+                file_name: "photo.rthid".into(),
+                name: "photo.rthid".into(),
+                dir: true,
+            }],
+        );
+        std::fs::remove_file(session.join("manifest.toml")).unwrap();
+        assert_eq!(picker.sessions, [true]);
+        let step = modal.handle_key(key(KeyCode::Enter), context());
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, _)) if path == std::path::Path::new("photo.rthid"))
+        );
+        let area = modal
+            .layout(
+                Rect::new(0, 0, 80, 24),
+                Rect::new(0, 0, 100, 30),
+                &context(),
+            )
+            .list
+            .unwrap();
+        let Modal::OpenFile(picker) = &modal else {
+            unreachable!()
+        };
+        picker.list.render(
+            [Line::raw("photo.rthid [session]")],
+            None,
+            Style::default(),
+            area,
+            &mut ratatui::buffer::Buffer::empty(area),
+        );
+        let step = modal.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), area, 0),
+            context(),
+        );
+        assert!(
+            matches!(step.effect, Some(Effect::Open(path, _)) if path == std::path::Path::new("photo.rthid"))
+        );
     }
 
     #[test]
@@ -1107,7 +1225,7 @@ mod tests {
             unreachable!()
         };
         *confirm = Some((
-            Confirm::new("Delete preset?"),
+            Confirm::new("Delete preset?").yes_label("delete"),
             OnYes::RemovePreset("Paper".into()),
         ));
         let step = modal.handle_mouse(click, context());

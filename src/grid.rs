@@ -1,6 +1,6 @@
 //! Source image, print grid and processed preview caches.
 
-use crate::{document::History, memo::Memo, print::Placement, settings::Settings};
+use crate::{document::Document, memo::Memo, print::Placement, settings::Settings};
 use image::{Rgba, RgbaImage, imageops};
 use rthid_dither::{
     dither::{self, Options, PaletteColor},
@@ -86,7 +86,7 @@ impl GridCache {
     /// Returns true when new dithered indices were built.
     pub fn refresh(
         &mut self,
-        edits: &History,
+        edits: &Document,
         settings: &Settings,
         need_dither: bool,
         need_mass: bool,
@@ -100,7 +100,7 @@ impl GridCache {
             return false;
         };
         if self.composed_revision != Some(edits.revision()) {
-            let composed = edits.current().compose(source);
+            let composed = edits.compose(source);
             if composed != self.composed {
                 self.composed_generation += 1;
                 self.composed = composed;
@@ -333,9 +333,9 @@ mod tests {
         }
     }
 
-    fn empty_edits(cache: &GridCache) -> History {
+    fn empty_edits(cache: &GridCache) -> Document {
         let source = cache.source.as_ref().unwrap();
-        History::new(Document::new(source.width(), source.height()))
+        Document::new(source.width(), source.height())
     }
 
     #[test]
@@ -351,12 +351,12 @@ mod tests {
         assert_eq!(cache.grid(), Some(&source));
         let before = cache.grid_version();
         let indices = cache.dithered().unwrap().clone();
-        edits.edit(|doc| {
-            doc.add_layer("Exposure".into());
-        });
+        edits.add_layer("Exposure".into());
         assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert_eq!(cache.grid_version(), before);
-        edits.amend(|doc| doc.target_mut().unwrap().exposure.add(0, 0, STOP));
+        let before_stroke = edits.layers()[0].exposure.clone();
+        edits.paint(0, |map| map.add(0, 0, STOP));
+        edits.commit_stroke(0, before_stroke);
         assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert!(cache.grid_version() > before);
         assert_ne!(cache.dithered().unwrap(), &indices);
@@ -378,7 +378,7 @@ mod tests {
                 cache.dithered.version()
             )
         );
-        assert!(edits.undo());
+        assert!(edits.undo(0));
         assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert_eq!(cache.grid(), Some(&source));
         assert_eq!(cache.dithered(), Some(&indices));
@@ -396,33 +396,29 @@ mod tests {
         let mut edits = empty_edits(&cache);
         let settings = Settings::for_pixels(8, 8);
         let options = MassOptions::default();
-        edits.edit(|doc| {
-            doc.add_layer("Exposure".into());
-            doc.target_mut().unwrap().exposure.add(0, 0, STOP);
-        });
+        edits.add_layer("Exposure".into());
+        let before_stroke = edits.layers()[0].exposure.clone();
+        edits.paint(0, |map| map.add(0, 0, STOP));
+        edits.commit_stroke(0, before_stroke);
         assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         let grid_version = cache.grid_version();
         let dither_version = cache.dithered.version();
         let composed_generation = cache.composed_generation;
 
-        edits.edit(|doc| {
-            doc.add_layer("Empty".into());
-        });
+        edits.add_layer("Empty".into());
         assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert_eq!(cache.grid_version(), grid_version);
         assert_eq!(cache.dithered.version(), dither_version);
         assert_eq!(cache.composed_generation, composed_generation);
 
-        edits.edit(|doc| doc.set_visible(1, false));
+        edits.set_visible(1, false);
         assert!(!cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert_eq!(cache.grid_version(), grid_version);
         assert_eq!(cache.dithered.version(), dither_version);
         assert_eq!(cache.composed_generation, composed_generation);
 
-        edits.edit(|doc| {
-            doc.select(Some(0));
-            doc.target_mut().unwrap().exposure.add(1, 0, STOP);
-        });
+        edits.select(Some(0));
+        edits.paint(0, |map| map.add(1, 0, STOP));
         assert!(cache.refresh(&edits, &settings, true, false, &options, &mass::MONO));
         assert!(cache.grid_version() > grid_version);
         assert!(cache.dithered.version() > dither_version);

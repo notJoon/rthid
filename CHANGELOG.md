@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Editing layers with visibility, selection and undo history
+- A dodge/burn brush adjusts exposure on the selected layer
+- Ctrl+S saves editing sessions, including source pixels, layers, settings and view controls
+
 - `?` opens a full keyboard and mouse reference outside dialogs
 - Parameter settings are grouped into collapsible Print, Dither, and Tone sections;
   collapsed groups summarize how many active settings differ from defaults

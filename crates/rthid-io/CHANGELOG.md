@@ -7,9 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Shutdown flushes queued Save snapshots along with exports within the existing wait limit
+
 - Export jobs now coalesce per destination, so companion PNG and SVG writes coexist
 
 ### Breaking
+
+- New `Job::Save`, `Job::Load`, `Outcome::Saved` and `Outcome::Loaded` variants require
+  updating exhaustive matches
 
 - `check_not_source(source, Option<&Path>)` becomes `check_not_source(source, &[&Path])`; pass `&[]` or a slice of protected destinations
 - `Job::Open::protect: Option<PathBuf>` becomes `Vec<PathBuf>`; use `vec![]` or include every export destination
@@ -48,6 +53,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Shutdown text: load failure wording -> skipped job wording for `Cause::Stopped`, collect reads with `poll` before `finish`
 
 ### Added
+
+- `Job::Save` writes owned directory snapshots and reports `Outcome::Saved`
+- `Job::Load` reads application values and reports `Outcome::Loaded` with `Output`
+- `Job::load` and `Output::downcast` hide value boxing and report type mismatches with the path
+- `atomic::lock` exposes advisory locking and `atomic::sync_dir` flushes directory entries
+- Public `image::open_regular` opens pixel files while refusing directories and special files
 
 - Error contracts for fallible APIs and process panic hook guidance for `WORKER_NAME` and `panic_message`
 - Executable, compile-checked examples for synchronous config updates and background exports

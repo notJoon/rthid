@@ -41,6 +41,8 @@ mod memo;
 mod modal;
 /// Physical card composition.
 mod print;
+/// Editing session directories.
+mod session;
 /// Editable settings and palette presets.
 mod settings;
 /// Configuration storage and independent settings templates.
@@ -72,7 +74,7 @@ use crate::{app::App, cells::Glyphs, graphics::Mode as Graphics, ui::Renderer};
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Source image to preview.
+    /// Source image or session directory to preview.
     image: Option<PathBuf>,
     /// Save the dithered preview to a PNG file.
     #[arg(long, value_name = "PATH")]
@@ -90,8 +92,8 @@ struct Args {
     #[arg(long, value_enum)]
     glyphs: Option<CliGlyphs>,
     /// Tone colors for the mass study layer, from the dither palette or a fixed set.
-    #[arg(long, value_enum, default_value = "palette")]
-    mass_tones: CliMassTones,
+    #[arg(long, value_enum)]
+    mass_tones: Option<CliMassTones>,
     /// Treat light pixels as ink in the mass study, for light subjects on dark backgrounds.
     /// With `--mass-tones palette` the darkest palette color becomes the background; fixed tone sets keep their order.
     #[arg(long)]
@@ -141,6 +143,19 @@ fn log_timing(
 
 fn log_done(done: &Done, debug_log: &mut Option<&mut File>) -> io::Result<()> {
     log_timing(debug_log, done.op(), done.elapsed, Some(done.path()))
+}
+
+fn apply_mass_flags(app: &mut App, mass_tones: Option<CliMassTones>, mass_invert: bool) {
+    if let Some(tones) = mass_tones {
+        app.mass_tones = match tones {
+            CliMassTones::Palette => None,
+            CliMassTones::Mono => Some(rthid_dither::mass::MONO),
+            CliMassTones::Warm => Some(rthid_dither::mass::WARM),
+        };
+    }
+    if mass_invert {
+        app.mass.invert = true;
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -219,9 +234,27 @@ fn run() -> io::Result<()> {
                 .open(path)
         })
         .transpose()?;
+    let mut restored = None;
     let source = if let Some(path) = path {
+        let path = session::containing(&path).unwrap_or(path);
         let started = Instant::now();
-        let image = load_image(&path);
+        let image = if path.is_dir() && path.extension().is_some_and(|ext| ext == "rthid") {
+            session::read(&path)
+                .and_then(|session| {
+                    let protected: Vec<_> = preview_png.iter().chain(&mass_svg).collect();
+                    session::check_exports(&path, &protected)?;
+                    for source in [&session.source_path, &path.join("manifest.toml")] {
+                        check_not_source(source, &protected)
+                            .map_err(|cause| io::Error::other(cause.to_string()))?;
+                    }
+                    let image = session.source.clone();
+                    restored = Some((path.clone(), session));
+                    Ok(image)
+                })
+                .map_err(image::ImageError::IoError)
+        } else {
+            load_image(&path)
+        };
         log_timing(
             &mut debug_log.as_mut(),
             "decode",
@@ -238,15 +271,20 @@ fn run() -> io::Result<()> {
     };
     let config_path = store::config_path(config);
     let loaded = store::load_or_builtin(config_path.as_deref());
-    let mut app = App::new(source, preview_png.clone(), mass_svg.clone(), dpi, loaded);
+    let mut app = App::new(
+        if restored.is_some() { None } else { source },
+        preview_png.clone(),
+        mass_svg.clone(),
+        dpi,
+        loaded,
+    );
     let term_program = std::env::var("TERM_PROGRAM").ok();
     app.glyphs = glyphs.unwrap_or_else(|| Glyphs::for_terminal(term_program.as_deref()));
-    app.mass_tones = match mass_tones {
-        CliMassTones::Palette => None,
-        CliMassTones::Mono => Some(rthid_dither::mass::MONO),
-        CliMassTones::Warm => Some(rthid_dither::mass::WARM),
-    };
-    app.mass.invert = mass_invert;
+    if let Some((path, session)) = restored {
+        app.open_session(path, session);
+    }
+    apply_mass_flags(&mut app, mass_tones, mass_invert);
+    app.record_saved();
     let mut io = IO::new(std::env::var_os("HOME").map(PathBuf::from))?;
     let worker_panic = Arc::new(Mutex::new(None::<String>));
     #[allow(clippy::needless_update, reason = "Keep future input modes disabled.")]
@@ -288,7 +326,13 @@ fn run() -> io::Result<()> {
     }
     for done in io.finish() {
         terminal_result = terminal_result.and(log_done(&done, &mut debug_log.as_mut()));
-        if matches!(done.outcome, Outcome::Exported(_) | Outcome::Updated(_)) {
+        if let Outcome::Saved(Err(error)) = &done.outcome {
+            terminal_result = terminal_result.and(Err(io::Error::other(error.to_string())));
+        }
+        if matches!(
+            done.outcome,
+            Outcome::Exported(_) | Outcome::Updated(_) | Outcome::Saved(_)
+        ) {
             app.complete(done);
         }
     }
@@ -414,6 +458,24 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn explicit_mass_flags_override_restored_state() {
+        let mut app = App::builtin(image::RgbaImage::new(2, 3), None);
+        app.mass_tones = Some(rthid_dither::mass::WARM);
+        app.mass.invert = true;
+        apply_mass_flags(&mut app, None, false);
+        assert_eq!(app.mass_tones, Some(rthid_dither::mass::WARM));
+        assert!(app.mass.invert);
+        let args =
+            Args::try_parse_from(["rthid", "--mass-tones", "palette", "--mass-invert"]).unwrap();
+        app.mass.invert = false;
+        apply_mass_flags(&mut app, args.mass_tones, args.mass_invert);
+        assert_eq!(app.mass_tones, None);
+        assert!(app.mass.invert);
+        apply_mass_flags(&mut app, Some(CliMassTones::Mono), false);
+        assert_eq!(app.mass_tones, Some(rthid_dither::mass::MONO));
+    }
+
+    #[test]
     fn quit_retries_pending_changes_and_returns_save_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -476,7 +538,7 @@ mod tests {
         assert_eq!(args.dpi, None);
         assert_eq!(args.config, None);
         assert!(args.glyphs.is_none());
-        assert_eq!(args.mass_tones, CliMassTones::Palette);
+        assert_eq!(args.mass_tones, None);
         assert!(!args.mass_invert);
         assert!(matches!(args.graphics, CliGraphics::Auto));
         for (value, expected) in [("auto", CliGraphics::Auto), ("off", CliGraphics::Off)] {
@@ -514,7 +576,7 @@ mod tests {
         assert_eq!(args.mass_svg, Some(PathBuf::from("mass.svg")));
         assert_eq!(args.graphics, CliGraphics::Off);
         assert_eq!(args.glyphs, Some(CliGlyphs::Quadrant));
-        assert_eq!(args.mass_tones, CliMassTones::Warm);
+        assert_eq!(args.mass_tones, Some(CliMassTones::Warm));
         assert!(args.mass_invert);
         for args in [
             ["--graphics", "kitty"],

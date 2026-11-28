@@ -57,7 +57,8 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         "Layers",
         &[
             Hint::new("n", "new layer"),
-            Hint::new("u/U", "undo/redo"),
+            Hint::new("Ctrl+Z / u", "undo layer"),
+            Hint::new("Ctrl+Y / U", "redo layer"),
             Hint::new("Enter", "target"),
             Hint::new("v", "show/hide"),
             Hint::new("x", "delete"),
@@ -71,6 +72,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         "Files",
         &[
             Hint::new("o", "open"),
+            Hint::new("Ctrl+S", "save"),
             Hint::new("P", "presets"),
             Hint::new("T", "templates"),
         ],
@@ -81,6 +83,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
             Hint::new("Tab/Esc", "focus"),
             Hint::new("?", "keys"),
             Hint::new("b", "brush"),
+            Hint::new("B", "dodge/burn"),
             Hint::new("q/Ctrl+C", "quit"),
         ],
     ),
@@ -139,14 +142,23 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         }
         result.push(Hint::new("b", "brush"));
         if app.brush_on {
+            result.push(Hint::new("B", "dodge/burn"));
             result.push(Hint::new("drag", "paint"));
         }
         result.push(Hint::new("n", "new layer"));
-        if app.edits.can_undo() {
-            result.push(Hint::new("u", "undo"));
+        if app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_undo(index))
+        {
+            result.push(Hint::new("Ctrl+Z", "undo layer"));
         }
-        if app.edits.can_redo() {
-            result.push(Hint::new("U", "redo"));
+        if app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_redo(index))
+        {
+            result.push(Hint::new("Ctrl+Y", "redo layer"));
         }
     }
     result
@@ -192,6 +204,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                 Some(Hint::new("f", "flip")),
                 reset.then_some(Hint::new("d", "reset")),
                 Some(Hint::new("o", "open")),
+                Some(Hint::new("Ctrl+S", "save")),
                 Some(Hint::new("P", "presets")),
                 Some(Hint::new("T", "templates")),
             ]
@@ -236,6 +249,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
             Some(Hint::new("Tab", "preview")),
             Some(Hint::new("q", "quit")),
             Some(Hint::new("o", "open")),
+            image.then_some(Hint::new("Ctrl+S", "save")),
             image.then_some(Hint::new("Space", "original/dithered")),
             image.then_some(Hint::new("a", "mass study")),
             image.then(|| zoom_hint(app, geometry)).flatten(),
@@ -397,7 +411,7 @@ fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
 }
 
 fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
-    let doc = app.edits.current();
+    let doc = &app.document;
     let dim = Style::default().fg(Color::DarkGray);
     let title = if app.panel.is_collapsed(LAYER_GROUP) {
         Line::from(vec![
@@ -435,7 +449,11 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
     let block = Block::bordered()
-        .title("rthid")
+        .title(if app.brush_on {
+            format!("rthid · Brush: {}", app.brush.mode.name())
+        } else {
+            "rthid".into()
+        })
         .border_style(focus_style(app.preview_focus));
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
@@ -612,15 +630,35 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
         rows,
         picker,
     } = match modal {
+        Modal::Confirm { question, .. }
+        | Modal::Presets {
+            confirm: Some((question, _)),
+            ..
+        }
+        | Modal::Templates {
+            confirm: Some((question, _)),
+            ..
+        } => ModalContent {
+            title: question.message(),
+            rows: question.lines(),
+            picker: None,
+        },
         Modal::OpenFile(picker) => {
             let rows: Vec<_> = picker
                 .entries
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(index, entry)| {
                     Line::raw(format!(
                         "{}{}",
                         entry.name,
-                        if entry.dir { "/" } else { "" }
+                        if picker.sessions[index] {
+                            " [session]"
+                        } else if entry.dir {
+                            "/"
+                        } else {
+                            ""
+                        }
                     ))
                 })
                 .collect();
@@ -723,6 +761,8 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
             layout.list.unwrap(),
             frame.buffer_mut(),
         );
+    } else if editing.is_none() {
+        frame.render_widget(Paragraph::new(rows), Block::bordered().inner(layout.dialog));
     }
     if let Some(Editing {
         input,
@@ -905,7 +945,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     } else {
         app.view.name().into()
     };
-    report.graphics_error.unwrap_or_else(|| {
+    let text = report.graphics_error.unwrap_or_else(|| {
         format!(
             // Print fields lead so an 80 column terminal clips navigation, not them.
             "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}{}",
@@ -935,7 +975,12 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
                 ""
             },
         )
-    })
+    });
+    if app.modified() {
+        format!("modified | {text}")
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -952,6 +997,51 @@ mod tests {
         },
     };
     use std::io::{self, BufWriter, Write};
+
+    #[test]
+    fn discard_choices_are_inside_the_dialog_and_brush_title_tracks_mode() {
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut renderer = Renderer::default();
+        let screen = layout(Rect::new(0, 0, 100, 40));
+        let geometry = app.geometry(screen.preview);
+        app.brush_on = true;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            &geometry,
+        );
+        assert!(draw_text(&mut terminal, &app, &mut renderer).contains("rthid · Brush: Burn"));
+        app.brush_on = false;
+        assert!(!draw_text(&mut terminal, &app, &mut renderer).contains("Brush: Burn"));
+        app.document.add_layer(app.document.next_layer_name());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &geometry,
+        );
+        draw_text(&mut terminal, &app, &mut renderer);
+        let area = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .layout(screen.preview, screen.screen, &app.modal_ctx())
+            .dialog;
+        let inner = Block::bordered().inner(area);
+        let buffer = terminal.backend().buffer();
+        let body: String = inner
+            .rows()
+            .flat_map(|row| {
+                row.columns()
+                    .map(move |cell| buffer[(cell.x, cell.y)].symbol())
+            })
+            .collect();
+        assert!(body.contains("Edits since the last Ctrl+S will be lost."));
+        assert!(body.contains("y  discard changes"));
+        assert!(body.contains("Esc / other key  cancel"));
+        assert_eq!(
+            app.modal.as_ref().unwrap().hints(&app.modal_ctx())[0],
+            Hint::new("y", "discard changes")
+        );
+    }
 
     #[test]
     fn brush_panel_changed_count_status_and_hints() {
@@ -983,6 +1073,7 @@ mod tests {
             &actual[context.len()..],
             [
                 Hint::new("b", "brush"),
+                Hint::new("B", "dodge/burn"),
                 Hint::new("drag", "paint"),
                 Hint::new("n", "new layer")
             ]
@@ -997,7 +1088,7 @@ mod tests {
     #[test]
     fn layer_panel_renders_top_first_visibility_target_and_collapsed_count() {
         let mut app = hint_fixture(HintState::Layer);
-        app.edits.edit(|doc| doc.set_visible(1, false));
+        app.document.set_visible(1, false);
         let (_, items) = layer_group(&app);
         assert_eq!(
             items.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1030,8 +1121,8 @@ mod tests {
             let hints = hints(&app, &geometry);
             for expected in [
                 Hint::new("n", "new layer"),
-                Hint::new("u", "undo"),
-                Hint::new("U", "redo"),
+                Hint::new("Ctrl+Z", "undo layer"),
+                Hint::new("Ctrl+Y", "redo layer"),
                 Hint::new("Enter", "target"),
                 Hint::new("v", "show/hide"),
                 Hint::new("x", "delete"),
@@ -1138,14 +1229,18 @@ mod tests {
             }
             HintState::Layer | HintState::LayerRedo => {
                 for _ in 0..3 {
-                    app.edits.edit(|doc| {
-                        doc.add_layer(format!("Layer {}", doc.layers().len() + 1));
-                    });
+                    app.document
+                        .add_layer(format!("Layer {}", app.document.layers().len() + 1));
                 }
-                app.edits.select(Some(1));
+                app.document.select(Some(1));
+                let before = app.document.layers()[1].exposure.clone();
+                app.document.paint(1, |map| map.add(0, 0, 256));
+                app.document.commit_stroke(1, before);
+                let before = app.document.layers()[1].exposure.clone();
+                app.document.paint(1, |map| map.add(0, 0, 256));
+                app.document.commit_stroke(1, before);
                 if matches!(state, HintState::LayerRedo) {
-                    app.edits.edit(|doc| doc.set_visible(1, false));
-                    app.edits.undo();
+                    app.document.undo(1);
                 }
                 app.panel.select(
                     Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + 1),
@@ -1215,7 +1310,7 @@ mod tests {
                 app.modal = Some(Modal::Presets {
                     list: ListPicker::new(2),
                     confirm: Some((
-                        Confirm::new("Delete preset?"),
+                        Confirm::new("Delete preset?").yes_label("delete"),
                         OnYes::RemovePreset("Warm".into()),
                     )),
                 });
@@ -1242,7 +1337,7 @@ mod tests {
                     list: ListPicker::new(1),
                     prompt: Some(TextInput::new("Two", 32)),
                     confirm: Some((
-                        Confirm::new("Overwrite template?"),
+                        Confirm::new("Overwrite template?").yes_label("overwrite"),
                         OnYes::OverwriteTemplate("Two".into()),
                     )),
                 });
@@ -1292,6 +1387,9 @@ mod tests {
                 "Home" => vec![key(KeyCode::Home)],
                 "End" => vec![key(KeyCode::End)],
                 "Ctrl+C" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+                "Ctrl+Z" => vec![KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)],
+                "Ctrl+Y" => vec![KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)],
+                "Ctrl+S" => vec![KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)],
                 "arrows" => [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
                     .into_iter()
                     .map(key)
@@ -1361,9 +1459,11 @@ mod tests {
                 KeyModifiers::NONE,
             ));
         }
+        app.record_saved();
         let before = snapshot(&mut app, &mut terminal, &mut renderer);
         let geometry = app.geometry(screen.preview);
         app.handle_key(key, &geometry);
+        app.record_saved();
         before != snapshot(&mut app, &mut terminal, &mut renderer)
     }
 
@@ -1377,7 +1477,7 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, app, &screen, renderer))
             .unwrap();
-        // Brush mode can change while its status and hints are clipped.
+        // Controls can change while their status and hints are clipped.
         (terminal.backend().buffer().clone(), app.quit, app.brush_on)
     }
 
@@ -1450,8 +1550,19 @@ mod tests {
                                 .selected_setting()
                                 .is_some_and(|setting| app.settings.can_reseed(setting))
                     }
-                    KeyCode::Char('u') => !app.edits.can_undo(),
-                    KeyCode::Char('U') => !app.edits.can_redo(),
+                    KeyCode::Char('u') => {
+                        !app.document
+                            .target()
+                            .is_some_and(|index| app.document.can_undo(index))
+                            || advertised.contains(&named_keys("Ctrl+Z")[0])
+                    }
+                    KeyCode::Char('U') => {
+                        !app.document
+                            .target()
+                            .is_some_and(|index| app.document.can_redo(index))
+                            || advertised.contains(&named_keys("Ctrl+Y")[0])
+                    }
+                    KeyCode::Char('B') => !app.brush_on,
                     // = is the unshifted alias for the advertised + zoom binding.
                     KeyCode::Char('=') => true,
                     _ => false,
@@ -1538,12 +1649,12 @@ mod tests {
     }
 
     #[test]
-    fn key_overlay_fits_every_reference_row_at_71_by_31() {
-        assert_eq!(key_overlay_missing(71, 31), None);
-        assert!(key_overlay_missing(70, 31).is_some());
-        assert!(key_overlay_missing(71, 30).is_some());
-        assert_eq!(key_overlay_missing(80, 31), None);
+    fn key_overlay_fits_every_reference_row_at_71_by_32() {
+        assert_eq!(key_overlay_missing(71, 32), None);
+        assert!(key_overlay_missing(70, 32).is_some());
+        assert!(key_overlay_missing(71, 31).is_some());
         assert_eq!(key_overlay_missing(80, 32), None);
+        assert_eq!(key_overlay_missing(80, 33), None);
     }
 
     #[test]
@@ -1595,7 +1706,7 @@ mod tests {
             &geometry,
         );
         assert_eq!(app.keys_scroll, 0);
-        let large = app.geometry(layout(Rect::new(0, 0, 80, 31)).preview);
+        let large = app.geometry(layout(Rect::new(0, 0, 80, 32)).preview);
         assert_eq!(main_hints(&app, &large), vec![Hint::new("Esc/?", "close")]);
     }
 
@@ -2648,10 +2759,10 @@ mod tests {
         assert!(text(&app).starts_with("Card 6x4mm | Dots 30x20 @0.20mm"));
         app.settings.dot = 40;
         app.settings.rotation = crate::settings::Rotation::R90;
-        assert!(text(&app).starts_with("Card 8x12mm | Dots 20x30 @0.40mm"));
+        assert!(text(&app).starts_with("modified | Card 8x12mm | Dots 20x30 @0.40mm"));
         app.settings.margin = 20;
         app.settings.bleed = 3;
-        assert!(text(&app).starts_with("Card 18.4x22.4mm | Dots 46x56 @0.40mm"));
+        assert!(text(&app).starts_with("modified | Card 18.4x22.4mm | Dots 46x56 @0.40mm"));
         assert_eq!(
             status(
                 &App::empty(),
@@ -2672,7 +2783,9 @@ mod tests {
         app.settings.flip = true;
         let geometry = app.geometry(Rect::new(0, 0, 100, 20));
         let text = status(&app, &geometry, PreviewReport::default());
-        assert!(text.starts_with("Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | "));
+        assert!(
+            text.starts_with("modified | Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | ")
+        );
         assert!(!text.contains("PNG"));
         let with_dpi = |dpi| {
             let mut exporting = App::new(
@@ -2689,7 +2802,7 @@ mod tests {
             status(&with_dpi(600), &geometry, PreviewReport::default())
                 .contains("Rot 90° Flip | PNG 1323x2268 @600dpi | ")
         );
-        // Worst case: the widest PNG size and DPI still fit in 80 columns.
+        // The modified marker precedes physical fields so narrow terminals retain it.
         let report = PreviewReport {
             approximate: true,
             ..PreviewReport::default()
@@ -2697,7 +2810,7 @@ mod tests {
         let text = status(&with_dpi(4800), &geometry, report);
         let print =
             "Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | PNG 10583x18142 @4800dpi";
-        assert!(text.starts_with(print), "{text}");
+        assert!(text.starts_with(&format!("modified | {print}")), "{text}");
         assert!(print.chars().count() <= 80);
         app.settings = crate::settings::Settings {
             margin: 100,

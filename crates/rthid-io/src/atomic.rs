@@ -144,12 +144,40 @@ pub fn update<T>(
     let path = resolve(path, true)?;
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
+    let _lock = lock(Path::new(&lock_path), wait).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(error.kind(), format!("{}: file is busy", path.display()))
+        } else {
+            error
+        }
+    })?;
+    let text = read_regular(&path)?;
+    let (text, result) = transform(text)?;
+    replace(&path, |file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })?;
+    #[cfg(unix)]
+    {
+        // Rename committed the edit, reporting failure could retry it over another instance's edits.
+        let _ = File::open(path.parent().unwrap()).and_then(|dir| dir.sync_all());
+    }
+    Ok(result)
+}
+
+/// Holds an advisory lock between cooperating callers until the returned handle is dropped.
+/// `path` names a dedicated lock file, which is created if missing and left in place.
+/// Waits up to `wait` using the same bounded retries as configuration updates.
+///
+/// # Errors
+/// Returns `WouldBlock` when the timeout expires, or file opening and locking errors.
+pub fn lock(path: &Path, wait: Duration) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(lock_path)?;
+        .open(path)?;
     let deadline = Instant::now() + wait;
     let mut delay = Duration::from_millis(5);
     loop {
@@ -169,23 +197,59 @@ pub fn update<T>(
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
-    let text = read_regular(&path)?;
-    let (text, result) = transform(text)?;
-    replace(&path, |file| {
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
-    })?;
+    Ok(lock)
+}
+
+/// Flushes directory entries to storage on Unix, tolerating unsupported directory sync.
+/// Does nothing on other platforms.
+///
+/// # Errors
+/// Returns directory opening or sync errors other than unsupported directory sync.
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
+    return directory_sync_result(File::open(path).and_then(|dir| dir.sync_all()));
+    #[cfg(not(unix))]
     {
-        // Rename committed the edit, reporting failure could retry it over another instance's edits.
-        let _ = File::open(path.parent().unwrap()).and_then(|dir| dir.sync_all());
+        let _ = path;
+        Ok(())
     }
-    Ok(result)
+}
+
+#[cfg(unix)]
+fn directory_sync_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error)
+            if error.kind() == io::ErrorKind::Unsupported
+                || error.raw_os_error().is_some_and(|code| {
+                    [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code)
+                }) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_sync_ignores_only_unsupported_errors() {
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(directory_sync_result(Err(io::Error::from_raw_os_error(code))).is_ok());
+        }
+        assert!(directory_sync_result(Err(io::Error::from(io::ErrorKind::Unsupported))).is_ok());
+        for code in [libc::EIO, libc::EACCES, libc::ENOENT] {
+            assert_eq!(
+                directory_sync_result(Err(io::Error::from_raw_os_error(code)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+    }
 
     #[test]
     #[cfg(unix)]
