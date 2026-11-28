@@ -76,7 +76,7 @@ impl ExposureMap {
         )
     }
 
-    /// Reads an offset, treating absent tiles as zero.
+    /// Reads an offset, treating absent tiles as zero. Panics outside the map.
     pub fn get(&self, x: u32, y: u32) -> i16 {
         assert!(x < self.width && y < self.height);
         let (tile, pixel) = self.position(x, y);
@@ -223,6 +223,12 @@ impl Document {
     /// Applies summed visible offsets, avoiding a copy when no map contributes.
     pub fn compose(&self, source: &RgbaImage) -> Option<RgbaImage> {
         debug_assert_eq!(source.dimensions(), (self.width, self.height));
+        debug_assert!(
+            self.layers.iter().all(|layer| {
+                (layer.exposure.width(), layer.exposure.height()) == (self.width, self.height)
+            }),
+            "layer exposure dimensions must match the document"
+        );
         let layers: Vec<_> = self
             .layers
             .iter()
@@ -283,7 +289,7 @@ impl History {
         &self.states[self.cursor]
     }
 
-    /// Cache key that increases whenever the current state changes.
+    /// Cache key that increases on every edit, amend, reset and successful undo or redo.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -302,7 +308,13 @@ impl History {
     }
 
     /// Updates the current stroke without adding a snapshot.
+    /// Valid only during a gesture begun with `edit` at the current cursor,
+    /// with no undo, redo or reset in between.
     pub fn amend(&mut self, f: impl FnOnce(&mut Document)) {
+        debug_assert!(
+            !self.can_redo() && self.cursor > 0,
+            "amend requires a gesture begun with edit at the current cursor"
+        );
         f(&mut self.states[self.cursor]);
         self.revision += 1;
     }
@@ -433,6 +445,17 @@ mod tests {
         assert_eq!(history.states.len(), 1);
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "amend requires a gesture begun with edit at the current cursor")]
+    fn amend_after_undo_is_invalid() {
+        let mut history = History::new(Document::new(1, 1));
+        history.edit(|_| {});
+        history.edit(|_| {});
+        assert!(history.undo());
+        history.amend(|_| {});
+    }
+
     #[test]
     fn history_cap_keeps_the_newest_states() {
         let mut history = History::new(Document::new(0, 0));
@@ -495,6 +518,18 @@ mod tests {
         doc.target_mut().unwrap().exposure.add(0, 0, STOP);
         doc.set_visible(0, false);
         assert!(doc.compose(&source).is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "layer exposure dimensions must match the document")]
+    fn composition_rejects_mismatched_layer_dimensions() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("empty".into());
+        let layer = doc.target_mut().unwrap();
+        layer.exposure = ExposureMap::new(2, 1);
+        layer.visible = false;
+        doc.compose(&RgbaImage::new(1, 1));
     }
 
     #[test]
