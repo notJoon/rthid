@@ -376,7 +376,7 @@ fn event_loop(
     config_path: Option<&Path>,
     io: &mut IO,
 ) -> io::Result<()> {
-    let mut layout = ui::layout(terminal.size()?);
+    let mut layout = ui::layout(terminal.size()?, app.document.layers().len());
     let mut redraw = true;
     while !app.quit {
         while let Some(done) = io.poll() {
@@ -384,6 +384,7 @@ fn event_loop(
             redraw |= app.complete(done);
         }
         if redraw {
+            layout = ui::layout(layout.screen, app.document.layers().len());
             let started = Instant::now();
             let rebuilt = app.sync(layout.preview);
             if rebuilt {
@@ -431,7 +432,10 @@ fn event_loop(
                     Event::Resize(width, height) => {
                         app.end_layer_drag();
                         app.end_stroke();
-                        layout = ui::layout(ratatui::layout::Size::new(*width, *height));
+                        layout = ui::layout(
+                            ratatui::layout::Size::new(*width, *height),
+                            app.document.layers().len(),
+                        );
                         app.clamp_viewport(layout.preview);
                     }
                     _ => {}
@@ -631,7 +635,7 @@ mod tests {
     fn pointer_motion_after_drag_requests_redraw() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
         let mut app = App::drag_fixture();
-        let layout = ui::layout(ratatui::layout::Size::new(100, 24));
+        let layout = ui::layout(ratatui::layout::Size::new(100, 24), 0);
         for (kind, column, dragging, redraw) in [
             (MouseEventKind::Down(MouseButton::Left), 10, false, false),
             (MouseEventKind::Drag(MouseButton::Left), 9, true, true),

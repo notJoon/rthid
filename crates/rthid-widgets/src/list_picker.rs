@@ -40,6 +40,7 @@ pub struct ListPicker {
     selected: usize,
     offset: Cell<usize>,
     area: Cell<Rect>,
+    rendered_len: Cell<usize>,
 }
 
 impl ListPicker {
@@ -87,6 +88,7 @@ impl ListPicker {
             selected,
             offset: Cell::new(0),
             area: Cell::new(Rect::ZERO),
+            rendered_len: Cell::new(0),
         }
     }
 
@@ -119,6 +121,11 @@ impl ListPicker {
         let row = self.selected(len)?.checked_sub(self.offset.get())?;
         (area.width > 0 && row < usize::from(area.height))
             .then(|| Rect::new(area.x, area.y + row as u16, area.width, 1))
+    }
+
+    /// Ignores mouse input until the next render after rows move.
+    pub fn invalidate(&mut self) {
+        self.area.set(Rect::ZERO);
     }
 
     /// Sets the preferred index, clamped when queried, handled or drawn.
@@ -177,7 +184,8 @@ impl ListPicker {
     /// Selects a clicked item or submits it when already selected.
     ///
     /// Uses the content area remembered by the last draw. Before the first draw,
-    /// clicks and wheel events are ignored. Wheel events inside the content area
+    /// clicks and wheel events are ignored, as are counts changed since drawing.
+    /// Wheel events inside the content area
     /// move one item. Borders and other events are ignored.
     /// Clicking the selected item stands in for a double click in terminals.
     ///
@@ -194,6 +202,9 @@ impl ListPicker {
     /// assert_eq!(picker.handle_mouse(click, 3), Outcome::Submit(1));
     /// ```
     pub fn handle_mouse(&mut self, mouse: MouseEvent, len: usize) -> Outcome<usize> {
+        if self.rendered_len.get() != len {
+            return Outcome::Ignored;
+        }
         let area = self.area.get();
         let position = Position::new(mouse.column, mouse.row);
         if !area.contains(position) {
@@ -368,6 +379,7 @@ impl ListPicker {
         let len = items.len();
         let (list_area, scrollbar_area) = content_area(area, block.as_ref(), len);
         self.area.set(list_area);
+        self.rendered_len.set(len);
         let selected = self.selected(len);
         let mut state = ListState::default()
             .with_selected(selected)
@@ -419,6 +431,35 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn changed_counts_and_invalidated_rows_ignore_mouse_until_rendered() {
+        let area = Rect::new(0, 0, 10, 4);
+        let mut picker = ListPicker::new(0);
+        let render = |picker: &ListPicker, len| {
+            picker.render(
+                vec![Line::raw("item"); len],
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            )
+        };
+        render(&picker, 2);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(picker.handle_mouse(click, 3), Outcome::Ignored);
+        render(&picker, 3);
+        assert_eq!(picker.handle_mouse(click, 3), Outcome::Submit(0));
+        picker.invalidate();
+        assert_eq!(picker.handle_mouse(click, 3), Outcome::Ignored);
+        render(&picker, 3);
+        assert_eq!(picker.handle_mouse(click, 3), Outcome::Submit(0));
     }
 
     #[test]

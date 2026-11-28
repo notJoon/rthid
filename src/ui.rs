@@ -1,8 +1,8 @@
-//! Screen layout and per frame drawing of the preview, parameter panel, help line
+//! Screen layout and per frame drawing of the preview, control blocks, help line
 //! and status line.
 //!
 //! Drawing borrows App immutably. Renderer retains preview caches and terminal
-//! graphics while the panel retains its own scroll offset.
+//! graphics while each picker retains its own scroll offset.
 
 use crate::{
     brush::BrushRow,
@@ -19,8 +19,8 @@ use ratatui::widgets::{Block, Paragraph};
 use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Row, TextInput, hint_line};
 
 use crate::{
-    app::{App, BRUSH_GROUP, LAYER_GROUP, PanelItem},
-    settings::{GROUPS, Setting},
+    app::{App, Focus},
+    settings::{GROUP_LENS, GROUPS, Setting},
 };
 
 const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
@@ -80,7 +80,8 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
     (
         "General",
         &[
-            Hint::new("Tab/Esc", "focus"),
+            Hint::new("Tab/BackTab", "focus"),
+            Hint::new("Esc", "leave preview"),
             Hint::new("?", "keys"),
             Hint::new("b", "brush"),
             Hint::new("B", "dodge/burn"),
@@ -88,12 +89,12 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         ],
     ),
     (
-        "Mouse: panel/preview",
+        "Mouse: blocks/preview",
         &[
             Hint::new("minimap click/drag", "center view"),
             Hint::new("drag on preview", "move image"),
             Hint::new("brush left drag", "paint"),
-            Hint::new("wheel", "pan"),
+            Hint::new("wheel", "select/pan"),
             Hint::new("layer click", "target"),
             Hint::new("click on mark", "show/hide"),
             Hint::new("layer drag", "reorder"),
@@ -126,12 +127,9 @@ fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
 fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     let mut result = main_hints(app, geometry);
     if app.modal.is_none() && !app.keys_open && app.source_path().is_some() {
-        if let Some(Row::Item(item)) = app.panel.selected(&app.panel_lens())
-            && matches!(app.panel_row(item), PanelItem::Layer(_))
-        {
-            let at = usize::from(!app.preview_focus);
+        if app.focus == Focus::Layers && !app.document.layers().is_empty() {
             result.splice(
-                at..at,
+                1..1,
                 [
                     Hint::new("Enter", "target"),
                     Hint::new("v", "show/hide"),
@@ -187,7 +185,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     let overflowing = geometry.overflows();
     let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
     let mass_map = app.mass_map_available(geometry);
-    if app.preview_focus {
+    if app.focus == Focus::Preview {
         return if image {
             [
                 overflowing.then_some(Hint::new("hjkl/arrows", "pan")),
@@ -198,11 +196,11 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                 mass_map.then_some(Hint::new("M", "mass map")),
                 Some(Hint::new("Space", "original/dithered")),
                 Some(Hint::new("a", "mass study")),
-                Some(Hint::new("Tab/Esc", "parameters")),
+                Some(Hint::new("Tab/BackTab", "focus")),
+                Some(Hint::new("Esc", "parameters")),
                 Some(Hint::new("q", "quit")),
                 Some(Hint::new("r/R", "rotate")),
                 Some(Hint::new("f", "flip")),
-                reset.then_some(Hint::new("d", "reset")),
                 Some(Hint::new("o", "open")),
                 Some(Hint::new("Ctrl+S", "save")),
                 Some(Hint::new("P", "presets")),
@@ -214,7 +212,8 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         } else {
             vec![
                 Hint::new("o", "open"),
-                Hint::new("Tab/Esc", "parameters"),
+                Hint::new("Tab/BackTab", "focus"),
+                Hint::new("Esc", "parameters"),
                 Hint::new("q", "quit"),
                 Hint::new("P", "presets"),
                 Hint::new("T", "templates"),
@@ -222,31 +221,38 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         };
     }
     let mut result = vec![ListPicker::MOVE];
-    match app.panel.selected(&app.panel_lens()) {
-        Some(Row::Header(_)) => result.extend_from_slice(app.panel.hints(&app.panel_lens())),
-        Some(Row::Item(i)) => {
-            if let PanelItem::Setting(setting) = app.panel_row(i)
-                && setting.is_active(&app.settings)
-            {
-                result.push(Hint::new("Left/Right h/l", "change"));
-                if app.settings.can_reseed(setting) {
-                    result.push(Hint::new("Enter", "new seed"));
-                }
-                if reset {
-                    result.push(Hint::new("d", "reset"));
-                }
-            } else if let PanelItem::Brush(row) = app.panel_row(i) {
-                result.push(Hint::new("Left/Right h/l", "change"));
-                if row.changed(app.brush) {
-                    result.push(Hint::new("d", "reset"));
+    match app.focus {
+        Focus::Parameters => match app.panel.selected(&GROUP_LENS) {
+            Some(Row::Header(_)) => result.extend_from_slice(app.panel.hints(&GROUP_LENS)),
+            Some(Row::Item(i)) => {
+                let setting = Setting::ALL[i];
+                if setting.is_active(&app.settings) {
+                    result.push(Hint::new("Left/Right h/l", "change"));
+                    if app.settings.can_reseed(setting) {
+                        result.push(Hint::new("Enter", "new seed"));
+                    }
+                    if reset {
+                        result.push(Hint::new("d", "reset"));
+                    }
                 }
             }
+            None => {}
+        },
+        Focus::Brush => {
+            result.push(Hint::new("Left/Right h/l", "change"));
+            if app
+                .brush_picker
+                .selected(BrushRow::ALL.len())
+                .is_some_and(|i| BrushRow::ALL[i].changed(app.brush))
+            {
+                result.push(Hint::new("d", "reset"));
+            }
         }
-        None => {}
+        _ => {}
     }
     result.extend(
         [
-            Some(Hint::new("Tab", "preview")),
+            Some(Hint::new("Tab/BackTab", "focus")),
             Some(Hint::new("q", "quit")),
             Some(Hint::new("o", "open")),
             image.then_some(Hint::new("Ctrl+S", "save")),
@@ -282,16 +288,19 @@ pub struct Layout {
     /// App::geometry.
     pub preview: Rect,
     /// Parameter list including its border.
-    pub panel: Rect,
+    pub parameters: Rect,
+    /// Brush list including its border.
+    pub brush: Rect,
+    /// Layer list including its border.
+    pub layers: Rect,
     /// Key bindings below the body.
     pub help: Rect,
     /// Preview and export status.
     pub status: Rect,
 }
 
-/// Splits the screen into the preview and a fixed width parameter panel above
-/// one help row and one status row.
-pub fn layout(screen: impl Into<Rect>) -> Layout {
+/// Reserves Brush and Layers rows beside the preview, with remaining height for Parameters.
+pub fn layout(screen: impl Into<Rect>, layer_count: usize) -> Layout {
     let screen = screen.into();
     let [body, help, status] = Split::vertical([
         Constraint::Min(0),
@@ -301,11 +310,22 @@ pub fn layout(screen: impl Into<Rect>) -> Layout {
     .areas(screen);
     let [preview_block, panel] =
         Split::horizontal([Constraint::Min(0), Constraint::Length(29)]).areas(body);
+    let brush_height = (BrushRow::ALL.len() as u16 + 2).min(panel.height.saturating_sub(2));
+    let layers_height =
+        (layer_count.clamp(1, 8) as u16 + 2).min(panel.height.saturating_sub(2 + brush_height));
+    let [parameters, brush, layers] = Split::vertical([
+        Constraint::Min(0),
+        Constraint::Length(brush_height),
+        Constraint::Length(layers_height),
+    ])
+    .areas(panel);
     Layout {
         screen,
         preview_block,
         preview: Block::bordered().inner(preview_block),
-        panel,
+        parameters,
+        brush,
+        layers,
         help,
         status,
     }
@@ -391,7 +411,7 @@ fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
         .into_iter()
         .filter(|row| row.changed(app.brush))
         .count();
-    let title = if app.panel.is_collapsed(BRUSH_GROUP) && changed > 0 {
+    let title = if changed > 0 {
         Line::from(vec![
             Span::raw("Brush"),
             Span::styled(
@@ -402,7 +422,6 @@ fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
     } else {
         Line::raw("Brush")
     };
-    // Collapsed items are still passed so the rendered lens matches App::panel_lens.
     let items = BrushRow::ALL
         .into_iter()
         .map(|row| Line::raw(row.label(app.brush)))
@@ -413,14 +432,10 @@ fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
 fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
     let doc = &app.document;
     let dim = Style::default().fg(Color::DarkGray);
-    let title = if app.panel.is_collapsed(LAYER_GROUP) {
-        Line::from(vec![
-            Span::raw("Layers"),
-            Span::styled(format!("  {}", doc.layers().len()), dim),
-        ])
-    } else {
-        Line::raw("Layers")
-    };
+    let title = Line::from(vec![
+        Span::raw("Layers"),
+        Span::styled(format!("  {}", doc.layers().len()), dim),
+    ]);
     let items = doc
         .layers()
         .iter()
@@ -454,60 +469,75 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         } else {
             "rthid".into()
         })
-        .border_style(focus_style(app.preview_focus));
+        .border_style(focus_style(app.focus == Focus::Preview));
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
     frame.render_widget(block, layout.preview_block);
     let mut first = 0;
-    let groups = GROUPS
-        .iter()
-        .enumerate()
-        .map(|(group, &(title, len))| {
-            let settings = &Setting::ALL[first..first + len];
-            first += len;
-            // Collapsed groups still pass their items so the rendered lens
-            // matches App::panel_lens and mouse input stays live.
-            let items = settings
-                .iter()
-                .map(|&setting| {
-                    let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
-                    if setting.is_active(&app.settings) {
-                        label
-                    } else {
-                        label.style(Style::default().fg(Color::DarkGray))
-                    }
-                })
-                .collect();
-            let changed = settings
-                .iter()
-                .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
-                .count();
-            let title = if app.panel.is_collapsed(group) && changed > 0 {
-                Line::from(vec![
-                    Span::raw(title),
-                    Span::styled(
-                        format!("  {changed} changed"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])
-            } else {
-                Line::raw(title)
-            };
-            (title, items)
-        })
-        .chain(std::iter::once(brush_group(app)))
-        .chain(std::iter::once(layer_group(app)));
+    let groups = GROUPS.iter().enumerate().map(|(group, &(title, len))| {
+        let settings = &Setting::ALL[first..first + len];
+        first += len;
+        // Keep all items so collapsed groups retain valid mouse hit counts.
+        let items = settings
+            .iter()
+            .map(|&setting| {
+                let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
+                if setting.is_active(&app.settings) {
+                    label
+                } else {
+                    label.style(Style::default().fg(Color::DarkGray))
+                }
+            })
+            .collect();
+        let changed = settings
+            .iter()
+            .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
+            .count();
+        let title = if app.panel.is_collapsed(group) && changed > 0 {
+            Line::from(vec![
+                Span::raw(title),
+                Span::styled(
+                    format!("  {changed} changed"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        } else {
+            Line::raw(title)
+        };
+        (title, items)
+    });
     let block = Block::bordered()
         .title("Parameters")
-        .border_style(focus_style(!app.preview_focus));
+        .border_style(focus_style(app.focus == Focus::Parameters));
     let highlight = Style::default().fg(Color::Black).bg(Color::Cyan);
     app.panel.render(
         groups,
         Some(block),
         highlight,
-        layout.panel,
+        layout.parameters,
         frame.buffer_mut(),
     );
+    for (picker, (title, rows), area, focus) in [
+        (
+            &app.brush_picker,
+            brush_group(app),
+            layout.brush,
+            Focus::Brush,
+        ),
+        (&app.layers, layer_group(app), layout.layers, Focus::Layers),
+    ] {
+        picker.render(
+            rows,
+            Some(
+                Block::bordered()
+                    .title(title)
+                    .border_style(focus_style(app.focus == focus)),
+            ),
+            highlight,
+            area,
+            frame.buffer_mut(),
+        );
+    }
     frame.render_widget(
         Paragraph::new(hint_line(
             &hints(app, &geometry),
@@ -1003,7 +1033,7 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(16, 16), None);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut renderer = Renderer::default();
-        let screen = layout(Rect::new(0, 0, 100, 40));
+        let screen = layout(Rect::new(0, 0, 100, 40), 0);
         let geometry = app.geometry(screen.preview);
         app.brush_on = true;
         app.handle_key(
@@ -1044,6 +1074,49 @@ mod tests {
     }
 
     #[test]
+    fn independent_blocks_keep_their_titles_and_only_focus_has_a_cyan_border() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for index in 0..12 {
+            app.document.add_layer(format!("Layer {}", index + 1));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut renderer = Renderer::default();
+        let regions = layout(Rect::new(0, 0, 100, 40), 12);
+        for focus in [
+            Focus::Preview,
+            Focus::Parameters,
+            Focus::Brush,
+            Focus::Layers,
+        ] {
+            app.focus = focus;
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            for title in ["Parameters", "Brush", "Layers  12"] {
+                assert!(text.contains(title));
+            }
+            for (area, region) in [
+                (regions.preview_block, Focus::Preview),
+                (regions.parameters, Focus::Parameters),
+                (regions.brush, Focus::Brush),
+                (regions.layers, Focus::Layers),
+            ] {
+                assert_eq!(
+                    terminal.backend().buffer()[(area.x, area.y)].fg,
+                    if focus == region {
+                        Color::Cyan
+                    } else {
+                        Color::Reset
+                    }
+                );
+            }
+        }
+        app.layers.select(11);
+        let text = draw_text(&mut terminal, &app, &mut renderer);
+        assert!(app.layers.offset() > 0);
+        assert!(text.contains("Layer 1"));
+        assert!(!text.contains("Layer 12"));
+    }
+
+    #[test]
     fn brush_panel_changed_count_status_and_hints() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         let (title, rows) = brush_group(&app);
@@ -1052,17 +1125,15 @@ mod tests {
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
             ["Mode  Dodge", "Radius  16 px", "Strength  20%"]
         );
-        app.panel
-            .select(Row::Header(BRUSH_GROUP), &app.panel_lens());
-        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40)).preview);
-        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
+        app.focus = Focus::Brush;
+        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40), 0).preview);
         assert_eq!(brush_group(&app).0.to_string(), "Brush");
         app.brush.radius = 24;
         app.brush.strength = 25;
         let (title, rows) = brush_group(&app);
         assert_eq!(title.to_string(), "Brush  2 changed");
         assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
-        // Outline hides collapsed rows, so the group still passes all of them.
+        // The brush list always shows all controls.
         assert_eq!(rows.len(), BrushRow::ALL.len());
         app.brush_on = true;
         assert!(status(&app, &geometry, PreviewReport::default()).contains("Brush Dodge 24px 25%"));
@@ -1078,15 +1149,14 @@ mod tests {
                 Hint::new("n", "new layer")
             ]
         );
-        app.panel
-            .select(Row::Item(Setting::ALL.len() + 1), &app.panel_lens());
+        app.brush_picker.select(1);
         assert!(hints(&app, &geometry).contains(&Hint::new("d", "reset")));
         app.brush_on = false;
         assert!(!hints(&app, &geometry).contains(&Hint::new("drag", "paint")));
     }
 
     #[test]
-    fn layer_panel_renders_top_first_visibility_target_and_collapsed_count() {
+    fn layer_block_renders_top_first_visibility_target_and_count() {
         let mut app = hint_fixture(HintState::Layer);
         app.document.set_visible(1, false);
         let (_, items) = layer_group(&app);
@@ -1100,35 +1170,43 @@ mod tests {
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("● Layer 3"));
         assert!(text.contains("○ Layer 2 *"));
-        app.panel
-            .select(Row::Header(LAYER_GROUP), &app.panel_lens());
-        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        app.focus = Focus::Layers;
+        let geometry = app.geometry(layout(terminal.size().unwrap(), 0).preview);
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
         let (title, _) = layer_group(&app);
         assert_eq!(title.to_string(), "Layers  3");
         assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Layers  3"));
-        assert!(!text.contains("Layer 2"));
+        assert!(text.contains("Layer 2"));
     }
 
     #[test]
     fn layer_hints_follow_source_history_row_and_modal_state() {
         let mut app = hint_fixture(HintState::LayerRedo);
-        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40)).preview);
-        for preview in [false, true] {
-            app.preview_focus = preview;
+        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40), 0).preview);
+        for focus in [
+            Focus::Preview,
+            Focus::Parameters,
+            Focus::Brush,
+            Focus::Layers,
+        ] {
+            app.focus = focus;
             let hints = hints(&app, &geometry);
             for expected in [
                 Hint::new("n", "new layer"),
                 Hint::new("Ctrl+Z", "undo layer"),
                 Hint::new("Ctrl+Y", "redo layer"),
+            ] {
+                assert!(hints.contains(&expected), "{expected:?}");
+            }
+            for expected in [
                 Hint::new("Enter", "target"),
                 Hint::new("v", "show/hide"),
                 Hint::new("x", "delete"),
                 Hint::new("[ ]", "move"),
             ] {
-                assert!(hints.contains(&expected), "{expected:?}");
+                assert_eq!(hints.contains(&expected), focus == Focus::Layers);
             }
         }
         app.modal = Some(Modal::templates());
@@ -1160,7 +1238,14 @@ mod tests {
         renderer: &mut Renderer,
     ) -> String {
         terminal
-            .draw(|frame| draw(frame, app, &layout(frame.area()), renderer))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    &layout(frame.area(), app.document.layers().len()),
+                    renderer,
+                )
+            })
             .unwrap();
         terminal
             .backend()
@@ -1221,11 +1306,9 @@ mod tests {
         };
         let row = |setting| Setting::ALL.iter().position(|s| *s == setting).unwrap();
         match state {
-            HintState::EmptyPanel => app
-                .panel
-                .select(Row::Item(row(Setting::Zoom)), &app.panel_lens()),
+            HintState::EmptyPanel => app.panel.select(Row::Item(row(Setting::Zoom)), &GROUP_LENS),
             HintState::EmptyPreview | HintState::FitPreview | HintState::SmallFitPreview => {
-                app.preview_focus = true
+                app.focus = Focus::Preview
             }
             HintState::Layer | HintState::LayerRedo => {
                 for _ in 0..3 {
@@ -1242,43 +1325,42 @@ mod tests {
                 if matches!(state, HintState::LayerRedo) {
                     app.document.undo(1);
                 }
-                app.panel.select(
-                    Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + 1),
-                    &app.panel_lens(),
-                );
+                app.focus = Focus::Layers;
+                app.layers.select(1);
             }
             HintState::FitPanel => {
                 app.panel
-                    .select(Row::Item(row(Setting::Brightness)), &app.panel_lens());
+                    .select(Row::Item(row(Setting::Brightness)), &GROUP_LENS);
                 app.settings.tone.brightness = 0.1;
             }
             HintState::OverflowPreview => {
-                app.preview_focus = true;
+                app.focus = Focus::Preview;
                 app.viewport.zoom = viewport::Zoom::In(1);
             }
             HintState::Seed | HintState::SeedPreview => {
-                app.panel
-                    .select(Row::Item(row(Setting::Seed)), &app.panel_lens());
+                app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS);
                 app.settings.dither = Dither::Noise;
                 app.settings.seed = 7;
-                app.preview_focus = matches!(state, HintState::SeedPreview);
+                app.focus = if matches!(state, HintState::SeedPreview) {
+                    Focus::Preview
+                } else {
+                    Focus::Parameters
+                };
             }
             HintState::Header | HintState::CollapsedHeader => {
-                app.panel.select(Row::Header(1), &app.panel_lens());
+                app.panel.select(Row::Header(1), &GROUP_LENS);
                 if matches!(state, HintState::CollapsedHeader) {
                     app.panel.handle_key(
                         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        &app.panel_lens(),
+                        &GROUP_LENS,
                     );
                 }
             }
             HintState::DiffusionSkip => {
                 app.panel
-                    .select(Row::Item(row(Setting::Serpentine)), &app.panel_lens());
+                    .select(Row::Item(row(Setting::Serpentine)), &GROUP_LENS);
             }
-            HintState::InactiveRow => app
-                .panel
-                .select(Row::Item(row(Setting::Seed)), &app.panel_lens()),
+            HintState::InactiveRow => app.panel.select(Row::Item(row(Setting::Seed)), &GROUP_LENS),
             HintState::Keys => app.keys_open = true,
             HintState::OpenFile => {
                 app.modal = Some(Modal::open_file("/images".into(), 1));
@@ -1379,6 +1461,7 @@ mod tests {
                 "Enter" => vec![key(KeyCode::Enter)],
                 "Esc" => vec![key(KeyCode::Esc)],
                 "Tab" => vec![key(KeyCode::Tab)],
+                "BackTab" => vec![key(KeyCode::BackTab)],
                 "Space" => vec![key(KeyCode::Char(' '))],
                 "Up" => vec![key(KeyCode::Up)],
                 "Down" => vec![key(KeyCode::Down)],
@@ -1439,7 +1522,7 @@ mod tests {
         let mut app = hint_fixture(state);
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         let mut renderer = Renderer::default();
-        let screen = layout(Rect::new(0, 0, 80, 30));
+        let screen = layout(Rect::new(0, 0, 80, 30), 0);
         app.sync(screen.preview);
         if matches!(state, HintState::OverflowPreview) {
             let geometry = app.geometry(screen.preview);
@@ -1472,7 +1555,7 @@ mod tests {
         terminal: &mut Terminal<TestBackend>,
         renderer: &mut Renderer,
     ) -> (ratatui::buffer::Buffer, bool, bool) {
-        let screen = layout(terminal.size().unwrap());
+        let screen = layout(terminal.size().unwrap(), app.document.layers().len());
         app.sync(screen.preview);
         terminal
             .draw(|frame| draw(frame, app, &screen, renderer))
@@ -1485,7 +1568,7 @@ mod tests {
     fn every_advertised_key_changes_the_representative_state() {
         for &state in HINT_STATES {
             let mut source = hint_fixture(state);
-            let screen = layout(Rect::new(0, 0, 80, 30));
+            let screen = layout(Rect::new(0, 0, 80, 30), 0);
             source.sync(screen.preview);
             let state_hints = state_hints(&source, &screen);
             for hint in state_hints {
@@ -1535,7 +1618,7 @@ mod tests {
             if app.modal.is_some() {
                 continue;
             }
-            let screen = layout(Rect::new(0, 0, 80, 30));
+            let screen = layout(Rect::new(0, 0, 80, 30), 0);
             app.sync(screen.preview);
             let advertised: Vec<_> = state_hints(&app, &screen)
                 .iter()
@@ -1543,13 +1626,6 @@ mod tests {
                 .collect();
             for key in keys.clone() {
                 let allowed = match key.code {
-                    // Enter also rerolls an active Noise seed while preview has focus.
-                    KeyCode::Enter => {
-                        app.preview_focus
-                            && app
-                                .selected_setting()
-                                .is_some_and(|setting| app.settings.can_reseed(setting))
-                    }
                     KeyCode::Char('u') => {
                         !app.document
                             .target()
@@ -1585,7 +1661,7 @@ mod tests {
         let before = draw_text(&mut terminal, &app, &mut renderer);
         assert!(before.contains("Keys"));
         assert!(before.contains("Esc/?: close"));
-        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        let geometry = app.geometry(layout(terminal.size().unwrap(), 0).preview);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             &geometry,
@@ -1613,7 +1689,8 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         draw_text(&mut terminal, &app, &mut renderer);
-        let inner = Block::bordered().inner(key_help_area(&layout(Rect::new(0, 0, width, height))));
+        let inner =
+            Block::bordered().inner(key_help_area(&layout(Rect::new(0, 0, width, height), 0)));
         let buffer = terminal.backend().buffer();
         inner
             .rows()
@@ -1664,7 +1741,7 @@ mod tests {
         let mut app = hint_fixture(HintState::Keys);
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let geometry = app.geometry(layout(Rect::new(0, 0, 80, 24)).preview);
+        let geometry = app.geometry(layout(Rect::new(0, 0, 80, 24), 0).preview);
         let before = draw_text(&mut terminal, &app, &mut renderer);
         assert!(before.contains("↓ more"));
         assert!(!before.contains("↑ more"));
@@ -1706,7 +1783,7 @@ mod tests {
             &geometry,
         );
         assert_eq!(app.keys_scroll, 0);
-        let large = app.geometry(layout(Rect::new(0, 0, 80, 32)).preview);
+        let large = app.geometry(layout(Rect::new(0, 0, 80, 32), 0).preview);
         assert_eq!(main_hints(&app, &large), vec![Hint::new("Esc/?", "close")]);
     }
 
@@ -1723,7 +1800,7 @@ mod tests {
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
         let mut app = hint_fixture(HintState::OpenFile);
-        let screen = layout(Rect::new(0, 0, 80, 30));
+        let screen = layout(Rect::new(0, 0, 80, 30), 0);
         let before = app
             .modal
             .as_mut()
@@ -1746,7 +1823,7 @@ mod tests {
 
     #[test]
     fn narrow_help_keeps_dialog_escape_and_panel_change() {
-        let screen = layout(Rect::new(0, 0, 80, 30));
+        let screen = layout(Rect::new(0, 0, 80, 30), 0);
         for state in [
             HintState::OpenFile,
             HintState::Presets,
@@ -1828,7 +1905,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let layout = layout(AREA);
+            let layout = layout(AREA, 0);
             app.viewport.set_zoom(zoom, &app.geometry(layout.preview));
             app.view = view;
             app.sync(layout.preview);
@@ -1973,7 +2050,7 @@ mod tests {
         let mut app = App::drag_fixture();
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let layout = layout(terminal.size().unwrap());
+        let layout = layout(terminal.size().unwrap(), 0);
         let g = app.geometry(layout.preview);
         assert!(g.overflows());
         for kind in [
@@ -2012,13 +2089,20 @@ mod tests {
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("No image"));
         assert!(text.contains("o: open file | drop an image file here"));
-        let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
+        let geometry = app.geometry(layout(terminal.size().unwrap(), 0).preview);
         assert_eq!(
             status(&app, &geometry, PreviewReport::default()),
             "No image"
         );
         let frame = terminal
-            .draw(|frame| draw(frame, &app, &layout(frame.area()), &mut renderer))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &layout(frame.area(), app.document.layers().len()),
+                    &mut renderer,
+                )
+            })
             .unwrap();
         let mut log = Vec::new();
         log_minimap(&app, &mut log, &frame, &geometry).unwrap();
@@ -2090,7 +2174,7 @@ mod tests {
                     .iter()
                     .any(|cell| cell.symbol() == "o" && cell.fg == Color::Red)
             );
-            let layout = layout(terminal.size().unwrap());
+            let layout = layout(terminal.size().unwrap(), 0);
             let inner = app
                 .modal
                 .as_ref()
@@ -2182,7 +2266,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
             draw_text(&mut terminal, &app, &mut renderer);
             let modal = app.modal.as_ref().unwrap();
-            let screen = layout(terminal.size().unwrap());
+            let screen = layout(terminal.size().unwrap(), app.document.layers().len());
             let field = modal
                 .layout(screen.preview, screen.screen, &app.modal_ctx())
                 .field
@@ -2259,7 +2343,7 @@ mod tests {
         for with_export in [false, true] {
             if with_export {
                 app = App::builtin(RgbaImage::new(4, 6), Some(dir.path().to_path_buf()));
-                app.sync(layout(Rect::new(0, 0, 80, 24)).preview);
+                app.sync(layout(Rect::new(0, 0, 80, 24), 0).preview);
                 app.complete(rthid_io::io::Done::new(
                     0,
                     std::time::Duration::ZERO,
@@ -2288,53 +2372,27 @@ mod tests {
 
     #[test]
     fn layout_preserves_regions_and_preview_border() {
-        for (screen, expected) in [
-            (
-                Rect::new(0, 0, 100, 40),
-                Layout {
-                    screen: Rect::new(0, 0, 100, 40),
-                    preview_block: Rect::new(0, 0, 71, 38),
-                    preview: Rect::new(1, 1, 69, 36),
-                    panel: Rect::new(71, 0, 29, 38),
-                    help: Rect::new(0, 38, 100, 1),
-                    status: Rect::new(0, 39, 100, 1),
-                },
-            ),
-            (
-                Rect::new(2, 3, 41, 9),
-                Layout {
-                    screen: Rect::new(2, 3, 41, 9),
-                    preview_block: Rect::new(2, 3, 12, 7),
-                    preview: Rect::new(3, 4, 10, 5),
-                    panel: Rect::new(14, 3, 29, 7),
-                    help: Rect::new(2, 10, 41, 1),
-                    status: Rect::new(2, 11, 41, 1),
-                },
-            ),
-            (
-                Rect::new(0, 0, 20, 5),
-                Layout {
-                    screen: Rect::new(0, 0, 20, 5),
-                    preview_block: Rect::new(0, 0, 0, 3),
-                    preview: Rect::new(0, 1, 0, 1),
-                    panel: Rect::new(0, 0, 20, 3),
-                    help: Rect::new(0, 3, 20, 1),
-                    status: Rect::new(0, 4, 20, 1),
-                },
-            ),
-            (
-                Rect::default(),
-                Layout {
-                    screen: Rect::default(),
-                    preview_block: Rect::default(),
-                    preview: Rect::default(),
-                    panel: Rect::default(),
-                    help: Rect::default(),
-                    status: Rect::default(),
-                },
-            ),
+        for screen in [
+            Rect::new(0, 0, 100, 40),
+            Rect::new(2, 3, 41, 9),
+            Rect::new(0, 0, 20, 5),
+            Rect::default(),
         ] {
-            assert_eq!(layout(screen), expected, "{screen:?}");
+            for count in [0, 1, 8, 12] {
+                let regions = layout(screen, count);
+                assert_eq!(
+                    regions.preview,
+                    Block::bordered().inner(regions.preview_block)
+                );
+                assert_eq!(regions.parameters.bottom(), regions.brush.y);
+                assert_eq!(regions.brush.bottom(), regions.layers.y);
+                assert_eq!(regions.layers.bottom(), regions.help.y);
+                assert!(regions.parameters.height <= screen.height);
+                if screen.height >= 20 {
+                    assert_eq!(regions.brush.height, BrushRow::ALL.len() as u16 + 2);
+                    assert_eq!(regions.layers.height, count.clamp(1, 8) as u16 + 2);
+                }
+            }
         }
     }
 
@@ -2351,7 +2409,7 @@ mod tests {
         app.viewport.zoom = viewport::Zoom::In(1);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let mut log = Vec::new();
-        let area = layout(terminal.size().unwrap()).preview;
+        let area = layout(terminal.size().unwrap(), 0).preview;
         app.sync(area);
         let geometry = app.geometry(area);
         assert!(matches!(
@@ -2371,7 +2429,12 @@ mod tests {
         app.mass_minimap = true;
         let frame = terminal
             .draw(|f| {
-                draw(f, &app, &layout(f.area()), &mut renderer);
+                draw(
+                    f,
+                    &app,
+                    &layout(f.area(), app.document.layers().len()),
+                    &mut renderer,
+                );
             })
             .unwrap();
         log_minimap(&app, &mut log, &frame, &geometry).unwrap();
@@ -2420,10 +2483,10 @@ mod tests {
         app.sync(Rect::new(0, 0, 180, 30));
         assert_eq!(app.view, View::Original);
         app.viewport.zoom = viewport::Zoom::In(1);
-        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
-        let panel = layout(terminal.size().unwrap()).panel;
+        let panel = layout(terminal.size().unwrap(), 0).parameters;
         assert_eq!(buffer[(panel.x + 1, panel.y + 1)].symbol(), "▾");
         assert_eq!(buffer[(panel.x + 1, panel.y + 2)].symbol(), ">");
         assert_eq!(buffer[(panel.x + 3, panel.y + 2)].symbol(), "C");
@@ -2461,7 +2524,12 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    draw(
+                        frame,
+                        &app,
+                        &layout(frame.area(), app.document.layers().len()),
+                        &mut renderer,
+                    );
                 })
                 .unwrap();
         }
@@ -2473,13 +2541,13 @@ mod tests {
         let mut app = App::empty();
         app.settings.tone.brightness = 0.1;
         app.settings.tone.contrast = 0.1;
-        app.panel.select(Row::Header(2), &app.panel_lens());
+        app.panel.select(Row::Header(2), &GROUP_LENS);
         app.panel.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &app.panel_lens(),
+            &GROUP_LENS,
         );
-        app.panel.select(Row::Item(0), &app.panel_lens());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app.panel.select(Row::Item(0), &GROUP_LENS);
+        let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("▸ Tone  2 changed"), "{text}");
         assert!(text.contains("> Card: Image"), "{text}");
@@ -2490,23 +2558,23 @@ mod tests {
     fn collapsed_group_header_click_expands_after_draw() {
         let mut renderer = Renderer::default();
         let mut app = App::empty();
-        for group in [BRUSH_GROUP, 0] {
-            app.panel.select(Row::Header(group), &app.panel_lens());
+        for group in [1, 0] {
+            app.panel.select(Row::Header(group), &GROUP_LENS);
             app.panel.handle_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &app.panel_lens(),
+                &GROUP_LENS,
             );
             assert!(app.panel.is_collapsed(group));
         }
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         draw_text(&mut terminal, &app, &mut renderer);
         let screen = terminal.size().unwrap().into();
-        let layout = layout(screen);
+        let layout = layout(screen, 0);
         app.handle_mouse(
             ratatui::crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: layout.panel.x + 2,
-                row: layout.panel.y + 1,
+                column: layout.parameters.x + 2,
+                row: layout.parameters.y + 1,
                 modifiers: KeyModifiers::NONE,
             },
             &app.geometry(layout.preview),
@@ -2533,7 +2601,7 @@ mod tests {
         let mut renderer = Renderer::default();
         for (width, height) in [(60, 12), (1, 1), (20, 5)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            let layout = layout(terminal.size().unwrap());
+            let layout = layout(terminal.size().unwrap(), 0);
             for _ in 0..20 {
                 app.handle_key(
                     KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
@@ -2566,20 +2634,25 @@ mod tests {
 
         let mut renderer = Renderer::default();
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
         for _ in 0..15 {
             app.handle_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                &app.geometry(layout(terminal.size().unwrap()).preview),
+                &app.geometry(layout(terminal.size().unwrap(), 0).preview),
             );
             terminal
                 .draw(|frame| {
-                    draw(frame, &app, &layout(frame.area()), &mut renderer);
+                    draw(
+                        frame,
+                        &app,
+                        &layout(frame.area(), app.document.layers().len()),
+                        &mut renderer,
+                    );
                 })
                 .unwrap();
         }
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(14)));
-        let panel = layout(terminal.size().unwrap()).panel;
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(14)));
+        let panel = layout(terminal.size().unwrap(), 0).parameters;
         let first_panel_row = |terminal: &Terminal<TestBackend>| {
             (panel.x + 1..panel.right() - 1)
                 .map(|x| terminal.backend().buffer()[(x, panel.y + 1)].symbol())
@@ -2590,10 +2663,10 @@ mod tests {
         assert_eq!(first_panel_row(&terminal), "▾ Tone");
         app.handle_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            &app.geometry(layout(terminal.size().unwrap()).preview),
+            &app.geometry(layout(terminal.size().unwrap(), 0).preview),
         );
         let text = draw_text(&mut terminal, &app, &mut renderer);
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(13)));
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(13)));
         assert_eq!(first_panel_row(&terminal), "▾ Tone");
         for label in ["Tone", "Brightness", "Contrast"] {
             assert!(text.contains(label), "missing {label}: {text}");
@@ -2606,7 +2679,7 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(8, 12), None);
         app.settings = crate::settings::Settings::for_pixels(8, 12);
         app.view = View::Dithered;
-        app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
+        app.sync(layout(Rect::new(0, 0, 100, 24), 0).preview);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Dithered | Fit (sextant)"));
@@ -2614,13 +2687,13 @@ mod tests {
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Fit (quadrant)"));
         app.viewport.zoom = viewport::Zoom::In(1);
-        app.preview_focus = true;
+        app.focus = Focus::Preview;
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
         assert!(text.contains("100% x 1-8 y 1-12"));
         assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
         app.view = View::Mass;
-        app.sync(layout(Rect::new(0, 0, 100, 24)).preview);
+        app.sync(layout(Rect::new(0, 0, 100, 24), 0).preview);
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("Mass | 100%"));
     }
@@ -2642,7 +2715,7 @@ mod tests {
                 let mut picker = ratatui_image::picker::Picker::halfblocks();
                 picker.set_protocol_type(protocol);
                 let font = picker.font_size();
-                let geometry = app.geometry(layout(ratatui::layout::Size::new(100, 40)).preview);
+                let geometry = app.geometry(layout(ratatui::layout::Size::new(100, 40), 0).preview);
                 let (cw, ch) = viewport::fit_aspect(
                     geometry.grid.0,
                     geometry.grid.1,
@@ -2656,16 +2729,26 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
                 terminal
                     .draw(|frame| {
-                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                        crate::ui::draw(
+                            frame,
+                            &app,
+                            &layout(frame.area(), app.document.layers().len()),
+                            &mut renderer,
+                        );
                     })
                     .unwrap();
                 app.view = view;
                 app.viewport.zoom = zoom;
                 app.brush_on = brush_on;
-                app.sync(layout(terminal.size().unwrap()).preview);
+                app.sync(layout(terminal.size().unwrap(), 0).preview);
                 let completed = terminal
                     .draw(|frame| {
-                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
+                        crate::ui::draw(
+                            frame,
+                            &app,
+                            &layout(frame.area(), app.document.layers().len()),
+                            &mut renderer,
+                        );
                     })
                     .unwrap();
                 for pos in completed.buffer.area.positions() {
@@ -2679,7 +2762,12 @@ mod tests {
                 let mut baseline = Terminal::new(TestBackend::new(100, 40)).unwrap();
                 baseline
                     .draw(|frame| {
-                        crate::ui::draw(frame, &app, &layout(frame.area()), &mut glyphs);
+                        crate::ui::draw(
+                            frame,
+                            &app,
+                            &layout(frame.area(), app.document.layers().len()),
+                            &mut glyphs,
+                        );
                     })
                     .unwrap();
                 for pos in completed.buffer.area.positions() {
@@ -2715,7 +2803,7 @@ mod tests {
             let mut app = App::builtin(RgbaImage::new(400, 400), None);
             for view in [View::Original, View::Dithered, View::Mass] {
                 app.view = view;
-                app.sync(layout(terminal.size().unwrap()).preview);
+                app.sync(layout(terminal.size().unwrap(), 0).preview);
                 for zoom in [
                     viewport::Zoom::Fit,
                     viewport::Zoom::Out(4),
@@ -2731,7 +2819,9 @@ mod tests {
                         app.brush_on = brush_on;
                         terminal
                             .draw(|frame| {
-                                let g = app.geometry(layout(frame.area()).preview);
+                                let g = app.geometry(
+                                    layout(frame.area(), app.document.layers().len()).preview,
+                                );
                                 let report = draw_preview(frame, &app, &g, &mut renderer);
                                 assert_eq!(
                                     report.graphics_name.is_some(),
