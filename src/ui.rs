@@ -5,6 +5,7 @@
 //! graphics while the panel retains its own scroll offset.
 
 use crate::{
+    brush::BrushRow,
     cells::{self, View},
     graphics,
     modal::{Modal, editor_prefix, editor_rows, preset_rows, swatch_span, template_rows},
@@ -18,13 +19,13 @@ use ratatui::widgets::{Block, Paragraph};
 use rthid_widgets::{Dialog, Hint, KeyHelp, ListPicker, Row, TextInput, hint_line};
 
 use crate::{
-    app::{App, PanelItem},
+    app::{App, BRUSH_GROUP, LAYER_GROUP, PanelItem},
     settings::{GROUPS, Setting},
 };
 
 const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
     (
-        "Parameters",
+        "Parameters / Brush",
         &[
             ListPicker::MOVE,
             Hint::new("Left/Right h/l", "change/close/open"),
@@ -79,6 +80,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         &[
             Hint::new("Tab/Esc", "focus"),
             Hint::new("?", "keys"),
+            Hint::new("b", "brush"),
             Hint::new("q/Ctrl+C", "quit"),
         ],
     ),
@@ -87,6 +89,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         &[
             Hint::new("minimap click/drag", "center view"),
             Hint::new("drag on preview", "move image"),
+            Hint::new("brush left drag", "paint"),
             Hint::new("wheel", "pan"),
             Hint::new("layer click", "target"),
             Hint::new("click on mark", "show/hide"),
@@ -133,6 +136,10 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                     Hint::new("[ ]", "move"),
                 ],
             );
+        }
+        result.push(Hint::new("b", "brush"));
+        if app.brush_on {
+            result.push(Hint::new("drag", "paint"));
         }
         result.push(Hint::new("n", "new layer"));
         if app.edits.can_undo() {
@@ -213,6 +220,11 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                     result.push(Hint::new("Enter", "new seed"));
                 }
                 if reset {
+                    result.push(Hint::new("d", "reset"));
+                }
+            } else if let PanelItem::Brush(row) = app.panel_row(i) {
+                result.push(Hint::new("Left/Right h/l", "change"));
+                if row.changed(app.brush) {
                     result.push(Hint::new("d", "reset"));
                 }
             }
@@ -360,10 +372,34 @@ pub fn log_minimap(
     log.flush()
 }
 
+fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
+    let changed = BrushRow::ALL
+        .into_iter()
+        .filter(|row| row.changed(app.brush))
+        .count();
+    let title = if app.panel.is_collapsed(BRUSH_GROUP) && changed > 0 {
+        Line::from(vec![
+            Span::raw("Brush"),
+            Span::styled(
+                format!("  {changed} changed"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::raw("Brush")
+    };
+    // Collapsed items are still passed so the rendered lens matches App::panel_lens.
+    let items = BrushRow::ALL
+        .into_iter()
+        .map(|row| Line::raw(row.label(app.brush)))
+        .collect();
+    (title, items)
+}
+
 fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
     let doc = app.edits.current();
     let dim = Style::default().fg(Color::DarkGray);
-    let title = if app.panel.is_collapsed(3) {
+    let title = if app.panel.is_collapsed(LAYER_GROUP) {
         Line::from(vec![
             Span::raw("Layers"),
             Span::styled(format!("  {}", doc.layers().len()), dim),
@@ -441,6 +477,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
             };
             (title, items)
         })
+        .chain(std::iter::once(brush_group(app)))
         .chain(std::iter::once(layer_group(app)));
     let block = Block::bordered()
         .title("Parameters")
@@ -742,7 +779,7 @@ fn rgb_to_ansi256(rgb: [u8; 3]) -> u8 {
     }
 }
 
-// Uses terminal graphics only for Original at Fit and cell glyphs otherwise.
+// Uses terminal graphics only for Original at Fit with the brush off.
 // Calls present every frame so a hidden image is cleared.
 fn draw_preview(
     frame: &mut Frame,
@@ -765,6 +802,7 @@ fn draw_preview(
     };
     let image_mode = app.modal.is_none()
         && !app.keys_open
+        && !app.brush_on
         && renderer.graphics.is_some()
         && app.view == View::Original
         && geometry.zoom == viewport::Zoom::Fit
@@ -852,6 +890,16 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
             )
         }
     };
+    let mode = if app.brush_on {
+        format!(
+            "{mode} | Brush {} {}px {}%",
+            app.brush.mode.name(),
+            app.brush.radius,
+            app.brush.strength
+        )
+    } else {
+        mode
+    };
     let displayed = if let Some(name) = report.graphics_name {
         format!("Original ({name})")
     } else {
@@ -906,6 +954,47 @@ mod tests {
     use std::io::{self, BufWriter, Write};
 
     #[test]
+    fn brush_panel_changed_count_status_and_hints() {
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        let (title, rows) = brush_group(&app);
+        assert_eq!(title.to_string(), "Brush");
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["Mode  Dodge", "Radius  16 px", "Strength  20%"]
+        );
+        app.panel
+            .select(Row::Header(BRUSH_GROUP), &app.panel_lens());
+        let geometry = app.geometry(layout(Rect::new(0, 0, 100, 40)).preview);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
+        assert_eq!(brush_group(&app).0.to_string(), "Brush");
+        app.brush.radius = 24;
+        app.brush.strength = 25;
+        let (title, rows) = brush_group(&app);
+        assert_eq!(title.to_string(), "Brush  2 changed");
+        assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
+        // Outline hides collapsed rows, so the group still passes all of them.
+        assert_eq!(rows.len(), BrushRow::ALL.len());
+        app.brush_on = true;
+        assert!(status(&app, &geometry, PreviewReport::default()).contains("Brush Dodge 24px 25%"));
+        let context = main_hints(&app, &geometry);
+        let actual = hints(&app, &geometry);
+        assert_eq!(&actual[..context.len()], context);
+        assert_eq!(
+            &actual[context.len()..],
+            [
+                Hint::new("b", "brush"),
+                Hint::new("drag", "paint"),
+                Hint::new("n", "new layer")
+            ]
+        );
+        app.panel
+            .select(Row::Item(Setting::ALL.len() + 1), &app.panel_lens());
+        assert!(hints(&app, &geometry).contains(&Hint::new("d", "reset")));
+        app.brush_on = false;
+        assert!(!hints(&app, &geometry).contains(&Hint::new("drag", "paint")));
+    }
+
+    #[test]
     fn layer_panel_renders_top_first_visibility_target_and_collapsed_count() {
         let mut app = hint_fixture(HintState::Layer);
         app.edits.edit(|doc| doc.set_visible(1, false));
@@ -920,7 +1009,8 @@ mod tests {
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("● Layer 3"));
         assert!(text.contains("○ Layer 2 *"));
-        app.panel.select(Row::Header(3), &app.panel_lens());
+        app.panel
+            .select(Row::Header(LAYER_GROUP), &app.panel_lens());
         let geometry = app.geometry(layout(terminal.size().unwrap()).preview);
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
         let (title, _) = layer_group(&app);
@@ -1057,8 +1147,10 @@ mod tests {
                     app.edits.edit(|doc| doc.set_visible(1, false));
                     app.edits.undo();
                 }
-                app.panel
-                    .select(Row::Item(Setting::ALL.len() + 1), &app.panel_lens());
+                app.panel.select(
+                    Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + 1),
+                    &app.panel_lens(),
+                );
             }
             HintState::FitPanel => {
                 app.panel
@@ -1279,13 +1371,14 @@ mod tests {
         app: &mut App,
         terminal: &mut Terminal<TestBackend>,
         renderer: &mut Renderer,
-    ) -> (ratatui::buffer::Buffer, bool) {
+    ) -> (ratatui::buffer::Buffer, bool, bool) {
         let screen = layout(terminal.size().unwrap());
         app.sync(screen.preview);
         terminal
             .draw(|frame| draw(frame, app, &screen, renderer))
             .unwrap();
-        (terminal.backend().buffer().clone(), app.quit)
+        // Brush mode can change while its status and hints are clipped.
+        (terminal.backend().buffer().clone(), app.quit, app.brush_on)
     }
 
     #[test]
@@ -2286,12 +2379,14 @@ mod tests {
     fn collapsed_group_header_click_expands_after_draw() {
         let mut renderer = Renderer::default();
         let mut app = App::empty();
-        app.panel.select(Row::Header(0), &app.panel_lens());
-        app.panel.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &app.panel_lens(),
-        );
-        assert!(app.panel.is_collapsed(0));
+        for group in [BRUSH_GROUP, 0] {
+            app.panel.select(Row::Header(group), &app.panel_lens());
+            app.panel.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &app.panel_lens(),
+            );
+            assert!(app.panel.is_collapsed(group));
+        }
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         draw_text(&mut terminal, &app, &mut renderer);
         let screen = terminal.size().unwrap().into();
@@ -2422,7 +2517,11 @@ mod tests {
     fn leaving_graphics_repaints_the_previous_image_in_one_draw() {
         use ratatui::buffer::CellDiffOption;
         use ratatui_image::picker::ProtocolType;
-        for exact in [false, true] {
+        for (view, zoom, brush_on) in [
+            (View::Dithered, viewport::Zoom::Fit, false),
+            (View::Original, viewport::Zoom::In(1), false),
+            (View::Original, viewport::Zoom::Fit, true),
+        ] {
             for protocol in [
                 ProtocolType::Kitty,
                 ProtocolType::Iterm2,
@@ -2449,16 +2548,9 @@ mod tests {
                         crate::ui::draw(frame, &app, &layout(frame.area()), &mut renderer);
                     })
                     .unwrap();
-                app.view = if exact {
-                    View::Original
-                } else {
-                    View::Dithered
-                };
-                app.viewport.zoom = if exact {
-                    viewport::Zoom::In(1)
-                } else {
-                    viewport::Zoom::Fit
-                };
+                app.view = view;
+                app.viewport.zoom = zoom;
+                app.brush_on = brush_on;
                 app.sync(layout(terminal.size().unwrap()).preview);
                 let completed = terminal
                     .draw(|frame| {
@@ -2524,16 +2616,21 @@ mod tests {
                     viewport::Zoom::In(4),
                 ] {
                     app.viewport.zoom = zoom;
-                    terminal
-                        .draw(|frame| {
-                            let g = app.geometry(layout(frame.area()).preview);
-                            let report = draw_preview(frame, &app, &g, &mut renderer);
-                            assert_eq!(
-                                report.graphics_name.is_some(),
-                                view == View::Original && zoom == viewport::Zoom::Fit
-                            );
-                        })
-                        .unwrap();
+                    for brush_on in [false, true, false] {
+                        app.brush_on = brush_on;
+                        terminal
+                            .draw(|frame| {
+                                let g = app.geometry(layout(frame.area()).preview);
+                                let report = draw_preview(frame, &app, &g, &mut renderer);
+                                assert_eq!(
+                                    report.graphics_name.is_some(),
+                                    !brush_on
+                                        && view == View::Original
+                                        && zoom == viewport::Zoom::Fit
+                                );
+                            })
+                            .unwrap();
+                    }
                 }
             }
         }

@@ -434,6 +434,53 @@ mod tests {
     }
 
     #[test]
+    fn inverse_placement_matches_coordinate_pixels_for_every_orientation_and_crop() {
+        let source = RgbaImage::from_fn(30, 20, |x, y| Rgba([x as u8, y as u8, 0, 255]));
+        for rotation in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            for flip in [false, true] {
+                for (zoom, pan_x, pan_y) in [(100, 0, 0), (175, 65, -40), (60, -30, 55)] {
+                    let settings = Settings {
+                        rotation,
+                        flip,
+                        zoom,
+                        pan_x,
+                        pan_y,
+                        margin: 4,
+                        ..Settings::default()
+                    };
+                    let mut cache = cache(source.clone());
+                    cache.refresh(
+                        &empty_edits(&cache),
+                        &settings,
+                        false,
+                        false,
+                        &MassOptions::default(),
+                        &mass::MONO,
+                    );
+                    let p = cache.placement(&settings).unwrap();
+                    let (x0, y0, x1, y1) = p.covered();
+                    for (x, y, pixel) in cache.grid().unwrap().enumerate_pixels() {
+                        let mapped =
+                            p.source_point((f64::from(x), f64::from(y)), source.dimensions());
+                        let covered = x >= p.inset + x0
+                            && x < p.inset + x1
+                            && y >= p.inset + y0
+                            && y < p.inset + y1;
+                        assert_eq!(mapped.is_some(), covered);
+                        if let Some((sx, sy)) = mapped {
+                            assert!(
+                                (sx - f64::from(pixel[0])).abs() <= 1.0,
+                                "{rotation:?} {flip} {x},{y}: {sx} {pixel:?}"
+                            );
+                            assert!((sy - f64::from(pixel[1])).abs() <= 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn image_card_preserves_every_source_pixel_at_each_rotation() {
         for (w, h) in [(30, 20), (1, 2)] {
             let source = RgbaImage::from_fn(w, h, |x, y| Rgba([x as u8, y as u8, 0, 255]));

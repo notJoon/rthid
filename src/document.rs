@@ -60,19 +60,11 @@ impl ExposureMap {
     }
 
     /// Source width in pixels.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
-    )]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Source height in pixels.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
-    )]
     pub fn height(&self) -> u32 {
         self.height
     }
@@ -92,10 +84,6 @@ impl ExposureMap {
     }
 
     /// Adds with saturation, ignoring coordinates outside the source.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
-    )]
     pub fn add(&mut self, x: u32, y: u32, delta: i16) {
         if x >= self.width || y >= self.height {
             return;
@@ -164,6 +152,19 @@ impl Document {
         self.selected
     }
 
+    /// Uses the first available numbered layer name, filling gaps after deletion.
+    pub fn next_layer_name(&self) -> String {
+        let mut k = 1;
+        while self
+            .layers
+            .iter()
+            .any(|layer| layer.name == format!("Layer {k}"))
+        {
+            k += 1;
+        }
+        format!("Layer {k}")
+    }
+
     /// Adds a layer at the top and selects it.
     pub fn add_layer(&mut self, name: String) -> usize {
         self.layers.push(Layer::new(name, self.width, self.height));
@@ -228,10 +229,6 @@ impl Document {
     }
 
     /// Mutable access to the layer an edit should affect.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "used by the dodge/burn brush (#40)")
-    )]
     pub fn target_mut(&mut self) -> Option<&mut Layer> {
         let index = self.target()?;
         self.layers.get_mut(index)
@@ -415,6 +412,18 @@ impl History {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn layer_names_fill_the_first_available_number() {
+        let mut document = Document::new(1, 1);
+        assert_eq!(document.next_layer_name(), "Layer 1");
+        document.add_layer(document.next_layer_name());
+        document.add_layer(document.next_layer_name());
+        document.add_layer(document.next_layer_name());
+        assert_eq!(document.next_layer_name(), "Layer 4");
+        document.remove_layer(1);
+        assert_eq!(document.next_layer_name(), "Layer 2");
+    }
 
     #[test]
     fn unchanged_snapshot_is_discarded_only_when_equal() {

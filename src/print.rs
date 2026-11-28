@@ -113,6 +113,39 @@ impl Placement {
         Ok(result)
     }
 
+    /// Maps a dot center back to the original source, excluding paper and uncovered space.
+    /// Integer results are source pixel centers. `source` must match the size passed to `new`.
+    pub(crate) fn source_point(&self, dot: (f64, f64), source: (u32, u32)) -> Option<(f64, f64)> {
+        debug_assert!(source.0 > 0 && source.1 > 0);
+        let x = dot.0 - f64::from(self.inset);
+        let y = dot.1 - f64::from(self.inset);
+        let (x0, y0, x1, y1) = self.covered();
+        let ix = (x + 0.5).floor();
+        let iy = (y + 0.5).floor();
+        if !(ix >= f64::from(x0) && ix < f64::from(x1) && iy >= f64::from(y0) && iy < f64::from(y1))
+        {
+            return None;
+        }
+        let (ew, eh) = if self.rotation.swaps_axes() {
+            (source.1, source.0)
+        } else {
+            source
+        };
+        let mut x = ((x - self.x as f64 + 0.5) * f64::from(ew) / f64::from(self.sw) - 0.5)
+            .clamp(0.0, f64::from(ew - 1));
+        let y = ((y - self.y as f64 + 0.5) * f64::from(eh) / f64::from(self.sh) - 0.5)
+            .clamp(0.0, f64::from(eh - 1));
+        if self.flip {
+            x = f64::from(ew - 1) - x;
+        }
+        Some(match self.rotation {
+            Rotation::R0 => (x, y),
+            Rotation::R90 => (y, f64::from(source.1 - 1) - x),
+            Rotation::R180 => (f64::from(source.0 - 1) - x, f64::from(source.1 - 1) - y),
+            Rotation::R270 => (f64::from(source.0 - 1) - y, x),
+        })
+    }
+
     /// Image area cells the resized source covers, as `(x0, y0, x1, y1)` with exclusive ends.
     pub fn covered(&self) -> (u32, u32, u32, u32) {
         let clip = |offset: i64, size: u32, area: u32| {
@@ -135,6 +168,40 @@ mod tests {
 
     fn grid_dimensions(settings: &Settings) -> Result<(u32, u32), &'static str> {
         Ok(settings.dimensions((1, 1))?.grid)
+    }
+
+    #[test]
+    fn source_point_uses_dot_footprints_at_paper_edges() {
+        let settings = Settings {
+            margin: 2,
+            ..Settings::default()
+        };
+        let source = (8, 8);
+        let placement = Placement::new(source, &settings).unwrap();
+        assert_eq!(placement.inset, 1);
+        assert_eq!(
+            placement.source_point((0.75, 1.0), source),
+            Some((0.0, 0.0))
+        );
+        assert_eq!(placement.source_point((8.75, 1.0), source), None);
+        assert_eq!(
+            placement.source_point((1.0, 0.75), source),
+            Some((0.0, 0.0))
+        );
+        assert_eq!(placement.source_point((1.0, 8.75), source), None);
+        for y in 0..10 {
+            for x in 0..10 {
+                let expected = if (1..9).contains(&x) && (1..9).contains(&y) {
+                    Some((f64::from(x - 1), f64::from(y - 1)))
+                } else {
+                    None
+                };
+                assert_eq!(
+                    placement.source_point((f64::from(x), f64::from(y)), source),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

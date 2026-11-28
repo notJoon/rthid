@@ -122,8 +122,8 @@ pub(crate) fn fit_aspect(w: u32, h: u32, area: Rect, aspect: f64) -> (u16, u16) 
 /// 8     b b b b              . . . .     . . . .
 /// ```
 ///
-/// With Original at Fit and a graphics backend, the preview is drawn as a real
-/// image and none of these cells are painted.
+/// With Original at Fit, a graphics backend and the brush off, the preview is drawn
+/// as a real image and none of these cells are painted.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Zoom {
     /// The whole grid fitted to the preview with the cell aspect preserved.
@@ -231,6 +231,30 @@ pub struct PreviewGeometry {
 }
 
 impl PreviewGeometry {
+    /// Grid dot under the cell center, excluding cells outside the preview target.
+    /// Integer coordinates are dot centers. A trailing partial cell maps to the
+    /// last dot it draws.
+    pub(crate) fn dot_at(&self, column: u16, row: u16) -> Option<(f64, f64)> {
+        if !self.target.contains((column, row).into()) {
+            return None;
+        }
+        let (dx, dy) = if self.zoom == Zoom::Fit {
+            (
+                f64::from(self.grid.0) / f64::from(self.target.width),
+                f64::from(self.grid.1) / f64::from(self.target.height),
+            )
+        } else {
+            self.zoom.dots_per_cell(self.grid, self.area)
+        };
+        let last = |len: u32| f64::from(len.saturating_sub(1));
+        Some((
+            (f64::from(self.origin.0) + (f64::from(column - self.target.x) + 0.5) * dx - 0.5)
+                .clamp(0.0, last(self.grid.0)),
+            (f64::from(self.origin.1) + (f64::from(row - self.target.y) + 0.5) * dy - 0.5)
+                .clamp(0.0, last(self.grid.1)),
+        ))
+    }
+
     /// Whether any image dots lie outside the visible region.
     pub fn overflows(&self) -> bool {
         self.grid.0 > self.visible.0 || self.grid.1 > self.visible.1
@@ -422,6 +446,48 @@ mod tests {
         Zoom::In(3),
         Zoom::In(4),
     ];
+
+    #[test]
+    fn cell_centers_map_to_dots_at_fit_out_and_in() {
+        let area = Rect::new(3, 5, 20, 10);
+        for (zoom, target, first, second) in [
+            (
+                Zoom::Fit,
+                Rect::new(3, 6, 20, 8),
+                (2.0, 5.125),
+                (7.0, 16.375),
+            ),
+            (Zoom::Out(2), area, (12.5, 9.75), (14.5, 14.25)),
+            (Zoom::In(2), area, (11.75, 8.0), (12.25, 9.0)),
+        ] {
+            let viewport = Viewport {
+                zoom,
+                x: 12,
+                y: 8,
+                ..Viewport::default()
+            };
+            let g = geometry(&viewport, (100, 90), area);
+            assert_eq!(g.target, target);
+            assert_eq!(g.dot_at(target.x, target.y), Some(first));
+            assert_eq!(g.dot_at(target.x + 1, target.y + 1), Some(second));
+            assert_eq!(g.dot_at(target.x - 1, target.y), None);
+            assert_eq!(g.dot_at(target.right(), target.y), None);
+            assert_eq!(g.dot_at(target.x, target.bottom()), None);
+        }
+    }
+
+    #[test]
+    fn trailing_partial_cells_map_to_the_last_dot() {
+        let viewport = Viewport {
+            zoom: Zoom::In(1),
+            ..Viewport::default()
+        };
+        let area = Rect::new(0, 0, 20, 10);
+        for (grid, row, y) in [((10, 1), 0, 0.0), ((10, 3), 1, 2.0)] {
+            let g = geometry(&viewport, grid, area);
+            assert_eq!(g.dot_at(g.target.x, g.target.y + row), Some((0.0, y)));
+        }
+    }
 
     #[test]
     fn partial_edge_dots_remain_reachable() {
