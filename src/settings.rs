@@ -66,6 +66,9 @@ impl Palette {
     }
 }
 
+/// Color models in selection order.
+pub const MODES: [Mode; 2] = [Mode::Tone, Mode::Color];
+
 /// Compact color model label for saved settings and palette editing.
 pub fn mode_label(mode: Mode) -> &'static str {
     match mode {
@@ -662,6 +665,38 @@ impl Setting {
         Self::Sharpen,
     ];
 
+    /// Dropdown title for rows with a fixed choice list.
+    pub fn list_title(self) -> Option<&'static str> {
+        match self {
+            Self::Dither => Some("Dither"),
+            Self::Card => Some("Card"),
+            Self::Mode => Some("Mode"),
+            _ => None,
+        }
+    }
+
+    /// Valid choice labels in the same order as cycling.
+    pub fn choices(self) -> Vec<&'static str> {
+        match self {
+            Self::Dither => Dither::ALL.iter().map(|dither| dither.label()).collect(),
+            Self::Card => CARDS.iter().map(|card| card.label).collect(),
+            Self::Mode => MODES.into_iter().map(mode_label).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Current choice index for rows with a fixed list.
+    pub fn choice(self, settings: &Settings) -> Option<usize> {
+        match self {
+            Self::Dither => Dither::ALL
+                .iter()
+                .position(|dither| *dither == settings.dither),
+            Self::Card => CARDS.iter().position(|card| *card == settings.card),
+            Self::Mode => MODES.iter().position(|mode| *mode == settings.mode),
+            _ => None,
+        }
+    }
+
     /// Label including the current value.
     pub fn label(self, settings: &Settings, palettes: &Palettes) -> String {
         let o = settings;
@@ -1038,6 +1073,20 @@ impl Settings {
         next
     }
 
+    /// Selects a valid fixed choice, leaving unrelated and inactive rows unchanged.
+    pub fn with_choice(&self, setting: Setting, index: usize) -> Self {
+        let mut next = self.clone();
+        if setting.is_active(self) {
+            match setting {
+                Setting::Dither if index < Dither::ALL.len() => next.dither = Dither::ALL[index],
+                Setting::Card if index < CARDS.len() => next.card = CARDS[index],
+                Setting::Mode if index < MODES.len() => next.mode = MODES[index],
+                _ => {}
+            }
+        }
+        next
+    }
+
     /// Returns settings moved `dir` steps and clamped to the range. Mode and
     /// Serpentine toggle, Palette wraps around the presets.
     pub fn adjusted(&self, setting: Setting, dir: i32, palettes: &Palettes) -> Self {
@@ -1098,6 +1147,22 @@ fn wrap(index: usize, dir: i32, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_choices_follow_cycling_and_reject_invalid_indices() {
+        let settings = Settings::default();
+        let palettes = Palettes::builtin();
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut cycled = settings.clone();
+            for index in 0..setting.choices().len() {
+                assert!(settings.with_choice(setting, index) == cycled);
+                assert_eq!(setting.choice(&cycled), Some(index));
+                cycled = cycled.adjusted(setting, 1, &palettes);
+            }
+            assert!(settings.with_choice(setting, usize::MAX) == settings);
+        }
+        assert!(settings.with_choice(Setting::Strength, 0) == settings);
+    }
 
     #[test]
     fn dither_labels_fit_the_panel_and_stay_distinct() {

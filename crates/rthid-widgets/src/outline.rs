@@ -106,6 +106,16 @@ impl Outline {
         self.picker.selected(rows.len()).map(|index| rows[index])
     }
 
+    /// Returns the visible selection using the last rendered scroll offset.
+    pub fn selected_row(
+        &self,
+        area: Rect,
+        block: Option<&Block<'_>>,
+        lens: &[usize],
+    ) -> Option<Rect> {
+        self.picker.selected_row(area, block, self.rows(lens).len())
+    }
+
     /// Returns the keys owned by the selected group header.
     ///
     /// Expanded headers offer collapse and toggle; collapsed headers offer
@@ -354,6 +364,29 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn selected_row_forwards_the_visible_scroll_position() {
+        let lens = [4];
+        let mut outline = Outline::new(&lens);
+        outline.select(Row::Item(3), &lens);
+        let area = Rect::new(2, 3, 12, 4);
+        let block = Block::bordered();
+        outline.render(
+            [(Line::raw("Group"), vec![Line::raw("item"); 4])],
+            Some(block.clone()),
+            Style::default(),
+            area,
+            &mut Buffer::empty(area),
+        );
+        assert_eq!(
+            outline.selected_row(area, Some(&block), &lens),
+            Some(Rect::new(3, 5, 10, 1))
+        );
+        outline.select(Row::Item(0), &lens);
+        assert_eq!(outline.selected_row(area, Some(&block), &lens), None);
+        assert_eq!(outline.selected_row(Rect::ZERO, None, &lens), None);
     }
 
     #[test]

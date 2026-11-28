@@ -1230,6 +1230,12 @@ impl App {
                     Focus::Layers => self.layers.handle_mouse(mouse, len),
                     _ => Outcome::Ignored,
                 };
+                if focus == Focus::Parameters
+                    && let Outcome::Submit(i) = outcome
+                    && let Some(modal) = Modal::dropdown(Setting::ALL[i], &self.settings)
+                {
+                    self.show_modal(modal);
+                }
                 if focus == Focus::Layers
                     && outcome != Outcome::Ignored
                     && self.source_path().is_some()
@@ -1561,6 +1567,10 @@ impl App {
                 Outcome::Ignored => {}
                 Outcome::Submit(i) => {
                     let setting = Setting::ALL[i];
+                    if let Some(modal) = Modal::dropdown(setting, &self.settings) {
+                        self.show_modal(modal);
+                        return;
+                    }
                     // Enter picks a new seed on an active Seed row. The clock is read only
                     // here, Settings decides the seed and the engine stays deterministic.
                     let entropy = SystemTime::now()
@@ -1654,6 +1664,9 @@ impl App {
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
+            Effect::Choose(setting, index) => {
+                self.apply_setting(setting, self.settings.with_choice(setting, index));
+            }
             Effect::Quit => self.quit = true,
             Effect::RemoveLayer(index) => {
                 let row = self
@@ -4715,6 +4728,94 @@ mod tests {
     }
 
     #[test]
+    fn dropdowns_start_current_cancel_and_match_arrow_changes() {
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut app = app_at(setting);
+            press(&mut app, KeyCode::Right);
+            app.view = View::Original;
+            let before = app.settings.clone();
+            let version = versions(&app);
+            press(&mut app, KeyCode::Enter);
+            let Some(Modal::Dropdown(dropdown)) = &app.modal else {
+                panic!("dropdown expected")
+            };
+            assert_eq!(dropdown.setting, setting);
+            let entries = dropdown.entries();
+            assert_eq!(
+                entries[dropdown.list.selected(entries.len()).unwrap()].0,
+                setting.choice(&before)
+            );
+            press(&mut app, KeyCode::Down);
+            assert!(app.settings == before);
+            assert_eq!(versions(&app), version);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.modal.is_none());
+            assert!(app.settings == before);
+            assert_eq!(app.view, View::Original);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.settings == before);
+            assert_eq!(app.view, View::Original);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::Enter);
+            let mut arrows = app_at(setting);
+            arrows.settings = before;
+            arrows.view = View::Original;
+            press(&mut arrows, KeyCode::Left);
+            assert!(app.settings == arrows.settings);
+            assert_eq!(app.view, arrows.view);
+        }
+        for setting in Setting::ALL {
+            if setting.list_title().is_some() {
+                continue;
+            }
+            let mut app = app_at(setting);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.modal.is_none(), "{setting:?}");
+        }
+        let mut app = app_at(Setting::Dither);
+        app.focus = Focus::Preview;
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn second_click_opens_each_parameter_list() {
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut app = app_at(setting);
+            select(&mut app, Setting::Brightness);
+            let screen = Rect::new(0, 0, 100, 60);
+            let layout = crate::ui::layout(screen, 0);
+            render_panel(&app, layout.parameters);
+            let index = Setting::ALL
+                .iter()
+                .position(|item| *item == setting)
+                .unwrap();
+            let group = if index < GROUP_LENS[0] { 1 } else { 2 };
+            let row = layout.parameters.y + 1 + index as u16 + group;
+            let geometry = app.geometry(layout.preview);
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.parameters.x + 3,
+                row,
+                &geometry,
+                screen,
+            );
+            assert!(app.modal.is_none());
+            assert_eq!(app.selected_setting(), Some(setting));
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.parameters.x + 3,
+                row,
+                &geometry,
+                screen,
+            );
+            assert!(matches!(app.modal, Some(Modal::Dropdown(_))));
+        }
+    }
+
+    #[test]
     fn grid_cache_rebuilds_only_stale_stages() {
         let mut app = business_app(RgbaImage::new(20, 10), None);
         assert_eq!(app.grid_cache.grid.version(), 1);
@@ -5217,7 +5318,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_mouse_toggles_headers_without_an_image_and_does_not_submit_items() {
+    fn panel_mouse_toggles_headers_and_leaves_seed_and_numeric_rows_unchanged() {
         let mut app = App::empty();
         let screen = Rect::new(0, 0, 80, 40);
         let layout = crate::ui::layout(screen, 0);

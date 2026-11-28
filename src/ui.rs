@@ -30,7 +30,7 @@ const PARAMETERS_KEYS: KeySection = (
     &[
         ListPicker::MOVE,
         Hint::new("Left/Right h/l", "change/close/open"),
-        Hint::new("Enter", "new seed/toggle"),
+        Hint::new("Enter", "list/seed/toggle"),
         Hint::new("d", "reset"),
     ],
 );
@@ -79,6 +79,7 @@ const PANEL_MOUSE: KeySection = (
     "Mouse: panel",
     &[
         Hint::new("click row", "focus/select"),
+        Hint::new("click again", "list"),
         Hint::new("click header", "collapse/expand"),
         Hint::new("wheel", "focus/select"),
     ],
@@ -274,6 +275,9 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                 let setting = Setting::ALL[i];
                 if setting.is_active(&app.settings) {
                     result.push(Hint::new("Left/Right h/l", "change"));
+                    if setting.list_title().is_some() {
+                        result.push(Hint::new("Enter", "list"));
+                    }
                     if app.settings.can_reseed(setting) {
                         result.push(Hint::new("Enter", "new seed"));
                     }
@@ -725,17 +729,33 @@ struct Editing<'a> {
 
 fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
     let modal = app.modal.as_ref().unwrap();
-    let layout = modal.layout(
-        screen_layout.preview,
-        screen_layout.screen,
-        &app.modal_ctx(),
-    );
+    let anchor = if matches!(modal, Modal::Dropdown(_)) {
+        app.panel
+            .selected_row(
+                screen_layout.parameters,
+                Some(&Block::bordered()),
+                &GROUP_LENS,
+            )
+            .unwrap_or(screen_layout.parameters)
+    } else {
+        screen_layout.preview
+    };
+    let layout = modal.layout(anchor, screen_layout.screen, &app.modal_ctx());
     let mut editing = None;
     let ModalContent {
         title,
         rows,
         picker,
     } = match modal {
+        Modal::Dropdown(dropdown) => ModalContent {
+            title: dropdown.setting.list_title().unwrap(),
+            rows: dropdown
+                .entries()
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect(),
+            picker: Some(&dropdown.list),
+        },
         Modal::Confirm { question, .. }
         | Modal::Presets {
             confirm: Some((question, _)),
@@ -1103,6 +1123,42 @@ mod tests {
         },
     };
     use std::io::{self, BufWriter, Write};
+
+    #[test]
+    fn parameter_dropdowns_draw_at_the_selected_row_with_list_hints() {
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut app = App::builtin(RgbaImage::new(4, 4), None);
+            let index = Setting::ALL
+                .iter()
+                .position(|item| *item == setting)
+                .unwrap();
+            app.panel.select(Row::Item(index), &GROUP_LENS);
+            let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+            let mut renderer = Renderer::default();
+            let screen = layout(Rect::new(0, 0, 100, 45), 0);
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            assert!(text.contains("Enter: list"));
+            let anchor = app
+                .panel
+                .selected_row(screen.parameters, Some(&Block::bordered()), &GROUP_LENS)
+                .unwrap();
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &app.geometry(screen.preview),
+            );
+            let modal = app.modal.as_ref().unwrap();
+            let popup = modal.layout(anchor, screen.screen, &app.modal_ctx()).dialog;
+            assert_eq!(popup.y, anchor.bottom());
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            assert!(text.contains(setting.list_title().unwrap()));
+            assert!(text.contains("> "));
+            if setting == Setting::Dither {
+                for header in ["Diffusion", "Ordered", "Noise"] {
+                    assert!(text.contains(header));
+                }
+            }
+        }
+    }
 
     #[test]
     fn discard_choices_are_inside_the_dialog_and_brush_title_tracks_mode() {

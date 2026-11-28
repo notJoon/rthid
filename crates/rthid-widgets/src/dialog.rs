@@ -77,6 +77,21 @@ impl Dialog<'_> {
         Rect::new(x as u16, y as u16, width, height)
     }
 
+    /// Places a popup below the anchor, or above when it will not fit, within the screen.
+    pub fn anchored_area(&self, anchor: Rect, screen: Rect, content: (u16, u16)) -> Rect {
+        let mut area = self.area(anchor, screen, content);
+        area.x = anchor
+            .x
+            .clamp(screen.x, screen.right().saturating_sub(area.width));
+        let y = if screen.bottom().saturating_sub(anchor.bottom()) >= area.height {
+            anchor.bottom()
+        } else {
+            anchor.y.saturating_sub(area.height)
+        };
+        area.y = y.clamp(screen.y, screen.bottom().saturating_sub(area.height));
+        area
+    }
+
     /// Clears every cell in `area`, draws the border with the title and
     /// returns the rectangle inside the border.
     ///
@@ -107,6 +122,31 @@ impl Dialog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchored_placement_flips_and_clamps() {
+        let dialog = Dialog {
+            title: "Choices",
+            min_width: 0,
+        };
+        let screen = Rect::new(5, 3, 30, 20);
+        assert_eq!(
+            dialog.anchored_area(Rect::new(7, 5, 10, 1), screen, (8, 4)),
+            Rect::new(7, 6, 12, 6)
+        );
+        assert_eq!(
+            dialog.anchored_area(Rect::new(33, 21, 2, 1), screen, (8, 4)),
+            Rect::new(23, 15, 12, 6)
+        );
+        assert_eq!(
+            dialog.anchored_area(Rect::new(0, 0, 1, 1), screen, (u16::MAX, u16::MAX)),
+            screen
+        );
+        assert_eq!(
+            dialog.anchored_area(Rect::ZERO, Rect::ZERO, (8, 4)),
+            Rect::ZERO
+        );
+    }
 
     #[test]
     fn centers_clamps_and_clears() {
