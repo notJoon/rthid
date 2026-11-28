@@ -223,6 +223,7 @@ impl App {
                 self.edits.edit(|doc| {
                     doc.add_layer(format!("Layer {k}"));
                 });
+                self.panel.invalidate();
                 self.retain_panel(self.layer_row(self.edits.current().layers().len() - 1));
             }
             KeyCode::Char('u' | 'U') => {
@@ -232,6 +233,8 @@ impl App {
                 } else {
                     self.edits.redo()
                 };
+                // Undo and redo can reorder layers without changing the lens.
+                self.panel.invalidate();
                 if !changed {
                     self.set_notice(
                         if undo {
@@ -256,6 +259,7 @@ impl App {
                     KeyCode::Char('v') => self.toggle_layer(index),
                     KeyCode::Char('x') => {
                         self.edits.edit(|doc| doc.remove_layer(index));
+                        self.panel.invalidate();
                         self.retain_panel(row);
                     }
                     KeyCode::Char('[' | ']') => {
@@ -266,6 +270,7 @@ impl App {
                         };
                         if to != index {
                             self.edits.edit(|doc| doc.move_layer(index, to));
+                            self.panel.invalidate();
                             self.retain_panel(self.layer_row(to));
                         }
                     }
@@ -786,6 +791,8 @@ impl App {
             && drag.moved
         {
             self.edits.discard_if_unchanged();
+            // Drag hits follow row positions, so only later clicks see a stale layout.
+            self.panel.invalidate();
         }
     }
 
@@ -1461,6 +1468,39 @@ mod tests {
         );
         assert!(app.edits.current().layers()[0].visible);
         assert!(!app.edits.current().layers()[1].visible);
+    }
+
+    #[test]
+    fn layer_click_after_reorder_without_redraw_ignores_stale_layout() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('n'));
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.panel);
+        let top = layout.panel.y + 1 + 4 + Setting::ALL.len() as u16;
+        let mark_x = layout.panel.x + 3;
+        press(&mut app, KeyCode::Char('['));
+        let revision = app.edits.revision();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            mark_x,
+            top,
+            &geometry,
+            screen,
+        );
+        assert_eq!(app.edits.revision(), revision);
+        render_panel(&app, layout.panel);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            mark_x,
+            top,
+            &geometry,
+            screen,
+        );
+        assert!(!app.edits.current().layers()[1].visible);
+        assert!(app.edits.current().layers()[0].visible);
     }
 
     #[test]
