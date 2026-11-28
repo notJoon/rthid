@@ -57,8 +57,8 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         "Layers",
         &[
             Hint::new("n", "new layer"),
-            Hint::new("Ctrl+Z / u", "undo"),
-            Hint::new("Ctrl+Y / U", "redo"),
+            Hint::new("Ctrl+Z / u", "undo layer"),
+            Hint::new("Ctrl+Y / U", "redo layer"),
             Hint::new("Enter", "target"),
             Hint::new("v", "show/hide"),
             Hint::new("x", "delete"),
@@ -146,11 +146,19 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
             result.push(Hint::new("drag", "paint"));
         }
         result.push(Hint::new("n", "new layer"));
-        if app.edits.can_undo() {
-            result.push(Hint::new("Ctrl+Z", "undo"));
+        if app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_undo(index))
+        {
+            result.push(Hint::new("Ctrl+Z", "undo layer"));
         }
-        if app.edits.can_redo() {
-            result.push(Hint::new("Ctrl+Y", "redo"));
+        if app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_redo(index))
+        {
+            result.push(Hint::new("Ctrl+Y", "redo layer"));
         }
     }
     result
@@ -403,7 +411,7 @@ fn brush_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
 }
 
 fn layer_group(app: &App) -> (Line<'_>, Vec<Line<'_>>) {
-    let doc = app.edits.current();
+    let doc = &app.document;
     let dim = Style::default().fg(Color::DarkGray);
     let title = if app.panel.is_collapsed(LAYER_GROUP) {
         Line::from(vec![
@@ -1005,9 +1013,7 @@ mod tests {
         assert!(draw_text(&mut terminal, &app, &mut renderer).contains("rthid · Brush: Burn"));
         app.brush_on = false;
         assert!(!draw_text(&mut terminal, &app, &mut renderer).contains("Brush: Burn"));
-        app.edits.edit(|doc| {
-            doc.add_layer(doc.next_layer_name());
-        });
+        app.document.add_layer(app.document.next_layer_name());
         app.handle_key(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             &geometry,
@@ -1082,7 +1088,7 @@ mod tests {
     #[test]
     fn layer_panel_renders_top_first_visibility_target_and_collapsed_count() {
         let mut app = hint_fixture(HintState::Layer);
-        app.edits.edit(|doc| doc.set_visible(1, false));
+        app.document.set_visible(1, false);
         let (_, items) = layer_group(&app);
         assert_eq!(
             items.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1115,8 +1121,8 @@ mod tests {
             let hints = hints(&app, &geometry);
             for expected in [
                 Hint::new("n", "new layer"),
-                Hint::new("Ctrl+Z", "undo"),
-                Hint::new("Ctrl+Y", "redo"),
+                Hint::new("Ctrl+Z", "undo layer"),
+                Hint::new("Ctrl+Y", "redo layer"),
                 Hint::new("Enter", "target"),
                 Hint::new("v", "show/hide"),
                 Hint::new("x", "delete"),
@@ -1223,14 +1229,18 @@ mod tests {
             }
             HintState::Layer | HintState::LayerRedo => {
                 for _ in 0..3 {
-                    app.edits.edit(|doc| {
-                        doc.add_layer(format!("Layer {}", doc.layers().len() + 1));
-                    });
+                    app.document
+                        .add_layer(format!("Layer {}", app.document.layers().len() + 1));
                 }
-                app.edits.select(Some(1));
+                app.document.select(Some(1));
+                let before = app.document.layers()[1].exposure.clone();
+                app.document.paint(1, |map| map.add(0, 0, 256));
+                app.document.commit_stroke(1, before);
+                let before = app.document.layers()[1].exposure.clone();
+                app.document.paint(1, |map| map.add(0, 0, 256));
+                app.document.commit_stroke(1, before);
                 if matches!(state, HintState::LayerRedo) {
-                    app.edits.edit(|doc| doc.set_visible(1, false));
-                    app.edits.undo();
+                    app.document.undo(1);
                 }
                 app.panel.select(
                     Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + 1),
@@ -1541,10 +1551,16 @@ mod tests {
                                 .is_some_and(|setting| app.settings.can_reseed(setting))
                     }
                     KeyCode::Char('u') => {
-                        !app.edits.can_undo() || advertised.contains(&named_keys("Ctrl+Z")[0])
+                        !app.document
+                            .target()
+                            .is_some_and(|index| app.document.can_undo(index))
+                            || advertised.contains(&named_keys("Ctrl+Z")[0])
                     }
                     KeyCode::Char('U') => {
-                        !app.edits.can_redo() || advertised.contains(&named_keys("Ctrl+Y")[0])
+                        !app.document
+                            .target()
+                            .is_some_and(|index| app.document.can_redo(index))
+                            || advertised.contains(&named_keys("Ctrl+Y")[0])
                     }
                     KeyCode::Char('B') => !app.brush_on,
                     // = is the unshifted alias for the advertised + zoom binding.

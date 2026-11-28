@@ -154,8 +154,6 @@ impl Brush {
 pub(crate) struct Stroke {
     point: Option<(f64, f64)>,
     remaining: f64,
-    /// Removes the automatically added layer if the stroke leaves it untouched.
-    pub(crate) created_layer: bool,
 }
 
 impl Stroke {
@@ -164,7 +162,6 @@ impl Stroke {
         Self {
             point: Some(point),
             remaining: f64::from(brush.spacing()),
-            created_layer: false,
         }
     }
 

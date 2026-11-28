@@ -3,7 +3,7 @@
 use crate::{
     brush::{Brush, BrushRow, Stroke},
     cells::{Glyphs, Pixels, View},
-    document::{Document, History},
+    document::{Document, ExposureMap},
     export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
@@ -77,6 +77,12 @@ pub(crate) enum PanelItem {
     Layer(usize),
 }
 
+struct Painting {
+    stroke: Stroke,
+    index: usize,
+    before: ExposureMap,
+}
+
 #[derive(Clone, Copy)]
 struct LayerDrag {
     index: usize,
@@ -136,7 +142,7 @@ pub struct App {
     pub preview_focus: bool,
     last_drag: Option<Drag>,
     layer_drag: Option<LayerDrag>,
-    stroke: Option<Stroke>,
+    stroke: Option<Painting>,
     /// Current source pixel brush controls, independent of history.
     pub(crate) brush: Brush,
     /// Whether left preview drags paint exposure.
@@ -146,7 +152,7 @@ pub struct App {
     /// Image processing caches.
     pub grid_cache: GridCache,
     /// Source exposure layers and their undo history.
-    pub edits: History,
+    pub document: Document,
     /// Named configuration lists and their pending saves.
     pub library: Library,
     /// Current image settings.
@@ -180,7 +186,7 @@ impl App {
             GROUP_LENS[1],
             GROUP_LENS[2],
             BrushRow::ALL.len(),
-            self.edits.current().layers().len(),
+            self.document.layers().len(),
         ]
     }
 
@@ -193,7 +199,7 @@ impl App {
             PanelItem::Brush(row)
         } else {
             PanelItem::Layer(
-                self.edits.current().layers().len()
+                self.document.layers().len()
                     - 1
                     - (item - Setting::ALL.len() - BrushRow::ALL.len()),
             )
@@ -213,14 +219,12 @@ impl App {
 
     fn layer_row(&self, index: usize) -> Row {
         Row::Item(
-            Setting::ALL.len() + BrushRow::ALL.len() + self.edits.current().layers().len()
-                - 1
-                - index,
+            Setting::ALL.len() + BrushRow::ALL.len() + self.document.layers().len() - 1 - index,
         )
     }
 
     fn retain_panel(&mut self, row: Row) {
-        let len = self.edits.current().layers().len();
+        let len = self.document.layers().len();
         let row = match row {
             Row::Item(i) if i >= Setting::ALL.len() + BrushRow::ALL.len() + len => {
                 if len == 0 {
@@ -235,18 +239,18 @@ impl App {
     }
 
     fn select_layer(&mut self, index: usize, toggle: bool) {
-        let selected = if toggle && self.edits.current().selected() == Some(index) {
+        let selected = if toggle && self.document.selected() == Some(index) {
             None
         } else {
             Some(index)
         };
-        self.edits.select(selected);
+        self.document.select(selected);
         self.retain_panel(self.layer_row(index));
     }
 
     fn toggle_layer(&mut self, index: usize) {
-        let visible = !self.edits.current().layers()[index].visible;
-        self.edits.edit(|doc| doc.set_visible(index, visible));
+        let visible = !self.document.layers()[index].visible;
+        self.document.set_visible(index, visible);
         self.retain_panel(self.layer_row(index));
     }
 
@@ -260,31 +264,31 @@ impl App {
             .unwrap_or(Row::Header(LAYER_GROUP));
         match code {
             KeyCode::Char('n') => {
-                self.edits.edit(|doc| {
-                    doc.add_layer(doc.next_layer_name());
-                });
+                self.document.add_layer(self.document.next_layer_name());
                 self.panel.invalidate();
-                self.retain_panel(self.layer_row(self.edits.current().layers().len() - 1));
+                self.retain_panel(self.layer_row(self.document.layers().len() - 1));
             }
             KeyCode::Char('u' | 'U') => {
-                let undo = code == KeyCode::Char('u');
-                let changed = if undo {
-                    self.edits.undo()
+                let action = if code == KeyCode::Char('u') {
+                    "undo"
                 } else {
-                    self.edits.redo()
+                    "redo"
                 };
-                // Undo and redo can reorder layers without changing the lens.
-                self.panel.invalidate();
-                if !changed {
-                    self.set_notice(
-                        if undo {
-                            "nothing to undo"
-                        } else {
-                            "nothing to redo"
-                        }
-                        .into(),
-                    );
-                }
+                let target = self.document.target();
+                let changed = target.is_some_and(|index| {
+                    if action == "undo" {
+                        self.document.undo(index)
+                    } else {
+                        self.document.redo(index)
+                    }
+                });
+                let prefix = target.map_or_else(String::new, |index| {
+                    format!("{}: ", self.document.layers()[index].name)
+                });
+                self.set_notice(format!(
+                    "{prefix}{}{action}",
+                    if changed { "" } else { "nothing to " }
+                ));
                 self.retain_panel(row);
             }
             _ => {
@@ -298,18 +302,21 @@ impl App {
                     KeyCode::Enter => self.select_layer(index, true),
                     KeyCode::Char('v') => self.toggle_layer(index),
                     KeyCode::Char('x') => {
-                        self.edits.edit(|doc| doc.remove_layer(index));
-                        self.panel.invalidate();
-                        self.retain_panel(row);
+                        self.confirm(
+                            Confirm::new(format!("Delete {}?", self.document.layers()[index].name))
+                                .detail("Its brush strokes and their undo history are lost.")
+                                .yes_label("delete"),
+                            Effect::RemoveLayer(index),
+                        );
                     }
                     KeyCode::Char('[' | ']') => {
                         let to = if code == KeyCode::Char('[') {
                             index.saturating_sub(1)
                         } else {
-                            (index + 1).min(self.edits.current().layers().len() - 1)
+                            (index + 1).min(self.document.layers().len() - 1)
                         };
                         if to != index {
-                            self.edits.edit(|doc| doc.move_layer(index, to));
+                            self.document.move_layer(index, to);
                             self.panel.invalidate();
                             self.retain_panel(self.layer_row(to));
                         }
@@ -357,7 +364,7 @@ impl App {
             brush_on: false,
             minimap_visible: false,
             grid_cache: GridCache::default(),
-            edits: History::new(Document::new(0, 0)),
+            document: Document::new(0, 0),
             library: Library::new(loaded),
             notice: None,
             outbox: Vec::new(),
@@ -461,8 +468,7 @@ impl App {
         self.save_uncertain = false;
         self.source_path = Some(path);
         self.session = None;
-        self.edits
-            .reset(Document::new(image.width(), image.height()));
+        self.document = Document::new(image.width(), image.height());
         self.retain_panel(row);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
@@ -474,10 +480,10 @@ impl App {
 
     fn current_state(&self) -> SavedState {
         SavedState {
-            revision: self.edits.revision(),
+            revision: self.document.revision(),
             settings: self.settings.clone(),
             view: ViewState::capture_unsaved(self),
-            selected: self.edits.current().selected(),
+            selected: self.document.selected(),
         }
     }
 
@@ -503,7 +509,7 @@ impl App {
             .selected(&self.panel_lens())
             .unwrap_or(Row::Header(LAYER_GROUP));
         self.set_image(session.source_path, session.source);
-        self.edits.reset(session.document);
+        self.document = session.document;
         self.retain_panel(row);
         self.settings = session.settings;
         session.view.restore(self);
@@ -572,7 +578,7 @@ impl App {
         let snapshot = Session {
             source_path: self.source_path.clone().unwrap(),
             source,
-            document: self.edits.current().clone(),
+            document: self.document.clone(),
             settings: self.settings.clone(),
             view: ViewState::capture(self),
         };
@@ -951,7 +957,7 @@ impl App {
             mass::tones_from_palette(self.settings.palette.colors(), &self.mass)
         });
         let changed = self.grid_cache.refresh(
-            &self.edits,
+            &self.document,
             &self.settings,
             need_dither,
             self.view == View::Mass || inset_mass || self.mass_export.is_some(),
@@ -1073,7 +1079,6 @@ impl App {
         if !self.layer_drag.take().is_some_and(|drag| drag.moved) {
             return false;
         }
-        self.edits.discard_if_unchanged();
         // Drag hits follow row positions, so only later clicks see a stale layout.
         self.panel.invalidate();
         true
@@ -1081,11 +1086,8 @@ impl App {
 
     /// Ends the current exposure stroke before unrelated input changes its context.
     pub(crate) fn end_stroke(&mut self) {
-        if let Some(stroke) = self.stroke.take() {
-            if stroke.created_layer && self.edits.current().layers()[0].exposure.is_empty() {
-                self.edits.amend(|doc| doc.remove_layer(0));
-            }
-            self.edits.discard_if_unchanged();
+        if let Some(painting) = self.stroke.take() {
+            self.document.commit_stroke(painting.index, painting.before);
         }
     }
 
@@ -1107,26 +1109,27 @@ impl App {
     }
 
     fn start_stroke(&mut self, point: (f64, f64)) -> bool {
-        let doc = self.edits.current();
-        if doc.target().is_some_and(|i| !doc.layers()[i].visible) {
+        if self
+            .document
+            .target()
+            .is_some_and(|i| !self.document.layers()[i].visible)
+        {
             self.set_notice("target layer is hidden".into());
             return true;
         }
         self.notice = None;
+        if self.document.layers().is_empty() {
+            self.document.add_layer(self.document.next_layer_name());
+        }
+        let index = self.document.target().expect("stroke target");
+        let before = self.document.layers()[index].exposure.clone();
         let brush = self.brush;
-        let created_layer = doc.layers().is_empty();
-        self.edits.edit(|doc| {
-            if doc.layers().is_empty() {
-                doc.add_layer(doc.next_layer_name());
-            }
-            brush.dab(
-                &mut doc.target_mut().expect("stroke target").exposure,
-                point,
-            );
+        self.document.paint(index, |map| brush.dab(map, point));
+        self.stroke = Some(Painting {
+            stroke: Stroke::new(point, brush),
+            index,
+            before,
         });
-        let mut stroke = Stroke::new(point, brush);
-        stroke.created_layer = created_layer;
-        self.stroke = Some(stroke);
         self.last_drag = None;
         true
     }
@@ -1182,11 +1185,12 @@ impl App {
             let point = self.source_point(geometry, mouse.column, mouse.row);
             let brush = self.brush;
             let mut centers = Vec::new();
-            stroke.advance(point, brush, |point| centers.push(point));
+            stroke
+                .stroke
+                .advance(point, brush, |point| centers.push(point));
             let painted = !centers.is_empty();
             if painted {
-                self.edits.amend(|doc| {
-                    let map = &mut doc.target_mut().expect("stroke target").exposure;
+                self.document.paint(stroke.index, |map| {
                     for point in centers {
                         brush.dab(map, point);
                     }
@@ -1203,11 +1207,7 @@ impl App {
                 && let PanelItem::Layer(to) = self.panel_row(item)
                 && to != drag.index
             {
-                if drag.moved {
-                    self.edits.amend(|doc| doc.move_layer(drag.index, to));
-                } else {
-                    self.edits.edit(|doc| doc.move_layer(drag.index, to));
-                }
+                self.document.move_layer(drag.index, to);
                 drag.index = to;
                 drag.moved = true;
                 self.retain_panel(self.layer_row(to));
@@ -1640,6 +1640,15 @@ impl App {
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
             Effect::Quit => self.quit = true,
+            Effect::RemoveLayer(index) => {
+                let row = self
+                    .panel
+                    .selected(&self.panel_lens())
+                    .unwrap_or(Row::Header(LAYER_GROUP));
+                self.document.remove_layer(index);
+                self.panel.invalidate();
+                self.retain_panel(row);
+            }
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
             Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
             Effect::SaveSession(dir) => self.save_session(dir),
@@ -1825,7 +1834,7 @@ mod tests {
         Session {
             source: app.grid_cache.source.clone().unwrap(),
             source_path: app.source_path.clone().unwrap(),
-            document: app.edits.current().clone(),
+            document: app.document.clone(),
             settings: app.settings.clone(),
             view: ViewState::capture(app),
         }
@@ -1924,9 +1933,7 @@ mod tests {
                 let loaded = snapshot(&app);
                 app.request_open("next.png".into(), None);
                 let tag = app.open_request.as_ref().unwrap().token;
-                app.edits.edit(|doc| {
-                    doc.add_layer("Keep".into());
-                });
+                app.document.add_layer("Keep".into());
                 let outcome = if session_load {
                     IoOutcome::Loaded(Ok(rthid_io::io::Output {
                         path: "next.rthid".into(),
@@ -1940,9 +1947,9 @@ mod tests {
                 };
                 app.complete(Done::new(tag, std::time::Duration::ZERO, outcome));
                 assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
-                assert_eq!(app.edits.current().layers().len(), 1);
+                assert_eq!(app.document.layers().len(), 1);
                 press(&mut app, KeyCode::Char(if accept { 'y' } else { 'n' }));
-                assert_eq!(app.edits.current().layers().len(), usize::from(!accept));
+                assert_eq!(app.document.layers().len(), usize::from(!accept));
                 assert!(app.open_request.is_none());
             }
         }
@@ -2021,16 +2028,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
         let mut app = App::builtin(RgbaImage::new(2, 3), None);
-        app.edits.edit(|doc| {
-            doc.add_layer("Stored".into());
-        });
+        app.document.add_layer("Stored".into());
         session::write(&dir, snapshot(&app)).unwrap();
         let source = session::read(&dir).unwrap().source_path;
         app.open_image("other.png".into(), RgbaImage::new(1, 1));
         app.request_open(source.clone(), None);
         run_session_job(&mut app);
         assert_eq!(app.session.as_ref(), Some(&dir));
-        assert_eq!(app.edits.current().layers()[0].name, "Stored");
+        assert_eq!(app.document.layers()[0].name, "Stored");
         app.open_dialog(dir.clone());
         app.request_open(
             PathBuf::from(source.file_name().unwrap()),
@@ -2096,9 +2101,7 @@ mod tests {
         assert!(app.modified());
         ctrl(&mut app, 's');
         app.settings.flip = true;
-        app.edits.edit(|doc| {
-            doc.add_layer("Later".into());
-        });
+        app.document.add_layer("Later".into());
         run_session_job(&mut app);
         let dir = temp.path().join("photo.rthid");
         assert_eq!(app.session.as_ref(), Some(&dir));
@@ -2109,7 +2112,7 @@ mod tests {
         run_session_job(&mut app);
         assert!(!app.modified());
         assert_eq!(std::fs::read(&source).unwrap(), original);
-        let document = app.edits.current().clone();
+        let document = app.document.clone();
         app.open_image("other.png".into(), RgbaImage::new(1, 1));
         assert!(app.session.is_none());
         assert!(!app.modified());
@@ -2120,9 +2123,13 @@ mod tests {
             app.source_path(),
             Some(session::read(&dir).unwrap().source_path.as_path())
         );
-        assert_eq!(app.edits.current(), &document);
+        crate::document::assert_same_content(&app.document, &document);
         assert!(app.settings.flip);
-        assert!(!app.edits.can_undo());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
         assert!(!app.modified());
         ctrl(&mut app, 's');
         assert!(matches!(&app.outbox[0].0, Job::Save { dir: target, .. } if target == &dir));
@@ -2218,15 +2225,13 @@ mod tests {
         app.sync(Rect::new(0, 0, 8, 4));
         assert!(!app.modified());
         app.record_saved();
-        app.edits.edit(|doc| {
-            doc.add_layer("One".into());
-        });
+        app.document.add_layer("One".into());
         app.record_saved();
-        app.edits.select(None);
+        app.document.select(None);
         assert!(app.modified());
         app.record_saved();
-        app.edits.edit(|doc| doc.set_visible(0, false));
-        assert!(app.edits.undo());
+        app.document.set_visible(0, false);
+        assert!(!app.document.undo(0));
         assert!(app.modified());
     }
 
@@ -2319,7 +2324,11 @@ mod tests {
             press(&mut app, KeyCode::Char('d'));
         }
         assert_eq!(app.brush, Brush::default());
-        assert!(!app.edits.can_undo());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
         app.open_image("source.png".into(), RgbaImage::new(10, 10));
         press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.panel_row(Setting::ALL.len() + 3), PanelItem::Layer(0));
@@ -2340,7 +2349,8 @@ mod tests {
         let geometry = app.geometry(layout.preview);
         let (x, y) = (geometry.target.x + 4, geometry.target.y + 4);
         let center = app.source_point(&geometry, x, y).unwrap();
-        let before = app.edits.current().clone();
+        app.document.add_layer("Layer 1".into());
+        let before = app.document.clone();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             x,
@@ -2349,7 +2359,7 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_some());
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
+        assert_eq!(app.document.layers()[0].name, "Layer 1");
         let version = app.grid_cache.grid_version();
         app.sync(layout.preview);
         assert!(app.grid_cache.grid_version() > version);
@@ -2374,15 +2384,19 @@ mod tests {
         );
         assert!(app.stroke.is_none());
         assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
-        let painted = app.edits.current().clone();
+        let painted = app.document.clone();
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current(), &before);
-        assert!(!app.edits.can_undo());
+        crate::document::assert_same_content(&app.document, &before);
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
         press(&mut app, KeyCode::Char('U'));
-        assert_eq!(app.edits.current(), &painted);
+        crate::document::assert_same_content(&app.document, &painted);
         assert!(app.brush_on);
         app.sync(layout.preview);
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             x,
@@ -2405,7 +2419,7 @@ mod tests {
             screen,
         );
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current(), &before);
+        crate::document::assert_same_content(&app.document, &before);
     }
 
     #[test]
@@ -2425,7 +2439,7 @@ mod tests {
             &geometry,
             screen,
         );
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         assert!(!app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
             x + 1,
@@ -2433,7 +2447,7 @@ mod tests {
             &geometry,
             screen,
         ));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
     }
 
     #[test]
@@ -2454,7 +2468,7 @@ mod tests {
             &geometry,
             screen,
         );
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         let outside = geometry.target.x - 1;
         assert!(app.source_point(&geometry, outside, y).is_none());
         assert!(!app.mouse_at(
@@ -2472,7 +2486,7 @@ mod tests {
             screen,
         ));
         let entry = app.source_point(&geometry, x + 24, y).unwrap();
-        let map = &app.edits.current().layers()[0].exposure;
+        let map = &app.document.layers()[0].exposure;
         assert!(map.get(entry.0.round() as u32, entry.1.round() as u32) > 0);
         for column in x + 2..x + 23 {
             let point = app.source_point(&geometry, column, y).unwrap();
@@ -2486,40 +2500,32 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.undo());
-        assert!(app.edits.current().layers().is_empty());
-        assert!(!app.edits.can_undo());
+        assert!(app.document.undo(0));
+        assert!(app.document.layers()[0].exposure.is_empty());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
     }
 
     #[test]
-    fn unchanged_strokes_restore_redo_with_and_without_a_layer() {
-        for has_layer in [false, true] {
-            let mut app = App::builtin(RgbaImage::new(8, 8), None);
-            if has_layer {
-                let mut document = Document::new(8, 8);
-                document.add_layer(document.next_layer_name());
-                for y in 0..8 {
-                    for x in 0..8 {
-                        document.target_mut().unwrap().exposure.add(x, y, i16::MAX);
-                    }
-                }
-                app.edits = History::new(document);
-            } else {
-                app.brush.strength = 0;
-            }
-            let before = app.edits.current().clone();
-            app.edits.edit(|doc| {
-                doc.add_layer("Redo".into());
-            });
-            let redo = app.edits.current().clone();
-            assert!(app.edits.undo());
-            app.start_stroke((4.0, 4.0));
-            app.end_stroke();
-            assert_eq!(app.edits.current(), &before);
-            assert!(!app.edits.can_undo());
-            assert!(app.edits.redo());
-            assert_eq!(app.edits.current(), &redo);
-        }
+    fn unchanged_strokes_keep_redo_and_auto_created_layer() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.brush.strength = 0;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert_eq!(app.document.layers().len(), 1);
+        assert!(!app.document.can_undo(0));
+        app.brush.strength = 50;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert!(app.document.undo(0));
+        app.brush.strength = 0;
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        assert!(app.document.can_redo(0));
+        assert!(app.document.redo(0));
     }
 
     #[test]
@@ -2545,9 +2551,9 @@ mod tests {
         press(&mut app, KeyCode::Char('B'));
         assert!(app.stroke.is_none());
         assert_eq!(app.brush.mode.name(), "Dodge");
-        let painted = app.edits.current().clone();
+        let painted = app.document.clone();
         ctrl(&mut app, 'z');
-        assert!(app.edits.current().layers().is_empty());
+        assert!(app.document.layers()[0].exposure.is_empty());
         for redo in [
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
             KeyEvent::new(
@@ -2560,7 +2566,7 @@ mod tests {
             ),
         ] {
             app.handle_key(redo, &geometry);
-            assert_eq!(app.edits.current(), &painted);
+            crate::document::assert_same_content(&app.document, &painted);
             ctrl(&mut app, 'z');
         }
         app.handle_key(
@@ -2577,26 +2583,30 @@ mod tests {
         assert!(app.stroke.is_some());
         ctrl(&mut app, 'z');
         assert!(app.stroke.is_none());
-        assert_eq!(app.edits.current(), &painted);
+        crate::document::assert_same_content(&app.document, &painted);
         for overlay in [false, true] {
             app.keys_open = overlay;
             app.modal = (!overlay).then(Modal::templates);
-            let revision = app.edits.revision();
+            let revision = app.document.revision();
             for c in ['z', 'y'] {
                 ctrl(&mut app, c);
             }
-            assert_eq!(app.edits.revision(), revision);
+            assert_eq!(app.document.revision(), revision);
         }
         app.keys_open = false;
         app.modal = None;
         ctrl(&mut app, 'z');
         ctrl(&mut app, 'z');
-        assert_eq!(app.notice(), Some("nothing to undo"));
-        while app.edits.can_redo() {
+        assert_eq!(app.notice(), Some("Layer 1: nothing to undo"));
+        while app
+            .document
+            .target()
+            .is_some_and(|index| app.document.can_redo(index))
+        {
             ctrl(&mut app, 'y');
         }
         ctrl(&mut app, 'y');
-        assert_eq!(app.notice(), Some("nothing to redo"));
+        assert_eq!(app.notice(), Some("Layer 1: nothing to redo"));
     }
 
     #[test]
@@ -2622,7 +2632,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.current().layers()[0].exposure.get(15, 15) > 0);
+        assert!(app.document.layers()[0].exposure.get(15, 15) > 0);
     }
 
     #[test]
@@ -2637,10 +2647,9 @@ mod tests {
                     map.add(x, y, i16::MAX);
                 }
             }
+            app.document = document.clone();
             if can_undo {
-                app.edits.edit(|doc| *doc = document.clone());
-            } else {
-                app.edits = History::new(document.clone());
+                app.document.commit_stroke(0, ExposureMap::new(128, 128));
             }
             let screen = Rect::new(0, 0, 100, 40);
             let area = crate::ui::layout(screen).preview;
@@ -2669,14 +2678,19 @@ mod tests {
                 &geometry,
                 screen,
             );
-            assert_eq!(app.edits.current(), &document);
-            assert_eq!(app.edits.can_undo(), can_undo);
-            let revision = app.edits.revision();
+            crate::document::assert_same_content(&app.document, &document);
+            assert_eq!(
+                app.document
+                    .target()
+                    .is_some_and(|index| app.document.can_undo(index)),
+                can_undo
+            );
+            let revision = app.document.revision();
             app.end_stroke();
-            assert_eq!(app.edits.revision(), revision);
+            assert_eq!(app.document.revision(), revision);
             if can_undo {
-                assert!(app.edits.undo());
-                assert!(app.edits.current().layers().is_empty());
+                assert!(app.document.undo(0));
+                assert!(app.document.layers()[0].exposure.is_empty());
             }
         }
     }
@@ -2690,7 +2704,7 @@ mod tests {
         app.brush_on = true;
         let geometry = app.geometry(area);
         let map = geometry.minimap.unwrap();
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             map.map.x,
@@ -2699,8 +2713,8 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_none());
-        assert!(app.edits.current().layers().is_empty());
-        assert_eq!(app.edits.revision(), revision);
+        assert!(app.document.layers().is_empty());
+        assert_eq!(app.document.revision(), revision);
         app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
             map.map.right() - 1,
@@ -2718,7 +2732,7 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('v'));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         let geometry = app.geometry(area);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2736,8 +2750,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
-        assert!(app.edits.current().layers()[0].exposure.is_empty());
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers()[0].exposure.is_empty());
         app.settings.margin = 10;
         app.viewport = Viewport::default();
         let geometry = app.geometry(area);
@@ -2749,7 +2763,7 @@ mod tests {
             screen,
         );
         assert!(app.stroke.is_none());
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
     }
 
     #[test]
@@ -2798,7 +2812,7 @@ mod tests {
                 ),
             }
             assert!(app.stroke.is_none());
-            let revision = app.edits.revision();
+            let revision = app.document.revision();
             app.mouse_at(
                 MouseEventKind::Drag(MouseButton::Left),
                 x + 2,
@@ -2806,16 +2820,88 @@ mod tests {
                 &geometry,
                 screen,
             );
-            assert_eq!(app.edits.revision(), revision);
+            assert_eq!(app.document.revision(), revision);
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
         }
         app.viewport.zoom = Zoom::In(1);
         app.preview_focus = true;
         let geometry = app.geometry(area);
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &geometry);
         assert!(app.viewport.x > 0);
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
+    }
+
+    #[test]
+    fn undo_keys_stay_on_the_target_layer_and_name_it() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        let first = app.document.layers()[0].exposure.clone();
+        press(&mut app, KeyCode::Char('n'));
+        app.start_stroke((4.0, 4.0));
+        app.end_stroke();
+        app.document.select(None);
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 2: undo"));
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 2: nothing to undo"));
+        assert_eq!(app.document.layers()[0].exposure, first);
+        assert!(app.document.layers()[1].exposure.is_empty());
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("Layer 2: redo"));
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("Layer 2: nothing to redo"));
+        app.document.select(Some(0));
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("Layer 1: undo"));
+        assert!(app.document.layers()[0].exposure.is_empty());
+        assert!(!app.document.layers()[1].exposure.is_empty());
+    }
+
+    #[test]
+    fn layer_delete_requires_y_and_cannot_be_undone() {
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Char('x'),
+            KeyCode::Char('Y'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('y'),
+        ] {
+            let mut app = App::builtin(RgbaImage::new(8, 8), None);
+            press(&mut app, KeyCode::Char('n'));
+            app.start_stroke((4.0, 4.0));
+            app.end_stroke();
+            press(&mut app, KeyCode::Char('n'));
+            app.start_stroke((4.0, 4.0));
+            app.end_stroke();
+            let before = app.document.clone();
+            let revision = app.document.revision();
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.document.revision(), revision);
+            let Some(Modal::Confirm { question, .. }) = &app.modal else {
+                panic!("missing confirmation")
+            };
+            assert_eq!(question.message(), "Delete Layer 2?");
+            assert_eq!(
+                question.lines()[0].to_string(),
+                "Its brush strokes and their undo history are lost."
+            );
+            assert_eq!(question.hints()[0].label, "delete");
+            press(&mut app, key);
+            assert!(app.modal.is_none());
+            if key == KeyCode::Char('y') {
+                assert_eq!(app.document.layers().len(), 1);
+                assert_eq!(app.document.revision(), revision + 1);
+                ctrl(&mut app, 'z');
+                assert_eq!(app.document.layers().len(), 1);
+                assert_eq!(app.notice(), Some("Layer 1: undo"));
+            } else {
+                assert_eq!(app.document, before);
+                assert!(app.document.can_undo(1));
+            }
+        }
     }
 
     #[test]
@@ -2828,8 +2914,8 @@ mod tests {
         for _ in 0..2 {
             press(&mut app, KeyCode::Char('n'));
         }
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 1");
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
+        assert_eq!(app.document.layers()[0].name, "Layer 1");
+        assert_eq!(app.document.layers()[1].name, "Layer 2");
         assert_eq!(
             app.panel_row(Setting::ALL.len() + BrushRow::ALL.len()),
             PanelItem::Layer(1)
@@ -2839,49 +2925,53 @@ mod tests {
             PanelItem::Layer(0)
         );
         assert_eq!(app.selected_setting(), None);
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         let versions = versions(&app);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.current().selected(), None);
-        assert_eq!(app.edits.current().target(), Some(1));
+        assert_eq!(app.document.selected(), None);
+        assert_eq!(app.document.target(), Some(1));
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.current().selected(), Some(1));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.selected(), Some(1));
+        assert_eq!(app.document.revision(), revision);
         assert_eq!(versions, self::versions(&app));
         press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 2");
+        assert_eq!(app.document.layers()[0].name, "Layer 2");
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         press(&mut app, KeyCode::Char(']'));
         press(&mut app, KeyCode::Char('v'));
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
         app.panel.select(app.layer_row(0), &app.panel_lens());
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 1");
+        assert_eq!(app.document.layers()[1].name, "Layer 1");
         app.preview_focus = true;
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.edits.current().layers().len(), 1);
+        assert_eq!(app.document.layers().len(), 2);
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(0))
+            Some(app.layer_row(1))
         );
         press(&mut app, KeyCode::Char('U'));
-        assert_eq!(app.edits.current().layers().len(), 2);
+        assert_eq!(app.document.layers().len(), 2);
         app.preview_focus = false;
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        app.panel.select(app.layer_row(0), &app.panel_lens());
         press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(Row::Header(LAYER_GROUP))
@@ -2895,7 +2985,11 @@ mod tests {
         app.panel.select(Row::Item(0), &app.panel_lens());
         app.open_image("next.png".into(), RgbaImage::new(2, 2));
         assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(0)));
-        assert!(!app.edits.can_undo());
+        assert!(
+            !app.document
+                .target()
+                .is_some_and(|index| app.document.can_undo(index))
+        );
     }
 
     #[test]
@@ -2904,17 +2998,17 @@ mod tests {
         for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
             press(&mut app, KeyCode::Char(code));
         }
-        assert_eq!(app.edits.revision(), 0);
+        assert_eq!(app.document.revision(), 0);
         assert!(app.notice().is_none());
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         app.show_modal(Modal::templates());
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         for code in ['n', 'u', 'U', 'v', 'x', '[', ']'] {
             press(&mut app, KeyCode::Char(code));
         }
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.edits.revision(), revision);
-        assert!(app.edits.current().layers().is_empty());
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers().is_empty());
     }
 
     #[test]
@@ -2928,7 +3022,7 @@ mod tests {
         let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('n'));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -2936,14 +3030,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
-        assert!(
-            app.edits
-                .current()
-                .layers()
-                .iter()
-                .all(|layer| layer.visible)
-        );
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.document.layers().iter().all(|layer| layer.visible));
         render_panel(&app, layout.panel);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2952,8 +3040,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(app.edits.current().layers()[0].visible);
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(app.document.layers()[0].visible);
+        assert!(!app.document.layers()[1].visible);
     }
 
     #[test]
@@ -2968,7 +3056,7 @@ mod tests {
         let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
         let mark_x = layout.panel.x + 3;
         press(&mut app, KeyCode::Char('['));
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -2976,7 +3064,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.revision(), revision);
+        assert_eq!(app.document.revision(), revision);
         render_panel(&app, layout.panel);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
@@ -2985,12 +3073,12 @@ mod tests {
             &geometry,
             screen,
         );
-        assert!(!app.edits.current().layers()[1].visible);
-        assert!(app.edits.current().layers()[0].visible);
+        assert!(!app.document.layers()[1].visible);
+        assert!(app.document.layers()[0].visible);
     }
 
     #[test]
-    fn layer_mouse_selects_marks_and_groups_drag_into_one_undo() {
+    fn layer_mouse_selects_marks_and_drag_does_not_undo() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..3 {
             press(&mut app, KeyCode::Char('n'));
@@ -3003,7 +3091,7 @@ mod tests {
         let x = layout.panel.x + 5;
         let click = MouseEventKind::Down(MouseButton::Left);
         app.mouse_at(click, x, top + 1, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(1));
+        assert_eq!(app.document.selected(), Some(1));
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
             x,
@@ -3012,7 +3100,7 @@ mod tests {
             screen,
         );
         app.mouse_at(click, x, top + 1, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(1));
+        assert_eq!(app.document.selected(), Some(1));
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
             x,
@@ -3020,7 +3108,7 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current().selected(), None);
+        assert_eq!(app.document.selected(), None);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
         let mut renderer = crate::ui::Renderer::default();
@@ -3030,11 +3118,11 @@ mod tests {
             .unwrap();
         let mark_x = layout.panel.x + 3;
         assert_eq!(terminal.backend().buffer()[(mark_x, top + 1)].symbol(), "●");
-        let revision = app.edits.revision();
+        let revision = app.document.revision();
         app.mouse_at(click, mark_x, top + 1, &geometry, screen);
-        assert!(!app.edits.current().layers()[1].visible);
-        assert_eq!(app.edits.current().selected(), None);
-        assert_eq!(app.edits.revision(), revision + 1);
+        assert!(!app.document.layers()[1].visible);
+        assert_eq!(app.document.selected(), None);
+        assert_eq!(app.document.revision(), revision + 1);
         assert!(app.layer_drag.is_none());
         app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
@@ -3043,8 +3131,8 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current().layers()[1].name, "Layer 2");
-        assert_eq!(app.edits.revision(), revision + 1);
+        assert_eq!(app.document.layers()[1].name, "Layer 2");
+        assert_eq!(app.document.revision(), revision + 1);
         app.mouse_at(click, x, top, &geometry, screen);
         app.mouse_at(
             MouseEventKind::Up(MouseButton::Left),
@@ -3054,8 +3142,8 @@ mod tests {
             screen,
         );
         app.mouse_at(click, x, top, &geometry, screen);
-        assert_eq!(app.edits.current().selected(), Some(2));
-        let revision = app.edits.revision();
+        assert_eq!(app.document.selected(), Some(2));
+        let revision = app.document.revision();
         let drag = MouseEventKind::Drag(MouseButton::Left);
         app.mouse_at(drag, x, top + 1, &geometry, screen);
         app.mouse_at(drag, x, top + 2, &geometry, screen);
@@ -3068,37 +3156,36 @@ mod tests {
             screen,
         ));
         assert!(app.layer_drag.is_none());
-        assert_eq!(app.edits.revision(), revision + 2);
-        assert_eq!(app.edits.current().layers()[0].name, "Layer 3");
-        assert_eq!(app.edits.current().selected(), Some(0));
-        assert_eq!(app.edits.current().target(), Some(0));
+        assert_eq!(app.document.revision(), revision + 2);
+        assert_eq!(app.document.layers()[0].name, "Layer 3");
+        assert_eq!(app.document.selected(), Some(0));
+        assert_eq!(app.document.target(), Some(0));
         assert_eq!(
             app.panel.selected(&app.panel_lens()),
             Some(app.layer_row(0))
         );
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(
-            app.edits
-                .current()
+            app.document
                 .layers()
                 .iter()
                 .map(|l| l.name.as_str())
                 .collect::<Vec<_>>(),
-            ["Layer 1", "Layer 2", "Layer 3"]
+            ["Layer 3", "Layer 1", "Layer 2"]
         );
         press(&mut app, KeyCode::Char('u'));
-        assert!(app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[2].visible);
     }
 
     #[test]
-    fn layer_drag_back_to_start_discards_undo_step() {
+    fn layer_drag_back_to_start_keeps_visibility() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..2 {
             press(&mut app, KeyCode::Char('n'));
         }
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('u'));
-        let before = app.edits.current().clone();
+        let before = app.document.clone();
         let screen = Rect::new(0, 0, 100, 40);
         let layout = crate::ui::layout(screen);
         let geometry = app.geometry(layout.preview);
@@ -3133,11 +3220,11 @@ mod tests {
             &geometry,
             screen,
         );
-        assert_eq!(app.edits.current(), &before);
+        crate::document::assert_same_content(&app.document, &before);
         press(&mut app, KeyCode::Char('U'));
-        assert!(!app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
         press(&mut app, KeyCode::Char('u'));
-        assert!(app.edits.current().layers()[1].visible);
+        assert!(!app.document.layers()[1].visible);
     }
 
     #[test]
@@ -4319,7 +4406,7 @@ mod tests {
             )))
             .chain(std::iter::once((
                 ratatui::text::Line::raw("Layers"),
-                vec![ratatui::text::Line::default(); app.edits.current().layers().len()],
+                vec![ratatui::text::Line::default(); app.document.layers().len()],
             )));
         app.panel.render(
             groups,
@@ -4393,8 +4480,7 @@ mod tests {
         );
         let before = versions(&app);
         let replacement = RgbaImage::from_pixel(20, 10, image::Rgba([255, 255, 255, 255]));
-        app.edits
-            .reset(Document::new(replacement.width(), replacement.height()));
+        app.document = Document::new(replacement.width(), replacement.height());
         app.grid_cache.set_source(replacement);
         assert!(app.grid_cache.grid().is_none());
         assert!(app.grid_cache.dithered().is_none());

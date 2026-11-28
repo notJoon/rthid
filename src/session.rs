@@ -392,11 +392,10 @@ fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Sessio
         } else {
             ExposureMap::new(width, height)
         };
-        layers.push(Layer {
-            name: layer.name,
-            visible: layer.visible,
-            exposure,
-        });
+        let mut restored = Layer::new(layer.name, width, height);
+        restored.visible = layer.visible;
+        restored.exposure = exposure;
+        layers.push(restored);
     }
     let document = Document::from_layers(width, height, layers, manifest.selected)
         .map_err(|e| named(&path, e))?;
@@ -681,18 +680,17 @@ mod tests {
 
     fn fixture() -> Session {
         let mut app = App::builtin(RgbaImage::from_pixel(67, 65, Rgba([23, 64, 96, 200])), None);
-        app.edits.edit(|doc| {
-            doc.add_layer("Bottom".into());
-            let map = &mut doc.target_mut().unwrap().exposure;
-            map.add(0, 0, i16::MIN);
-            map.add(66, 64, i16::MAX);
-            map.add(64, 0, -512);
-            doc.add_layer("Empty".into());
-            doc.add_layer("Hidden".into());
-            doc.target_mut().unwrap().exposure.add(1, 1, 256);
-            doc.set_visible(2, false);
-            doc.select(Some(0));
-        });
+        app.document.add_layer("Bottom".into());
+        let map = &mut app.document.target_mut().unwrap().exposure;
+        map.add(0, 0, i16::MIN);
+        map.add(66, 64, i16::MAX);
+        map.add(64, 0, -512);
+        app.document.add_layer("Empty".into());
+        app.document.add_layer("Hidden".into());
+        app.document.target_mut().unwrap().exposure.add(1, 1, 256);
+        app.document.set_visible(2, false);
+        app.document.select(Some(0));
+        app.document.commit_stroke(0, ExposureMap::new(67, 65));
         app.settings.card = BUSINESS_CARD;
         app.settings.dot = 25;
         app.settings.margin = 10;
@@ -731,7 +729,7 @@ mod tests {
         Session {
             source_path: PathBuf::new(),
             source: app.grid_cache.source.clone().unwrap(),
-            document: app.edits.current().clone(),
+            document: app.document.clone(),
             settings: app.settings.clone(),
             view: ViewState::capture(&app),
         }
@@ -739,7 +737,7 @@ mod tests {
 
     fn assert_equal(a: &Session, b: &Session) {
         assert_eq!(a.source, b.source);
-        assert_eq!(a.document, b.document);
+        crate::document::assert_same_content(&a.document, &b.document);
         assert!(a.settings == b.settings);
         assert!(a.view == b.view);
     }
@@ -1137,7 +1135,12 @@ mod tests {
         assert_eq!(default_path(&temp.path().join("photo.png")), dir);
         write(&dir, fixture()).unwrap();
         assert!(is_session(&dir));
-        assert_equal(&fixture(), &read(&dir).unwrap());
+        let loaded = read(&dir).unwrap();
+        assert_equal(&fixture(), &loaded);
+        for index in 0..loaded.document.layers().len() {
+            assert!(!loaded.document.can_undo(index));
+            assert!(!loaded.document.can_redo(index));
+        }
         assert_eq!(
             exposure_files(&dir),
             ["exposure-1-0.png", "exposure-1-2.png"]

@@ -77,6 +77,8 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
+    /// Permanently remove a layer and its stroke history after confirmation.
+    RemoveLayer(usize),
     /// Exit after confirming unsaved changes.
     Quit,
     /// Continue an accepted source replacement.
