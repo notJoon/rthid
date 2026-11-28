@@ -7,7 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Editing layers with visibility, selection and undo history
+- Editing layers with visibility, selection and undo history; deleting a layer selects
+  the one below it, or the one above when none is below
 - A dodge/burn brush adjusts exposure on the selected layer
 - Ctrl+S saves editing sessions, including source pixels, layers, settings and view controls
 - Enter on the Dither, Card and Mode rows opens a list below the row, with Dither grouped
