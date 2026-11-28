@@ -208,40 +208,42 @@ fn zoom_hint(app: &App, geometry: &viewport::PreviewGeometry) -> Option<Hint> {
 }
 
 fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
-    let mut result = main_hints(app, geometry);
-    if app.modal.is_none() && !app.keys_open && app.source_path().is_some() {
-        if app.focus == Focus::Layers && !app.document.layers().is_empty() {
-            result.splice(
-                1..1,
-                [
-                    Hint::new("Enter", "target"),
-                    Hint::new("v", "show/hide"),
-                    Hint::new("x", "delete"),
-                    Hint::new("[ ]", "move"),
-                ],
-            );
-        }
-        result.push(Hint::new("b", "brush"));
-        if app.brush_on {
-            result.push(Hint::new("B", "dodge/burn"));
-            result.push(Hint::new("drag", "paint"));
-        }
-        result.push(Hint::new("n", "new layer"));
-        if app
-            .document
-            .target()
-            .is_some_and(|index| app.document.can_undo(index))
-        {
+    if app.modal.is_some() || app.keys_open || app.source_path().is_none() {
+        return main_hints(app, geometry);
+    }
+
+    // Priority: focus controls, layer actions, history, active brush, toggles, generic hints.
+    let mut result = focus_hints(app, geometry);
+    let layer_focus = app.focus == Focus::Layers && !app.document.layers().is_empty();
+    if layer_focus {
+        result.extend([
+            Hint::new("Enter", "target"),
+            SHOW_LAYER,
+            DELETE_LAYER,
+            Hint::new("[ ]", "move"),
+            NEW_LAYER,
+        ]);
+    }
+    if let Some(index) = app.document.target() {
+        if app.document.can_undo(index) {
             result.push(Hint::new("Ctrl+Z", "undo layer"));
         }
-        if app
-            .document
-            .target()
-            .is_some_and(|index| app.document.can_redo(index))
-        {
+        if app.document.can_redo(index) {
             result.push(Hint::new("Ctrl+Y", "redo layer"));
         }
     }
+    if app.brush_on {
+        result.push(Hint::new("B", "dodge/burn"));
+        result.push(Hint::new("drag", "paint"));
+        result.push(Hint::new("b", "brush"));
+    }
+    if !app.brush_on {
+        result.push(Hint::new("b", "brush"));
+    }
+    if !layer_focus {
+        result.push(NEW_LAYER);
+    }
+    result.extend(generic_main_hints(app, geometry));
     result
 }
 
@@ -271,47 +273,33 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     if let Some(modal) = &app.modal {
         return modal.hints(&app.modal_ctx());
     }
+    let mut result = focus_hints(app, geometry);
+    result.extend(generic_main_hints(app, geometry));
+    result
+}
+
+fn focus_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     let reset = app
         .selected_setting()
         .is_some_and(|setting| app.settings.is_changed(setting, &app.library.palettes));
-    let image = app.source_path().is_some();
-    let overflowing = geometry.overflows();
-    let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
-    let mass_map = app.mass_map_available(geometry);
     if app.focus == Focus::Preview {
-        return if image {
-            [
-                overflowing.then_some(Hint::new("hjkl/arrows", "pan")),
-                overflowing.then_some(Hint::new("HJKL", "page")),
-                zoom_hint(app, geometry),
-                zoomed.then_some(Hint::new("0", "fit")),
-                overflowing.then_some(Hint::new("m", "map")),
-                mass_map.then_some(Hint::new("M", "mass map")),
-                Some(Hint::new("Space", "original/dithered")),
-                Some(Hint::new("a", "mass study")),
-                Some(Hint::new("Tab", "focus")),
-                Some(Hint::new("Esc", "parameters")),
-                Some(Hint::new("q", "quit")),
-                Some(Hint::new("r/R", "rotate")),
-                Some(Hint::new("f", "flip")),
-                Some(Hint::new("o", "open")),
-                Some(Hint::new("Ctrl+S", "save")),
-                Some(Hint::new("P", "presets")),
-                Some(Hint::new("T", "templates")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        } else {
-            vec![
-                Hint::new("o", "open"),
-                Hint::new("Tab", "focus"),
-                Hint::new("Esc", "parameters"),
-                Hint::new("q", "quit"),
-                Hint::new("P", "presets"),
-                Hint::new("T", "templates"),
-            ]
-        };
+        if app.source_path().is_none() {
+            return Vec::new();
+        }
+        let overflowing = geometry.overflows();
+        let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
+        let mass_map = app.mass_map_available(geometry);
+        return [
+            overflowing.then_some(Hint::new("hjkl/arrows", "pan")),
+            overflowing.then_some(Hint::new("HJKL", "page")),
+            zoom_hint(app, geometry),
+            zoomed.then_some(Hint::new("0", "fit")),
+            overflowing.then_some(Hint::new("m", "map")),
+            mass_map.then_some(Hint::new("M", "mass map")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
     }
     let mut result = vec![ListPicker::MOVE];
     match app.focus {
@@ -346,27 +334,59 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         }
         _ => {}
     }
-    result.extend(
-        [
-            Some(Hint::new("Tab", "focus")),
-            Some(Hint::new("q", "quit")),
-            Some(Hint::new("o", "open")),
-            image.then_some(Hint::new("Ctrl+S", "save")),
-            image.then_some(Hint::new("Space", "original/dithered")),
-            image.then_some(Hint::new("a", "mass study")),
-            image.then(|| zoom_hint(app, geometry)).flatten(),
-            (image && zoomed).then_some(Hint::new("0", "fit")),
-            (image && overflowing).then_some(Hint::new("m", "map")),
-            (image && mass_map).then_some(Hint::new("M", "mass map")),
-            Some(Hint::new("P", "presets")),
-            Some(Hint::new("T", "templates")),
-            image.then_some(Hint::new("r/R", "rotate")),
-            image.then_some(Hint::new("f", "flip")),
-        ]
-        .into_iter()
-        .flatten(),
-    );
     result
+}
+
+fn generic_main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
+    let image = app.source_path().is_some();
+    if app.focus == Focus::Preview {
+        return if image {
+            vec![
+                Hint::new("Space", "original/dithered"),
+                Hint::new("a", "mass study"),
+                Hint::new("Tab", "focus"),
+                Hint::new("Esc", "parameters"),
+                Hint::new("q", "quit"),
+                Hint::new("r/R", "rotate"),
+                Hint::new("f", "flip"),
+                Hint::new("o", "open"),
+                Hint::new("Ctrl+S", "save"),
+                Hint::new("P", "presets"),
+                Hint::new("T", "templates"),
+            ]
+        } else {
+            vec![
+                Hint::new("o", "open"),
+                Hint::new("Tab", "focus"),
+                Hint::new("Esc", "parameters"),
+                Hint::new("q", "quit"),
+                Hint::new("P", "presets"),
+                Hint::new("T", "templates"),
+            ]
+        };
+    }
+    let zoomed = app.viewport.zoom != viewport::Zoom::Fit;
+    let overflowing = geometry.overflows();
+    let mass_map = app.mass_map_available(geometry);
+    [
+        Some(Hint::new("Tab", "focus")),
+        Some(Hint::new("q", "quit")),
+        Some(Hint::new("o", "open")),
+        image.then_some(Hint::new("Ctrl+S", "save")),
+        image.then_some(Hint::new("Space", "original/dithered")),
+        image.then_some(Hint::new("a", "mass study")),
+        image.then(|| zoom_hint(app, geometry)).flatten(),
+        (image && zoomed).then_some(Hint::new("0", "fit")),
+        (image && overflowing).then_some(Hint::new("m", "map")),
+        (image && mass_map).then_some(Hint::new("M", "mass map")),
+        Some(Hint::new("P", "presets")),
+        Some(Hint::new("T", "templates")),
+        image.then_some(Hint::new("r/R", "rotate")),
+        image.then_some(Hint::new("f", "flip")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn more_hint(app: &App) -> Option<Hint> {
@@ -1297,18 +1317,20 @@ mod tests {
         assert_eq!(rows.len(), BrushRow::ALL.len());
         app.brush_on = true;
         assert!(status(&app, &geometry, PreviewReport::default()).contains("Brush Dodge 24px 25%"));
-        let context = main_hints(&app, &geometry);
+        let focused = focus_hints(&app, &geometry);
+        let generic = generic_main_hints(&app, &geometry);
         let actual = hints(&app, &geometry);
-        assert_eq!(&actual[..context.len()], context);
+        assert_eq!(&actual[..focused.len()], focused);
         assert_eq!(
-            &actual[context.len()..],
+            &actual[focused.len()..focused.len() + 4],
             [
-                Hint::new("b", "brush"),
                 Hint::new("B", "dodge/burn"),
                 Hint::new("drag", "paint"),
+                Hint::new("b", "brush"),
                 Hint::new("n", "new layer")
             ]
         );
+        assert_eq!(&actual[focused.len() + 4..], generic);
         app.brush_picker.select(1);
         assert!(hints(&app, &geometry).contains(&Hint::new("d", "reset")));
         app.brush_on = false;
@@ -1371,6 +1393,59 @@ mod tests {
         assert!(!hints(&app, &geometry).contains(&Hint::new("n", "new layer")));
         let app = App::empty();
         assert!(!hints(&app, &geometry).contains(&Hint::new("n", "new layer")));
+    }
+
+    #[test]
+    fn rendered_hint_line_prioritizes_current_state_actions() {
+        for width in [120, 158] {
+            let hint_row = |app: &App| {
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                draw_text(&mut terminal, app, &mut Renderer::default());
+                let screen = layout(terminal.size().unwrap(), app.document.layers().len());
+                let buffer = terminal.backend().buffer();
+                screen
+                    .help
+                    .columns()
+                    .map(|cell| buffer[(cell.x, screen.help.y)].symbol())
+                    .collect::<String>()
+            };
+
+            let mut app = hint_fixture(HintState::Layer);
+            app.focus = Focus::Layers;
+            let line = hint_row(&app);
+            assert!(line.contains("Up/Down k/j: select"), "{width}: {line}");
+            assert!(line.contains("x: delete"), "{width}: {line}");
+            assert!(line.contains("n: new layer"), "{width}: {line}");
+            assert!(line.contains("Ctrl+Z: undo layer"), "{width}: {line}");
+
+            app.brush_on = true;
+            let line = hint_row(&app);
+            assert!(line.contains("Up/Down k/j: select"), "{width}: {line}");
+            assert!(line.contains("x: delete"), "{width}: {line}");
+            assert!(line.contains("Ctrl+Z: undo layer"), "{width}: {line}");
+
+            app.focus = Focus::Parameters;
+            app.panel.select(
+                Row::Item(
+                    Setting::ALL
+                        .iter()
+                        .position(|setting| *setting == Setting::Brightness)
+                        .unwrap(),
+                ),
+                &GROUP_LENS,
+            );
+            let line = hint_row(&app);
+            assert!(line.contains("Left/Right h/l: change"), "{width}: {line}");
+            assert!(line.contains("B: dodge/burn"), "{width}: {line}");
+            assert!(line.contains("Ctrl+Z: undo layer"), "{width}: {line}");
+
+            let mut app = hint_fixture(HintState::OverflowPreview);
+            app.brush_on = true;
+            let line = hint_row(&app);
+            assert!(line.contains("hjkl/arrows: pan"), "{width}: {line}");
+            assert!(line.contains(": zoom"), "{width}: {line}");
+            assert!(line.contains("B: dodge/burn"), "{width}: {line}");
+        }
     }
 
     #[test]
