@@ -36,6 +36,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Overwrite-session and delete-layer confirmations are skipped with a notice if another
   document opens before they are accepted
+- Zoom, pan and minimap visibility changes mark editing sessions as modified, while
+  terminal resize clamping does not
 
 ## [0.2.0] - 2026-11-28
 

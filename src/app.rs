@@ -457,7 +457,7 @@ impl App {
         SavedState {
             revision: self.document.revision(),
             settings: self.settings.clone(),
-            view: ViewState::capture_unsaved(self),
+            view: ViewState::capture(self),
             selected: self.document.selected(),
         }
     }
@@ -936,6 +936,16 @@ impl App {
         }
         let (w, h) = self.grid_size();
         self.viewport.clamp(w, h, area);
+        // Snapshots share the live clamp so a resize (or a grid-shrinking edit) never dirties.
+        if let Some(saved) = &mut self.saved {
+            saved.view.clamp_viewport(w, h, area);
+        }
+        for save in &mut self.saving {
+            save.state.view.clamp_viewport(w, h, area);
+        }
+        if let Some(request) = &mut self.open_request {
+            request.state.view.clamp_viewport(w, h, area);
+        }
     }
 
     fn refresh(&mut self, inset_mass: bool) {
@@ -2394,7 +2404,7 @@ mod tests {
         app.viewport.x = 200;
         app.viewport.y = 300;
         app.sync(Rect::new(0, 0, 8, 4));
-        assert!(!app.modified());
+        assert!(app.modified());
         app.record_saved();
         app.document.add_layer("One".into());
         app.record_saved();
@@ -2404,6 +2414,92 @@ mod tests {
         app.document.set_visible(0, false);
         assert!(!app.document.undo(0));
         assert!(app.modified());
+    }
+
+    #[test]
+    fn session_viewport_changes_require_quit_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.save_session(temp.path().join("photo.rthid"));
+        run_session_job(&mut app);
+        assert_eq!(app.viewport.zoom, Zoom::Fit);
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+    }
+
+    // A clean session panned to the far corner of a small terminal.
+    fn panned_clean_app() -> App {
+        let mut app = App::builtin(RgbaImage::new(120, 120), None);
+        app.viewport.zoom = Zoom::In(1);
+        app.viewport.x = 100;
+        app.viewport.y = 100;
+        app.sync(Rect::new(0, 0, 20, 10));
+        app.record_saved();
+        app
+    }
+
+    // Grows the terminal the way the event loop does: clamp on resize, then sync.
+    fn grow_terminal(app: &mut App) {
+        let resized = Rect::new(0, 0, 100, 50);
+        app.clamp_viewport(resized);
+        app.sync(resized);
+    }
+
+    #[test]
+    fn terminal_resize_reclamp_does_not_modify_session() {
+        let mut app = panned_clean_app();
+
+        grow_terminal(&mut app);
+
+        assert_eq!((app.viewport.x, app.viewport.y), (20, 20));
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn terminal_resize_during_session_save_stays_clean_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut app = panned_clean_app();
+        app.save_session(dir.clone());
+        let tag = app.take_jobs().pop().unwrap().1;
+
+        grow_terminal(&mut app);
+        app.complete(session_completion(tag, &dir, true));
+
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn terminal_resize_during_open_does_not_ask_to_discard_edits() {
+        let mut app = panned_clean_app();
+        app.request_open("next.png".into(), None);
+        app.take_jobs();
+
+        grow_terminal(&mut app);
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Ok(Opened::Image {
+                path: "next.png".into(),
+                image: RgbaImage::new(4, 5),
+            })),
+        ));
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.source_path(), Some(Path::new("next.png")));
+    }
+
+    #[test]
+    fn terminal_resize_rebases_pan_while_viewport_change_is_pending() {
+        let mut app = panned_clean_app();
+        press(&mut app, KeyCode::Char('m'));
+
+        grow_terminal(&mut app);
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(!app.modified());
     }
 
     #[test]
@@ -3315,6 +3411,37 @@ mod tests {
     }
 
     #[test]
+    fn layer_delete_confirmation_skips_after_another_document_opens() {
+        let mut app = App::builtin(RgbaImage::new(8, 8), None);
+        app.document.add_layer("Old".into());
+        app.record_saved();
+        let mut next = snapshot(&app);
+        next.source_path = "next.png".into();
+        next.document.add_layer("New".into());
+
+        app.request_open("next.rthid".into(), None);
+        app.take_jobs();
+        app.focus = Focus::Layers;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        app.complete(done(
+            &app,
+            IoOutcome::Loaded(Ok(rthid_io::io::Output {
+                path: "next.rthid".into(),
+                value: Box::new(next),
+            })),
+        ));
+        let layers = app.document.layers().len();
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(app.document.layers().len(), layers);
+        assert_eq!(
+            app.notice(),
+            Some("layer delete skipped: another document was opened")
+        );
+    }
+
+    #[test]
     fn layer_keys_history_targets_names_and_cursor() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         press(&mut app, KeyCode::Char('u'));
@@ -3407,37 +3534,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.document.revision(), revision);
         assert!(app.document.layers().is_empty());
-    }
-
-    #[test]
-    fn layer_delete_confirmation_skips_after_another_document_opens() {
-        let mut app = App::builtin(RgbaImage::new(8, 8), None);
-        app.document.add_layer("Old".into());
-        app.record_saved();
-        let mut next = snapshot(&app);
-        next.source_path = "next.png".into();
-        next.document.add_layer("New".into());
-
-        app.request_open("next.rthid".into(), None);
-        app.take_jobs();
-        app.focus = Focus::Layers;
-        press(&mut app, KeyCode::Char('x'));
-        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
-        app.complete(done(
-            &app,
-            IoOutcome::Loaded(Ok(rthid_io::io::Output {
-                path: "next.rthid".into(),
-                value: Box::new(next),
-            })),
-        ));
-        let layers = app.document.layers().len();
-        press(&mut app, KeyCode::Char('y'));
-
-        assert_eq!(app.document.layers().len(), layers);
-        assert_eq!(
-            app.notice(),
-            Some("layer delete skipped: another document was opened")
-        );
     }
 
     #[test]

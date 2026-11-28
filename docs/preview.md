@@ -150,7 +150,8 @@ paint target, visibility marks toggle visibility, and dragging a layer reorders 
 
 Panning works whenever the image overflows, including reduced zoom levels, and
 stops at grid edges. Fit does not pan. Focus, panning, zoom, and minimap changes
-do not re-dither the image.
+do not re-dither the image. Zoom, pan, and minimap visibility are stored in editing
+sessions, so changing them marks the session modified until it is saved.
 
 ## Opening images
 
