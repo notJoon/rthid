@@ -411,25 +411,24 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
         .map(|(group, &(title, len))| {
             let settings = &Setting::ALL[first..first + len];
             first += len;
-            if !app.panel.is_collapsed(group) {
-                let items = settings
-                    .iter()
-                    .map(|&setting| {
-                        let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
-                        if setting.is_active(&app.settings) {
-                            label
-                        } else {
-                            label.style(Style::default().fg(Color::DarkGray))
-                        }
-                    })
-                    .collect();
-                return (Line::raw(title), items);
-            }
+            // Collapsed groups still pass their items so the rendered lens
+            // matches App::panel_lens and mouse input stays live.
+            let items = settings
+                .iter()
+                .map(|&setting| {
+                    let label = Line::raw(setting.label(&app.settings, &app.library.palettes));
+                    if setting.is_active(&app.settings) {
+                        label
+                    } else {
+                        label.style(Style::default().fg(Color::DarkGray))
+                    }
+                })
+                .collect();
             let changed = settings
                 .iter()
                 .filter(|&&setting| app.settings.is_changed(setting, &app.library.palettes))
                 .count();
-            let title = if changed > 0 {
+            let title = if app.panel.is_collapsed(group) && changed > 0 {
                 Line::from(vec![
                     Span::raw(title),
                     Span::styled(
@@ -440,7 +439,7 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
             } else {
                 Line::raw(title)
             };
-            (title, Vec::new())
+            (title, items)
         })
         .chain(std::iter::once(layer_group(app)));
     let block = Block::bordered()
@@ -2281,6 +2280,33 @@ mod tests {
         assert!(text.contains("▸ Tone  2 changed"), "{text}");
         assert!(text.contains("> Card: Image"), "{text}");
         assert!(!text.contains("Brightness:"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_group_header_click_expands_after_draw() {
+        let mut renderer = Renderer::default();
+        let mut app = App::empty();
+        app.panel.select(Row::Header(0), &app.panel_lens());
+        app.panel.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &app.panel_lens(),
+        );
+        assert!(app.panel.is_collapsed(0));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        draw_text(&mut terminal, &app, &mut renderer);
+        let screen = terminal.size().unwrap().into();
+        let layout = layout(screen);
+        app.handle_mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.panel.x + 2,
+                row: layout.panel.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &app.geometry(layout.preview),
+            screen,
+        );
+        assert!(!app.panel.is_collapsed(0));
     }
     #[test]
     fn open_dialog_keeps_path_above_scrolled_entries() {
