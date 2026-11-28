@@ -143,9 +143,11 @@ pub struct App {
     last_token: u64,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
-    /// Whether the full key reference is capturing input.
+    /// Whether the key reference is capturing input.
     pub(crate) keys_open: bool,
-    /// Retained row offset in the full key reference.
+    /// Whether the key reference includes every region.
+    pub(crate) keys_all: bool,
+    /// Retained row offset in the current key reference.
     pub(crate) keys_scroll: u16,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
@@ -344,6 +346,7 @@ impl App {
             last_token: 0,
             modal: None,
             keys_open: false,
+            keys_all: false,
             keys_scroll: 0,
             settings: Settings::default(),
             panel: Outline::new(&GROUP_LENS),
@@ -1391,14 +1394,18 @@ impl App {
         }
         self.notice = None;
         if self.keys_open {
-            let max = crate::ui::key_help_scroll_max(geometry.area.height);
+            let max = crate::ui::key_help_scroll_max(self, geometry.area.height);
             self.keys_scroll = self.keys_scroll.min(max);
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('?') => self.keys_open = false,
+                    KeyCode::Esc => self.keys_open = false,
+                    KeyCode::Char('?') => {
+                        self.keys_all = !self.keys_all;
+                        self.keys_scroll = 0;
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.keys_scroll = self.keys_scroll.saturating_sub(1);
                     }
@@ -1441,6 +1448,7 @@ impl App {
         }
         if key.code == KeyCode::Char('?') {
             self.keys_open = true;
+            self.keys_all = false;
             self.keys_scroll = 0;
             self.last_drag = None;
             return;

@@ -23,25 +23,91 @@ use crate::{
     settings::{GROUP_LENS, GROUPS, Setting},
 };
 
-const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
+type KeySection = (&'static str, &'static [Hint]);
+
+const PARAMETERS_KEYS: KeySection = (
+    "Parameters",
+    &[
+        ListPicker::MOVE,
+        Hint::new("Left/Right h/l", "change/close/open"),
+        Hint::new("Enter", "new seed/toggle"),
+        Hint::new("d", "reset"),
+    ],
+);
+const BRUSH_KEYS: KeySection = (
+    "Brush",
+    &[
+        ListPicker::MOVE,
+        Hint::new("Left/Right h/l", "change"),
+        Hint::new("d", "reset"),
+    ],
+);
+const PREVIEW_KEYS: KeySection = (
+    "Preview",
+    &[
+        Hint::new("hjkl/arrows", "pan"),
+        Hint::new("HJKL", "page"),
+        Hint::new("+/=/-", "zoom"),
+        Hint::new("0", "fit"),
+        Hint::new("m", "map"),
+        Hint::new("M", "mass map"),
+    ],
+);
+const LAYERS_KEYS: KeySection = (
+    "Layers",
+    &[
+        ListPicker::MOVE,
+        Hint::new("n", "new layer"),
+        Hint::new("Ctrl+Z / u", "undo layer"),
+        Hint::new("Ctrl+Y / U", "redo layer"),
+        Hint::new("Enter", "target on/off"),
+        Hint::new("v", "show/hide"),
+        Hint::new("x", "delete"),
+        Hint::new("[/]", "move down/up"),
+    ],
+);
+const PREVIEW_MOUSE: KeySection = (
+    "Mouse: preview",
+    &[
+        Hint::new("minimap click/drag", "center view"),
+        Hint::new("drag on preview", "move image"),
+        Hint::new("brush left drag", "paint"),
+        Hint::new("wheel", "pan"),
+    ],
+);
+const PANEL_MOUSE: KeySection = (
+    "Mouse: panel",
+    &[
+        Hint::new("click row", "focus/select"),
+        Hint::new("click header", "collapse/expand"),
+        Hint::new("wheel", "focus/select"),
+    ],
+);
+const LAYERS_MOUSE: KeySection = (
+    "Mouse: layers",
+    &[
+        Hint::new("layer click", "focus/target"),
+        Hint::new("target click", "target off"),
+        Hint::new("click on mark", "show/hide"),
+        Hint::new("layer drag", "reorder"),
+        Hint::new("wheel", "focus/select"),
+    ],
+);
+const KEY_HELP_PARAMETERS: &[KeySection] = &[PARAMETERS_KEYS, PANEL_MOUSE];
+const KEY_HELP_BRUSH: &[KeySection] = &[BRUSH_KEYS];
+const KEY_HELP_PREVIEW: &[KeySection] = &[PREVIEW_KEYS, PREVIEW_MOUSE];
+const KEY_HELP_LAYERS: &[KeySection] = &[LAYERS_KEYS, LAYERS_MOUSE];
+const KEY_HELP_LEFT: &[KeySection] = &[PARAMETERS_KEYS, BRUSH_KEYS, PREVIEW_KEYS, LAYERS_KEYS];
+const KEY_HELP_GLOBAL: &[KeySection] = &[
     (
-        "Parameters / Brush",
+        "General",
         &[
-            ListPicker::MOVE,
-            Hint::new("Left/Right h/l", "change/close/open"),
-            Hint::new("Enter", "new seed/toggle"),
-            Hint::new("d", "reset"),
-        ],
-    ),
-    (
-        "Preview",
-        &[
-            Hint::new("hjkl/arrows", "pan"),
-            Hint::new("HJKL", "page"),
-            Hint::new("+/=/-", "zoom"),
-            Hint::new("0", "fit"),
-            Hint::new("m", "map"),
-            Hint::new("M", "mass map"),
+            Hint::new("Tab/BackTab", "cycle regions"),
+            Hint::new("Esc", "leave preview"),
+            Hint::new("?", "keys"),
+            Hint::new("b", "brush"),
+            Hint::new("B", "dodge/burn"),
+            Hint::new("q/Ctrl+C", "quit"),
         ],
     ),
     (
@@ -54,21 +120,6 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         ],
     ),
     (
-        "Layers",
-        &[
-            Hint::new("n", "new layer"),
-            Hint::new("Ctrl+Z / u", "undo layer"),
-            Hint::new("Ctrl+Y / U", "redo layer"),
-            Hint::new("Enter", "target"),
-            Hint::new("v", "show/hide"),
-            Hint::new("x", "delete"),
-            Hint::new("[/]", "move down/up"),
-        ],
-    ),
-];
-
-const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
-    (
         "Files",
         &[
             Hint::new("o", "open"),
@@ -77,29 +128,14 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
             Hint::new("T", "templates"),
         ],
     ),
-    (
-        "General",
-        &[
-            Hint::new("Tab/BackTab", "focus"),
-            Hint::new("Esc", "leave preview"),
-            Hint::new("?", "keys"),
-            Hint::new("b", "brush"),
-            Hint::new("B", "dodge/burn"),
-            Hint::new("q/Ctrl+C", "quit"),
-        ],
-    ),
-    (
-        "Mouse: blocks/preview",
-        &[
-            Hint::new("minimap click/drag", "center view"),
-            Hint::new("drag on preview", "move image"),
-            Hint::new("brush left drag", "paint"),
-            Hint::new("wheel", "select/pan"),
-            Hint::new("layer click", "target"),
-            Hint::new("click on mark", "show/hide"),
-            Hint::new("layer drag", "reorder"),
-        ],
-    ),
+];
+const KEY_HELP_RIGHT: &[KeySection] = &[
+    KEY_HELP_GLOBAL[0],
+    KEY_HELP_GLOBAL[1],
+    KEY_HELP_GLOBAL[2],
+    PREVIEW_MOUSE,
+    PANEL_MOUSE,
+    LAYERS_MOUSE,
     (
         "Mouse: dialogs",
         &[
@@ -164,9 +200,19 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
 
 fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     if app.keys_open {
-        let max = key_help_scroll_max(geometry.area.height);
+        let max = key_help_scroll_max(app, geometry.area.height);
         let offset = app.keys_scroll.min(max);
-        let mut hints = vec![Hint::new("Esc/?", "close")];
+        let mut hints = vec![
+            Hint::new("Esc", "close"),
+            Hint::new(
+                "?",
+                if app.keys_all {
+                    "this region"
+                } else {
+                    "all keys"
+                },
+            ),
+        ];
         if offset > 0 {
             hints.push(Hint::new("Up/k", "scroll up"));
         }
@@ -557,27 +603,46 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     }
 }
 
-const KEY_HELP: (KeyHelp, KeyHelp) = (
-    KeyHelp {
-        sections: KEY_HELP_LEFT,
-    },
-    KeyHelp {
-        sections: KEY_HELP_RIGHT,
-    },
-);
-const KEY_HELP_GAP: u16 = 3;
-const KEY_HELP_DIALOG: Dialog = Dialog {
-    title: "Keys",
-    min_width: 28,
-};
+fn key_help(app: &App) -> (KeyHelp<'static>, KeyHelp<'static>) {
+    let (left, right) = if app.keys_all {
+        (KEY_HELP_LEFT, KEY_HELP_RIGHT)
+    } else {
+        let sections = match app.focus {
+            Focus::Preview => KEY_HELP_PREVIEW,
+            Focus::Parameters => KEY_HELP_PARAMETERS,
+            Focus::Brush => KEY_HELP_BRUSH,
+            Focus::Layers => KEY_HELP_LAYERS,
+        };
+        (sections, KEY_HELP_GLOBAL)
+    };
+    (KeyHelp { sections: left }, KeyHelp { sections: right })
+}
 
-fn key_help_area(layout: &Layout) -> Rect {
-    let (left, right) = (KEY_HELP.0.size(), KEY_HELP.1.size());
+fn key_help_dialog(app: &App) -> Dialog<'static> {
+    Dialog {
+        title: if app.keys_all {
+            "Keys · All"
+        } else {
+            match app.focus {
+                Focus::Preview => "Keys · Preview",
+                Focus::Parameters => "Keys · Parameters",
+                Focus::Brush => "Keys · Brush",
+                Focus::Layers => "Keys · Layers",
+            }
+        },
+        min_width: 28,
+    }
+}
+
+const KEY_HELP_GAP: u16 = 3;
+fn key_help_area(app: &App, layout: &Layout) -> Rect {
+    let help = key_help(app);
+    let (left, right) = (help.0.size(), help.1.size());
     let body = Rect {
         height: layout.help.y.saturating_sub(layout.screen.y),
         ..layout.screen
     };
-    KEY_HELP_DIALOG.area(
+    key_help_dialog(app).area(
         layout.preview,
         body,
         (
@@ -588,22 +653,18 @@ fn key_help_area(layout: &Layout) -> Rect {
 }
 
 /// Maximum key reference offset for the available content height.
-pub(crate) fn key_help_scroll_max(height: u16) -> u16 {
-    KEY_HELP
-        .0
-        .size()
-        .1
-        .max(KEY_HELP.1.size().1)
-        .saturating_sub(height)
+pub(crate) fn key_help_scroll_max(app: &App, height: u16) -> u16 {
+    let (left, right) = key_help(app);
+    left.size().1.max(right.size().1).saturating_sub(height)
 }
 
 fn draw_key_help(frame: &mut Frame, app: &App, layout: &Layout) {
-    let (left, right) = KEY_HELP;
-    let area = key_help_area(layout);
-    let inner = KEY_HELP_DIALOG.render(area, frame.buffer_mut());
+    let (left, right) = key_help(app);
+    let area = key_help_area(app, layout);
+    let inner = key_help_dialog(app).render(area, frame.buffer_mut());
     let content = inner.inner(Margin::new(1, 0));
     let height = left.size().1.max(right.size().1);
-    let max = key_help_scroll_max(content.height);
+    let max = key_help_scroll_max(app, content.height);
     let offset = app.keys_scroll.min(max);
     let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, content.width, height));
     left.render(buffer.area, &mut buffer);
@@ -618,6 +679,21 @@ fn draw_key_help(frame: &mut Frame, app: &App, layout: &Layout) {
         for x in 0..content.width {
             frame.buffer_mut()[(content.x + x, content.y + y)] = buffer[(x, y + offset)].clone();
         }
+    }
+    let hint = if app.keys_all {
+        "? this region"
+    } else {
+        "? all keys"
+    };
+    let hint_width = hint.len() as u16;
+    let more_width = if offset < max { 9 } else { 1 };
+    if area.height > 1 && area.width >= hint_width + more_width + 3 {
+        frame.buffer_mut().set_string(
+            area.x + 2,
+            area.bottom() - 1,
+            hint,
+            Style::default().fg(Color::DarkGray),
+        );
     }
     for (visible, y, label) in [
         (offset > 0, area.y, "↑ more"),
@@ -1660,7 +1736,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(36, 6)).unwrap();
         let before = draw_text(&mut terminal, &app, &mut renderer);
         assert!(before.contains("Keys"));
-        assert!(before.contains("Esc/?: close"));
+        assert!(before.contains("Esc: close"));
         let geometry = app.geometry(layout(terminal.size().unwrap(), 0).preview);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
@@ -1685,12 +1761,15 @@ mod tests {
     }
 
     fn key_overlay_rows(width: u16, height: u16) -> Vec<String> {
-        let app = hint_fixture(HintState::Keys);
+        let mut app = hint_fixture(HintState::Keys);
+        app.keys_all = true;
         let mut renderer = Renderer::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         draw_text(&mut terminal, &app, &mut renderer);
-        let inner =
-            Block::bordered().inner(key_help_area(&layout(Rect::new(0, 0, width, height), 0)));
+        let inner = Block::bordered().inner(key_help_area(
+            &app,
+            &layout(Rect::new(0, 0, width, height), 0),
+        ));
         let buffer = terminal.backend().buffer();
         inner
             .rows()
@@ -1726,22 +1805,27 @@ mod tests {
     }
 
     #[test]
-    fn key_overlay_fits_every_reference_row_at_71_by_32() {
-        assert_eq!(key_overlay_missing(71, 32), None);
-        assert!(key_overlay_missing(70, 32).is_some());
-        assert!(key_overlay_missing(71, 31).is_some());
-        assert_eq!(key_overlay_missing(80, 32), None);
-        assert_eq!(key_overlay_missing(80, 33), None);
+    fn key_overlay_fits_every_reference_row_when_sized_for_all_sections() {
+        let mut app = hint_fixture(HintState::Keys);
+        app.keys_all = true;
+        let (left, right) = key_help(&app);
+        let width = left.size().0 + KEY_HELP_GAP + right.size().0 + 4;
+        let height = left.size().1.max(right.size().1) + 4;
+        assert_eq!(key_overlay_missing(width, height), None);
+        assert!(key_overlay_missing(width - 1, height).is_some());
+        assert!(key_overlay_missing(width, height - 1).is_some());
+        assert_eq!(key_overlay_missing(width + 10, height + 1), None);
     }
 
     #[test]
-    fn key_overlay_scroll_reaches_last_entry_at_80_by_24() {
+    fn key_overlay_scroll_reaches_last_entry_in_all_view() {
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
         let mut app = hint_fixture(HintState::Keys);
+        app.keys_all = true;
         let mut renderer = Renderer::default();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let geometry = app.geometry(layout(Rect::new(0, 0, 80, 24), 0).preview);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let geometry = app.geometry(layout(Rect::new(0, 0, 120, 24), 0).preview);
         let before = draw_text(&mut terminal, &app, &mut renderer);
         assert!(before.contains("↓ more"));
         assert!(!before.contains("↑ more"));
@@ -1751,16 +1835,20 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &geometry);
         }
         let after = draw_text(&mut terminal, &app, &mut renderer);
-        assert!(after.contains("move down/up"));
+        assert!(after.contains("Mouse: dialogs"));
+        assert!(after.contains(ListPicker::WHEEL.label));
         assert!(after.contains("↑ more"));
         assert!(!after.contains("↓ more"));
         assert!(!main_hints(&app, &geometry).contains(&Hint::new("Down/j", "scroll down")));
         assert!(main_hints(&app, &geometry).contains(&Hint::new("Up/k", "scroll up")));
-        assert_eq!(app.keys_scroll, key_help_scroll_max(geometry.area.height));
+        assert_eq!(
+            app.keys_scroll,
+            key_help_scroll_max(&app, geometry.area.height)
+        );
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &geometry);
         assert_eq!(
             app.keys_scroll,
-            key_help_scroll_max(geometry.area.height) - 1
+            key_help_scroll_max(&app, geometry.area.height) - 1
         );
         for _ in 0..50 {
             app.handle_key(
@@ -1783,8 +1871,99 @@ mod tests {
             &geometry,
         );
         assert_eq!(app.keys_scroll, 0);
-        let large = app.geometry(layout(Rect::new(0, 0, 80, 32), 0).preview);
-        assert_eq!(main_hints(&app, &large), vec![Hint::new("Esc/?", "close")]);
+        let large = app.geometry(layout(Rect::new(0, 0, 120, 70), 0).preview);
+        assert_eq!(
+            main_hints(&app, &large),
+            vec![Hint::new("Esc", "close"), Hint::new("?", "this region")]
+        );
+    }
+
+    #[test]
+    fn key_overlay_selects_sections_and_titles_for_each_focus() {
+        for (focus, title, expected) in [
+            (
+                Focus::Preview,
+                "Keys · Preview",
+                &["Preview", "Mouse: preview"][..],
+            ),
+            (
+                Focus::Parameters,
+                "Keys · Parameters",
+                &["Parameters", "Mouse: panel"][..],
+            ),
+            (Focus::Brush, "Keys · Brush", &["Brush"][..]),
+            (
+                Focus::Layers,
+                "Keys · Layers",
+                &["Layers", "Mouse: layers"][..],
+            ),
+        ] {
+            let mut app = hint_fixture(HintState::Keys);
+            app.focus = focus;
+            let (left, right) = key_help(&app);
+            assert_eq!(
+                left.sections.iter().map(|s| s.0).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                right.sections.iter().map(|s| s.0).collect::<Vec<_>>(),
+                ["General", "Image", "Files"]
+            );
+            let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
+            let text = draw_text(&mut terminal, &app, &mut Renderer::default());
+            assert!(text.contains(title));
+            assert!(text.contains("? all keys"));
+        }
+    }
+
+    #[test]
+    fn key_overlay_toggles_views_resets_scroll_and_reopens_focused() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut app = hint_fixture(HintState::Keys);
+        app.focus = Focus::Layers;
+        let geometry = app.geometry(layout(Rect::new(0, 0, 120, 12), 0).preview);
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        let mut renderer = Renderer::default();
+        let focused_area = key_help_area(&app, &layout(Rect::new(0, 0, 120, 70), 0));
+        let focused_max = key_help_scroll_max(&app, geometry.area.height);
+        for all in [true, false] {
+            app.keys_scroll = 3;
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &geometry,
+            );
+            assert!(app.keys_open);
+            assert_eq!(app.keys_all, all);
+            assert_eq!(app.keys_scroll, 0);
+            assert_eq!(app.focus, Focus::Layers);
+            let text = draw_text(&mut terminal, &app, &mut renderer);
+            assert!(text.contains(if all { "Keys · All" } else { "Keys · Layers" }));
+            assert!(text.contains(if all { "? this region" } else { "? all keys" }));
+            if all {
+                assert!(key_help_scroll_max(&app, geometry.area.height) > focused_max);
+                assert!(
+                    key_help_area(&app, &layout(Rect::new(0, 0, 120, 70), 0)).height
+                        > focused_area.height
+                );
+                let (left, right) = key_help(&app);
+                assert_eq!(left.sections, KEY_HELP_LEFT);
+                assert_eq!(right.sections, KEY_HELP_RIGHT);
+            }
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &geometry,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &geometry);
+        assert!(!app.keys_open);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &geometry,
+        );
+        assert!(app.keys_open);
+        assert!(!app.keys_all);
+        assert_eq!(app.keys_scroll, 0);
     }
 
     #[test]
