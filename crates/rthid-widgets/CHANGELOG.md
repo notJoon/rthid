@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `Outline::selected_row` returns the selected row rectangle from the last render
+- `Dialog::anchored_area` places a popup below or above an anchor rectangle, on the side with more room,
+  clamped to the screen
+- `ListPicker` ignores mouse input until rendered with the current row count
+
 - `Confirm` supports action labels, optional detail, and body lines with bold keys
   through `yes_label`, `detail`, and `lines`, with matching `hints`
 
