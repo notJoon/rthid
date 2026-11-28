@@ -123,26 +123,6 @@ pub enum OnYes {
     OverwriteTemplate(String),
 }
 
-impl OnYes {
-    // Names the action instead of a generic yes.
-    fn hints(&self) -> Vec<Hint> {
-        let (yes, cancel) = match self {
-            Self::RemovePreset(_) | Self::RemoveTemplate(_) => ("delete", "cancel"),
-            Self::OverwriteTemplate(_) => ("overwrite", "return to name"),
-        };
-        vec![
-            Hint {
-                label: yes,
-                ..Confirm::YES
-            },
-            Hint {
-                label: cancel,
-                ..Confirm::CANCEL
-            },
-        ]
-    }
-}
-
 /// Dialogs that capture all input except quitting with Ctrl+C.
 pub enum Modal {
     /// Confirmation with the previous dialog retained for cancellation.
@@ -519,7 +499,22 @@ impl Modal {
     /// Computes dialog and content rectangles without changing selection or scroll.
     pub fn layout(&self, preview: Rect, screen: Rect, ctx: &Ctx<'_>) -> ModalLayout {
         let (title, width, height) = match self {
-            Self::Confirm { question, .. } => (question.message(), question.message().len(), 1),
+            Self::Confirm { question, .. }
+            | Self::Presets {
+                confirm: Some((question, _)),
+                ..
+            }
+            | Self::Templates {
+                confirm: Some((question, _)),
+                ..
+            } => {
+                let lines = question.lines();
+                (
+                    question.message(),
+                    lines.iter().map(Line::width).max().unwrap_or(0),
+                    lines.len(),
+                )
+            }
             Self::OpenFile(picker) => (
                 "Open image",
                 picker
@@ -597,6 +592,13 @@ impl Modal {
             );
             let inner = Block::bordered().inner(dialog);
             let (field, list) = match self {
+                Self::Confirm { .. }
+                | Self::Presets {
+                    confirm: Some(_), ..
+                }
+                | Self::Templates {
+                    confirm: Some(_), ..
+                } => (None, None),
                 Self::OpenFile(_) => {
                     let [field, list] =
                         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
@@ -766,7 +768,7 @@ impl Modal {
     /// Key descriptions for the component currently receiving input.
     pub fn hints(&self, ctx: &Ctx<'_>) -> Vec<Hint> {
         match self {
-            Self::Confirm { .. } => vec![Confirm::YES, Confirm::CANCEL],
+            Self::Confirm { question, .. } => question.hints().to_vec(),
             Self::OpenFile(picker) => {
                 let listed = !picker.entries.is_empty();
                 [
@@ -780,13 +782,13 @@ impl Modal {
                 .collect()
             }
             Self::Presets {
-                confirm: Some((_, on_yes)),
+                confirm: Some((question, _)),
                 ..
             }
             | Self::Templates {
-                confirm: Some((_, on_yes)),
+                confirm: Some((question, _)),
                 ..
-            } => on_yes.hints(),
+            } => question.hints().to_vec(),
             Self::Presets { .. } => vec![
                 Hint {
                     label: "apply",
@@ -967,7 +969,7 @@ impl Modal {
                             return Step::notice("built-in presets cannot be removed".into());
                         }
                         *confirm = Some((
-                            Confirm::new("Delete preset?"),
+                            Confirm::new("Delete preset?").yes_label("delete"),
                             OnYes::RemovePreset(preset.name.clone()),
                         ));
                     }
@@ -989,7 +991,7 @@ impl Modal {
                             }
                             if ctx.templates.find(input.text()).is_some() {
                                 *confirm = Some((
-                                    Confirm::new("Overwrite template?"),
+                                    Confirm::new("Overwrite template?").yes_label("overwrite"),
                                     OnYes::OverwriteTemplate(input.text().into()),
                                 ));
                             } else {
@@ -1026,7 +1028,7 @@ impl Modal {
                                     return Step::stay();
                                 };
                                 *confirm = Some((
-                                    Confirm::new("Delete template?"),
+                                    Confirm::new("Delete template?").yes_label("delete"),
                                     OnYes::RemoveTemplate(template.name.clone()),
                                 ));
                             }
@@ -1219,7 +1221,7 @@ mod tests {
             unreachable!()
         };
         *confirm = Some((
-            Confirm::new("Delete preset?"),
+            Confirm::new("Delete preset?").yes_label("delete"),
             OnYes::RemovePreset("Paper".into()),
         ));
         let step = modal.handle_mouse(click, context());

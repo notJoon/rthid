@@ -505,10 +505,10 @@ impl App {
         self.record_saved();
     }
 
-    fn confirm(&mut self, message: String, effect: Effect) {
+    fn confirm(&mut self, question: Confirm, effect: Effect) {
         let back = self.modal.take().map(Box::new);
         self.show_modal(Modal::Confirm {
-            question: Confirm::new(message),
+            question,
             action: Some(Box::new(effect)),
             back,
         });
@@ -530,10 +530,12 @@ impl App {
             self.set_notice(format!("{}: not a session directory", dir.display()));
         } else if !own_pending && self.session.is_none() && dir.exists() {
             self.confirm(
-                format!(
+                Confirm::new(format!(
                     "Overwrite {}?",
                     dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
-                ),
+                ))
+                .detail("The existing session will be replaced.")
+                .yes_label("overwrite"),
                 Effect::SaveSession(dir),
             );
         } else {
@@ -787,7 +789,9 @@ impl App {
         let resolved = Self::resolve_open(&path, dir.as_deref());
         if self.modified() && !(resolved.is_dir() && !session::is_session(&resolved)) {
             self.confirm(
-                "Discard unsaved changes?".into(),
+                Confirm::new("Discard unsaved changes?")
+                    .detail("Edits since the last Ctrl+S will be lost.")
+                    .yes_label("discard changes"),
                 Effect::OpenConfirmed(path, dir),
             );
         } else {
@@ -1382,6 +1386,17 @@ impl App {
             }
             return;
         }
+        if (key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('z' | 'y')))
+            || (key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char('z' | 'Z')))
+        {
+            if self.modal.is_none() {
+                let undo =
+                    key.code == KeyCode::Char('z') && !key.modifiers.contains(KeyModifiers::SHIFT);
+                self.handle_layer_key(KeyCode::Char(if undo { 'u' } else { 'U' }));
+            }
+            return;
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -1427,6 +1442,12 @@ impl App {
             if self.source_path().is_some() {
                 self.brush_on = !self.brush_on;
                 self.last_drag = None;
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('B') {
+            if self.source_path().is_some() {
+                BrushRow::Mode.adjust(&mut self.brush, 1);
             }
             return;
         }
@@ -1516,7 +1537,12 @@ impl App {
         match key.code {
             KeyCode::Char('q') => {
                 if self.modified() {
-                    self.confirm("Discard unsaved changes?".into(), Effect::Quit);
+                    self.confirm(
+                        Confirm::new("Discard unsaved changes?")
+                            .detail("Edits since the last Ctrl+S will be lost.")
+                            .yes_label("discard changes"),
+                        Effect::Quit,
+                    );
                 } else {
                     self.quit = true;
                 }
@@ -2356,6 +2382,83 @@ mod tests {
             assert!(app.edits.redo());
             assert_eq!(app.edits.current(), &redo);
         }
+    }
+
+    #[test]
+    fn brush_toggle_ends_stroke_and_history_chords_undo_and_redo_it() {
+        let mut empty = App::empty();
+        press(&mut empty, KeyCode::Char('B'));
+        assert_eq!(empty.brush.mode.name(), "Dodge");
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.brush.mode.name(), "Burn");
+        assert!(!app.brush_on);
+        app.brush_on = true;
+        let screen = Rect::new(0, 0, 100, 40);
+        let geometry = app.geometry(crate::ui::layout(screen).preview);
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_some());
+        press(&mut app, KeyCode::Char('B'));
+        assert!(app.stroke.is_none());
+        assert_eq!(app.brush.mode.name(), "Dodge");
+        let painted = app.edits.current().clone();
+        ctrl(&mut app, 'z');
+        assert!(app.edits.current().layers().is_empty());
+        for redo in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            app.handle_key(redo, &geometry);
+            assert_eq!(app.edits.current(), &painted);
+            ctrl(&mut app, 'z');
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &geometry,
+        );
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            geometry.target.x,
+            geometry.target.y,
+            &geometry,
+            screen,
+        );
+        assert!(app.stroke.is_some());
+        ctrl(&mut app, 'z');
+        assert!(app.stroke.is_none());
+        assert_eq!(app.edits.current(), &painted);
+        for overlay in [false, true] {
+            app.keys_open = overlay;
+            app.modal = (!overlay).then(Modal::templates);
+            let revision = app.edits.revision();
+            for c in ['z', 'y'] {
+                ctrl(&mut app, c);
+            }
+            assert_eq!(app.edits.revision(), revision);
+        }
+        app.keys_open = false;
+        app.modal = None;
+        ctrl(&mut app, 'z');
+        ctrl(&mut app, 'z');
+        assert_eq!(app.notice(), Some("nothing to undo"));
+        while app.edits.can_redo() {
+            ctrl(&mut app, 'y');
+        }
+        ctrl(&mut app, 'y');
+        assert_eq!(app.notice(), Some("nothing to redo"));
     }
 
     #[test]
@@ -3916,7 +4019,7 @@ mod tests {
         let mut preset_confirm = Modal::Presets {
             list: rthid_widgets::ListPicker::new(0),
             confirm: Some((
-                rthid_widgets::Confirm::new("Delete preset?"),
+                rthid_widgets::Confirm::new("Delete preset?").yes_label("delete"),
                 crate::modal::OnYes::RemovePreset("Selected".into()),
             )),
         };
@@ -3924,7 +4027,7 @@ mod tests {
             list: rthid_widgets::ListPicker::new(0),
             prompt: None,
             confirm: Some((
-                rthid_widgets::Confirm::new("Delete template?"),
+                rthid_widgets::Confirm::new("Delete template?").yes_label("delete"),
                 crate::modal::OnYes::RemoveTemplate("Zine".into()),
             )),
         };

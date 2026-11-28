@@ -57,7 +57,8 @@ const KEY_HELP_LEFT: &[(&str, &[Hint])] = &[
         "Layers",
         &[
             Hint::new("n", "new layer"),
-            Hint::new("u/U", "undo/redo"),
+            Hint::new("Ctrl+Z / u", "undo"),
+            Hint::new("Ctrl+Y / U", "redo"),
             Hint::new("Enter", "target"),
             Hint::new("v", "show/hide"),
             Hint::new("x", "delete"),
@@ -82,6 +83,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
             Hint::new("Tab/Esc", "focus"),
             Hint::new("?", "keys"),
             Hint::new("b", "brush"),
+            Hint::new("B", "dodge/burn"),
             Hint::new("q/Ctrl+C", "quit"),
         ],
     ),
@@ -140,14 +142,15 @@ fn hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         }
         result.push(Hint::new("b", "brush"));
         if app.brush_on {
+            result.push(Hint::new("B", "dodge/burn"));
             result.push(Hint::new("drag", "paint"));
         }
         result.push(Hint::new("n", "new layer"));
         if app.edits.can_undo() {
-            result.push(Hint::new("u", "undo"));
+            result.push(Hint::new("Ctrl+Z", "undo"));
         }
         if app.edits.can_redo() {
-            result.push(Hint::new("U", "redo"));
+            result.push(Hint::new("Ctrl+Y", "redo"));
         }
     }
     result
@@ -438,7 +441,11 @@ pub fn draw(frame: &mut Frame, app: &App, layout: &Layout, renderer: &mut Render
     let focus_style =
         |focused| Style::default().fg(if focused { Color::Cyan } else { Color::Reset });
     let block = Block::bordered()
-        .title("rthid")
+        .title(if app.brush_on {
+            format!("rthid · Brush: {}", app.brush.mode.name())
+        } else {
+            "rthid".into()
+        })
         .border_style(focus_style(app.preview_focus));
     let geometry = app.geometry(layout.preview);
     let report = draw_preview(frame, app, &geometry, renderer);
@@ -615,9 +622,17 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
         rows,
         picker,
     } = match modal {
-        Modal::Confirm { question, .. } => ModalContent {
+        Modal::Confirm { question, .. }
+        | Modal::Presets {
+            confirm: Some((question, _)),
+            ..
+        }
+        | Modal::Templates {
+            confirm: Some((question, _)),
+            ..
+        } => ModalContent {
             title: question.message(),
-            rows: Vec::new(),
+            rows: question.lines(),
             picker: None,
         },
         Modal::OpenFile(picker) => {
@@ -738,6 +753,8 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
             layout.list.unwrap(),
             frame.buffer_mut(),
         );
+    } else if editing.is_none() {
+        frame.render_widget(Paragraph::new(rows), Block::bordered().inner(layout.dialog));
     }
     if let Some(Editing {
         input,
@@ -974,6 +991,53 @@ mod tests {
     use std::io::{self, BufWriter, Write};
 
     #[test]
+    fn discard_choices_are_inside_the_dialog_and_brush_title_tracks_mode() {
+        let mut app = App::builtin(RgbaImage::new(16, 16), None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut renderer = Renderer::default();
+        let screen = layout(Rect::new(0, 0, 100, 40));
+        let geometry = app.geometry(screen.preview);
+        app.brush_on = true;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            &geometry,
+        );
+        assert!(draw_text(&mut terminal, &app, &mut renderer).contains("rthid · Brush: Burn"));
+        app.brush_on = false;
+        assert!(!draw_text(&mut terminal, &app, &mut renderer).contains("Brush: Burn"));
+        app.edits.edit(|doc| {
+            doc.add_layer(doc.next_layer_name());
+        });
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &geometry,
+        );
+        draw_text(&mut terminal, &app, &mut renderer);
+        let area = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .layout(screen.preview, screen.screen, &app.modal_ctx())
+            .dialog;
+        let inner = Block::bordered().inner(area);
+        let buffer = terminal.backend().buffer();
+        let body: String = inner
+            .rows()
+            .flat_map(|row| {
+                row.columns()
+                    .map(move |cell| buffer[(cell.x, cell.y)].symbol())
+            })
+            .collect();
+        assert!(body.contains("Edits since the last Ctrl+S will be lost."));
+        assert!(body.contains("y  discard changes"));
+        assert!(body.contains("Esc / other key  cancel"));
+        assert_eq!(
+            app.modal.as_ref().unwrap().hints(&app.modal_ctx())[0],
+            Hint::new("y", "discard changes")
+        );
+    }
+
+    #[test]
     fn brush_panel_changed_count_status_and_hints() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
         let (title, rows) = brush_group(&app);
@@ -1003,6 +1067,7 @@ mod tests {
             &actual[context.len()..],
             [
                 Hint::new("b", "brush"),
+                Hint::new("B", "dodge/burn"),
                 Hint::new("drag", "paint"),
                 Hint::new("n", "new layer")
             ]
@@ -1050,8 +1115,8 @@ mod tests {
             let hints = hints(&app, &geometry);
             for expected in [
                 Hint::new("n", "new layer"),
-                Hint::new("u", "undo"),
-                Hint::new("U", "redo"),
+                Hint::new("Ctrl+Z", "undo"),
+                Hint::new("Ctrl+Y", "redo"),
                 Hint::new("Enter", "target"),
                 Hint::new("v", "show/hide"),
                 Hint::new("x", "delete"),
@@ -1235,7 +1300,7 @@ mod tests {
                 app.modal = Some(Modal::Presets {
                     list: ListPicker::new(2),
                     confirm: Some((
-                        Confirm::new("Delete preset?"),
+                        Confirm::new("Delete preset?").yes_label("delete"),
                         OnYes::RemovePreset("Warm".into()),
                     )),
                 });
@@ -1262,7 +1327,7 @@ mod tests {
                     list: ListPicker::new(1),
                     prompt: Some(TextInput::new("Two", 32)),
                     confirm: Some((
-                        Confirm::new("Overwrite template?"),
+                        Confirm::new("Overwrite template?").yes_label("overwrite"),
                         OnYes::OverwriteTemplate("Two".into()),
                     )),
                 });
@@ -1312,6 +1377,8 @@ mod tests {
                 "Home" => vec![key(KeyCode::Home)],
                 "End" => vec![key(KeyCode::End)],
                 "Ctrl+C" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+                "Ctrl+Z" => vec![KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)],
+                "Ctrl+Y" => vec![KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)],
                 "Ctrl+S" => vec![KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)],
                 "arrows" => [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
                     .into_iter()
@@ -1473,8 +1540,13 @@ mod tests {
                                 .selected_setting()
                                 .is_some_and(|setting| app.settings.can_reseed(setting))
                     }
-                    KeyCode::Char('u') => !app.edits.can_undo(),
-                    KeyCode::Char('U') => !app.edits.can_redo(),
+                    KeyCode::Char('u') => {
+                        !app.edits.can_undo() || advertised.contains(&named_keys("Ctrl+Z")[0])
+                    }
+                    KeyCode::Char('U') => {
+                        !app.edits.can_redo() || advertised.contains(&named_keys("Ctrl+Y")[0])
+                    }
+                    KeyCode::Char('B') => !app.brush_on,
                     // = is the unshifted alias for the advertised + zoom binding.
                     KeyCode::Char('=') => true,
                     _ => false,
@@ -1561,12 +1633,12 @@ mod tests {
     }
 
     #[test]
-    fn key_overlay_fits_every_reference_row_at_71_by_31() {
-        assert_eq!(key_overlay_missing(71, 31), None);
-        assert!(key_overlay_missing(70, 31).is_some());
-        assert!(key_overlay_missing(71, 30).is_some());
-        assert_eq!(key_overlay_missing(80, 31), None);
+    fn key_overlay_fits_every_reference_row_at_71_by_32() {
+        assert_eq!(key_overlay_missing(71, 32), None);
+        assert!(key_overlay_missing(70, 32).is_some());
+        assert!(key_overlay_missing(71, 31).is_some());
         assert_eq!(key_overlay_missing(80, 32), None);
+        assert_eq!(key_overlay_missing(80, 33), None);
     }
 
     #[test]
@@ -1618,7 +1690,7 @@ mod tests {
             &geometry,
         );
         assert_eq!(app.keys_scroll, 0);
-        let large = app.geometry(layout(Rect::new(0, 0, 80, 31)).preview);
+        let large = app.geometry(layout(Rect::new(0, 0, 80, 32)).preview);
         assert_eq!(main_hints(&app, &large), vec![Hint::new("Esc/?", "close")]);
     }
 

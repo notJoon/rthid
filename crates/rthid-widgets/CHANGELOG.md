@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `Confirm` supports action labels, optional detail, and body lines with bold keys
+  through `yes_label`, `detail`, and `lines`, with matching `hints`
+
 - `Outline` and `Row` provide independently collapsible groups with an unindented
   header, a shared item/selection gutter, first-item startup from the constructor's
   lens, and header actions through `hints`, `EXPAND`, `COLLAPSE`, and `TOGGLE`
