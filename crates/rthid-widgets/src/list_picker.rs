@@ -339,13 +339,25 @@ impl ListPicker {
         area: Rect,
         buf: &mut Buffer,
     ) {
+        self.render_with_highlight_symbol(items, block, highlight, area, buf, "> ");
+    }
+
+    pub(crate) fn render_with_highlight_symbol<'a>(
+        &self,
+        items: impl IntoIterator<Item = Line<'a>>,
+        block: Option<Block<'a>>,
+        highlight: Style,
+        area: Rect,
+        buf: &mut Buffer,
+        highlight_symbol: &'static str,
+    ) {
         let items: Vec<_> = items.into_iter().collect();
         let selected = self.selected(items.len());
         let mut state = ListState::default()
             .with_selected(selected)
             .with_offset(self.offset.get());
         let mut list = List::new(items)
-            .highlight_symbol("> ")
+            .highlight_symbol(highlight_symbol)
             .highlight_style(highlight);
         if let Some(block) = block {
             list = list.block(block);

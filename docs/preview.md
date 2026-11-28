@@ -108,7 +108,8 @@ to fit the width.
 
 The parameter panel has focus initially. A cyan border marks the focused panel.
 Parameters are grouped under Print, Dither, and Tone headers. A collapsed group
-shows `N changed` when any of its settings differ from their defaults.
+shows `N changed` when any of its settings differ from their defaults. Headers
+start at the panel edge; an item's two-column indent becomes `> ` when selected.
 
 | Context | Key | Action |
 | --- | --- | --- |

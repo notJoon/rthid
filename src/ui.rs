@@ -1981,6 +1981,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         let buffer = terminal.backend().buffer();
+        let panel = layout(terminal.size().unwrap()).panel;
+        assert_eq!(buffer[(panel.x + 1, panel.y + 1)].symbol(), "▾");
+        assert_eq!(buffer[(panel.x + 1, panel.y + 2)].symbol(), ">");
+        assert_eq!(buffer[(panel.x + 3, panel.y + 2)].symbol(), "C");
         for label in [
             "Card",
             "Dot:",
@@ -2032,9 +2036,11 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &GROUP_LENS,
         );
+        app.panel.select(Row::Item(0), &GROUP_LENS);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let text = draw_text(&mut terminal, &app, &mut renderer);
         assert!(text.contains("▸ Tone  2 changed"), "{text}");
+        assert!(text.contains("> Card: Image"), "{text}");
         assert!(!text.contains("Brightness:"), "{text}");
     }
     #[test]

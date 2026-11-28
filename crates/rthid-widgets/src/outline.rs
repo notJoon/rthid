@@ -53,13 +53,13 @@ pub enum Row {
 /// let mut outline = Outline::new();
 /// let mut buffer = Buffer::empty(area);
 /// outline.render(groups(), None, Style::default(), area, &mut buffer);
-/// assert_eq!(buffer[(4, 1)].symbol(), "c");
+/// assert_eq!(buffer[(2, 1)].symbol(), "c");
 ///
 /// let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
 /// assert_eq!(outline.handle_key(left, &[1, 1]), Outcome::Consumed);
 /// assert!(outline.is_collapsed(0));
 /// outline.render(groups(), None, Style::default(), area, &mut buffer);
-/// assert_eq!(buffer[(2, 1)].symbol(), "▾");
+/// assert_eq!(buffer[(0, 0)].symbol(), "▸");
 /// ```
 pub struct Outline {
     picker: ListPicker,
@@ -194,7 +194,9 @@ impl Outline {
     ///
     /// Each group is a `(title, items)` pair. Its item count must match the
     /// corresponding `lens` entry passed to input (see [`Outline`]).
-    /// Caller-provided line and span styles are preserved.
+    /// Headers start at the content edge. Items use a two-column selection
+    /// gutter: `> ` when selected and two spaces otherwise. Caller-provided
+    /// line and span styles are preserved.
     /// Collapsed items are omitted, and selection, highlighting, block layout,
     /// and retained scrolling match [`ListPicker::render`].
     pub fn render<'a>(
@@ -205,7 +207,7 @@ impl Outline {
         area: Rect,
         buf: &mut Buffer,
     ) {
-        let lines = groups
+        let lines: Vec<_> = groups
             .into_iter()
             .enumerate()
             .flat_map(|(group, (mut title, items))| {
@@ -214,12 +216,24 @@ impl Outline {
                     .spans
                     .insert(0, Span::raw(if collapsed { "▸ " } else { "▾ " }));
                 let items = if collapsed { Vec::new() } else { items };
-                std::iter::once(title).chain(items.into_iter().map(|mut item| {
-                    item.spans.insert(0, Span::raw("  "));
-                    item
-                }))
+                std::iter::once((title, false)).chain(items.into_iter().map(|item| (item, true)))
+            })
+            .collect();
+        let selected = self.picker.selected(lines.len());
+        let lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (mut line, item))| {
+                if item {
+                    line.spans.insert(
+                        0,
+                        Span::raw(if selected == Some(index) { "> " } else { "  " }),
+                    );
+                }
+                line
             });
-        self.picker.render(lines, block, highlight, area, buf);
+        self.picker
+            .render_with_highlight_symbol(lines, block, highlight, area, buf, "");
     }
 
     fn resize(&mut self, lens: &[usize]) {
@@ -459,11 +473,7 @@ mod tests {
     #[test]
     fn render_preserves_styles_indents_and_hides_collapsed_items() {
         let area = Rect::new(0, 0, 12, 4);
-        let mut outline = Outline::new();
-        outline.select(Row::Header(1), &[1, 1]);
-        outline.handle_key(key(KeyCode::Left), &[1, 1]);
-        let mut buf = Buffer::empty(area);
-        outline.render(
+        let groups = || {
             [
                 (
                     Line::from(Span::styled("A", Style::default().fg(Color::Red))),
@@ -473,20 +483,39 @@ mod tests {
                     ))],
                 ),
                 (Line::raw("B"), vec![Line::raw("b")]),
-            ],
+            ]
+        };
+        let mut outline = Outline::new();
+        outline.select(Row::Header(1), &[1, 1]);
+        outline.handle_key(key(KeyCode::Left), &[1, 1]);
+        let mut buf = Buffer::empty(area);
+        outline.render(
+            groups(),
             None,
             Style::default().bg(Color::Green),
             area,
             &mut buf,
         );
-        assert_eq!(buf[(2, 0)].symbol(), "▾");
-        assert_eq!(buf[(4, 0)].fg, Color::Red);
-        assert_eq!(buf[(4, 1)].symbol(), "a");
-        assert_eq!(buf[(4, 1)].fg, Color::Blue);
-        assert_eq!(buf[(0, 2)].symbol(), ">");
-        assert_eq!(buf[(2, 2)].symbol(), "▸");
-        assert_eq!(buf[(2, 2)].bg, Color::Green);
-        assert_eq!(buf[(4, 3)].symbol(), " ");
+        assert_eq!(buf[(0, 0)].symbol(), "▾");
+        assert_eq!(buf[(2, 0)].fg, Color::Red);
+        assert_eq!(buf[(2, 1)].symbol(), "a");
+        assert_eq!(buf[(2, 1)].fg, Color::Blue);
+        assert_eq!(buf[(0, 2)].symbol(), "▸");
+        assert_eq!(buf[(0, 2)].bg, Color::Green);
+        assert_eq!(buf[(2, 3)].symbol(), " ");
+
+        outline.select(Row::Item(0), &[1, 1]);
+        outline.render(
+            groups(),
+            None,
+            Style::default().bg(Color::Green),
+            area,
+            &mut buf,
+        );
+        assert_eq!(buf[(0, 1)].symbol(), ">");
+        assert_eq!(buf[(2, 1)].symbol(), "a");
+        assert_eq!(buf[(2, 1)].fg, Color::Blue);
+        assert_eq!(buf[(2, 1)].bg, Color::Green);
     }
 
     #[test]
@@ -544,8 +573,8 @@ mod tests {
         outline.select(Row::Header(1), &lens);
         let mut buf = Buffer::empty(area);
         outline.render(groups(), None, Style::default(), area, &mut buf);
-        assert_eq!(buf[(4, 0)].symbol(), "c");
-        assert_eq!(buf[(2, 1)].symbol(), "▾");
+        assert_eq!(buf[(2, 0)].symbol(), "c");
+        assert_eq!(buf[(0, 1)].symbol(), "▾");
 
         let item = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
         assert_eq!(
@@ -554,7 +583,7 @@ mod tests {
         );
         assert_eq!(outline.selected(&lens), Some(Row::Item(2)));
         outline.render(groups(), None, Style::default(), area, &mut buf);
-        assert_eq!(buf[(4, 0)].symbol(), "c");
+        assert_eq!(buf[(2, 0)].symbol(), "c");
 
         let header = mouse(MouseEventKind::Down(MouseButton::Left), 0, 1);
         assert_eq!(
