@@ -23,7 +23,7 @@ use rthid_dither::{
 };
 use rthid_io::{
     dir::Entry,
-    io::{Done, Job, Opened, Outcome as IoOutcome},
+    io::{Cause as IoCause, Done, IoError, Job, Op as IoOp, Opened, Outcome as IoOutcome},
 };
 use rthid_widgets::{Confirm, ListPicker, Outcome, Outline, Row};
 use std::{
@@ -120,6 +120,24 @@ enum PreviewKey {
 struct Notice {
     source: Source,
     text: String,
+}
+
+fn io_notice(error: &IoError) -> String {
+    let prefix = match error.op {
+        IoOp::Decode | IoOp::List => "open",
+        IoOp::Encode => "PNG",
+        IoOp::Save => "save",
+    };
+    match &error.cause {
+        IoCause::Stopped => format!("{}: {}: {}", error.op, error.cause, error.path.display()),
+        IoCause::IsSource(path) => format!(
+            "open: source image cannot be overwritten: {}",
+            path.display()
+        ),
+        // Session errors already end with their most specific path.
+        IoCause::Io(cause) if session::error_has_path(cause) => format!("{prefix}: {cause}"),
+        cause => format!("{prefix}: {cause}: {}", error.path.display()),
+    }
 }
 
 /// All interactive state: settings, focus, preview viewport, grid caches and
@@ -514,7 +532,7 @@ impl App {
             .iter()
             .any(|save| save.dir == dir && save.epoch == self.document_epoch);
         if !own_pending && dir.exists() && !session::is_saveable(&dir) {
-            self.set_notice(format!("{}: not a session directory", dir.display()));
+            self.set_notice(format!("save: not a session directory: {}", dir.display()));
         } else if !own_pending && self.session.is_none() && dir.exists() {
             self.confirm(
                 Confirm::new(format!(
@@ -671,7 +689,7 @@ impl App {
                         if save.superseded && self.document_epoch == save.epoch {
                             self.save_uncertain = true;
                         }
-                        self.set_notice(error.to_string());
+                        self.set_notice(io_notice(&error));
                     }
                 }
                 changed = true;
@@ -734,7 +752,7 @@ impl App {
                 if let Err(error) = result {
                     changed |= self.report_notice(Notice {
                         source: Source::Export,
-                        text: export_error.unwrap_or_else(|| error.to_string()),
+                        text: export_error.unwrap_or_else(|| io_notice(&error)),
                     });
                 }
             }
@@ -751,7 +769,7 @@ impl App {
             IoOutcome::Opened(Err(error))
             | IoOutcome::Listed(Err(error))
             | IoOutcome::Loaded(Err(error)) => {
-                changed |= self.set_notice(error.to_string());
+                changed |= self.set_notice(io_notice(&error));
             }
         }
         changed
@@ -818,7 +836,7 @@ impl App {
             IoOutcome::Loaded(Ok(output)) => match output.downcast::<Session>() {
                 Ok((path, session)) => self.open_session(path, session),
                 Err(error) => {
-                    self.set_notice(error.to_string());
+                    self.set_notice(io_notice(&error));
                 }
             },
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => self.open_image(path, image),
@@ -862,11 +880,17 @@ impl App {
         {
             Job::load(resolved, move |dir| {
                 let session = session::read(dir)?;
-                session::check_exports(dir, &protect)?;
                 for source in [&session.source_path, &dir.join("manifest.toml")] {
-                    rthid_io::image::check_not_source(source, &protect)
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    rthid_io::image::check_not_source(source, &protect).map_err(
+                        |error| match error {
+                            IoCause::IsSource(path) => {
+                                session::named(&path, "source image cannot be overwritten")
+                            }
+                            error => std::io::Error::other(error.to_string()),
+                        },
+                    )?;
                 }
+                session::check_exports(dir, &protect)?;
                 Ok(session)
             })
         } else {
@@ -2059,10 +2083,15 @@ mod tests {
             app.settings.flip = true;
             ctrl(&mut app, 's');
             run_session_job(&mut app);
-            assert!(
-                app.notice()
-                    .unwrap()
-                    .contains("export destination is inside the session directory")
+            assert_eq!(
+                app.notice(),
+                Some(
+                    format!(
+                        "save: export destination is inside the session directory: {}",
+                        destination.display()
+                    )
+                    .as_str()
+                )
             );
             assert!(app.saved == saved);
             assert!(app.modified());
@@ -2105,6 +2134,40 @@ mod tests {
             std::os::unix::fs::symlink(&dir, &alias).unwrap();
             assert!(session::check_exports(&dir, &[alias.join("new.png")]).is_err());
         }
+    }
+
+    #[test]
+    fn corrupt_session_notice_starts_with_the_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("corrupt.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&app)).unwrap();
+        std::fs::write(dir.join("manifest.toml"), "[broken").unwrap();
+        app.request_open(dir.clone(), None);
+        let (job, tag) = app.take_jobs().pop().unwrap();
+        let Job::Load { path, read } = job else {
+            panic!("expected session load")
+        };
+        let error = read(&path).unwrap_err();
+        app.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Loaded(Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Decode,
+                path,
+                cause: rthid_io::io::Cause::Io(error),
+            })),
+        ));
+        assert_eq!(
+            app.notice(),
+            Some(
+                format!(
+                    "open: broken manifest, restore it: unclosed table, expected `]`: {}",
+                    dir.join("manifest.toml").display()
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -2182,7 +2245,16 @@ mod tests {
             })),
         ));
         assert!(protected.session.is_none());
-        assert!(protected.notice().unwrap().contains("manifest.toml"));
+        assert_eq!(
+            protected.notice(),
+            Some(
+                format!(
+                    "open: source image cannot be overwritten: {}",
+                    dir.join("manifest.toml").display()
+                )
+                .as_str()
+            )
+        );
         assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), before);
     }
 
@@ -2266,13 +2338,19 @@ mod tests {
         app.open_image(source.clone(), RgbaImage::new(2, 3));
         std::fs::write(&target, b"unrelated").unwrap();
         ctrl(&mut app, 's');
-        assert!(app.notice().unwrap().contains("not a session directory"));
+        assert_eq!(
+            app.notice(),
+            Some(format!("save: not a session directory: {}", target.display()).as_str())
+        );
         assert!(app.take_jobs().is_empty());
         std::fs::remove_file(&target).unwrap();
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("notes.txt"), b"unrelated").unwrap();
         ctrl(&mut app, 's');
-        assert!(app.notice().unwrap().contains("not a session directory"));
+        assert_eq!(
+            app.notice(),
+            Some(format!("save: not a session directory: {}", target.display()).as_str())
+        );
         std::fs::remove_file(target.join("notes.txt")).unwrap();
         std::fs::remove_dir(&target).unwrap();
         ctrl(&mut app, 's');
@@ -2403,6 +2481,31 @@ mod tests {
         run_session_job(&mut app);
         assert!(app.session.is_none());
         assert!(app.modified());
+    }
+
+    #[test]
+    fn session_lock_failure_notice_has_one_specific_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+        session::write(&dir, snapshot(&app)).unwrap();
+        app.session = Some(dir.clone());
+        app.settings.flip = true;
+        let lock_path = dir.join(".lock");
+        let _lock = rthid_io::atomic::lock(&lock_path, std::time::Duration::ZERO).unwrap();
+        ctrl(&mut app, 's');
+        run_session_job(&mut app);
+        assert_eq!(
+            app.notice(),
+            Some(
+                format!(
+                    "save: another rthid is saving this session, try again: {}",
+                    lock_path.display()
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -3676,7 +3779,7 @@ mod tests {
         assert!(jobs(&mut app).is_empty());
         assert_eq!(
             app.export_status(),
-            Some("PNG preview.png: output size 18898x27969 exceeds 268435456 pixels")
+            Some("PNG: output size 18898x27969 exceeds 268435456 pixels: preview.png")
         );
         assert!(app.export_result().is_err());
     }
@@ -3711,7 +3814,7 @@ mod tests {
         assert!(jobs(&mut app).is_empty());
         assert!(
             app.export_status()
-                .is_some_and(|status| status.starts_with("SVG mass.svg: mass study:"))
+                .is_some_and(|status| status.starts_with("SVG: mass study:"))
         );
         assert!(app.export_result().is_err());
 
@@ -3748,9 +3851,9 @@ mod tests {
             cause: rthid_io::io::Cause::Io(std::io::Error::other("denied")),
         };
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
-        assert_eq!(app.export_status(), Some("SVG mass.svg: denied"));
+        assert_eq!(app.export_status(), Some("SVG: denied: mass.svg"));
         app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
-        assert_eq!(app.notice(), Some("SVG mass.svg: denied"));
+        assert_eq!(app.notice(), Some("SVG: denied: mass.svg"));
     }
 
     fn encoded_bytes(job: Job) -> (PathBuf, Vec<u8>) {
@@ -3804,21 +3907,25 @@ mod tests {
             panic!("open dialog expected")
         };
         assert_eq!(picker.dir, PathBuf::from("/images"));
-        for outcome in [
-            IoOutcome::Opened(Err(failure(Op::Decode))),
-            IoOutcome::Listed(Err(failure(Op::List))),
+        for (outcome, expected) in [
+            (
+                IoOutcome::Opened(Err(failure(Op::Decode))),
+                "open: denied: failed.png",
+            ),
+            (
+                IoOutcome::Listed(Err(IoError {
+                    op: IoOp::List,
+                    path: "/images".into(),
+                    cause: IoCause::Io(std::io::Error::other("denied")),
+                })),
+                "open: denied: /images",
+            ),
         ] {
             if matches!(outcome, IoOutcome::Opened(_)) {
                 app.request_open("failed.png".into(), None);
             }
-            let expected = match &outcome {
-                IoOutcome::Opened(Err(error))
-                | IoOutcome::Listed(Err(error))
-                | IoOutcome::Loaded(Err(error)) => error.to_string(),
-                _ => unreachable!(),
-            };
             assert!(app.complete(done(&app, outcome)));
-            assert_eq!(app.notice(), Some(expected.as_str()));
+            assert_eq!(app.notice(), Some(expected));
             assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
         }
         assert!(app.complete(done(&app, IoOutcome::Listed(Ok(listing())))));
@@ -3829,6 +3936,76 @@ mod tests {
         assert!(app.notice().is_none());
         assert_eq!(app.source_path(), Some(std::path::Path::new("photo.png")));
         assert_eq!(app.grid_size(), (250, 450));
+    }
+
+    #[test]
+    fn io_error_notices_put_the_reason_before_one_path() {
+        let mut app = App::empty();
+
+        app.request_open("source.png".into(), None);
+        app.take_jobs();
+        let source = PathBuf::from("/images/source.png");
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Err(IoError {
+                op: IoOp::Decode,
+                path: source.clone(),
+                cause: IoCause::IsSource(source),
+            })),
+        ));
+        assert_eq!(
+            app.notice(),
+            Some("open: source image cannot be overwritten: /images/source.png")
+        );
+
+        app.request_open("stopped.png".into(), None);
+        app.take_jobs();
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Err(IoError {
+                op: IoOp::Decode,
+                path: "/images/stopped.png".into(),
+                cause: IoCause::Stopped,
+            })),
+        ));
+        assert_eq!(
+            app.notice(),
+            Some("decode: skipped because the IO worker shut down: /images/stopped.png")
+        );
+
+        let mut exported = App::new(
+            None,
+            Some("/images/preview.png".into()),
+            None,
+            None,
+            Loaded::default(),
+        );
+        exported.complete(done(
+            &exported,
+            IoOutcome::Exported(Err(IoError {
+                op: IoOp::Encode,
+                path: "/images/preview.png".into(),
+                cause: IoCause::Io(std::io::Error::other("disk full")),
+            })),
+        ));
+        assert_eq!(
+            exported.notice(),
+            Some("PNG: disk full: /images/preview.png")
+        );
+
+        let mut untracked = App::empty();
+        untracked.complete(done(
+            &untracked,
+            IoOutcome::Exported(Err(IoError {
+                op: IoOp::Encode,
+                path: "/images/untracked.png".into(),
+                cause: IoCause::Io(std::io::Error::other("read only")),
+            })),
+        ));
+        assert_eq!(
+            untracked.notice(),
+            Some("PNG: read only: /images/untracked.png")
+        );
     }
 
     #[test]
@@ -4459,7 +4636,7 @@ mod tests {
         saved(&mut app, text);
         save_failed(&mut app);
         let error = failure(rthid_io::io::Op::Encode);
-        let export_error = error.to_string();
+        let export_error = "PNG: denied: preview.png".to_string();
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
         assert_eq!(app.notice(), Some(export_error.as_str()));
         press(&mut app, KeyCode::Esc);
@@ -4482,7 +4659,7 @@ mod tests {
             Loaded::default(),
         );
         let error = failure(rthid_io::io::Op::Encode);
-        let text = error.to_string();
+        let text = "PNG: denied: preview.png".to_string();
         app.complete(done(&app, IoOutcome::Exported(Err(error))));
         app.set_notice(text.clone());
         app.complete(done(&app, IoOutcome::Exported(Ok("preview.png".into()))));
@@ -4550,7 +4727,7 @@ mod tests {
                     1 => {
                         app.open_dialog("/images".into());
                         let error = failure(Op::List);
-                        let expected = error.to_string();
+                        let expected = "open: denied: failed.png".to_string();
                         app.complete(done(&app, IoOutcome::Listed(Err(error))));
                         expected
                     }
@@ -4571,7 +4748,7 @@ mod tests {
                     _ => IoOutcome::Opened(Err(failure(Op::Decode))),
                 };
                 let expected = if result_kind == 2 {
-                    failure(Op::Decode).to_string()
+                    "open: denied: failed.png".to_string()
                 } else {
                     expected
                 };

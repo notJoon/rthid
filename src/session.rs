@@ -209,8 +209,38 @@ impl FileView {
     }
 }
 
-fn named(path: &Path, error: impl std::fmt::Display) -> io::Error {
-    io::Error::other(format!("{}: {error}", path.display()))
+#[derive(Debug)]
+struct PathError {
+    reason: String,
+    path: PathBuf,
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.path.display())
+    }
+}
+
+impl std::error::Error for PathError {}
+
+fn with_path(path: &Path, kind: io::ErrorKind, reason: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        kind,
+        PathError {
+            reason: reason.to_string(),
+            path: path.to_path_buf(),
+        },
+    )
+}
+
+pub(crate) fn error_has_path(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.downcast_ref::<PathError>().is_some())
+}
+
+pub(crate) fn named(path: &Path, error: impl std::fmt::Display) -> io::Error {
+    with_path(path, io::ErrorKind::Other, error)
 }
 
 /// Recognizes session directories without teaching the IO crate their format.
@@ -265,14 +295,12 @@ fn child(dir: &Path, name: &str) -> io::Result<PathBuf> {
 }
 
 fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
-    let broken = |error: &dyn std::fmt::Display| {
-        named(path, format!("broken manifest, restore it: {error}"))
-    };
-    let value: toml::Value = toml::from_str(text).map_err(|e| broken(&e))?;
+    let broken = |reason: &str| named(path, format!("broken manifest, restore it: {reason}"));
+    let value: toml::Value = toml::from_str(text).map_err(|error| broken(error.message()))?;
     let version = value
         .get("version")
         .and_then(toml::Value::as_integer)
-        .ok_or_else(|| broken(&"missing or invalid version"))?;
+        .ok_or_else(|| broken("missing or invalid version"))?;
     if version != 1 {
         let reason = if version > 1 {
             "was written by a newer rthid"
@@ -284,7 +312,7 @@ fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
             format!("{reason} (version {version}), upgrade rthid"),
         ));
     }
-    toml::from_str(text).map_err(|e| broken(&e))
+    toml::from_str(text).map_err(|error| broken(error.message()))
 }
 
 fn resolve(path: &Path) -> io::Result<PathBuf> {
@@ -336,7 +364,17 @@ fn read_with(dir: &Path, mut after_manifest: impl FnMut()) -> io::Result<Session
 }
 
 fn pixel_error(path: &Path, error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+    with_path(path, error.kind(), error)
+}
+
+fn regular_error(path: &Path, error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string() == format!("{}: not a regular file", path.display())
+    {
+        with_path(path, io::ErrorKind::InvalidInput, "not a regular file")
+    } else {
+        pixel_error(path, error)
+    }
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
@@ -353,7 +391,7 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
 fn read_once(dir: &Path, after_manifest: &mut impl FnMut()) -> io::Result<Session> {
     let path = dir.join("manifest.toml");
     let text = atomic::read_regular(&path)
-        .map_err(|e| named(&path, e))?
+        .map_err(|error| regular_error(&path, error))?
         .ok_or_else(|| named(&path, "missing manifest"))?;
     let manifest = parse_manifest(&path, &text)?;
     after_manifest();
@@ -532,24 +570,26 @@ fn write_with_sync(
         return Err(io::Error::other("at most 256 layers are allowed"));
     }
     create_session_dir(dir, &mut sync)?;
-    let _lock =
-        atomic::lock(&dir.join(".lock"), std::time::Duration::from_secs(2)).map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                io::Error::new(
-                    error.kind(),
-                    "another rthid is saving this session, try again",
-                )
-            } else {
-                error
-            }
-        })?;
+    let lock_path = dir.join(".lock");
+    let _lock = atomic::lock(&lock_path, std::time::Duration::from_secs(2)).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            with_path(
+                &lock_path,
+                error.kind(),
+                "another rthid is saving this session, try again",
+            )
+        } else {
+            pixel_error(&lock_path, error)
+        }
+    })?;
     let (width, height) = session.source.dimensions();
     let hash = source_hash(&session.source);
     let manifest_path = dir.join("manifest.toml");
     if fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(named(&manifest_path, "session files must not be symlinks"));
     }
-    let previous = atomic::read_regular(&manifest_path)?
+    let previous = atomic::read_regular(&manifest_path)
+        .map_err(|error| regular_error(&manifest_path, error))?
         .map(|text| parse_manifest(&manifest_path, &text))
         .transpose()?;
     // Leftovers of a failed first save are reused, and the cleanup below removes them.
@@ -1006,12 +1046,39 @@ mod tests {
     #[test]
     fn lock_timeout_tells_the_user_to_retry() {
         let temp = tempfile::tempdir().unwrap();
-        let _lock = atomic::lock(&temp.path().join(".lock"), std::time::Duration::ZERO).unwrap();
+        let lock_path = temp.path().join(".lock");
+        let _lock = atomic::lock(&lock_path, std::time::Duration::ZERO).unwrap();
         let error = write(temp.path(), fixture()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(
             error.to_string(),
-            "another rthid is saving this session, try again"
+            format!(
+                "another rthid is saving this session, try again: {}",
+                lock_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn pixel_errors_put_the_reason_before_the_path_and_keep_the_kind() {
+        let error = pixel_error(
+            Path::new("/session/source.png"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "permission denied: /session/source.png");
+    }
+
+    #[test]
+    fn non_regular_manifests_name_the_path_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("manifest.toml");
+        fs::create_dir(&manifest).unwrap();
+        let expected = format!("not a regular file: {}", manifest.display());
+        assert_eq!(read(temp.path()).err().unwrap().to_string(), expected);
+        assert_eq!(
+            write(temp.path(), fixture()).unwrap_err().to_string(),
+            expected
         );
     }
 

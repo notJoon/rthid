@@ -39,7 +39,7 @@ impl ExportState {
     }
 
     /// Updates the retained error and reports whether the status changed.
-    /// Export errors are always `Op::Encode`, so PNG text matches `IoError`'s display.
+    /// Export errors are always `Op::Encode` and use the same reason-before-path shape.
     pub fn complete(&mut self, result: Result<(), &IoError>) -> bool {
         let error = result
             .err()
@@ -48,7 +48,7 @@ impl ExportState {
     }
 
     fn message(&self, cause: &str) -> String {
-        format!("{} {}: {cause}", self.label, self.path.display())
+        format!("{}: {cause}: {}", self.label, self.path.display())
     }
 
     fn set_error(&mut self, error: Option<String>) -> bool {
@@ -277,7 +277,7 @@ mod tests {
         export.complete(Err(&error));
         assert_eq!(
             export.status(),
-            Some("PNG preview.png: grid has 0 indices, expected 1x1 = 1")
+            Some("PNG: grid has 0 indices, expected 1x1 = 1: preview.png")
         );
     }
 }
