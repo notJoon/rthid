@@ -72,9 +72,12 @@ pub fn load_image(path: &Path) -> Result<RgbaImage, image::ImageError> {
     .to_rgba8())
 }
 
-// Opens without blocking on FIFOs and checks the opened handle, so the path cannot be swapped
-// for a special file between the check and the read.
-fn open_regular(path: &Path) -> io::Result<File> {
+/// Opens a regular source file without blocking on Unix FIFOs.
+/// Checks the opened handle so replacing the path cannot bypass the file type check.
+///
+/// # Errors
+/// Returns open errors or `InvalidInput` for special files and directories.
+pub fn open_regular(path: &Path) -> io::Result<File> {
     let not_regular =
         || io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file");
     let mut options = OpenOptions::new();

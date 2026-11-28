@@ -7,6 +7,7 @@ use crate::{
     export::{Export, MassExport},
     grid::GridCache,
     modal::{Ctx, Effect, Modal, Next, Step},
+    session::{self, Session, ViewState},
     settings::{GROUP_LENS, Setting, Settings, Template},
     store::{Change, Library, Loaded},
     viewport::{PreviewGeometry, Viewport, Zoom},
@@ -24,11 +25,26 @@ use rthid_io::{
     dir::Entry,
     io::{Done, Job, Opened, Outcome as IoOutcome},
 };
-use rthid_widgets::{Outcome, Outline, Row};
+use rthid_widgets::{Confirm, Outcome, Outline, Row};
 use std::{
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Clone, PartialEq)]
+struct SavedState {
+    revision: u64,
+    settings: Settings,
+    view: ViewState,
+    selected: Option<usize>,
+}
+
+struct SessionSave {
+    token: u64,
+    epoch: u64,
+    dir: PathBuf,
+    state: SavedState,
+}
 
 struct OpenRequest {
     /// Tag the result echoes, unique to this request.
@@ -90,6 +106,12 @@ pub struct App {
     export: Option<Export>,
     mass_export: Option<MassExport>,
     source_path: Option<PathBuf>,
+    /// Directory used when saving the current editing session.
+    pub(crate) session: Option<PathBuf>,
+    saved: Option<SavedState>,
+    saved_token: u64,
+    saving: Vec<SessionSave>,
+    document_epoch: u64,
     notice: Option<Notice>,
     outbox: Vec<(Job, u64)>,
     open_request: Option<OpenRequest>,
@@ -315,6 +337,11 @@ impl App {
             export: preview_png.map(|path| Export::new(path, dpi)),
             mass_export: mass_svg.map(MassExport::new),
             source_path: None,
+            session: None,
+            saved: None,
+            saved_token: 0,
+            saving: Vec::new(),
+            document_epoch: 0,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
             preview_focus: false,
@@ -412,13 +439,22 @@ impl App {
 
     /// Replaces the source and resets image composition and preview navigation.
     pub fn open_image(&mut self, path: PathBuf, image: RgbaImage) {
+        self.set_image(path, image);
+        self.refresh(false);
+        self.record_saved();
+    }
+
+    fn set_image(&mut self, path: PathBuf, image: RgbaImage) {
         let row = self
             .panel
             .selected(&self.panel_lens())
             .unwrap_or(Row::Header(LAYER_GROUP));
         self.layer_drag = None;
         self.stroke = None;
+        self.document_epoch += 1;
+        self.saved_token = 0;
         self.source_path = Some(path);
+        self.session = None;
         self.edits
             .reset(Document::new(image.width(), image.height()));
         self.retain_panel(row);
@@ -428,7 +464,112 @@ impl App {
         self.settings.reset_composition();
         self.view = View::Original;
         self.mass_return = View::Original;
+    }
+
+    fn current_state(&self) -> SavedState {
+        SavedState {
+            revision: self.edits.revision(),
+            settings: self.settings.clone(),
+            view: ViewState::capture_unsaved(self),
+            selected: self.edits.current().selected(),
+        }
+    }
+
+    /// Records the current document as the initial saved state.
+    pub(crate) fn record_saved(&mut self) {
+        self.saved = Some(self.current_state());
+    }
+
+    /// Whether document, processing or preview state differs from the last saved snapshot.
+    pub(crate) fn modified(&self) -> bool {
+        self.source_path.is_some()
+            && self
+                .saved
+                .as_ref()
+                .is_some_and(|saved| *saved != self.current_state())
+    }
+
+    /// Replaces source, settings and layers with a validated session and fresh history.
+    pub(crate) fn open_session(&mut self, dir: PathBuf, session: Session) {
+        let row = self
+            .panel
+            .selected(&self.panel_lens())
+            .unwrap_or(Row::Header(LAYER_GROUP));
+        self.set_image(session.source_path, session.source);
+        self.edits.reset(session.document);
+        self.retain_panel(row);
+        self.settings = session.settings;
+        session.view.restore(self);
+        self.session = Some(dir);
         self.refresh(false);
+        self.record_saved();
+    }
+
+    fn confirm(&mut self, message: String, effect: Effect) {
+        let back = self.modal.take().map(Box::new);
+        self.show_modal(Modal::Confirm {
+            question: Confirm::new(message),
+            action: Some(Box::new(effect)),
+            back,
+        });
+    }
+
+    fn request_session_save(&mut self) {
+        let Some(source) = self.source_path() else {
+            return;
+        };
+        let dir = self
+            .session
+            .clone()
+            .unwrap_or_else(|| session::default_path(source));
+        let own_pending = self
+            .saving
+            .iter()
+            .any(|save| save.dir == dir && save.epoch == self.document_epoch);
+        if !own_pending && dir.exists() && !session::is_session(&dir) {
+            self.set_notice(format!("{}: not a session directory", dir.display()));
+        } else if !own_pending && self.session.is_none() && dir.exists() {
+            self.confirm(
+                format!(
+                    "Overwrite {}?",
+                    dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                ),
+                Effect::SaveSession(dir),
+            );
+        } else {
+            self.save_session(dir);
+        }
+    }
+
+    fn save_session(&mut self, dir: PathBuf) {
+        let Some(source) = self.grid_cache.source.clone() else {
+            return;
+        };
+        let token = self.next_token();
+        self.saving.push(SessionSave {
+            token,
+            epoch: self.document_epoch,
+            dir: dir.clone(),
+            state: self.current_state(),
+        });
+        self.set_notice(format!(
+            "saving {}",
+            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+        ));
+        let snapshot = Session {
+            source_path: self.source_path.clone().unwrap(),
+            source,
+            document: self.edits.current().clone(),
+            settings: self.settings.clone(),
+            view: ViewState::capture(self),
+        };
+        self.outbox.push((
+            Job::Save {
+                dir,
+                write: Box::new(move |dir| session::write(dir, snapshot)),
+            },
+            token,
+        ));
     }
 
     /// Supplies directory entries to the open dialog if it is still open.
@@ -492,7 +633,7 @@ impl App {
         let mut changed = false;
         // Dialog that asked for the result. Listings always come from one.
         let mut requester = Some(done.tag);
-        let opened = matches!(done.outcome, IoOutcome::Opened(_));
+        let opened = matches!(done.outcome, IoOutcome::Opened(_) | IoOutcome::Loaded(_));
         if matches!(done.outcome, IoOutcome::Listed(_)) && self.dialog() != Some(done.tag) {
             return false;
         }
@@ -507,6 +648,42 @@ impl App {
             changed = true;
         }
         match done.outcome {
+            IoOutcome::Saved(result) => {
+                let Some(index) = self.saving.iter().position(|save| save.token == done.tag) else {
+                    return false;
+                };
+                let save = self.saving.remove(index);
+                match result {
+                    Ok(dir)
+                        if self.document_epoch == save.epoch && save.token > self.saved_token =>
+                    {
+                        self.saved_token = save.token;
+                        self.session = Some(dir.clone());
+                        self.saved = Some(save.state);
+                        self.set_notice(format!(
+                            "saved {}",
+                            dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy()
+                        ));
+                    }
+                    Ok(_) => return false,
+                    Err(error) => {
+                        self.set_notice(error.to_string());
+                    }
+                }
+                changed = true;
+            }
+            IoOutcome::Loaded(Ok(output)) => {
+                if requester.is_some() && requester == self.dialog() {
+                    self.modal = None;
+                }
+                match output.value.downcast::<Session>() {
+                    Ok(session) => self.open_session(output.path, *session),
+                    Err(_) => {
+                        self.set_notice("invalid session reader result".into());
+                    }
+                }
+                changed = true;
+            }
             IoOutcome::Opened(Ok(Opened::Image { path, image })) => {
                 if requester.is_some() && requester == self.dialog() {
                     self.modal = None;
@@ -570,7 +747,9 @@ impl App {
                 }
                 changed = true;
             }
-            IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => {
+            IoOutcome::Opened(Err(error))
+            | IoOutcome::Listed(Err(error))
+            | IoOutcome::Loaded(Err(error)) => {
                 changed |= self.set_notice(error.to_string());
             }
         }
@@ -603,6 +782,35 @@ impl App {
 
     /// Queues an image load and shows its file name while loading.
     pub fn request_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
+        let resolved = Self::resolve_open(&path, dir.as_deref());
+        if self.modified() && !(resolved.is_dir() && !session::is_session(&resolved)) {
+            self.confirm(
+                "Discard unsaved changes?".into(),
+                Effect::OpenConfirmed(path, dir),
+            );
+        } else {
+            self.start_open(path, dir);
+        }
+    }
+
+    fn resolve_open(path: &Path, dir: Option<&Path>) -> PathBuf {
+        let expanded = path.to_str().map_or_else(
+            || path.to_path_buf(),
+            |text| {
+                rthid_io::path::expand_tilde(
+                    text,
+                    std::env::var_os("HOME").as_deref().map(Path::new),
+                )
+            },
+        );
+        if expanded.is_relative() {
+            dir.map_or_else(|| expanded.clone(), |dir| dir.join(&expanded))
+        } else {
+            expanded
+        }
+    }
+
+    fn start_open(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         let token = self.next_token();
         self.open_request = Some(OpenRequest {
             token,
@@ -615,20 +823,35 @@ impl App {
             ),
         });
         self.notice = None;
-        let job = Job::Open {
-            path,
-            dir,
-            protect: self
-                .export
-                .as_ref()
-                .map(|export| export.path().to_path_buf())
-                .into_iter()
-                .chain(
-                    self.mass_export
-                        .as_ref()
-                        .map(|export| export.path().to_path_buf()),
-                )
-                .collect(),
+        let resolved = Self::resolve_open(&path, dir.as_deref());
+        let resolved = session::containing(&resolved).unwrap_or(resolved);
+        let protect: Vec<_> = self
+            .export
+            .as_ref()
+            .map(|export| export.path().to_path_buf())
+            .into_iter()
+            .chain(
+                self.mass_export
+                    .as_ref()
+                    .map(|export| export.path().to_path_buf()),
+            )
+            .collect();
+        let job = if session::is_session(&resolved)
+            || (resolved.is_dir() && resolved.extension().is_some_and(|ext| ext == "rthid"))
+        {
+            Job::Load {
+                path: resolved,
+                read: Box::new(move |dir| {
+                    let session = session::read(dir)?;
+                    for source in [&session.source_path, &dir.join("manifest.toml")] {
+                        rthid_io::image::check_not_source(source, &protect)
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    }
+                    Ok(Box::new(session) as Box<dyn std::any::Any + Send>)
+                }),
+            }
+        } else {
+            Job::Open { path, dir, protect }
         };
         self.outbox.push((job, token));
     }
@@ -1100,7 +1323,14 @@ impl App {
         }
     }
 
-    fn apply_step(&mut self, step: Step) {
+    fn apply_step(&mut self, mut step: Step) {
+        if matches!(self.modal, Some(Modal::Confirm { .. })) && step.effect.is_some() {
+            match std::mem::replace(&mut step.next, Next::Stay) {
+                Next::Stay => {}
+                Next::Close => self.modal = None,
+                Next::Replace(modal) => self.show_modal(modal),
+            }
+        }
         if let Some(effect) = step.effect {
             self.notice = None;
             if let Err(error) = self.apply(effect) {
@@ -1144,6 +1374,12 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('s') {
+            if self.modal.is_none() {
+                self.request_session_save();
             }
             return;
         }
@@ -1279,7 +1515,13 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if self.modified() {
+                    self.confirm("Discard unsaved changes?".into(), Effect::Quit);
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Char('f') => self.settings.flip = !self.settings.flip,
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
@@ -1343,6 +1585,9 @@ impl App {
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
+            Effect::Quit => self.quit = true,
+            Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
+            Effect::SaveSession(dir) => self.save_session(dir),
             Effect::Open(path, dir) => self.request_open(path, Some(dir)),
             Effect::ListDir(path) => self.request_list(path),
             Effect::Notice(message) => {
@@ -1487,6 +1732,391 @@ mod tests {
 
     fn jobs(app: &mut App) -> Vec<Job> {
         app.take_jobs().into_iter().map(|(job, _)| job).collect()
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            &app.geometry(test_layout().preview),
+        );
+    }
+
+    fn run_session_job(app: &mut App) {
+        let jobs = app.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        let (job, tag) = jobs.into_iter().next().unwrap();
+        let outcome = match job {
+            Job::Save { dir, write } => {
+                let result =
+                    write(&dir)
+                        .map(|()| dir.clone())
+                        .map_err(|error| rthid_io::io::IoError {
+                            op: rthid_io::io::Op::Save,
+                            path: dir,
+                            cause: rthid_io::io::Cause::Io(error),
+                        });
+                IoOutcome::Saved(result)
+            }
+            Job::Load { path, read } => {
+                let value = read(&path).unwrap();
+                IoOutcome::Loaded(Ok(rthid_io::io::Output { path, value }))
+            }
+            _ => panic!("expected session job"),
+        };
+        app.complete(Done::new(tag, std::time::Duration::ZERO, outcome));
+    }
+
+    fn snapshot(app: &App) -> Session {
+        Session {
+            source: app.grid_cache.source.clone().unwrap(),
+            source_path: app.source_path.clone().unwrap(),
+            document: app.edits.current().clone(),
+            settings: app.settings.clone(),
+            view: ViewState::capture(app),
+        }
+    }
+
+    fn session_completion(tag: u64, dir: &Path, succeeds: bool) -> Done {
+        let result = if succeeds {
+            Ok(dir.to_path_buf())
+        } else {
+            Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Save,
+                path: dir.to_path_buf(),
+                cause: rthid_io::io::Cause::Io(std::io::Error::other("injected save failure")),
+            })
+        };
+        Done::new(tag, std::time::Duration::ZERO, IoOutcome::Saved(result))
+    }
+
+    #[test]
+    fn overlapping_session_saves_keep_the_newest_successful_baseline() {
+        for (newest_first, second_succeeds) in [(false, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("photo.rthid");
+            let mut app = App::builtin(RgbaImage::new(2, 3), None);
+            app.open_image(temp.path().join("photo.png"), RgbaImage::new(2, 3));
+            app.settings.flip = true;
+            ctrl(&mut app, 's');
+            let first = app.take_jobs().pop().unwrap().1;
+            session::write(&dir, snapshot(&app)).unwrap();
+            app.settings.flip = false;
+            ctrl(&mut app, 's');
+            assert!(app.modal.is_none());
+            let second = app.take_jobs().pop().unwrap().1;
+            if newest_first {
+                app.complete(session_completion(second, &dir, second_succeeds));
+                app.complete(session_completion(first, &dir, true));
+            } else {
+                app.complete(session_completion(first, &dir, true));
+                app.complete(session_completion(second, &dir, second_succeeds));
+            }
+            assert_eq!(app.session.as_ref(), Some(&dir));
+            assert_eq!(app.modified(), !second_succeeds);
+            if !second_succeeds {
+                assert!(app.notice().unwrap().contains("injected save failure"));
+                app.settings.flip = true;
+                assert!(!app.modified());
+            }
+        }
+    }
+
+    #[test]
+    fn late_save_failure_is_reported_for_a_different_document() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        ctrl(&mut app, 's');
+        let tag = app.take_jobs().pop().unwrap().1;
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        assert!(app.complete(session_completion(tag, Path::new("photo.rthid"), false)));
+        assert!(app.notice().unwrap().contains("injected save failure"));
+        assert!(app.session.is_none());
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn confirmed_open_failure_restores_the_dialog() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.settings.flip = true;
+        app.open_dialog(".".into());
+        let dialog = app.dialog();
+        app.request_open("missing.png".into(), Some(".".into()));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.dialog(), dialog);
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        app.take_jobs();
+        app.complete(done(
+            &app,
+            IoOutcome::Opened(Err(failure(rthid_io::io::Op::Decode))),
+        ));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        assert!(app.notice().is_some());
+        app.request_open("photo.png".into(), Some(".".into()));
+        press(&mut app, KeyCode::Char('y'));
+        app.take_jobs();
+        app.complete(done(&app, opened_photo()));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn session_source_paths_route_to_sessions_and_protect_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.edits.edit(|doc| {
+            doc.add_layer("Stored".into());
+        });
+        session::write(&dir, snapshot(&app)).unwrap();
+        let source = session::read(&dir).unwrap().source_path;
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        app.request_open(source.clone(), None);
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(app.edits.current().layers()[0].name, "Stored");
+        app.open_dialog(dir.clone());
+        app.request_open(
+            PathBuf::from(source.file_name().unwrap()),
+            Some(dir.clone()),
+        );
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        let before = std::fs::read(dir.join("manifest.toml")).unwrap();
+        let mut protected = App::builtin(RgbaImage::new(1, 1), Some(dir.join("manifest.toml")));
+        protected.take_jobs();
+        protected.request_open(dir.clone(), None);
+        let (job, tag) = protected.take_jobs().pop().unwrap();
+        let Job::Load { path, read } = job else {
+            panic!("expected session load")
+        };
+        let error = read(&path).err().unwrap();
+        protected.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Loaded(Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Decode,
+                path,
+                cause: rthid_io::io::Cause::Io(error),
+            })),
+        ));
+        assert!(protected.session.is_none());
+        assert!(protected.notice().unwrap().contains("manifest.toml"));
+        assert_eq!(std::fs::read(dir.join("manifest.toml")).unwrap(), before);
+    }
+
+    #[test]
+    fn session_open_refreshes_once_with_restored_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let mut stored = App::builtin(RgbaImage::new(2, 3), None);
+        stored.settings.flip = true;
+        stored.settings.rotation = Rotation::R90;
+        session::write(&dir, snapshot(&stored)).unwrap();
+        let mut app = App::builtin(RgbaImage::new(1, 1), Some(temp.path().join("preview.png")));
+        app.take_jobs();
+        let before = app.grid_cache.grid_version();
+        app.open_session(dir.clone(), session::read(&dir).unwrap());
+        assert_eq!(app.grid_cache.grid_version(), before + 1);
+        assert!(app.settings == stored.settings);
+        assert!(matches!(
+            app.take_jobs().as_slice(),
+            [(Job::Export { .. }, _)]
+        ));
+        app.sync(Rect::new(0, 0, 1, 1));
+        assert!(!app.modified());
+    }
+
+    #[test]
+    fn session_save_default_path_tracks_submitted_snapshot_and_writes_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        RgbaImage::new(2, 3).save(&source).unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        assert!(!app.modified());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.modified());
+        ctrl(&mut app, 's');
+        app.settings.flip = true;
+        app.edits.edit(|doc| {
+            doc.add_layer("Later".into());
+        });
+        run_session_job(&mut app);
+        let dir = temp.path().join("photo.rthid");
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(app.notice(), Some("saved photo.rthid"));
+        assert_eq!(session::read(&dir).unwrap().document.layers().len(), 1);
+        assert!(app.modified());
+        ctrl(&mut app, 's');
+        run_session_job(&mut app);
+        assert!(!app.modified());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let document = app.edits.current().clone();
+        app.open_image("other.png".into(), RgbaImage::new(1, 1));
+        assert!(app.session.is_none());
+        assert!(!app.modified());
+        app.request_open(dir.clone(), None);
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&dir));
+        assert_eq!(
+            app.source_path(),
+            Some(session::read(&dir).unwrap().source_path.as_path())
+        );
+        assert_eq!(app.edits.current(), &document);
+        assert!(app.settings.flip);
+        assert!(!app.edits.can_undo());
+        assert!(!app.modified());
+        ctrl(&mut app, 's');
+        assert!(matches!(&app.outbox[0].0, Job::Save { dir: target, .. } if target == &dir));
+        run_session_job(&mut app);
+        assert!(!dir.join("source.rthid").exists());
+    }
+
+    #[test]
+    fn session_overwrite_confirmation_refuses_other_targets_and_can_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.png");
+        let target = temp.path().join("photo.rthid");
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        std::fs::write(&target, b"unrelated").unwrap();
+        ctrl(&mut app, 's');
+        assert!(app.notice().unwrap().contains("not a session directory"));
+        assert!(app.take_jobs().is_empty());
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        ctrl(&mut app, 's');
+        assert!(app.notice().unwrap().contains("not a session directory"));
+        std::fs::remove_dir(&target).unwrap();
+        ctrl(&mut app, 's');
+        run_session_job(&mut app);
+        app.open_image(source, RgbaImage::new(2, 3));
+        ctrl(&mut app, 's');
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { question, .. }) if question.message() == "Overwrite photo.rthid?")
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.modal.is_none());
+        assert!(app.take_jobs().is_empty());
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('y'));
+        run_session_job(&mut app);
+        assert_eq!(app.session.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn session_unsaved_quit_open_and_cancel_restore_the_dialog() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.settings.flip = true;
+        assert!(app.modified());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.quit);
+        app.quit = false;
+        app.request_open("next.png".into(), None);
+        assert!(app.take_jobs().is_empty());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.take_jobs().is_empty());
+        app.open_dialog(".".into());
+        app.apply(Effect::Open("next.png".into(), ".".into()))
+            .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.modal, Some(Modal::OpenFile(_))));
+        app.apply(Effect::Open("next.png".into(), ".".into()))
+            .unwrap();
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            app.take_jobs().as_slice(),
+            [(Job::Open { .. }, _)]
+        ));
+        app.complete(done(&app, opened_photo()));
+        assert!(!app.modified());
+        app.settings.flip = true;
+        ctrl(&mut app, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn session_modified_tracks_view_and_selection_but_excludes_brush_controls() {
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        app.brush_on = true;
+        app.brush.radius += 1;
+        assert!(!app.modified());
+        app.mass_minimap = !app.mass_minimap;
+        assert!(app.modified());
+        app.mass_minimap = !app.mass_minimap;
+        assert!(!app.modified());
+        app.viewport.hide_minimap = true;
+        app.viewport.zoom = Zoom::In(2);
+        app.viewport.x = 200;
+        app.viewport.y = 300;
+        app.sync(Rect::new(0, 0, 8, 4));
+        assert!(!app.modified());
+        app.record_saved();
+        app.edits.edit(|doc| {
+            doc.add_layer("One".into());
+        });
+        app.record_saved();
+        app.edits.select(None);
+        assert!(app.modified());
+        app.record_saved();
+        app.edits.edit(|doc| doc.set_visible(0, false));
+        assert!(app.edits.undo());
+        assert!(app.modified());
+    }
+
+    #[test]
+    fn session_save_ignores_modal_overlay_and_absent_source() {
+        let mut app = App::empty();
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        app.open_image("photo.png".into(), RgbaImage::new(2, 3));
+        app.keys_open = true;
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        app.keys_open = false;
+        app.open_dialog(".".into());
+        ctrl(&mut app, 's');
+        assert!(app.take_jobs().is_empty());
+        assert!(app.modal.is_some());
+        ctrl(&mut app, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn session_failed_save_and_late_completion_never_mark_new_document_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::builtin(RgbaImage::new(2, 3), None);
+        let source = temp.path().join("photo.png");
+        app.open_image(source.clone(), RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        ctrl(&mut app, 's');
+        let (job, tag) = app.take_jobs().pop().unwrap();
+        let Job::Save { dir, .. } = job else {
+            panic!("expected save")
+        };
+        app.complete(Done::new(
+            tag,
+            std::time::Duration::ZERO,
+            IoOutcome::Saved(Err(rthid_io::io::IoError {
+                op: rthid_io::io::Op::Save,
+                path: dir,
+                cause: rthid_io::io::Cause::Io(std::io::Error::other("injected failure")),
+            })),
+        ));
+        assert!(app.modified());
+        assert!(app.session.is_none());
+        assert!(app.notice().unwrap().contains("injected failure"));
+        ctrl(&mut app, 's');
+        app.open_image(source, RgbaImage::new(2, 3));
+        app.settings.flip = true;
+        run_session_job(&mut app);
+        assert!(app.session.is_none());
+        assert!(app.modified());
     }
 
     #[test]
@@ -2489,7 +3119,9 @@ mod tests {
                 app.request_open("failed.png".into(), None);
             }
             let expected = match &outcome {
-                IoOutcome::Opened(Err(error)) | IoOutcome::Listed(Err(error)) => error.to_string(),
+                IoOutcome::Opened(Err(error))
+                | IoOutcome::Listed(Err(error))
+                | IoOutcome::Loaded(Err(error)) => error.to_string(),
                 _ => unreachable!(),
             };
             assert!(app.complete(done(&app, outcome)));
@@ -2631,7 +3263,7 @@ mod tests {
         assert_eq!(app.notice(), Some(error.as_str()));
         assert!(app.export_result().is_err());
         let grid_version = app.grid_cache.grid.version();
-        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+        for code in [KeyCode::Char('r'), KeyCode::Char('q'), KeyCode::Char('y')] {
             app.handle_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
                 &app.geometry(test_layout().preview),
@@ -4368,7 +5000,9 @@ mod tests {
         }
         assert!(app.dragging());
         assert!(app.modal.is_none());
-        app.request_open("/images".into(), None);
+        let temp = tempfile::tempdir().unwrap();
+        app.request_open(temp.path().to_path_buf(), None);
+        assert!(!matches!(app.modal, Some(Modal::Confirm { .. })));
         let outcome = IoOutcome::Opened(Ok(Opened::Dir(rthid_io::dir::Listing {
             dir: "/images".into(),
             entries: vec![],

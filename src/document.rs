@@ -26,9 +26,9 @@
 //! Every pixel change bumps the history revision, which keys the composed image
 //! cache. Caches therefore never need to be cleared by hand for edits.
 //!
-//! The planned session format for #41 is a directory with manifest.toml,
-//! a copy of the shrunk source, and one exposure PNG per layer.
-//! Ctrl+S will save the session and never overwrite the source image.
+//! Sessions use a directory with manifest.toml,
+//! a copy of the shrunk source, and one exposure PNG per nonempty layer.
+//! Ctrl+S saves the session and never overwrites the source image.
 
 use std::sync::Arc;
 
@@ -94,6 +94,32 @@ impl ExposureMap {
         tile[pixel] = tile[pixel].saturating_add(delta);
     }
 
+    /// Encodes signed offsets around the PNG midpoint.
+    pub fn to_luma16(&self) -> Vec<u16> {
+        let mut pixels = Vec::with_capacity(self.width as usize * self.height as usize);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                pixels.push((i32::from(self.get(x, y)) + 32768) as u16);
+            }
+        }
+        pixels
+    }
+
+    /// Restores offsets while leaving tiles containing only zero offsets absent.
+    pub fn from_luma16(width: u32, height: u32, pixels: &[u16]) -> Self {
+        assert_eq!(pixels.len(), width as usize * height as usize);
+        let mut map = Self::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (i32::from(pixels[(y * width + x) as usize]) - 32768) as i16;
+                if offset != 0 {
+                    map.add(x, y, offset);
+                }
+            }
+        }
+        map
+    }
+
     /// Whether every tile is absent.
     pub fn is_empty(&self) -> bool {
         self.tiles.iter().all(Option::is_none)
@@ -140,6 +166,30 @@ impl Document {
             layers: Vec::new(),
             selected: None,
         }
+    }
+
+    /// Restores layers after validating their dimensions and explicit selection.
+    pub fn from_layers(
+        width: u32,
+        height: u32,
+        layers: Vec<Layer>,
+        selected: Option<usize>,
+    ) -> Result<Self, &'static str> {
+        if selected.is_some_and(|index| index >= layers.len()) {
+            return Err("invalid layer selection");
+        }
+        if layers
+            .iter()
+            .any(|layer| (layer.exposure.width(), layer.exposure.height()) != (width, height))
+        {
+            return Err("layer dimensions differ from source");
+        }
+        Ok(Self {
+            width,
+            height,
+            layers,
+            selected,
+        })
     }
 
     /// Layers in composition order, bottom first.
@@ -412,6 +462,22 @@ impl History {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn exposure_png_conversion_preserves_offsets_and_sparse_zero_tiles() {
+        let pixels = vec![32768; 130 * 65];
+        let empty = ExposureMap::from_luma16(130, 65, &pixels);
+        assert!(empty.is_empty());
+        assert_eq!(empty.to_luma16(), pixels);
+        let mut map = ExposureMap::new(130, 65);
+        map.add(129, 64, i16::MIN);
+        map.add(0, 0, i16::MAX);
+        let restored = ExposureMap::from_luma16(130, 65, &map.to_luma16());
+        assert_eq!(restored, map);
+        assert!(restored.tiles[1].is_none());
+        assert!(Document::from_layers(1, 1, Vec::new(), Some(0)).is_err());
+        assert!(Document::from_layers(1, 1, vec![Layer::new("wrong".into(), 2, 2)], None).is_err());
+    }
 
     #[test]
     fn layer_names_fill_the_first_available_number() {

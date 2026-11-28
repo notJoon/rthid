@@ -197,7 +197,7 @@ impl Zoom {
 }
 
 /// User controlled zoom, minimap visibility and dot origin.
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
     /// Current preview scale.
     pub zoom: Zoom,

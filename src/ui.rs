@@ -71,6 +71,7 @@ const KEY_HELP_RIGHT: &[(&str, &[Hint])] = &[
         "Files",
         &[
             Hint::new("o", "open"),
+            Hint::new("Ctrl+S", "save"),
             Hint::new("P", "presets"),
             Hint::new("T", "templates"),
         ],
@@ -192,6 +193,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                 Some(Hint::new("f", "flip")),
                 reset.then_some(Hint::new("d", "reset")),
                 Some(Hint::new("o", "open")),
+                Some(Hint::new("Ctrl+S", "save")),
                 Some(Hint::new("P", "presets")),
                 Some(Hint::new("T", "templates")),
             ]
@@ -236,6 +238,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
             Some(Hint::new("Tab", "preview")),
             Some(Hint::new("q", "quit")),
             Some(Hint::new("o", "open")),
+            image.then_some(Hint::new("Ctrl+S", "save")),
             image.then_some(Hint::new("Space", "original/dithered")),
             image.then_some(Hint::new("a", "mass study")),
             image.then(|| zoom_hint(app, geometry)).flatten(),
@@ -612,15 +615,27 @@ fn draw_modal(frame: &mut Frame, app: &App, screen_layout: &Layout) {
         rows,
         picker,
     } = match modal {
+        Modal::Confirm { question, .. } => ModalContent {
+            title: question.message(),
+            rows: Vec::new(),
+            picker: None,
+        },
         Modal::OpenFile(picker) => {
             let rows: Vec<_> = picker
                 .entries
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(index, entry)| {
                     Line::raw(format!(
                         "{}{}",
                         entry.name,
-                        if entry.dir { "/" } else { "" }
+                        if picker.sessions[index] {
+                            " [session]"
+                        } else if entry.dir {
+                            "/"
+                        } else {
+                            ""
+                        }
                     ))
                 })
                 .collect();
@@ -905,7 +920,7 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
     } else {
         app.view.name().into()
     };
-    report.graphics_error.unwrap_or_else(|| {
+    let text = report.graphics_error.unwrap_or_else(|| {
         format!(
             // Print fields lead so an 80 column terminal clips navigation, not them.
             "Card {}x{}{}mm | Dots {gw}x{gh} @{:.2}mm | Rot {}°{}{}{} | {displayed} | {mode}{}",
@@ -935,7 +950,12 @@ fn status(app: &App, geometry: &viewport::PreviewGeometry, report: PreviewReport
                 ""
             },
         )
-    })
+    });
+    if app.modified() {
+        format!("modified | {text}")
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -1292,6 +1312,7 @@ mod tests {
                 "Home" => vec![key(KeyCode::Home)],
                 "End" => vec![key(KeyCode::End)],
                 "Ctrl+C" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+                "Ctrl+S" => vec![KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)],
                 "arrows" => [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
                     .into_iter()
                     .map(key)
@@ -1361,9 +1382,11 @@ mod tests {
                 KeyModifiers::NONE,
             ));
         }
+        app.record_saved();
         let before = snapshot(&mut app, &mut terminal, &mut renderer);
         let geometry = app.geometry(screen.preview);
         app.handle_key(key, &geometry);
+        app.record_saved();
         before != snapshot(&mut app, &mut terminal, &mut renderer)
     }
 
@@ -1377,7 +1400,7 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, app, &screen, renderer))
             .unwrap();
-        // Brush mode can change while its status and hints are clipped.
+        // Controls can change while their status and hints are clipped.
         (terminal.backend().buffer().clone(), app.quit, app.brush_on)
     }
 
@@ -2648,10 +2671,10 @@ mod tests {
         assert!(text(&app).starts_with("Card 6x4mm | Dots 30x20 @0.20mm"));
         app.settings.dot = 40;
         app.settings.rotation = crate::settings::Rotation::R90;
-        assert!(text(&app).starts_with("Card 8x12mm | Dots 20x30 @0.40mm"));
+        assert!(text(&app).starts_with("modified | Card 8x12mm | Dots 20x30 @0.40mm"));
         app.settings.margin = 20;
         app.settings.bleed = 3;
-        assert!(text(&app).starts_with("Card 18.4x22.4mm | Dots 46x56 @0.40mm"));
+        assert!(text(&app).starts_with("modified | Card 18.4x22.4mm | Dots 46x56 @0.40mm"));
         assert_eq!(
             status(
                 &App::empty(),
@@ -2672,7 +2695,9 @@ mod tests {
         app.settings.flip = true;
         let geometry = app.geometry(Rect::new(0, 0, 100, 20));
         let text = status(&app, &geometry, PreviewReport::default());
-        assert!(text.starts_with("Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | "));
+        assert!(
+            text.starts_with("modified | Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | ")
+        );
         assert!(!text.contains("PNG"));
         let with_dpi = |dpi| {
             let mut exporting = App::new(
@@ -2689,7 +2714,7 @@ mod tests {
             status(&with_dpi(600), &geometry, PreviewReport::default())
                 .contains("Rot 90° Flip | PNG 1323x2268 @600dpi | ")
         );
-        // Worst case: the widest PNG size and DPI still fit in 80 columns.
+        // The modified marker precedes physical fields so narrow terminals retain it.
         let report = PreviewReport {
             approximate: true,
             ..PreviewReport::default()
@@ -2697,7 +2722,7 @@ mod tests {
         let text = status(&with_dpi(4800), &geometry, report);
         let print =
             "Card 50x90+3mm | Dots 280x480 @0.20mm | Rot 90° Flip | PNG 10583x18142 @4800dpi";
-        assert!(text.starts_with(print), "{text}");
+        assert!(text.starts_with(&format!("modified | {print}")), "{text}");
         assert!(print.chars().count() <= 80);
         app.settings = crate::settings::Settings {
             margin: 100,

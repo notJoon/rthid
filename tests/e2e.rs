@@ -289,3 +289,58 @@ fn terminal_workflow_restores_the_terminal() {
             && !screen.bracketed_paste()
     });
 }
+
+#[test]
+fn sessions_save_restore_from_cli_and_flush_at_quit() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("photo.png");
+    image::RgbaImage::from_pixel(8, 12, image::Rgba([40, 100, 180, 255]))
+        .save(&source)
+        .unwrap();
+    let source_bytes = std::fs::read(&source).unwrap();
+    let session = home.path().join("photo.rthid");
+    let mut run = Run::spawn(home.path(), &source);
+    run.wait_for_screen("Dots 8x12 ");
+    run.send(b"n ");
+    run.wait_for_screen("Dithered");
+    run.send(b"\x13");
+    run.wait_for_screen("saved photo.rthid");
+    assert!(
+        std::fs::read_to_string(session.join("manifest.toml"))
+            .unwrap()
+            .contains("name = \"Layer 1\"")
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    run.quit();
+    assert!(run.wait_for_exit().success());
+
+    let mut run = Run::spawn(home.path(), &session);
+    run.wait_for_screen("Dithered");
+    run.send(b"f\x13\x03");
+    run.exiting = true;
+    assert!(run.wait_for_exit().success());
+    let manifest = std::fs::read_to_string(session.join("manifest.toml")).unwrap();
+    assert!(manifest.contains("flip = true"));
+    assert!(!session.join("source.rthid").exists());
+    let mut run = Run::spawn(home.path(), &session.join("source-1.png"));
+    run.wait_for_screen("Dithered");
+    run.quit();
+    assert!(run.wait_for_exit().success());
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+}
+
+#[test]
+fn cli_reports_invalid_sessions_before_starting_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let session = home.path().join("broken.rthid");
+    std::fs::create_dir(&session).unwrap();
+    std::fs::write(session.join("manifest.toml"), "version = 2").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rthid"))
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("Could not load"));
+    assert!(error.contains("manifest.toml"));
+}

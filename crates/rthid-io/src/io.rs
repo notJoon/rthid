@@ -1,4 +1,4 @@
-//! Background filesystem work with latest reads and updates, plus one export per destination.
+//! Background filesystem work with latest reads and updates, plus writes per destination.
 //!
 //! This is not a queue that guarantees every submission will run. See [`IO`] for replacement
 //! and shutdown policies.
@@ -6,6 +6,7 @@
 use crate::dir::Listing;
 use image::RgbaImage;
 use std::{
+    any::Any,
     collections::VecDeque,
     fmt,
     fs::File,
@@ -21,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Work kinds. Jobs of the same kind coalesce, with exports separated by destination path.
+/// Work kinds with snapshot writes separated by destination path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// Open an image or directory.
@@ -33,6 +34,10 @@ pub(crate) enum Kind {
     /// Replace a text file under its lock. Coalesces across paths, so each edit carries every
     /// unsaved change.
     Update,
+    /// Write a directory snapshot, coalescing per directory.
+    Save,
+    /// Read an owned value, keeping only the newest request.
+    Load,
 }
 
 /// Replacement text computed from the current file contents while its lock is held.
@@ -46,7 +51,7 @@ pub trait Edit: Send {
 
 /// Owned filesystem work for the shared thread.
 ///
-/// [`IO::submit`] replaces queued work of the same variant. Exports coalesce per path.
+/// [`IO::submit`] replaces queued work of the same variant. Export and Save coalesce per path.
 pub enum Job {
     /// Decode an image, or list it when the path is a directory.
     Open {
@@ -83,6 +88,22 @@ pub enum Job {
         /// Computes the replacement text, carrying all changes not yet confirmed saved.
         edit: Box<dyn Edit>,
     },
+    /// Writes an owned snapshot on the worker, coalescing per directory.
+    Save {
+        /// Destination directory.
+        dir: PathBuf,
+        /// Writer carrying its snapshot.
+        #[allow(clippy::type_complexity)]
+        write: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
+    },
+    /// Reads an application value on the worker, keeping the newest request.
+    Load {
+        /// Path passed to the reader.
+        path: PathBuf,
+        /// Reader carrying any application context.
+        #[allow(clippy::type_complexity)]
+        read: Box<dyn FnOnce(&Path) -> io::Result<Box<dyn Any + Send>> + Send>,
+    },
     /// Trigger a panic to verify worker recovery.
     #[cfg(test)]
     Panic(PathBuf),
@@ -99,6 +120,8 @@ impl Job {
             Self::List(_) => Kind::List,
             Self::Export { .. } => Kind::Export,
             Self::Update { .. } => Kind::Update,
+            Self::Save { .. } => Kind::Save,
+            Self::Load { .. } => Kind::Load,
             #[cfg(test)]
             Self::Panic(_) => Kind::Open,
             #[cfg(test)]
@@ -115,6 +138,8 @@ impl Job {
             Self::List(path) => (Op::List, path.clone()),
             Self::Export { path, .. } => (Op::Encode, path.clone()),
             Self::Update { path, .. } => (Op::Save, path.clone()),
+            Self::Save { dir, .. } => (Op::Save, dir.clone()),
+            Self::Load { path, .. } => (Op::Decode, path.clone()),
             #[cfg(test)]
             Self::Panic(path) => (Op::Decode, path.clone()),
             #[cfg(test)]
@@ -134,6 +159,26 @@ pub enum Outcome {
     Exported(Result<PathBuf, IoError>),
     /// A text file was replaced.
     Updated(Result<Updated, IoError>),
+    /// A directory snapshot was written.
+    Saved(Result<PathBuf, IoError>),
+    /// An application value was read.
+    Loaded(Result<Output, IoError>),
+}
+
+/// Owned reader result with the path retained for diagnostics.
+pub struct Output {
+    /// Path given to the reader.
+    pub path: PathBuf,
+    /// Application value to downcast at the caller.
+    pub value: Box<dyn Any + Send>,
+}
+
+impl fmt::Debug for Output {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Output")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The file replaced by an Update job.
@@ -190,6 +235,8 @@ impl Done {
             Outcome::Listed(_) => Kind::List,
             Outcome::Exported(_) => Kind::Export,
             Outcome::Updated(_) => Kind::Update,
+            Outcome::Saved(_) => Kind::Save,
+            Outcome::Loaded(_) => Kind::Load,
         }
     }
 
@@ -210,10 +257,14 @@ impl Done {
                 (Op::List, &listing.dir)
             }
             Outcome::Exported(Ok(path)) => (Op::Encode, path),
+            Outcome::Saved(Ok(path)) => (Op::Save, path),
+            Outcome::Loaded(Ok(output)) => (Op::Decode, &output.path),
             Outcome::Updated(Ok(updated)) => (Op::Save, &updated.path),
             Outcome::Opened(Err(error))
             | Outcome::Listed(Err(error))
             | Outcome::Exported(Err(error))
+            | Outcome::Saved(Err(error))
+            | Outcome::Loaded(Err(error))
             | Outcome::Updated(Err(error)) => (error.op, &error.path),
         }
     }
@@ -321,6 +372,7 @@ impl std::error::Error for IoError {
 }
 
 struct Pending {
+    kind: Kind,
     id: u64,
     tag: u64,
     op: Op,
@@ -359,7 +411,7 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 struct Queued {
-    slots: [Option<(u64, u64, Job)>; 4],
+    slots: [Option<(u64, u64, Job)>; 6],
     exports: Vec<(PathBuf, (u64, u64, Job))>,
 }
 
@@ -370,12 +422,12 @@ struct Queue {
 
 /// One filesystem thread with an independent newest result for each work kind.
 ///
-/// Open, List and Update each have one queued slot. Exports have one slot per destination path.
+/// Open, Load, List and Update each have one queued slot. Export and Save have slots per path.
 /// A submission replaces queued work in its slot, and [`Self::poll`] discards superseded results.
 /// Work already running may still complete its filesystem changes.
 ///
 /// Dropping this value can block for up to five seconds. Like [`Self::finish`], it skips queued
-/// reads and updates, attempts the latest queued export, and detaches a worker still running at
+/// reads and updates, attempts queued exports and snapshots, and detaches a worker still running at
 /// the deadline. Drop discards all results; call `finish` when the caller needs to inspect them.
 /// Keep unsaved configuration changes until a matching successful result, then synchronously
 /// save any that remain with [`crate::atomic::update`] after `finish`.
@@ -384,7 +436,7 @@ pub struct IO {
     jobs: Arc<Queue>,
     results: Receiver<Done>,
     local: VecDeque<Done>,
-    pending: [Option<Pending>; 4],
+    pending: [Option<Pending>; 6],
     export_pending: Vec<Pending>,
     next_id: u64,
     stopping: Arc<AtomicBool>,
@@ -394,7 +446,14 @@ pub struct IO {
     exited: Receiver<()>,
 }
 
-const KINDS: [Kind; 4] = [Kind::Open, Kind::List, Kind::Export, Kind::Update];
+const KINDS: [Kind; 6] = [
+    Kind::Open,
+    Kind::List,
+    Kind::Export,
+    Kind::Update,
+    Kind::Save,
+    Kind::Load,
+];
 
 impl IO {
     /// Starts the worker. `home` expands `~` in Open paths without reading the environment.
@@ -404,7 +463,7 @@ impl IO {
     pub fn new(home: Option<PathBuf>) -> io::Result<Self> {
         let jobs = Arc::new(Queue {
             queued: Mutex::new(Queued {
-                slots: [None, None, None, None],
+                slots: [None, None, None, None, None, None],
                 exports: Vec::new(),
             }),
             ready: Condvar::new(),
@@ -426,7 +485,7 @@ impl IO {
             jobs,
             results,
             local: VecDeque::new(),
-            pending: [None, None, None, None],
+            pending: [None, None, None, None, None, None],
             export_pending: Vec::new(),
             next_id: 0,
             stopping,
@@ -438,7 +497,7 @@ impl IO {
 
     /// Queues work without waiting. The result echoes `tag` so callers can tell who asked for it.
     ///
-    /// Replaces a queued job of the same kind; exports replace only the same destination path.
+    /// Replaces queued work of the same kind. Export and Save replace only the same destination.
     /// Superseded jobs have no result; already running work is not cancelled, but its result is
     /// discarded if superseded. Update jobs must carry all unsaved changes.
     pub fn submit(&mut self, job: Job, tag: u64) {
@@ -452,6 +511,7 @@ impl IO {
         let kind = job.kind();
         let (op, path) = job.context();
         let pending = Pending {
+            kind,
             id,
             tag,
             op,
@@ -463,12 +523,11 @@ impl IO {
             .as_ref()
             .is_none_or(JoinHandle::is_finished)
             .then(|| pending.fail(kind, Cause::Stopped));
-        if kind == Kind::Export {
-            // ponytail: normally two destinations; use a map if export counts become user-sized.
+        if matches!(kind, Kind::Export | Kind::Save) {
             if let Some(slot) = self
                 .export_pending
                 .iter_mut()
-                .find(|slot| slot.path == path)
+                .find(|slot| slot.path == path && slot.kind == kind)
             {
                 *slot = pending;
             } else {
@@ -481,8 +540,12 @@ impl IO {
             self.local.push_back(stopped);
         } else {
             let mut queued = self.jobs.queued.lock().unwrap();
-            if kind == Kind::Export {
-                if let Some(slot) = queued.exports.iter_mut().find(|slot| slot.0 == path) {
+            if matches!(kind, Kind::Export | Kind::Save) {
+                if let Some(slot) = queued
+                    .exports
+                    .iter_mut()
+                    .find(|slot| slot.0 == path && slot.1.2.kind() == kind)
+                {
                     slot.1 = (id, tag, job);
                 } else {
                     queued.exports.push((path, (id, tag, job)));
@@ -512,15 +575,14 @@ impl IO {
                         });
                         return regular.or_else(|| {
                             (!self.export_pending.is_empty()).then(|| {
-                                self.export_pending
-                                    .remove(0)
-                                    .fail(Kind::Export, Cause::Stopped)
+                                let pending = self.export_pending.remove(0);
+                                pending.fail(pending.kind, Cause::Stopped)
                             })
                         });
                     }
                 }
             };
-            if done.kind() == Kind::Export {
+            if matches!(done.kind(), Kind::Export | Kind::Save) {
                 if let Some(index) = self
                     .export_pending
                     .iter()
@@ -547,7 +609,7 @@ impl IO {
         self.pending.iter().any(Option::is_some) || !self.export_pending.is_empty()
     }
 
-    /// Skips queued reads and updates and waits up to five seconds for each newest export.
+    /// Skips queued reads and updates and waits up to five seconds for queued exports and snapshots.
     /// Returns available results and detaches a worker still running at the deadline.
     ///
     /// Queued jobs may be skipped at shutdown. Collect reads with [`Self::poll`] before
@@ -555,7 +617,7 @@ impl IO {
     /// [`Cause::Stopped`]. Jobs still pending at the deadline return [`Cause::TimedOut`].
     /// A timeout does not cancel an operation already running. Inspect matching Update results,
     /// then synchronously save remaining unsaved changes with [`crate::atomic::update`].
-    /// `finish` does not flush every save.
+    /// Update jobs still require the caller to save unconfirmed configuration changes.
     pub fn finish(self) -> Vec<Done> {
         self.finish_timeout(SHUTDOWN_WAIT)
     }
@@ -571,7 +633,7 @@ impl IO {
         done.extend(
             self.export_pending
                 .drain(..)
-                .map(|pending| pending.fail(Kind::Export, Cause::TimedOut)),
+                .map(|pending| pending.fail(pending.kind, Cause::TimedOut)),
         );
         done
     }
@@ -620,6 +682,8 @@ fn failure(
             Kind::List => Outcome::Listed(Err(error)),
             Kind::Export => Outcome::Exported(Err(error)),
             Kind::Update => Outcome::Updated(Err(error)),
+            Kind::Save => Outcome::Saved(Err(error)),
+            Kind::Load => Outcome::Loaded(Err(error)),
         },
     }
 }
@@ -667,7 +731,7 @@ fn run(
         let (mut op, mut path) = job.context();
         let started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            if stop.load(Ordering::SeqCst) && kind != Kind::Export {
+            if stop.load(Ordering::SeqCst) && !matches!(kind, Kind::Export | Kind::Save) {
                 return Err(Cause::Stopped);
             }
             execute(job, home.as_deref(), &mut op, &mut path, &abandoned)
@@ -722,6 +786,17 @@ fn execute(
             Ok(Outcome::Opened(Ok(Opened::Image {
                 path: path.clone(),
                 image,
+            })))
+        }
+        Job::Save { write, .. } => {
+            write(path).map_err(Cause::Io)?;
+            Ok(Outcome::Saved(Ok(path.clone())))
+        }
+        Job::Load { read, .. } => {
+            let value = read(path).map_err(Cause::Io)?;
+            Ok(Outcome::Loaded(Ok(Output {
+                path: path.clone(),
+                value,
             })))
         }
         Job::List(_) => listing(path).map(|listing| Outcome::Listed(Ok(listing))),
@@ -795,6 +870,140 @@ mod tests {
             dir: None,
             protect: Vec::new(),
         }
+    }
+
+    #[test]
+    fn saves_coalesce_per_directory_and_flush_independently_of_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = IO::new(None).unwrap();
+        let resume = pause(&mut worker);
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for (dir, value, tag) in [(&first, 1, 10), (&second, 2, 11), (&first, 3, 12)] {
+            worker.submit(
+                Job::Save {
+                    dir: dir.clone(),
+                    write: Box::new(move |dir| {
+                        std::fs::create_dir_all(dir)?;
+                        std::fs::write(dir.join("value"), [value])
+                    }),
+                },
+                tag,
+            );
+        }
+        worker.submit(
+            Job::Update {
+                path: temp.path().join("config"),
+                wait: Duration::ZERO,
+                edit: Box::new(Append("config")),
+            },
+            13,
+        );
+        assert_eq!(worker.jobs.queued.lock().unwrap().exports.len(), 2);
+        resume.send(()).unwrap();
+        let results = worker.finish();
+        assert!(
+            results
+                .iter()
+                .any(|done| done.tag == 12 && matches!(done.outcome, Outcome::Saved(Ok(_))))
+        );
+        assert!(
+            results
+                .iter()
+                .any(|done| done.tag == 11 && matches!(done.outcome, Outcome::Saved(Ok(_))))
+        );
+        assert!(!results.iter().any(|done| done.tag == 10));
+        assert_eq!(std::fs::read(first.join("value")).unwrap(), [3]);
+        assert_eq!(std::fs::read(second.join("value")).unwrap(), [2]);
+    }
+
+    #[test]
+    fn loads_keep_only_the_newest_value() {
+        let mut worker = IO::new(None).unwrap();
+        let resume = pause(&mut worker);
+        for value in 1..=3u64 {
+            worker.submit(
+                Job::Load {
+                    path: PathBuf::from(format!("read-{value}")),
+                    read: Box::new(move |_| Ok(Box::new(value))),
+                },
+                value,
+            );
+        }
+        resume.send(()).unwrap();
+        assert_eq!(wait(&mut worker).kind(), Kind::List);
+        let done = wait(&mut worker);
+        assert_eq!(done.tag, 3);
+        assert_eq!(done.path(), Path::new("read-3"));
+        let Outcome::Loaded(Ok(output)) = done.outcome else {
+            panic!("expected reader output")
+        };
+        assert_eq!(*output.value.downcast::<u64>().unwrap(), 3);
+        assert!(!worker.busy());
+    }
+
+    #[test]
+    fn running_load_results_are_discarded_when_superseded() {
+        let mut worker = IO::new(None).unwrap();
+        let (entered, started) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        worker.submit(
+            Job::Load {
+                path: "old".into(),
+                read: Box::new(move |_| {
+                    entered.send(()).unwrap();
+                    paused.recv().unwrap();
+                    Ok(Box::new(1u64))
+                }),
+            },
+            1,
+        );
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.submit(
+            Job::Load {
+                path: "new".into(),
+                read: Box::new(|_| Ok(Box::new(2u64))),
+            },
+            2,
+        );
+        resume.send(()).unwrap();
+        assert_eq!(wait(&mut worker).tag, 2);
+        assert!(!worker.busy());
+    }
+
+    #[test]
+    fn application_closure_panics_become_errors_and_worker_recovers() {
+        let mut worker = IO::new(None).unwrap();
+        worker.submit(
+            Job::Save {
+                dir: "save".into(),
+                write: Box::new(|_| panic!("save panic")),
+            },
+            1,
+        );
+        let done = wait(&mut worker);
+        assert_eq!(done.path(), Path::new("save"));
+        assert!(
+            matches!(done.outcome, Outcome::Saved(Err(IoError { cause: Cause::Panicked(message), .. })) if message == "save panic")
+        );
+        worker.submit(
+            Job::Load {
+                path: "load".into(),
+                read: Box::new(|_| panic!("load panic")),
+            },
+            2,
+        );
+        assert!(
+            matches!(wait(&mut worker).outcome, Outcome::Loaded(Err(IoError { cause: Cause::Panicked(message), .. })) if message == "load panic")
+        );
+        worker.submit(
+            Job::Load {
+                path: "ok".into(),
+                read: Box::new(|_| Ok(Box::new(()))),
+            },
+            3,
+        );
+        assert!(matches!(wait(&mut worker).outcome, Outcome::Loaded(Ok(_))));
     }
 
     #[test]
