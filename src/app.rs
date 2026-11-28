@@ -509,6 +509,10 @@ impl App {
             .session
             .clone()
             .unwrap_or_else(|| session::default_path(source));
+        if session::nested(&dir) {
+            self.set_notice("cannot save a session inside a session folder".into());
+            return;
+        }
         let own_pending = self
             .saving
             .iter()
@@ -2271,6 +2275,46 @@ mod tests {
         app.request_open(alias, None);
 
         assert!(matches!(&app.outbox[0].0, Job::Load { path, .. } if path == &dir));
+    }
+
+    fn assert_save_refused(app: &mut App, nested: &Path) {
+        ctrl(app, 's');
+
+        assert_eq!(
+            app.notice(),
+            Some("cannot save a session inside a session folder")
+        );
+        assert!(app.take_jobs().is_empty());
+        assert!(!nested.exists());
+    }
+
+    #[test]
+    fn session_save_refuses_a_default_path_inside_a_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        let stored = App::builtin(RgbaImage::new(2, 3), None);
+        session::write(&dir, snapshot(&stored)).unwrap();
+        let exposure = dir.join("exposure-1-0.png");
+        let nested = dir.join("exposure-1-0.rthid");
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+        app.open_image(exposure, RgbaImage::new(1, 1));
+
+        assert_save_refused(&mut app, &nested);
+    }
+
+    #[test]
+    fn session_save_refuses_a_default_path_inside_save_leftovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("photo.rthid");
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source-1.png");
+        RgbaImage::new(2, 3).save(&source).unwrap();
+        assert!(session::is_saveable(&dir));
+        let nested = dir.join("source-1.rthid");
+        let mut app = App::builtin(RgbaImage::new(1, 1), None);
+        app.open_image(source, RgbaImage::new(2, 3));
+
+        assert_save_refused(&mut app, &nested);
     }
 
     #[test]

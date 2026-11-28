@@ -228,6 +228,14 @@ pub(crate) fn is_saveable(path: &Path) -> bool {
             && only_save_leftovers(path).unwrap_or(false)
 }
 
+/// Whether `dir` would sit directly inside a session or a save's leftovers.
+pub(crate) fn nested(dir: &Path) -> bool {
+    resolve(dir)
+        .ok()
+        .and_then(|dir| dir.parent().map(is_saveable))
+        .unwrap_or(false)
+}
+
 /// Whether `dir` holds only the lock, generation files, and `atomic` temporaries.
 fn only_save_leftovers(dir: &Path) -> io::Result<bool> {
     for entry in fs::read_dir(dir)? {
