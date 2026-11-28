@@ -106,7 +106,9 @@ The help line lists the keys usable right now, Enter and Esc first in dialogs,
 and ends with `?: keys` outside dialogs. It drops the least specific keys first
 to fit the width.
 
-The parameter panel has focus initially. A cyan border marks the focused panel.
+Parameters has focus initially. A cyan border marks the focused block or preview.
+Brush and Layers sit below Parameters as separate lists. Layers shows the top
+layer first, with up to eight rows before scrolling.
 Parameters are grouped under Print, Dither, and Tone headers. A collapsed group
 shows `N changed` when any of its settings differ from their defaults. Headers
 start at the panel edge; an item's two-column indent becomes `> ` when selected.
@@ -116,25 +118,35 @@ start at the panel edge; an item's two-column indent becomes `> ` when selected.
 | Any, outside modals | `o` | Open an image |
 | Any, outside modals | `P` / `T` | Manage palette presets / settings templates |
 | Any, outside modals | `?` | Show all keys |
-| Any | `Tab` | Switch focus between parameters and preview |
+| Any, outside modals | `Tab` / `Shift+Tab` | Cycle Preview, Parameters, Brush, Layers forwards / backwards |
 | Any | `Space` | Toggle original / dithered, or show dithered from mass; compute a pending result if needed |
 | Any | `a` | Show mass / return to the previous layer |
-| Any | `Esc` | Return focus to parameters |
+| Preview | `Esc` | Return focus to Parameters |
 | Any | `r` / `R` | Rotate 90° clockwise / counterclockwise |
 | Any, outside modals | `f` | Flip left and right on the card |
-| Any | `d` | Reset selected parameter |
+| Parameters / Brush | `d` | Reset the selected control |
 | Any | `q` / `Ctrl+C` | Quit |
 | Parameters | `↑` / `↓`, `k` / `j` | Select parameter |
 | Parameter group header | `←` / `→`, `h` / `l` | Collapse / expand group |
 | Parameter group header | `Enter` | Toggle group |
 | Parameters, Seed row with Noise | `Enter` | Draw a new noise pattern |
 | Parameters | `←` / `→`, `h` / `l` | Change value |
+| Brush | `↑` / `↓`, `k` / `j` | Select brush control |
+| Brush | `←` / `→`, `h` / `l` | Change brush control |
+| Layers | `↑` / `↓`, `k` / `j` | Select layer row |
+| Layers | `Enter` / `v` / `x` | Target / show or hide / delete layer |
+| Layers | `[` / `]` | Move layer down / up |
+| Any, outside modals | `n` | Add layer |
+| Any, outside modals | `u` / `U`, `Ctrl+Z` / `Ctrl+Y` | Undo / redo target layer |
 | Any | `+` / `=` / `-` | Zoom in / in / out |
 | Any | `0` | Return to Fit |
 | Any | `m` | Toggle minimap |
 | Any | `M` | Switch minimap between mass study and main layer |
 | Preview | Arrows or `h` / `j` / `k` / `l` | Pan one cell worth of dots, at least one dot |
 | Preview | `H` / `J` / `K` / `L` | Pan one visible page with two cells of overlap, at least one step |
+
+Clicking or scrolling inside a control block focuses it. Layer names select the
+paint target, visibility marks toggle visibility, and dragging a layer reorders it.
 
 Panning works whenever the image overflows, including reduced zoom levels, and
 stops at grid edges. Fit does not pan. Focus, panning, zoom, and minimap changes

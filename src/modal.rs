@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::cells::View;
 
 use crate::settings::{
-    MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Settings, Templates, build_palette, validate_name,
+    Dither, MAX_COLORS, MAX_NAME_CHARS, Palettes, Preset, Setting, Settings, Templates,
+    build_palette, validate_name,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::{
@@ -77,6 +78,8 @@ pub enum Next {
 
 /// Changes applied by App after a modal handles input.
 pub enum Effect {
+    /// Apply a fixed setting choice with the panel preview rules.
+    Choose(Setting, usize),
     /// Permanently remove a layer and its stroke history after confirmation.
     RemoveLayer(usize),
     /// Exit after confirming unsaved changes.
@@ -129,6 +132,8 @@ pub enum OnYes {
 
 /// Dialogs that capture all input except quitting with Ctrl+C.
 pub enum Modal {
+    /// Fixed choices for the selected parameter without a live preview.
+    Dropdown(Dropdown),
     /// Confirmation with the previous dialog retained for cancellation.
     Confirm {
         /// Question shown as the dialog title.
@@ -158,6 +163,77 @@ pub enum Modal {
     },
     /// Palette draft with an independent cancel snapshot.
     Editor(Box<Editor>),
+}
+
+/// Setting choices with section rows that never receive the cursor.
+pub struct Dropdown {
+    /// Parameter applied only on confirmation.
+    pub setting: Setting,
+    /// Cursor and scroll over labels and section headers.
+    pub list: ListPicker,
+}
+
+impl Dropdown {
+    /// Builds labels and optional choice indices from the settings lists.
+    pub fn entries(&self) -> Vec<(Option<usize>, Line<'static>)> {
+        let mut rows = Vec::new();
+        let mut previous = None;
+        for (index, label) in self.setting.choices().into_iter().enumerate() {
+            if self.setting == Setting::Dither {
+                let section = Dither::ALL[index].section();
+                if previous != Some(section) {
+                    rows.push((
+                        None,
+                        Line::styled(
+                            section,
+                            Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                        ),
+                    ));
+                    previous = Some(section);
+                }
+            }
+            rows.push((Some(index), Line::raw(label)));
+        }
+        rows
+    }
+
+    fn outcome(
+        &mut self,
+        outcome: Outcome<usize>,
+        before: usize,
+        direction: i32,
+        mouse_click: bool,
+        settings: &Settings,
+    ) -> Step {
+        let entries = self.entries();
+        let selected = self.list.selected(entries.len()).unwrap();
+        if entries[selected].0.is_none() {
+            let next = if mouse_click {
+                before
+            } else {
+                let selectable = |index: &usize| entries[*index].0.is_some();
+                if direction < 0 {
+                    (0..selected).rev().find(selectable)
+                } else {
+                    (selected + 1..entries.len()).find(selectable)
+                }
+                .unwrap_or(before)
+            };
+            self.list.select(next);
+            return Step::stay();
+        }
+        match outcome {
+            Outcome::Cancel => Step::close(),
+            Outcome::Submit(index) if entries[index].0 == self.setting.choice(settings) => {
+                Step::close()
+            }
+            Outcome::Submit(index) => Step::effect(
+                Next::Close,
+                Effect::Choose(self.setting, entries[index].0.unwrap()),
+            ),
+            _ => Step::stay(),
+        }
+    }
 }
 
 /// Dialog regions shared by drawing and mouse input.
@@ -502,7 +578,35 @@ pub(crate) fn editor_rows(editor: &Editor) -> Vec<Line<'static>> {
 impl Modal {
     /// Computes dialog and content rectangles without changing selection or scroll.
     pub fn layout(&self, preview: Rect, screen: Rect, ctx: &Ctx<'_>) -> ModalLayout {
+        if let Self::Dropdown(dropdown) = self {
+            let entries = dropdown.entries();
+            let width = entries
+                .iter()
+                .map(|(_, line)| line.width())
+                .max()
+                .unwrap_or(0) as u16;
+            let visible = screen.height.saturating_sub(2);
+            let scrollbar = entries.len() > usize::from(visible) && visible > 2;
+            let dialog = Dialog {
+                title: dropdown.setting.list_title().unwrap(),
+                min_width: 0,
+            }
+            .anchored_area(
+                preview,
+                screen,
+                (
+                    width.saturating_add(u16::from(scrollbar)),
+                    entries.len() as u16,
+                ),
+            );
+            return ModalLayout {
+                dialog,
+                field: None,
+                list: Some(Block::bordered().inner(dialog)),
+            };
+        }
         let (title, width, height) = match self {
+            Self::Dropdown(_) => unreachable!(),
             Self::Confirm { question, .. }
             | Self::Presets {
                 confirm: Some((question, _)),
@@ -644,6 +748,7 @@ impl Modal {
 
     fn rows(&self, ctx: &Ctx<'_>) -> usize {
         match self {
+            Self::Dropdown(dropdown) => dropdown.entries().len(),
             Self::Confirm { .. } => 0,
             Self::OpenFile(picker) => picker.entries.len(),
             Self::Presets { .. } => ctx.palettes.len(),
@@ -656,6 +761,7 @@ impl Modal {
     pub(crate) fn selection(&self, ctx: &Ctx<'_>) -> (Option<usize>, bool) {
         let rows = self.rows(ctx);
         match self {
+            Self::Dropdown(dropdown) => (dropdown.list.selected(rows), false),
             Self::Confirm { .. } => (None, false),
             Self::OpenFile(picker) => (picker.list.selected(rows), picker.typed),
             Self::Presets { list, .. } | Self::Templates { list, .. } => {
@@ -667,6 +773,25 @@ impl Modal {
 
     /// Routes list mouse outcomes through the same actions as keyboard input.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, ctx: Ctx<'_>) -> Step {
+        if let Self::Dropdown(dropdown) = self {
+            let len = dropdown.entries().len();
+            let before = dropdown.list.selected(len).unwrap();
+            let outcome = dropdown.list.handle_mouse(mouse, len);
+            return dropdown.outcome(
+                outcome,
+                before,
+                if mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                },
+                matches!(
+                    mouse.kind,
+                    ratatui::crossterm::event::MouseEventKind::Down(_)
+                ),
+                ctx.settings,
+            );
+        }
         let rows = self.rows(&ctx);
         let outcome = match self {
             Self::OpenFile(picker) => {
@@ -701,6 +826,25 @@ impl Modal {
             }
             _ => Step::stay(),
         }
+    }
+
+    /// Opens fixed choices with the cursor on the current value.
+    pub fn dropdown(setting: Setting, settings: &Settings) -> Option<Self> {
+        let current = setting.choice(settings)?;
+        if !setting.is_active(settings) {
+            return None;
+        }
+        let mut dropdown = Dropdown {
+            setting,
+            list: ListPicker::new(0),
+        };
+        let row = dropdown
+            .entries()
+            .iter()
+            .position(|(index, _)| *index == Some(current))
+            .unwrap();
+        dropdown.list.select(row);
+        Some(Self::Dropdown(dropdown))
     }
 
     /// Opens a path field while the event loop loads the starting directory.
@@ -772,6 +916,7 @@ impl Modal {
     /// Key descriptions for the component currently receiving input.
     pub fn hints(&self, ctx: &Ctx<'_>) -> Vec<Hint> {
         match self {
+            Self::Dropdown(_) => vec![ListPicker::MOVE, ListPicker::SUBMIT, ListPicker::CANCEL],
             Self::Confirm { question, .. } => question.hints().to_vec(),
             Self::OpenFile(picker) => {
                 let listed = !picker.entries.is_empty();
@@ -897,6 +1042,22 @@ impl Modal {
             };
         }
         let confirm = match self {
+            Self::Dropdown(dropdown) => {
+                let len = dropdown.entries().len();
+                let before = dropdown.list.selected(len).unwrap();
+                let outcome = dropdown.list.handle_key(key, len);
+                return dropdown.outcome(
+                    outcome,
+                    before,
+                    if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                        -1
+                    } else {
+                        1
+                    },
+                    false,
+                    ctx.settings,
+                );
+            }
             Self::OpenFile(picker) => return picker.handle_key(key),
             Self::Presets { confirm, .. } | Self::Templates { confirm, .. } => confirm,
             Self::Editor(editor) => return editor.handle_key(key, &ctx),
@@ -1042,7 +1203,9 @@ impl Modal {
                     }
                 }
             }
-            Self::Editor(_) | Self::OpenFile(_) | Self::Confirm { .. } => unreachable!(),
+            Self::Dropdown(_) | Self::Editor(_) | Self::OpenFile(_) | Self::Confirm { .. } => {
+                unreachable!()
+            }
         }
         Step::stay()
     }
@@ -1064,6 +1227,120 @@ mod tests {
             column: area.x,
             row: area.y + row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn dropdown_skips_headers_and_mouse_never_selects_them() {
+        use ratatui::{
+            buffer::Buffer,
+            crossterm::event::{MouseButton, MouseEventKind},
+        };
+        let settings = Settings::default();
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let context = || Ctx {
+            palettes: &palettes,
+            templates: &templates,
+            settings: &settings,
+            view: View::Original,
+        };
+        let mut modal = Modal::dropdown(Setting::Dither, &settings).unwrap();
+        let selected = |modal: &Modal| {
+            let Modal::Dropdown(dropdown) = modal else {
+                panic!("dropdown expected")
+            };
+            dropdown.entries()[dropdown.list.selected(dropdown.entries().len()).unwrap()]
+                .0
+                .unwrap()
+        };
+        assert_eq!(selected(&modal), 0);
+        modal.handle_key(key(KeyCode::Up), context());
+        assert_eq!(selected(&modal), 0);
+        for expected in 1..Dither::ALL.len() {
+            let step = modal.handle_key(key(KeyCode::Char('j')), context());
+            assert!(step.effect.is_none());
+            assert_eq!(selected(&modal), expected);
+        }
+        modal.handle_key(key(KeyCode::Down), context());
+        assert_eq!(selected(&modal), Dither::ALL.len() - 1);
+        for expected in (0..Dither::ALL.len() - 1).rev() {
+            modal.handle_key(key(KeyCode::Char('k')), context());
+            assert_eq!(selected(&modal), expected);
+        }
+        let area = Rect::new(0, 0, 25, 12);
+        let Modal::Dropdown(dropdown) = &modal else {
+            unreachable!()
+        };
+        dropdown.list.render(
+            dropdown.entries().into_iter().map(|(_, line)| line),
+            None,
+            Style::default(),
+            area,
+            &mut Buffer::empty(area),
+        );
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(modal.handle_mouse(click(6), context()).effect.is_none());
+        assert_eq!(selected(&modal), 0);
+        assert!(modal.handle_mouse(click(7), context()).effect.is_none());
+        assert_eq!(selected(&modal), 5);
+        assert!(matches!(
+            modal.handle_mouse(click(7), context()).effect,
+            Some(Effect::Choose(Setting::Dither, 5))
+        ));
+        let outside = modal.handle_mouse(click(20), context());
+        assert!(outside.effect.is_none() && matches!(outside.next, Next::Stay));
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click(7)
+        };
+        assert!(modal.handle_mouse(wheel, context()).effect.is_none());
+        assert_eq!(selected(&modal), 4);
+    }
+
+    #[test]
+    fn dropdown_confirming_current_value_closes_without_effect() {
+        use ratatui::{
+            buffer::Buffer,
+            crossterm::event::{MouseButton, MouseEventKind},
+        };
+        let settings = Settings::default();
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let context = || ctx(&palettes, &templates, &settings);
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut modal = Modal::dropdown(setting, &settings).unwrap();
+            let step = modal.handle_key(key(KeyCode::Enter), context());
+            assert!(matches!(step.next, Next::Close));
+            assert!(step.effect.is_none());
+            let Modal::Dropdown(dropdown) = &modal else {
+                unreachable!()
+            };
+            let entries = dropdown.entries();
+            let selected = dropdown.list.selected(entries.len()).unwrap();
+            let area = Rect::new(0, 0, 25, 16);
+            dropdown.list.render(
+                entries.into_iter().map(|(_, line)| line),
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+            let step = modal.handle_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    area,
+                    selected as u16,
+                ),
+                context(),
+            );
+            assert!(matches!(step.next, Next::Close));
+            assert!(step.effect.is_none());
         }
     }
 

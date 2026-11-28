@@ -25,7 +25,7 @@ use rthid_io::{
     dir::Entry,
     io::{Done, Job, Opened, Outcome as IoOutcome},
 };
-use rthid_widgets::{Confirm, Outcome, Outline, Row};
+use rthid_widgets::{Confirm, ListPicker, Outcome, Outline, Row};
 use std::{
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -66,15 +66,28 @@ struct Drag {
     minimap: bool,
 }
 
-/// Meaning of a flat parameter panel item.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum PanelItem {
-    /// An image setting in its existing order.
-    Setting(Setting),
-    /// An independent brush control.
-    Brush(BrushRow),
-    /// A document layer indexed from the bottom.
-    Layer(usize),
+/// Region receiving navigation and editing keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// Image navigation and painting.
+    Preview,
+    /// Grouped image settings.
+    Parameters,
+    /// Independent brush controls.
+    Brush,
+    /// Document layers in display order.
+    Layers,
+}
+
+impl Focus {
+    fn cycle(self, backwards: bool) -> Self {
+        match (self, backwards) {
+            (Self::Preview, false) | (Self::Brush, true) => Self::Parameters,
+            (Self::Parameters, false) | (Self::Layers, true) => Self::Brush,
+            (Self::Brush, false) | (Self::Preview, true) => Self::Layers,
+            (Self::Layers, false) | (Self::Parameters, true) => Self::Preview,
+        }
+    }
 }
 
 struct Painting {
@@ -130,16 +143,18 @@ pub struct App {
     last_token: u64,
     /// Active dialog, which receives input before global bindings.
     pub modal: Option<Modal>,
-    /// Whether the full key reference is capturing input.
+    /// Whether the key reference is capturing input.
     pub(crate) keys_open: bool,
-    /// Retained row offset in the full key reference.
+    /// Whether the key reference includes every region.
+    pub(crate) keys_all: bool,
+    /// Retained row offset in the current key reference.
     pub(crate) keys_scroll: u16,
     /// Glyph set for sampled Dithered cells and the minimap.
     pub glyphs: Glyphs,
     /// Preview zoom, minimap and dot origin.
     pub viewport: Viewport,
-    /// Whether keys go to the preview first (toggled by Tab, left with Esc).
-    pub preview_focus: bool,
+    /// Region receiving local keys.
+    pub focus: Focus,
     last_drag: Option<Drag>,
     layer_drag: Option<LayerDrag>,
     stroke: Option<Painting>,
@@ -159,6 +174,10 @@ pub struct App {
     pub settings: Settings,
     /// Parameter selection and retained scroll offset.
     pub panel: Outline,
+    /// Brush selection and retained scroll offset.
+    pub brush_picker: ListPicker,
+    /// Layer selection in display order and retained scroll offset.
+    pub layers: ListPicker,
     /// Selected view, initially Original.
     pub view: View,
     /// View that `a` returns to from the mass study.
@@ -173,69 +192,22 @@ pub struct App {
     pub quit: bool,
 }
 
-/// Outline group containing the brush controls.
-pub(crate) const BRUSH_GROUP: usize = GROUP_LENS.len();
-/// Outline group containing document layers.
-pub(crate) const LAYER_GROUP: usize = BRUSH_GROUP + 1;
-
 impl App {
-    /// Counts settings, brush controls and current layers for the outline.
-    pub(crate) fn panel_lens(&self) -> [usize; 5] {
-        [
-            GROUP_LENS[0],
-            GROUP_LENS[1],
-            GROUP_LENS[2],
-            BrushRow::ALL.len(),
-            self.document.layers().len(),
-        ]
-    }
-
-    /// Maps an item from the current panel lens, with the top layer first.
-    pub(crate) fn panel_row(&self, item: usize) -> PanelItem {
-        debug_assert!(item < self.panel_lens().iter().sum());
-        if let Some(&setting) = Setting::ALL.get(item) {
-            PanelItem::Setting(setting)
-        } else if let Some(&row) = BrushRow::ALL.get(item - Setting::ALL.len()) {
-            PanelItem::Brush(row)
-        } else {
-            PanelItem::Layer(
-                self.document.layers().len()
-                    - 1
-                    - (item - Setting::ALL.len() - BrushRow::ALL.len()),
-            )
-        }
-    }
-
-    /// Returns a setting only when the cursor is on a settings row.
+    /// Returns the setting under the Parameters cursor.
     pub(crate) fn selected_setting(&self) -> Option<Setting> {
-        match self.panel.selected(&self.panel_lens()) {
-            Some(Row::Item(i)) => match self.panel_row(i) {
-                PanelItem::Setting(setting) => Some(setting),
-                PanelItem::Brush(_) | PanelItem::Layer(_) => None,
-            },
+        match self.panel.selected(&GROUP_LENS) {
+            Some(Row::Item(i)) => Setting::ALL.get(i).copied(),
             _ => None,
         }
     }
 
-    fn layer_row(&self, index: usize) -> Row {
-        Row::Item(
-            Setting::ALL.len() + BrushRow::ALL.len() + self.document.layers().len() - 1 - index,
-        )
+    /// Maps a display row to a document index, with the top layer first.
+    pub(crate) fn layer_index(&self, row: usize) -> Option<usize> {
+        self.document.layers().len().checked_sub(row + 1)
     }
 
-    fn retain_panel(&mut self, row: Row) {
-        let len = self.document.layers().len();
-        let row = match row {
-            Row::Item(i) if i >= Setting::ALL.len() + BrushRow::ALL.len() + len => {
-                if len == 0 {
-                    Row::Header(LAYER_GROUP)
-                } else {
-                    Row::Item(Setting::ALL.len() + BrushRow::ALL.len() + len - 1)
-                }
-            }
-            row => row,
-        };
-        self.panel.select(row, &self.panel_lens());
+    fn select_layer_row(&mut self, index: usize) {
+        self.layers.select(self.document.layers().len() - 1 - index);
     }
 
     fn select_layer(&mut self, index: usize, toggle: bool) {
@@ -245,13 +217,13 @@ impl App {
             Some(index)
         };
         self.document.select(selected);
-        self.retain_panel(self.layer_row(index));
+        self.select_layer_row(index);
     }
 
     fn toggle_layer(&mut self, index: usize) {
         let visible = !self.document.layers()[index].visible;
         self.document.set_visible(index, visible);
-        self.retain_panel(self.layer_row(index));
+        self.select_layer_row(index);
     }
 
     fn handle_layer_key(&mut self, code: KeyCode) -> bool {
@@ -259,14 +231,14 @@ impl App {
             return false;
         }
         let row = self
-            .panel
-            .selected(&self.panel_lens())
-            .unwrap_or(Row::Header(LAYER_GROUP));
+            .layers
+            .selected(self.document.layers().len())
+            .unwrap_or(0);
         match code {
             KeyCode::Char('n') => {
                 self.document.add_layer(self.document.next_layer_name());
-                self.panel.invalidate();
-                self.retain_panel(self.layer_row(self.document.layers().len() - 1));
+                self.layers.invalidate();
+                self.layers.select(0);
             }
             KeyCode::Char('u' | 'U') => {
                 let action = if code == KeyCode::Char('u') {
@@ -289,13 +261,13 @@ impl App {
                     "{prefix}{}{action}",
                     if changed { "" } else { "nothing to " }
                 ));
-                self.retain_panel(row);
+                self.layers.select(row);
             }
             _ => {
-                let Row::Item(item) = row else {
+                if self.focus != Focus::Layers {
                     return false;
-                };
-                let PanelItem::Layer(index) = self.panel_row(item) else {
+                }
+                let Some(index) = self.layer_index(row) else {
                     return false;
                 };
                 match code {
@@ -317,8 +289,8 @@ impl App {
                         };
                         if to != index {
                             self.document.move_layer(index, to);
-                            self.panel.invalidate();
-                            self.retain_panel(self.layer_row(to));
+                            self.layers.invalidate();
+                            self.select_layer_row(to);
                         }
                     }
                     _ => return false,
@@ -328,10 +300,12 @@ impl App {
         true
     }
 
+    /// Whether the visible minimap uses mass study pixels.
     pub(crate) fn mass_inset_shown(&self, geometry: &PreviewGeometry) -> bool {
         self.mass_minimap && self.mass_map_available(geometry)
     }
 
+    /// Whether the current view can show a separate mass minimap.
     pub(crate) fn mass_map_available(&self, geometry: &PreviewGeometry) -> bool {
         geometry.minimap.is_some() && self.view != View::Mass
     }
@@ -356,7 +330,7 @@ impl App {
             document_epoch: 0,
             glyphs: Glyphs::default(),
             viewport: Viewport::default(),
-            preview_focus: false,
+            focus: Focus::Parameters,
             last_drag: None,
             layer_drag: None,
             stroke: None,
@@ -372,15 +346,12 @@ impl App {
             last_token: 0,
             modal: None,
             keys_open: false,
+            keys_all: false,
             keys_scroll: 0,
             settings: Settings::default(),
-            panel: Outline::new(&[
-                GROUP_LENS[0],
-                GROUP_LENS[1],
-                GROUP_LENS[2],
-                BrushRow::ALL.len(),
-                0,
-            ]),
+            panel: Outline::new(&GROUP_LENS),
+            brush_picker: ListPicker::new(0),
+            layers: ListPicker::new(0),
             view: View::Original,
             mass_return: View::Original,
             mass_minimap: true,
@@ -458,9 +429,9 @@ impl App {
 
     fn set_image(&mut self, path: PathBuf, image: RgbaImage) {
         let row = self
-            .panel
-            .selected(&self.panel_lens())
-            .unwrap_or(Row::Header(LAYER_GROUP));
+            .layers
+            .selected(self.document.layers().len())
+            .unwrap_or(0);
         self.layer_drag = None;
         self.stroke = None;
         self.document_epoch += 1;
@@ -469,7 +440,8 @@ impl App {
         self.source_path = Some(path);
         self.session = None;
         self.document = Document::new(image.width(), image.height());
-        self.retain_panel(row);
+        self.layers.invalidate();
+        self.layers.select(row);
         self.grid_cache.set_source(image);
         self.viewport = Viewport::default();
         self.last_drag = None;
@@ -507,12 +479,12 @@ impl App {
     /// Replaces source, settings and layers with a validated session and fresh history.
     pub(crate) fn open_session(&mut self, dir: PathBuf, session: Session) {
         let row = self
-            .panel
-            .selected(&self.panel_lens())
-            .unwrap_or(Row::Header(LAYER_GROUP));
+            .layers
+            .selected(self.document.layers().len())
+            .unwrap_or(0);
         self.set_image(session.source_path, session.source);
         self.document = session.document;
-        self.retain_panel(row);
+        self.layers.select(row);
         self.settings = session.settings;
         session.view.restore(self);
         self.session = Some(dir);
@@ -1089,7 +1061,7 @@ impl App {
             return false;
         }
         // Drag hits follow row positions, so only later clicks see a stale layout.
-        self.panel.invalidate();
+        self.layers.invalidate();
         true
     }
 
@@ -1208,54 +1180,90 @@ impl App {
             self.stroke = Some(stroke);
             return painted;
         }
-        let panel = crate::ui::layout(screen).panel;
-        let lens = self.panel_lens();
-        let hit = self.panel.row_at((mouse.column, mouse.row).into(), &lens);
+        let layout = crate::ui::layout(screen, self.document.layers().len());
+        let position = (mouse.column, mouse.row).into();
+        let len = self.document.layers().len();
+        let hit = self.layers.index_at(
+            position,
+            Some(&ratatui::widgets::Block::bordered()),
+            layout.layers,
+            len,
+        );
         if let Some(mut drag) = active_drag {
-            if let Some(Row::Item(item)) = hit
-                && let PanelItem::Layer(to) = self.panel_row(item)
+            if let Some(to) = hit.and_then(|row| self.layer_index(row))
                 && to != drag.index
             {
                 self.document.move_layer(drag.index, to);
                 drag.index = to;
                 drag.moved = true;
-                self.retain_panel(self.layer_row(to));
+                self.select_layer_row(to);
                 self.layer_drag = Some(drag);
                 return true;
             }
             self.layer_drag = Some(drag);
             return false;
         }
-        if panel.contains((mouse.column, mouse.row).into())
-            && !geometry.area.contains((mouse.column, mouse.row).into())
-            && !matches!(mouse.kind, MouseEventKind::Drag(_))
-        {
-            self.last_drag = None;
-            let before = self.panel.selected(&lens);
-            let outcome = self.panel.handle_mouse(mouse, &lens);
-            let clicked = outcome != Outcome::Ignored
-                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-            if clicked {
-                self.preview_focus = false;
-                if self.source_path().is_some()
-                    && let Some(Row::Item(item)) = hit
-                    && let PanelItem::Layer(index) = self.panel_row(item)
-                {
-                    if mouse.column == panel.x + 3 {
-                        self.toggle_layer(index);
-                    } else {
-                        if before != hit {
-                            self.select_layer(index, false);
-                        }
-                        self.layer_drag = Some(LayerDrag {
-                            index,
-                            moved: false,
-                            toggle: before == hit,
-                        });
-                    }
+        if !geometry.area.contains(position) && !matches!(mouse.kind, MouseEventKind::Drag(_)) {
+            for (area, focus) in [
+                (layout.parameters, Focus::Parameters),
+                (layout.brush, Focus::Brush),
+                (layout.layers, Focus::Layers),
+            ] {
+                if !area.contains(position) {
+                    continue;
                 }
+                self.last_drag = None;
+                let interacting = matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                );
+                let changed_focus = interacting && self.focus != focus;
+                if interacting {
+                    self.focus = focus;
+                }
+                let outcome = match focus {
+                    Focus::Parameters => self.panel.handle_mouse(mouse, &GROUP_LENS),
+                    Focus::Brush => self.brush_picker.handle_mouse(mouse, BrushRow::ALL.len()),
+                    Focus::Layers => {
+                        let before = self.layers.selected(len);
+                        let outcome = self.layers.handle_mouse(mouse, len);
+                        if outcome != Outcome::Ignored
+                            && self.source_path().is_some()
+                            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                            && let Some(index) = hit.and_then(|row| self.layer_index(row))
+                        {
+                            if mouse.column == layout.layers.x + 3 {
+                                self.toggle_layer(index);
+                            } else {
+                                if before != hit {
+                                    self.select_layer(index, false);
+                                }
+                                self.layer_drag = Some(LayerDrag {
+                                    index,
+                                    moved: false,
+                                    toggle: !changed_focus && before == hit,
+                                });
+                            }
+                        }
+                        outcome
+                    }
+                    Focus::Preview => unreachable!(),
+                };
+                let outcome = if changed_focus && matches!(outcome, Outcome::Submit(_)) {
+                    Outcome::Consumed
+                } else {
+                    outcome
+                };
+                if focus == Focus::Parameters
+                    && let Outcome::Submit(i) = outcome
+                    && let Some(modal) = Modal::dropdown(Setting::ALL[i], &self.settings)
+                {
+                    self.show_modal(modal);
+                }
+                return was_dragging || changed_focus || outcome != Outcome::Ignored;
             }
-            return was_dragging || outcome != Outcome::Ignored;
         }
         if self.source_path().is_none() {
             self.last_drag = None;
@@ -1399,14 +1407,18 @@ impl App {
         }
         self.notice = None;
         if self.keys_open {
-            let max = crate::ui::key_help_scroll_max(geometry.area.height);
+            let max = crate::ui::key_help_scroll_max(self, geometry.area.height);
             self.keys_scroll = self.keys_scroll.min(max);
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('?') => self.keys_open = false,
+                    KeyCode::Esc => self.keys_open = false,
+                    KeyCode::Char('?') => {
+                        self.keys_all = !self.keys_all;
+                        self.keys_scroll = 0;
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.keys_scroll = self.keys_scroll.saturating_sub(1);
                     }
@@ -1449,6 +1461,7 @@ impl App {
         }
         if key.code == KeyCode::Char('?') {
             self.keys_open = true;
+            self.keys_all = false;
             self.keys_scroll = 0;
             self.last_drag = None;
             return;
@@ -1472,8 +1485,8 @@ impl App {
             self.show_modal(Modal::templates());
             return;
         }
-        if key.code == KeyCode::Tab {
-            self.preview_focus = !self.preview_focus;
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = self.focus.cycle(key.code == KeyCode::BackTab);
             return;
         }
         if key.code == KeyCode::Char('b') {
@@ -1498,7 +1511,9 @@ impl App {
         }
         // Esc leaves preview focus. Only q or Ctrl+C exits.
         if key.code == KeyCode::Esc {
-            self.preview_focus = false;
+            if self.focus == Focus::Preview {
+                self.focus = Focus::Parameters;
+            }
             return;
         }
         if let Some(preview_key) = preview_key {
@@ -1532,44 +1547,47 @@ impl App {
             }
             return;
         }
-        if self.preview_focus
-            && key.code == KeyCode::Enter
-            && matches!(
-                self.panel.selected(&self.panel_lens()),
-                Some(Row::Header(_))
-            )
+        if self.focus == Focus::Brush {
+            if self.brush_picker.handle_key(key, BrushRow::ALL.len()) != Outcome::Ignored {
+                return;
+            }
+            if let Some(i) = self.brush_picker.selected(BrushRow::ALL.len()) {
+                let direction = match key.code {
+                    KeyCode::Char('d') => Some(0),
+                    KeyCode::Left | KeyCode::Char('h') => Some(-1),
+                    KeyCode::Right | KeyCode::Char('l') => Some(1),
+                    _ => None,
+                };
+                if let Some(direction) = direction {
+                    BrushRow::ALL[i].adjust(&mut self.brush, direction);
+                    return;
+                }
+            }
+        }
+        if self.focus == Focus::Layers
+            && self.layers.handle_key(key, self.document.layers().len()) != Outcome::Ignored
         {
             return;
         }
-        match self.handle_panel_key(key) {
-            Outcome::Ignored => {}
-            Outcome::Submit(i) => {
-                let PanelItem::Setting(setting) = self.panel_row(i) else {
+        if self.focus == Focus::Parameters {
+            match self.handle_panel_key(key) {
+                Outcome::Ignored => {}
+                Outcome::Submit(i) => {
+                    let setting = Setting::ALL[i];
+                    if let Some(modal) = Modal::dropdown(setting, &self.settings) {
+                        self.show_modal(modal);
+                        return;
+                    }
+                    // Enter picks a new seed on an active Seed row. The clock is read only
+                    // here, Settings decides the seed and the engine stays deterministic.
+                    let entropy = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    self.apply_setting(setting, self.settings.reseeded(setting, entropy));
                     return;
-                };
-                // Enter picks a new seed on an active Seed row. The clock is read only
-                // here, Settings decides the seed and the engine stays deterministic.
-                let entropy = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                self.apply_setting(setting, self.settings.reseeded(setting, entropy));
-                return;
-            }
-            Outcome::Consumed | Outcome::Cancel => return,
-        }
-        if let Some(Row::Item(i)) = self.panel.selected(&self.panel_lens())
-            && let PanelItem::Brush(row) = self.panel_row(i)
-        {
-            let direction = match key.code {
-                KeyCode::Char('d') => Some(0),
-                KeyCode::Left | KeyCode::Char('h') => Some(-1),
-                KeyCode::Right | KeyCode::Char('l') => Some(1),
-                _ => None,
-            };
-            if let Some(direction) = direction {
-                row.adjust(&mut self.brush, direction);
-                return;
+                }
+                Outcome::Consumed | Outcome::Cancel => return,
             }
         }
         match key.code {
@@ -1588,21 +1606,25 @@ impl App {
             KeyCode::Char('f') => self.settings.flip = !self.settings.flip,
             KeyCode::Char('r') => self.settings.rotation = self.settings.rotation.cw(),
             KeyCode::Char('R') => self.settings.rotation = self.settings.rotation.ccw(),
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if self.focus == Focus::Parameters => {
                 let Some(setting) = self.selected_setting() else {
                     return;
                 };
                 let next = self.settings.with_default(setting, &self.library.palettes);
                 let _ = self.set_settings(next, self.view);
             }
-            KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
+            KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Parameters => {
+                self.adjust(-1)
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.focus == Focus::Parameters => {
+                self.adjust(1)
+            }
             _ => {}
         }
     }
 
     fn handle_panel_key(&mut self, key: KeyEvent) -> Outcome<usize> {
-        let lens = self.panel_lens();
+        let lens = GROUP_LENS;
         if !matches!(
             key.code,
             KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j')
@@ -1621,8 +1643,7 @@ impl App {
                 }
                 return outcome;
             }
-            if !matches!(after, Some(Row::Item(i)) if matches!(self.panel_row(i), PanelItem::Setting(setting) if !setting.is_active(&self.settings)))
-            {
+            if !matches!(after, Some(Row::Item(i)) if !Setting::ALL[i].is_active(&self.settings)) {
                 return outcome;
             }
         }
@@ -1640,23 +1661,28 @@ impl App {
                 geometry.grid,
                 geometry.area,
             ))),
-            _ if self.preview_focus => pan_delta(code, geometry.visible, geometry.pan_step())
-                .map(|(dx, dy)| PreviewKey::Pan(dx, dy)),
+            _ if self.focus == Focus::Preview => {
+                pan_delta(code, geometry.visible, geometry.pan_step())
+                    .map(|(dx, dy)| PreviewKey::Pan(dx, dy))
+            }
             _ => None,
         }
     }
 
     fn apply(&mut self, effect: Effect) -> Result<(), String> {
         match effect {
+            Effect::Choose(setting, index) => {
+                self.apply_setting(setting, self.settings.with_choice(setting, index));
+            }
             Effect::Quit => self.quit = true,
             Effect::RemoveLayer(index) => {
                 let row = self
-                    .panel
-                    .selected(&self.panel_lens())
-                    .unwrap_or(Row::Header(LAYER_GROUP));
+                    .layers
+                    .selected(self.document.layers().len())
+                    .unwrap_or(0);
                 self.document.remove_layer(index);
-                self.panel.invalidate();
-                self.retain_panel(row);
+                self.layers.invalidate();
+                self.layers.select(row);
             }
             Effect::OpenConfirmed(path, dir) => self.start_open(path, dir),
             Effect::OpenLoaded(outcome) => self.replace_open(*outcome),
@@ -2395,15 +2421,252 @@ mod tests {
     }
 
     #[test]
+    fn focus_cycles_both_ways_and_escape_only_leaves_preview() {
+        let mut app = App::empty();
+        assert_eq!(app.focus, Focus::Parameters);
+        for expected in [
+            Focus::Brush,
+            Focus::Layers,
+            Focus::Preview,
+            Focus::Parameters,
+        ] {
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus, expected);
+        }
+        for expected in [
+            Focus::Preview,
+            Focus::Layers,
+            Focus::Brush,
+            Focus::Parameters,
+        ] {
+            app.handle_key(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &app.geometry(test_layout().preview),
+            );
+            assert_eq!(app.focus, expected);
+        }
+        for focus in [
+            Focus::Preview,
+            Focus::Parameters,
+            Focus::Brush,
+            Focus::Layers,
+        ] {
+            app.focus = focus;
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(
+                app.focus,
+                if focus == Focus::Preview {
+                    Focus::Parameters
+                } else {
+                    focus
+                }
+            );
+            assert!(!app.quit);
+        }
+    }
+
+    #[test]
+    fn local_keys_only_change_the_focused_block() {
+        let mut app = app_at(Setting::Brightness);
+        press(&mut app, KeyCode::Char('n'));
+        let settings_row = app.panel.selected(&GROUP_LENS);
+        let brush = app.brush;
+        for focus in [Focus::Preview, Focus::Brush, Focus::Layers] {
+            app.focus = focus;
+            let settings = app.settings.clone();
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('d'));
+            assert!(app.settings == settings);
+            assert_eq!(app.panel.selected(&GROUP_LENS), settings_row);
+            if focus == Focus::Brush {
+                assert_eq!(app.brush, brush);
+            }
+        }
+        app.focus = Focus::Brush;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.brush_picker.selected(BrushRow::ALL.len()), Some(1));
+        let revision = app.document.revision();
+        for code in ['v', 'x', '[', ']'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        assert_eq!(app.document.revision(), revision);
+        assert!(app.modal.is_none());
+        app.focus = Focus::Parameters;
+        press(&mut app, KeyCode::Right);
+        assert_ne!(app.settings.tone.brightness, 0.0);
+    }
+
+    #[test]
+    fn layer_creation_and_history_work_from_every_focus() {
+        for focus in [
+            Focus::Preview,
+            Focus::Parameters,
+            Focus::Brush,
+            Focus::Layers,
+        ] {
+            let mut app = App::builtin(RgbaImage::new(4, 4), None);
+            app.focus = focus;
+            press(&mut app, KeyCode::Char('n'));
+            assert_eq!(app.focus, focus);
+            assert_eq!(app.layers.selected(1), Some(0));
+            app.document.paint(0, |map| map.add(0, 0, 256));
+            app.document.commit_stroke(0, ExposureMap::new(4, 4));
+            press(&mut app, KeyCode::Char('u'));
+            assert!(app.document.can_redo(0));
+            press(&mut app, KeyCode::Char('U'));
+            assert!(app.document.can_undo(0));
+            ctrl(&mut app, 'z');
+            assert!(app.document.can_redo(0));
+            ctrl(&mut app, 'y');
+            assert!(app.document.can_undo(0));
+        }
+    }
+
+    #[test]
+    fn focus_click_does_not_submit_selected_dither_or_toggle_selected_layer() {
+        let mut app = app_at(Setting::Dither);
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen, 0);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.parameters);
+        let row = app
+            .panel
+            .selected_row(
+                layout.parameters,
+                Some(&ratatui::widgets::Block::bordered()),
+                &GROUP_LENS,
+            )
+            .unwrap();
+        app.focus = Focus::Brush;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(kind, row.x + 5, row.y, &geometry, screen);
+        }
+        assert_eq!(app.focus, Focus::Parameters);
+        assert_eq!(app.selected_setting(), Some(Setting::Dither));
+        assert!(app.modal.is_none());
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            row.x + 5,
+            row.y,
+            &geometry,
+            screen,
+        );
+        assert!(matches!(app.modal, Some(Modal::Dropdown(_))));
+        app.modal = None;
+
+        press(&mut app, KeyCode::Char('n'));
+        render_layers(&mut app, screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
+        let target = app.document.selected();
+        assert!(target.is_some());
+        app.focus = Focus::Parameters;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(
+                kind,
+                layout.layers.x + 5,
+                layout.layers.y + 1,
+                &geometry,
+                screen,
+            );
+        }
+        assert_eq!(app.focus, Focus::Layers);
+        assert_eq!(app.layers.selected(app.document.layers().len()), Some(0));
+        assert_eq!(app.document.selected(), target);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(
+                kind,
+                layout.layers.x + 5,
+                layout.layers.y + 1,
+                &geometry,
+                screen,
+            );
+        }
+        assert_eq!(app.document.selected(), None);
+    }
+
+    #[test]
+    fn mouse_click_and_wheel_focus_each_block_and_keep_other_cursors() {
+        let mut app = App::builtin(RgbaImage::new(4, 4), None);
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Char('n'));
+        }
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen, 12);
+        render_panel(&app, layout.parameters);
+        render_layers(&mut app, screen);
+        app.brush_picker.render(
+            BrushRow::ALL.map(|row| ratatui::text::Line::raw(row.label(app.brush))),
+            Some(ratatui::widgets::Block::bordered()),
+            ratatui::style::Style::default(),
+            layout.brush,
+            &mut ratatui::buffer::Buffer::empty(layout.brush),
+        );
+        let geometry = app.geometry(layout.preview);
+        for (area, focus) in [
+            (layout.parameters, Focus::Parameters),
+            (layout.brush, Focus::Brush),
+            (layout.layers, Focus::Layers),
+        ] {
+            let y = area.y + if focus == Focus::Parameters { 2 } else { 1 };
+            app.focus = Focus::Preview;
+            assert!(app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 5,
+                y,
+                &geometry,
+                screen
+            ));
+            assert_eq!(app.focus, focus);
+            assert!(app.modal.is_none());
+            app.mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                area.x + 5,
+                y,
+                &geometry,
+                screen,
+            );
+            app.focus = Focus::Preview;
+            assert!(app.mouse_at(MouseEventKind::ScrollDown, area.x + 5, y, &geometry, screen));
+            assert_eq!(app.focus, focus);
+        }
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Item(1)));
+        assert_eq!(app.brush_picker.selected(3), Some(1));
+        app.focus = Focus::Layers;
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Down);
+        }
+        render_layers(&mut app, screen);
+        assert!(app.layers.offset() > 0);
+        let visible = app.layers.offset();
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.layers.x + 3,
+            layout.layers.y + 1,
+            &geometry,
+            screen,
+        );
+        assert!(!app.document.layers()[11 - visible].visible);
+        assert_eq!(app.brush_picker.selected(3), Some(1));
+    }
+
+    #[test]
     fn brush_rows_adjust_reset_and_leave_layers_addressable() {
         let mut app = App::empty();
         press(&mut app, KeyCode::Char('b'));
         assert!(!app.brush_on);
         for (index, row) in BrushRow::ALL.into_iter().enumerate() {
-            let item = Setting::ALL.len() + index;
-            assert_eq!(app.panel_row(item), PanelItem::Brush(row));
-            app.panel.select(Row::Item(item), &app.panel_lens());
-            assert_eq!(app.selected_setting(), None);
+            app.focus = Focus::Brush;
+            app.brush_picker.select(index);
             press(&mut app, KeyCode::Char('h'));
             assert!(row.changed(app.brush));
             press(&mut app, KeyCode::Char('l'));
@@ -2425,7 +2688,7 @@ mod tests {
         );
         app.open_image("source.png".into(), RgbaImage::new(10, 10));
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.panel_row(Setting::ALL.len() + 3), PanelItem::Layer(0));
+        assert_eq!(app.layer_index(0), Some(0));
     }
 
     #[test]
@@ -2435,7 +2698,7 @@ mod tests {
             None,
         );
         let screen = Rect::new(0, 0, 100, 40);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, 0);
         app.viewport.zoom = Zoom::In(1);
         app.sync(layout.preview);
         press(&mut app, KeyCode::Char('b'));
@@ -2520,7 +2783,7 @@ mod tests {
     fn brush_drag_without_a_dab_keeps_revision() {
         let mut app = App::builtin(RgbaImage::new(128, 128), None);
         let screen = Rect::new(0, 0, 100, 40);
-        let area = crate::ui::layout(screen).preview;
+        let area = crate::ui::layout(screen, 0).preview;
         app.viewport.zoom = Zoom::In(1);
         app.brush_on = true;
         app.brush.radius = 256;
@@ -2548,7 +2811,7 @@ mod tests {
     fn brush_drag_across_margin_does_not_join_exit_and_entry() {
         let mut app = App::builtin(RgbaImage::new(128, 128), None);
         let screen = Rect::new(0, 0, 100, 40);
-        let area = crate::ui::layout(screen).preview;
+        let area = crate::ui::layout(screen, 0).preview;
         app.viewport.zoom = Zoom::In(1);
         app.brush_on = true;
         app.brush.radius = 1;
@@ -2633,7 +2896,7 @@ mod tests {
         assert!(!app.brush_on);
         app.brush_on = true;
         let screen = Rect::new(0, 0, 100, 40);
-        let geometry = app.geometry(crate::ui::layout(screen).preview);
+        let geometry = app.geometry(crate::ui::layout(screen, 0).preview);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             geometry.target.x,
@@ -2709,7 +2972,7 @@ mod tests {
         let screen = Rect::new(0, 0, 100, 40);
         app.brush_on = true;
         app.brush.radius = 1;
-        let geometry = app.geometry(crate::ui::layout(screen).preview);
+        let geometry = app.geometry(crate::ui::layout(screen, 0).preview);
         assert_eq!(geometry.zoom, Zoom::Fit);
         let (x, y) = (geometry.target.right() - 1, geometry.target.bottom() - 1);
         app.mouse_at(
@@ -2746,7 +3009,7 @@ mod tests {
                 app.document.commit_stroke(0, ExposureMap::new(128, 128));
             }
             let screen = Rect::new(0, 0, 100, 40);
-            let area = crate::ui::layout(screen).preview;
+            let area = crate::ui::layout(screen, 0).preview;
             app.viewport.zoom = Zoom::In(1);
             app.brush_on = true;
             let geometry = app.geometry(area);
@@ -2793,7 +3056,7 @@ mod tests {
     fn brush_rejects_hidden_target_and_minimap_and_paper_presses() {
         let mut app = App::builtin(RgbaImage::new(128, 128), None);
         let screen = Rect::new(0, 0, 100, 40);
-        let area = crate::ui::layout(screen).preview;
+        let area = crate::ui::layout(screen, 0).preview;
         app.viewport.zoom = Zoom::In(1);
         app.brush_on = true;
         let geometry = app.geometry(area);
@@ -2825,6 +3088,7 @@ mod tests {
             screen,
         );
         press(&mut app, KeyCode::Char('n'));
+        app.focus = Focus::Layers;
         press(&mut app, KeyCode::Char('v'));
         let revision = app.document.revision();
         let geometry = app.geometry(area);
@@ -2864,7 +3128,7 @@ mod tests {
     fn stroke_ends_on_unrelated_input_and_paints_at_fit() {
         let mut app = App::builtin(RgbaImage::new(128, 128), None);
         let screen = Rect::new(0, 0, 100, 40);
-        let area = crate::ui::layout(screen).preview;
+        let area = crate::ui::layout(screen, 0).preview;
         app.brush_on = true;
         let geometry = app.geometry(area);
         let (x, y) = (geometry.target.x + 2, geometry.target.y + 2);
@@ -2918,7 +3182,7 @@ mod tests {
             assert_eq!((app.viewport.x, app.viewport.y), (0, 0));
         }
         app.viewport.zoom = Zoom::In(1);
-        app.preview_focus = true;
+        app.focus = Focus::Preview;
         let geometry = app.geometry(area);
         let revision = app.document.revision();
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &geometry);
@@ -2972,6 +3236,7 @@ mod tests {
             app.end_stroke();
             let before = app.document.clone();
             let revision = app.document.revision();
+            app.focus = Focus::Layers;
             press(&mut app, KeyCode::Char('x'));
             assert_eq!(app.document.revision(), revision);
             let Some(Modal::Confirm { question, .. }) = &app.modal else {
@@ -3010,15 +3275,9 @@ mod tests {
         }
         assert_eq!(app.document.layers()[0].name, "Layer 1");
         assert_eq!(app.document.layers()[1].name, "Layer 2");
-        assert_eq!(
-            app.panel_row(Setting::ALL.len() + BrushRow::ALL.len()),
-            PanelItem::Layer(1)
-        );
-        assert_eq!(
-            app.panel_row(Setting::ALL.len() + BrushRow::ALL.len() + 1),
-            PanelItem::Layer(0)
-        );
-        assert_eq!(app.selected_setting(), None);
+        assert_eq!(app.layer_index(0), Some(1));
+        assert_eq!(app.layer_index(1), Some(0));
+        app.focus = Focus::Layers;
         let revision = app.document.revision();
         let versions = versions(&app);
         press(&mut app, KeyCode::Enter);
@@ -3033,8 +3292,8 @@ mod tests {
         press(&mut app, KeyCode::Char('['));
         assert_eq!(app.document.layers()[0].name, "Layer 2");
         assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(0))
+            app.layers.selected(app.document.layers().len()),
+            Some(app.document.layers().len() - 1)
         );
         let revision = app.document.revision();
         press(&mut app, KeyCode::Char('['));
@@ -3042,43 +3301,37 @@ mod tests {
         press(&mut app, KeyCode::Char(']'));
         press(&mut app, KeyCode::Char('v'));
         assert!(!app.document.layers()[1].visible);
-        app.panel.select(app.layer_row(0), &app.panel_lens());
+        app.select_layer_row(0);
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(0))
+            app.layers.selected(app.document.layers().len()),
+            Some(app.document.layers().len() - 1)
         );
         press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.document.layers()[1].name, "Layer 1");
-        app.preview_focus = true;
+        app.focus = Focus::Preview;
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(app.document.layers().len(), 2);
         assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(1))
+            app.layers.selected(app.document.layers().len()),
+            Some(app.document.layers().len() - 1 - 1)
         );
         press(&mut app, KeyCode::Char('U'));
         assert_eq!(app.document.layers().len(), 2);
-        app.preview_focus = false;
+        app.focus = Focus::Layers;
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('y'));
-        app.panel.select(app.layer_row(0), &app.panel_lens());
+        app.select_layer_row(0);
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('y'));
-        assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(Row::Header(LAYER_GROUP))
-        );
+        assert_eq!(app.layers.selected(app.document.layers().len()), None);
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(Row::Header(LAYER_GROUP))
-        );
+        assert_eq!(app.layers.selected(app.document.layers().len()), None);
         press(&mut app, KeyCode::Char('n'));
-        app.panel.select(Row::Item(0), &app.panel_lens());
+        app.layers.select(0);
         app.open_image("next.png".into(), RgbaImage::new(2, 2));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Item(0)));
+        assert_eq!(app.layers.selected(app.document.layers().len()), None);
         assert!(
             !app.document
                 .target()
@@ -3110,11 +3363,11 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         press(&mut app, KeyCode::Char('n'));
         let screen = Rect::new(0, 0, 100, 40);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
         let geometry = app.geometry(layout.preview);
-        render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
-        let mark_x = layout.panel.x + 3;
+        render_layers(&mut app, screen);
+        let top = layout.layers.y + 1;
+        let mark_x = layout.layers.x + 3;
         press(&mut app, KeyCode::Char('n'));
         let revision = app.document.revision();
         app.mouse_at(
@@ -3126,7 +3379,11 @@ mod tests {
         );
         assert_eq!(app.document.revision(), revision);
         assert!(app.document.layers().iter().all(|layer| layer.visible));
-        render_panel(&app, layout.panel);
+        render_layers(&mut app, screen);
+        let top = crate::ui::layout(screen, app.document.layers().len())
+            .layers
+            .y
+            + 1;
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -3144,11 +3401,12 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('n'));
         let screen = Rect::new(0, 0, 100, 40);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
         let geometry = app.geometry(layout.preview);
-        render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
-        let mark_x = layout.panel.x + 3;
+        render_layers(&mut app, screen);
+        let top = layout.layers.y + 1;
+        let mark_x = layout.layers.x + 3;
+        app.focus = Focus::Layers;
         press(&mut app, KeyCode::Char('['));
         let revision = app.document.revision();
         app.mouse_at(
@@ -3159,7 +3417,7 @@ mod tests {
             screen,
         );
         assert_eq!(app.document.revision(), revision);
-        render_panel(&app, layout.panel);
+        render_layers(&mut app, screen);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             mark_x,
@@ -3178,11 +3436,11 @@ mod tests {
             press(&mut app, KeyCode::Char('n'));
         }
         let screen = Rect::new(0, 0, 100, 40);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
         let geometry = app.geometry(layout.preview);
-        render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
-        let x = layout.panel.x + 5;
+        render_layers(&mut app, screen);
+        let top = layout.layers.y + 1;
+        let x = layout.layers.x + 5;
         let click = MouseEventKind::Down(MouseButton::Left);
         app.mouse_at(click, x, top + 1, &geometry, screen);
         assert_eq!(app.document.selected(), Some(1));
@@ -3210,7 +3468,7 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &app, &layout, &mut renderer))
             .unwrap();
-        let mark_x = layout.panel.x + 3;
+        let mark_x = layout.layers.x + 3;
         assert_eq!(terminal.backend().buffer()[(mark_x, top + 1)].symbol(), "●");
         let revision = app.document.revision();
         app.mouse_at(click, mark_x, top + 1, &geometry, screen);
@@ -3255,8 +3513,8 @@ mod tests {
         assert_eq!(app.document.selected(), Some(0));
         assert_eq!(app.document.target(), Some(0));
         assert_eq!(
-            app.panel.selected(&app.panel_lens()),
-            Some(app.layer_row(0))
+            app.layers.selected(app.document.layers().len()),
+            Some(app.document.layers().len() - 1)
         );
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(
@@ -3277,15 +3535,16 @@ mod tests {
         for _ in 0..2 {
             press(&mut app, KeyCode::Char('n'));
         }
+        app.focus = Focus::Layers;
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('u'));
         let before = app.document.clone();
         let screen = Rect::new(0, 0, 100, 40);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
         let geometry = app.geometry(layout.preview);
-        render_panel(&app, layout.panel);
-        let top = layout.panel.y + 1 + 5 + (Setting::ALL.len() + BrushRow::ALL.len()) as u16;
-        let x = layout.panel.x + 5;
+        render_layers(&mut app, screen);
+        let top = layout.layers.y + 1;
+        let x = layout.layers.x + 5;
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
             x,
@@ -3864,7 +4123,11 @@ mod tests {
         assert_eq!(app.grid_size(), (0, 0));
         assert!(app.grid_cache.source.is_none());
         for focus in [false, true] {
-            app.preview_focus = focus;
+            app.focus = if focus {
+                Focus::Preview
+            } else {
+                Focus::Parameters
+            };
             for code in [' ', '+', '=', '-', '0', 'm'] {
                 press(&mut app, KeyCode::Char(code));
             }
@@ -3898,7 +4161,7 @@ mod tests {
             assert_eq!(app.view, View::Original);
             assert_eq!(versions(&app), (0, 0));
         }
-        app.preview_focus = false;
+        app.focus = Focus::Parameters;
         press(&mut app, KeyCode::Right);
         assert_eq!(
             app.settings.card,
@@ -4464,7 +4727,7 @@ mod tests {
         }
 
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        app.preview_focus = true;
+        app.focus = Focus::Preview;
         for zoom in [Zoom::Fit, Zoom::Out(2), Zoom::In(4)] {
             app.viewport.zoom = zoom;
             for code in [
@@ -4482,28 +4745,29 @@ mod tests {
     }
 
     fn test_layout() -> Layout {
-        crate::ui::layout(Rect::new(0, 0, 41, 9))
+        crate::ui::layout(Rect::new(0, 0, 41, 9), 0)
     }
 
     fn render_panel(app: &App, area: Rect) {
-        let groups = crate::settings::GROUPS
-            .map(|(title, len)| {
-                (
-                    ratatui::text::Line::raw(title),
-                    vec![ratatui::text::Line::default(); len],
-                )
-            })
-            .into_iter()
-            .chain(std::iter::once((
-                ratatui::text::Line::raw("Brush"),
-                vec![ratatui::text::Line::default(); BrushRow::ALL.len()],
-            )))
-            .chain(std::iter::once((
-                ratatui::text::Line::raw("Layers"),
-                vec![ratatui::text::Line::default(); app.document.layers().len()],
-            )));
+        let groups = crate::settings::GROUPS.map(|(title, len)| {
+            (
+                ratatui::text::Line::raw(title),
+                vec![ratatui::text::Line::default(); len],
+            )
+        });
         app.panel.render(
             groups,
+            Some(ratatui::widgets::Block::bordered()),
+            ratatui::style::Style::default(),
+            area,
+            &mut ratatui::buffer::Buffer::empty(area),
+        );
+    }
+
+    fn render_layers(app: &mut App, screen: Rect) {
+        let area = crate::ui::layout(screen, app.document.layers().len()).layers;
+        app.layers.render(
+            vec![ratatui::text::Line::raw("layer"); app.document.layers().len()],
             Some(ratatui::widgets::Block::bordered()),
             ratatui::style::Style::default(),
             area,
@@ -4532,7 +4796,7 @@ mod tests {
     fn select(app: &mut App, setting: Setting) {
         app.panel.select(
             Row::Item(Setting::ALL.iter().position(|&row| row == setting).unwrap()),
-            &app.panel_lens(),
+            &GROUP_LENS,
         );
     }
 
@@ -4540,6 +4804,94 @@ mod tests {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         select(&mut app, setting);
         app
+    }
+
+    #[test]
+    fn dropdowns_start_current_cancel_and_match_arrow_changes() {
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut app = app_at(setting);
+            press(&mut app, KeyCode::Right);
+            app.view = View::Original;
+            let before = app.settings.clone();
+            let version = versions(&app);
+            press(&mut app, KeyCode::Enter);
+            let Some(Modal::Dropdown(dropdown)) = &app.modal else {
+                panic!("dropdown expected")
+            };
+            assert_eq!(dropdown.setting, setting);
+            let entries = dropdown.entries();
+            assert_eq!(
+                entries[dropdown.list.selected(entries.len()).unwrap()].0,
+                setting.choice(&before)
+            );
+            press(&mut app, KeyCode::Down);
+            assert!(app.settings == before);
+            assert_eq!(versions(&app), version);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.modal.is_none());
+            assert!(app.settings == before);
+            assert_eq!(app.view, View::Original);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.settings == before);
+            assert_eq!(app.view, View::Original);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::Enter);
+            let mut arrows = app_at(setting);
+            arrows.settings = before;
+            arrows.view = View::Original;
+            press(&mut arrows, KeyCode::Left);
+            assert!(app.settings == arrows.settings);
+            assert_eq!(app.view, arrows.view);
+        }
+        for setting in Setting::ALL {
+            if setting.list_title().is_some() {
+                continue;
+            }
+            let mut app = app_at(setting);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.modal.is_none(), "{setting:?}");
+        }
+        let mut app = app_at(Setting::Dither);
+        app.focus = Focus::Preview;
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn second_click_opens_each_parameter_list() {
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut app = app_at(setting);
+            select(&mut app, Setting::Brightness);
+            let screen = Rect::new(0, 0, 100, 60);
+            let layout = crate::ui::layout(screen, 0);
+            render_panel(&app, layout.parameters);
+            let index = Setting::ALL
+                .iter()
+                .position(|item| *item == setting)
+                .unwrap();
+            let group = if index < GROUP_LENS[0] { 1 } else { 2 };
+            let row = layout.parameters.y + 1 + index as u16 + group;
+            let geometry = app.geometry(layout.preview);
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.parameters.x + 3,
+                row,
+                &geometry,
+                screen,
+            );
+            assert!(app.modal.is_none());
+            assert_eq!(app.selected_setting(), Some(setting));
+            app.mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.parameters.x + 3,
+                row,
+                &geometry,
+                screen,
+            );
+            assert!(matches!(app.modal, Some(Modal::Dropdown(_))));
+        }
     }
 
     #[test]
@@ -4600,7 +4952,7 @@ mod tests {
             app.settings.rotation = rotation;
             app.viewport.x = 999;
             app.viewport.y = 999;
-            app.sync(crate::ui::layout(screen).preview);
+            app.sync(crate::ui::layout(screen, 0).preview);
             assert_eq!((app.viewport.x, app.viewport.y), expected);
             assert_eq!(
                 app.grid_cache.grid.get().unwrap().dimensions(),
@@ -4615,19 +4967,23 @@ mod tests {
         select(&mut app, Setting::Strength);
         assert_eq!(app.view, View::Original);
         for (focus, rebuilt) in [(false, true), (true, false)] {
-            app.preview_focus = focus;
+            app.focus = if focus {
+                Focus::Preview
+            } else {
+                Focus::Parameters
+            };
             assert_eq!(press(&mut app, KeyCode::Char(' ')), rebuilt);
             assert_eq!(app.view, View::Dithered);
             assert!(!press(&mut app, KeyCode::Char(' ')));
             assert_eq!(app.view, View::Original);
         }
-        app.preview_focus = false;
+        app.focus = Focus::Parameters;
         assert!(!press(&mut app, KeyCode::Right));
         assert_eq!(app.view, View::Original);
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.view, View::Dithered);
         assert!(!press(&mut app, KeyCode::Char(' ')));
-        app.panel = Outline::new(&app.panel_lens());
+        app.panel = Outline::new(&GROUP_LENS);
         assert!(press(&mut app, KeyCode::Left));
         assert_eq!(app.view, View::Original);
         for code in [KeyCode::Char('r'), KeyCode::Char('d')] {
@@ -4648,7 +5004,11 @@ mod tests {
     fn mass_toggle_builds_rgb_and_redraws_without_rebuilding_grid() {
         for focus in [false, true] {
             let mut app = App::builtin(RgbaImage::new(20, 10), None);
-            app.preview_focus = focus;
+            app.focus = if focus {
+                Focus::Preview
+            } else {
+                Focus::Parameters
+            };
             app.settings = Settings::for_pixels(8, 10);
             app.settings.rotation = Rotation::R90;
             let area = test_layout().preview;
@@ -4858,7 +5218,11 @@ mod tests {
         for focus in [false, true] {
             let mut app = App::builtin(RgbaImage::new(400, 400), None);
             let area = Rect::new(0, 0, 69, 36);
-            app.preview_focus = focus;
+            app.focus = if focus {
+                Focus::Preview
+            } else {
+                Focus::Parameters
+            };
             app.viewport.zoom = Zoom::In(2);
             assert!(app.sync(area));
             let before = versions(&app);
@@ -4981,18 +5345,18 @@ mod tests {
     fn navigation_stays_in_range_and_skips_redither() {
         let mut app = app_at(Setting::Card);
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(0)));
         assert!(!press(&mut app, KeyCode::Up));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(0)));
-        for _ in 0..Setting::ALL.len() + BrushRow::ALL.len() + 4 {
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(0)));
+        for _ in 0..Setting::ALL.len() + 4 {
             assert!(!press(&mut app, KeyCode::Char('j')));
         }
-        assert_eq!(app.selected_setting(), None);
-        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Esc] {
+        assert_eq!(app.selected_setting(), Setting::ALL.last().copied());
+        for code in [KeyCode::Char('x'), KeyCode::Esc] {
             assert!(!press(&mut app, code));
             assert_eq!(
-                app.panel.selected(&app.panel_lens()),
-                Some(Row::Header(LAYER_GROUP))
+                app.panel.selected(&GROUP_LENS),
+                Some(Row::Item(Setting::ALL.len() - 1))
             );
             assert!(!app.quit);
         }
@@ -5003,7 +5367,7 @@ mod tests {
         let mut app = app_at(Setting::Serpentine);
         app.settings.dither = Dither::Atkinson;
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(2)));
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(2)));
         press(&mut app, KeyCode::Up);
         assert_eq!(app.selected_setting(), Some(Setting::Serpentine));
 
@@ -5019,30 +5383,30 @@ mod tests {
         app.settings.dither = Dither::Atkinson;
         assert_eq!(app.selected_setting(), Some(Setting::Seed));
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(2)));
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(2)));
     }
 
     #[test]
     fn preview_focus_enter_does_not_toggle_a_group_header() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
-        app.panel.select(Row::Header(1), &app.panel_lens());
-        app.preview_focus = true;
+        app.panel.select(Row::Header(1), &GROUP_LENS);
+        app.focus = Focus::Preview;
         assert!(!press(&mut app, KeyCode::Enter));
         assert!(!app.panel.is_collapsed(1));
-        assert_eq!(app.panel.selected(&app.panel_lens()), Some(Row::Header(1)));
+        assert_eq!(app.panel.selected(&GROUP_LENS), Some(Row::Header(1)));
     }
 
     #[test]
-    fn panel_mouse_toggles_headers_without_an_image_and_does_not_submit_items() {
+    fn panel_mouse_toggles_headers_and_leaves_seed_and_numeric_rows_unchanged() {
         let mut app = App::empty();
-        let screen = Rect::new(0, 0, 80, 24);
-        let layout = crate::ui::layout(screen);
-        render_panel(&app, layout.panel);
+        let screen = Rect::new(0, 0, 80, 40);
+        let layout = crate::ui::layout(screen, 0);
+        render_panel(&app, layout.parameters);
         let geometry = app.geometry(layout.preview);
         assert!(app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
-            layout.panel.x + 1,
-            layout.panel.y + 1,
+            layout.parameters.x + 1,
+            layout.parameters.y + 1,
             &geometry,
             screen,
         ));
@@ -5051,13 +5415,13 @@ mod tests {
         let mut app = App::empty();
         app.settings.dither = Dither::Noise;
         app.settings.seed = 7;
-        render_panel(&app, layout.panel);
+        render_panel(&app, layout.parameters);
         let geometry = app.geometry(layout.preview);
-        let seed_row = layout.panel.y + 15;
+        let seed_row = layout.parameters.y + 15;
         for _ in 0..2 {
             app.mouse_at(
                 MouseEventKind::Down(MouseButton::Left),
-                layout.panel.x + 2,
+                layout.parameters.x + 2,
                 seed_row,
                 &geometry,
                 screen,
@@ -5070,28 +5434,28 @@ mod tests {
         app.settings = Settings::for_pixels(120, 120);
         app.refresh(false);
         app.viewport.zoom = Zoom::In(1);
-        app.preview_focus = true;
-        render_panel(&app, layout.panel);
+        app.focus = Focus::Preview;
+        render_panel(&app, layout.parameters);
         let geometry = app.geometry(layout.preview);
         let viewport = (app.viewport.x, app.viewport.y);
         app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
-            layout.panel.x + 2,
-            layout.panel.y + 17,
+            layout.parameters.x + 2,
+            layout.parameters.y + 17,
             &geometry,
             screen,
         );
         assert_eq!(app.selected_setting(), Some(Setting::Brightness));
-        assert!(!app.preview_focus);
-        app.preview_focus = true;
+        assert!(app.focus != Focus::Preview);
+        app.focus = Focus::Preview;
         assert!(app.mouse_at(
             MouseEventKind::Down(MouseButton::Left),
-            layout.panel.x + 2,
-            layout.panel.y + 17,
+            layout.parameters.x + 2,
+            layout.parameters.y + 17,
             &geometry,
             screen,
         ));
-        assert!(!app.preview_focus);
+        assert!(app.focus != Focus::Preview);
         assert!(press(&mut app, KeyCode::Right));
         assert_eq!((app.viewport.x, app.viewport.y), viewport);
         assert_eq!(app.settings.tone.brightness, 0.05);
@@ -5292,7 +5656,7 @@ mod tests {
         let mut app = app_at(Setting::Card);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Esc);
-        assert!(!app.preview_focus);
+        assert!(app.focus != Focus::Preview);
         press(&mut app, KeyCode::Esc);
         assert!(!app.quit);
         press(&mut app, KeyCode::Char('q'));
@@ -5317,7 +5681,11 @@ mod tests {
             for view in [View::Original, View::Dithered, View::Mass] {
                 let mut app = App::builtin(RgbaImage::new(16, 12), None);
                 app.settings = Settings::for_pixels(16, 12);
-                app.preview_focus = focus;
+                app.focus = if focus {
+                    Focus::Preview
+                } else {
+                    Focus::Parameters
+                };
                 app.view = view;
                 app.refresh(false);
                 assert!(!app.settings.flip);
@@ -5380,7 +5748,11 @@ mod tests {
         app.settings = Settings::for_pixels(400, 400);
         app.refresh(false);
         for focus in [false, true] {
-            app.preview_focus = focus;
+            app.focus = if focus {
+                Focus::Preview
+            } else {
+                Focus::Parameters
+            };
             assert!(!press(&mut app, KeyCode::Char('0')));
             assert_eq!(app.viewport.zoom, Zoom::Fit);
             assert!(!press(&mut app, KeyCode::Char('+')));
@@ -5462,7 +5834,7 @@ mod tests {
             );
             app.refresh(false);
             assert_eq!(versions(app), version);
-            assert!(!app.preview_focus);
+            assert!(app.focus != Focus::Preview);
         };
         mouse(
             &mut app,
@@ -5608,7 +5980,7 @@ mod tests {
         let mut app = App::drag_fixture();
         app.viewport.hide_minimap = false;
         let screen = Rect::new(0, 0, 80, 24);
-        let layout = crate::ui::layout(screen);
+        let layout = crate::ui::layout(screen, 0);
         let geometry = app.geometry(layout.preview);
         let minimap = geometry.minimap.unwrap();
         let map = minimap.map;
@@ -5622,8 +5994,8 @@ mod tests {
         let centered = (app.viewport.x, app.viewport.y);
         app.mouse_at(
             MouseEventKind::Drag(MouseButton::Left),
-            layout.panel.x + 2,
-            layout.panel.y + 2,
+            layout.parameters.x + 2,
+            layout.parameters.y + 2,
             &app.geometry(layout.preview),
             screen,
         );
@@ -5736,7 +6108,7 @@ mod tests {
     #[test]
     fn minimap_toggle_changes_visibility_without_redithering() {
         let mut app = App::builtin(RgbaImage::new(120, 120), None);
-        app.preview_focus = true;
+        app.focus = Focus::Preview;
         app.viewport.zoom = Zoom::In(1);
         assert!(press(&mut app, KeyCode::Char(' ')));
         for hidden in [true, false] {
@@ -5780,7 +6152,7 @@ mod tests {
                 );
             }
             assert_eq!((app.viewport.x, app.viewport.y), scrolled, "{zoom:?}");
-            assert!(!app.preview_focus);
+            assert!(app.focus != Focus::Preview);
         }
     }
 

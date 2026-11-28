@@ -34,7 +34,7 @@ import iterm2  # noqa: E402
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SAMPLE = os.path.join(REPO, 'sample', 'pratt.PNG')
 # Lines only rthid draws: help line, status line and panel borders.
-LEAK = re.compile(r'o: open \||Fit \((?:sextant|quadrant)\)|┌rthid|┌Parameters')
+LEAK = re.compile(r'o: open \||Fit \((?:sextant|quadrant)\)|┌rthid|┌Parameters|┌Brush|┌Layers')
 
 
 def write_png(path, width, height, rgb):

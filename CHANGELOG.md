@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Editing layers with visibility, selection and undo history
 - A dodge/burn brush adjusts exposure on the selected layer
 - Ctrl+S saves editing sessions, including source pixels, layers, settings and view controls
+- Enter on the Dither, Card and Mode rows opens a list below the row, with Dither grouped
+  into Diffusion, Ordered and Noise
 
 - `?` opens a full keyboard and mouse reference outside dialogs
 - Parameter settings are grouped into collapsible Print, Dither, and Tone sections;
@@ -20,6 +22,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The right column is split into Parameters, Brush and Layers blocks with their own focus
+  and scroll. Tab and BackTab cycle the preview and the three blocks, and keys go only to
+  the focused block
+- `?` lists the keys of the focused region plus global keys. `?` inside the dialog toggles
+  the full list
 - The help line shows only currently usable keys, fits the terminal width, and
   puts Enter and Esc first in dialogs
 - Up/Down navigation skips dimmed parameters while preserving a selected row
