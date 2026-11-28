@@ -38,6 +38,8 @@ use image::RgbaImage;
 pub const TILE: u32 = 64;
 /// Offset that doubles a channel value.
 pub const STOP: i16 = 256;
+/// PNG value representing a zero exposure offset.
+pub(crate) const LUMA16_MIDPOINT: u16 = 32768;
 /// Maximum number of history states kept, including the current one.
 pub const HISTORY_LIMIT: usize = 100;
 
@@ -99,19 +101,23 @@ impl ExposureMap {
         let mut pixels = Vec::with_capacity(self.width as usize * self.height as usize);
         for y in 0..self.height {
             for x in 0..self.width {
-                pixels.push((i32::from(self.get(x, y)) + 32768) as u16);
+                pixels.push((i32::from(self.get(x, y)) + i32::from(LUMA16_MIDPOINT)) as u16);
             }
         }
         pixels
     }
 
     /// Restores offsets while leaving tiles containing only zero offsets absent.
+    ///
+    /// # Panics
+    /// Panics if the pixel count does not equal width times height.
     pub fn from_luma16(width: u32, height: u32, pixels: &[u16]) -> Self {
         assert_eq!(pixels.len(), width as usize * height as usize);
         let mut map = Self::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let offset = (i32::from(pixels[(y * width + x) as usize]) - 32768) as i16;
+                let offset = (i32::from(pixels[(y * width + x) as usize])
+                    - i32::from(LUMA16_MIDPOINT)) as i16;
                 if offset != 0 {
                     map.add(x, y, offset);
                 }

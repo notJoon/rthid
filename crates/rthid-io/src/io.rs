@@ -97,6 +97,7 @@ pub enum Job {
         write: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
     },
     /// Reads an application value on the worker, keeping the newest request.
+    /// Open and Load do not supersede each other, so callers must match tags across both.
     Load {
         /// Path passed to the reader.
         path: PathBuf,
@@ -113,6 +114,19 @@ pub enum Job {
 }
 
 impl Job {
+    /// Reads a typed application value without requiring the caller to box it.
+    pub fn load<T: Send + 'static>(
+        path: PathBuf,
+        read: impl FnOnce(&Path) -> io::Result<T> + Send + 'static,
+    ) -> Self {
+        Self::Load {
+            path,
+            read: Box::new(move |path| {
+                read(path).map(|value| Box::new(value) as Box<dyn Any + Send>)
+            }),
+        }
+    }
+
     /// Returns the kind used for coalescing.
     pub(crate) fn kind(&self) -> Kind {
         match self {
@@ -171,6 +185,26 @@ pub struct Output {
     pub path: PathBuf,
     /// Application value to downcast at the caller.
     pub value: Box<dyn Any + Send>,
+}
+
+impl Output {
+    /// Takes the reader value while retaining its path.
+    ///
+    /// # Errors
+    /// Returns an error naming the path and requested type when the stored type differs.
+    pub fn downcast<T: 'static>(self) -> Result<(PathBuf, T), IoError> {
+        match self.value.downcast::<T>() {
+            Ok(value) => Ok((self.path, *value)),
+            Err(_) => Err(IoError {
+                op: Op::Decode,
+                path: self.path,
+                cause: Cause::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reader result is not {}", std::any::type_name::<T>()),
+                )),
+            }),
+        }
+    }
 }
 
 impl fmt::Debug for Output {
@@ -498,6 +532,7 @@ impl IO {
     /// Queues work without waiting. The result echoes `tag` so callers can tell who asked for it.
     ///
     /// Replaces queued work of the same kind. Export and Save replace only the same destination.
+    /// Open and Load do not supersede each other, so callers must match tags across both.
     /// Superseded jobs have no result; already running work is not cancelled, but its result is
     /// discarded if superseded. Update jobs must carry all unsaved changes.
     pub fn submit(&mut self, job: Job, tag: u64) {
@@ -918,15 +953,25 @@ mod tests {
     }
 
     #[test]
+    fn wrong_reader_type_names_the_path_and_requested_type() {
+        let output = Output {
+            path: "session.rthid".into(),
+            value: Box::new(42u64),
+        };
+        let error = output.downcast::<String>().unwrap_err();
+        assert_eq!(error.path, Path::new("session.rthid"));
+        assert!(error.to_string().contains("session.rthid"));
+        assert!(error.to_string().contains(std::any::type_name::<String>()));
+        assert!(matches!(error.cause, Cause::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
+    }
+
+    #[test]
     fn loads_keep_only_the_newest_value() {
         let mut worker = IO::new(None).unwrap();
         let resume = pause(&mut worker);
         for value in 1..=3u64 {
             worker.submit(
-                Job::Load {
-                    path: PathBuf::from(format!("read-{value}")),
-                    read: Box::new(move |_| Ok(Box::new(value))),
-                },
+                Job::load(PathBuf::from(format!("read-{value}")), move |_| Ok(value)),
                 value,
             );
         }
@@ -938,7 +983,10 @@ mod tests {
         let Outcome::Loaded(Ok(output)) = done.outcome else {
             panic!("expected reader output")
         };
-        assert_eq!(*output.value.downcast::<u64>().unwrap(), 3);
+        assert_eq!(
+            output.downcast::<u64>().unwrap(),
+            (PathBuf::from("read-3"), 3)
+        );
         assert!(!worker.busy());
     }
 

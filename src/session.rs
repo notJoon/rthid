@@ -3,7 +3,7 @@
 use crate::{
     app::App,
     cells::View,
-    document::{Document, ExposureMap, Layer},
+    document::{Document, ExposureMap, LUMA16_MIDPOINT, Layer},
     settings::{Rotation, Setting, Settings, Template, Templates, validate_name},
     store::FileTemplate,
     viewport::{Viewport, Zoom},
@@ -64,7 +64,7 @@ impl ViewState {
 pub(crate) struct Session {
     /// Shrunk immutable source pixels.
     pub source: RgbaImage,
-    /// Referenced source location when loaded from a session.
+    /// Source location set by `read` and ignored by `write`.
     pub source_path: PathBuf,
     /// Layer order, selection and exposure offsets.
     pub document: Document,
@@ -237,17 +237,39 @@ fn child(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(dir.join(name))
 }
 
+fn parse_manifest(path: &Path, text: &str) -> io::Result<Manifest> {
+    let broken = |error: &dyn std::fmt::Display| {
+        named(
+            path,
+            format!("broken manifest, restore it or save elsewhere: {error}"),
+        )
+    };
+    let value: toml::Value = toml::from_str(text).map_err(|e| broken(&e))?;
+    let version = value
+        .get("version")
+        .and_then(toml::Value::as_integer)
+        .ok_or_else(|| broken(&"missing or invalid version"))?;
+    if version != 1 {
+        let reason = if version > 1 {
+            "was written by a newer rthid"
+        } else {
+            "has an unsupported session version"
+        };
+        return Err(named(
+            path,
+            format!("{reason} (version {version}), upgrade rthid or save elsewhere"),
+        ));
+    }
+    toml::from_str(text).map_err(|e| broken(&e))
+}
+
 /// Validates the manifest and pixel files before returning a complete session.
 pub(crate) fn read(dir: &Path) -> io::Result<Session> {
     let path = dir.join("manifest.toml");
     let text = atomic::read_regular(&path)
         .map_err(|e| named(&path, e))?
         .ok_or_else(|| named(&path, "missing manifest"))?;
-    let version: toml::Value = toml::from_str(&text).map_err(|e| named(&path, e))?;
-    if version.get("version").and_then(toml::Value::as_integer) != Some(1) {
-        return Err(named(&path, "unsupported session version"));
-    }
-    let manifest: Manifest = toml::from_str(&text).map_err(|e| named(&path, e))?;
+    let manifest = parse_manifest(&path, &text)?;
     if manifest.layers.len() > 256 {
         return Err(named(&path, "at most 256 layers are allowed"));
     }
@@ -258,7 +280,10 @@ pub(crate) fn read(dir: &Path) -> io::Result<Session> {
     if (width, height) != (manifest.source_width, manifest.source_height)
         || source_hash(&source) != manifest.source_hash
     {
-        return Err(named(&source_path, "source pixels differ from manifest"));
+        return Err(named(
+            &source_path,
+            "source pixels differ from manifest, the session copy was modified outside rthid, reopen the original image",
+        ));
     }
     for layer in manifest.layers {
         validate_name(&layer.name, "layer").map_err(|e| named(&path, e))?;
@@ -366,7 +391,9 @@ pub(crate) fn containing(path: &Path) -> Option<PathBuf> {
     (child(dir, &manifest.source).ok()? == path).then(|| dir.to_path_buf())
 }
 
-/// Commits new exposure files before replacing the manifest and cleaning old files.
+/// Creates the session directory if missing and commits pixel files before the manifest.
+/// Deletes unreferenced source and exposure files whose names the generation parser accepts.
+/// Refuses non empty directories without a manifest and broken or unsupported manifests.
 pub(crate) fn write(dir: &Path, session: Session) -> io::Result<()> {
     write_before_manifest(dir, session, || Ok(()))
 }
@@ -380,7 +407,17 @@ fn write_before_manifest(
         return Err(io::Error::other("at most 256 layers are allowed"));
     }
     fs::create_dir_all(dir)?;
-    let _lock = atomic::lock(&dir.join(".lock"), std::time::Duration::from_secs(2))?;
+    let _lock =
+        atomic::lock(&dir.join(".lock"), std::time::Duration::from_secs(2)).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
+                    error.kind(),
+                    "another rthid is saving this session, try again",
+                )
+            } else {
+                error
+            }
+        })?;
     let (width, height) = session.source.dimensions();
     let hash = source_hash(&session.source);
     let manifest_path = dir.join("manifest.toml");
@@ -388,7 +425,15 @@ fn write_before_manifest(
         return Err(named(&manifest_path, "session files must not be symlinks"));
     }
     let previous = atomic::read_regular(&manifest_path)?
-        .and_then(|text| toml::from_str::<Manifest>(&text).ok());
+        .map(|text| parse_manifest(&manifest_path, &text))
+        .transpose()?;
+    if previous.is_none() {
+        for entry in fs::read_dir(dir)? {
+            if entry?.file_name() != ".lock" {
+                return Err(named(dir, "not a session directory, save elsewhere"));
+            }
+        }
+    }
     let mut generation = 0u64;
     let names = previous.iter().flat_map(|m| {
         std::iter::once(m.source.clone()).chain(m.layers.iter().filter_map(|l| l.exposure.clone()))
@@ -433,7 +478,7 @@ fn write_before_manifest(
     let mut layers = Vec::new();
     for (index, layer) in session.document.layers().iter().enumerate() {
         let pixels = layer.exposure.to_luma16();
-        let exposure = if pixels.iter().any(|value| *value != 32768) {
+        let exposure = if pixels.iter().any(|value| *value != LUMA16_MIDPOINT) {
             let name = format!("exposure-{generation}-{index}.png");
             let image: ImageBuffer<Luma<u16>, Vec<u16>> =
                 ImageBuffer::from_raw(width, height, pixels)
@@ -492,9 +537,8 @@ fn cleanup(dir: &Path, manifest: &Manifest) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (name.starts_with("exposure-") || name.starts_with("source-"))
+        if generation_number(&name).is_some()
             && name != manifest.source
-            && name.ends_with(".png")
             && !manifest
                 .layers
                 .iter()
@@ -587,6 +631,83 @@ mod tests {
     }
 
     #[test]
+    fn refuses_non_session_directories_and_preserves_unrecognized_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan = temp.path().join("source-scan.png");
+        fs::write(&scan, b"keep").unwrap();
+        assert!(
+            write(temp.path(), fixture())
+                .unwrap_err()
+                .to_string()
+                .contains("not a session directory")
+        );
+        assert_eq!(fs::read(&scan).unwrap(), b"keep");
+        fs::remove_file(&scan).unwrap();
+        write(temp.path(), fixture()).unwrap();
+        fs::write(&scan, b"keep").unwrap();
+        write(temp.path(), fixture()).unwrap();
+        assert_eq!(fs::read(scan).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn save_refuses_newer_and_broken_manifests_without_changing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        let path = temp.path().join("manifest.toml");
+        let mut names: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        for (text, message) in [
+            ("version = 2", "newer rthid (version 2), upgrade rthid"),
+            ("[broken", "broken manifest"),
+            ("version = 1", "broken manifest"),
+        ] {
+            fs::write(&path, text).unwrap();
+            let error = write(temp.path(), fixture()).unwrap_err().to_string();
+            assert!(
+                error.contains("manifest.toml") && error.contains(message),
+                "{error}"
+            );
+            let read_error = read(temp.path()).err().unwrap().to_string();
+            assert!(read_error.contains(message), "{read_error}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let mut after: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            after.sort();
+            assert_eq!(after, names);
+        }
+    }
+
+    #[test]
+    fn lock_timeout_tells_the_user_to_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let _lock = atomic::lock(&temp.path().join(".lock"), std::time::Duration::ZERO).unwrap();
+        let error = write(temp.path(), fixture()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            error.to_string(),
+            "another rthid is saving this session, try again"
+        );
+    }
+
+    #[test]
+    fn changed_source_pixels_tell_the_user_to_reopen_the_original() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), fixture()).unwrap();
+        let path = read(temp.path()).unwrap().source_path;
+        let mut source = fixture().source;
+        source.put_pixel(0, 0, Rgba([1; 4]));
+        source.save(path).unwrap();
+        let error = read(temp.path()).err().unwrap().to_string();
+        assert!(error.contains("session copy was modified outside rthid"));
+        assert!(error.contains("reopen the original image"));
+    }
+
+    #[test]
     fn replacing_source_and_repairing_corruption_uses_new_files() {
         let temp = tempfile::tempdir().unwrap();
         write(temp.path(), fixture()).unwrap();
@@ -615,7 +736,8 @@ mod tests {
     #[test]
     fn cleanup_failures_leave_a_committed_save_successful() {
         let temp = tempfile::tempdir().unwrap();
-        let orphan = temp.path().join("source-orphan.png");
+        write(temp.path(), fixture()).unwrap();
+        let orphan = temp.path().join("source-99.png");
         fs::create_dir(&orphan).unwrap();
         fs::write(orphan.join("keep"), b"cannot delete as a file").unwrap();
         write(temp.path(), fixture()).unwrap();
@@ -725,7 +847,11 @@ mod tests {
         write(temp.path(), fixture()).unwrap();
         assert_eq!(
             exposure_files(temp.path()),
-            ["exposure-13-0.png", "exposure-13-2.png"]
+            [
+                "exposure-13-0.png",
+                "exposure-13-2.png",
+                "exposure-999-bad.png"
+            ]
         );
         assert_eq!(
             generation_number("source-4294967295.png"),
@@ -807,6 +933,7 @@ mod tests {
                     .contains("manifest.toml")
             );
         }
+        fs::remove_file(dir.join("manifest.toml")).unwrap();
         write(dir, fixture()).unwrap();
         fs::remove_file(dir.join("source-1.png")).unwrap();
         assert!(

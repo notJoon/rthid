@@ -676,10 +676,10 @@ impl App {
                 if requester.is_some() && requester == self.dialog() {
                     self.modal = None;
                 }
-                match output.value.downcast::<Session>() {
-                    Ok(session) => self.open_session(output.path, *session),
-                    Err(_) => {
-                        self.set_notice("invalid session reader result".into());
+                match output.downcast::<Session>() {
+                    Ok((path, session)) => self.open_session(path, session),
+                    Err(error) => {
+                        self.set_notice(error.to_string());
                     }
                 }
                 changed = true;
@@ -839,17 +839,14 @@ impl App {
         let job = if session::is_session(&resolved)
             || (resolved.is_dir() && resolved.extension().is_some_and(|ext| ext == "rthid"))
         {
-            Job::Load {
-                path: resolved,
-                read: Box::new(move |dir| {
-                    let session = session::read(dir)?;
-                    for source in [&session.source_path, &dir.join("manifest.toml")] {
-                        rthid_io::image::check_not_source(source, &protect)
-                            .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    }
-                    Ok(Box::new(session) as Box<dyn std::any::Any + Send>)
-                }),
-            }
+            Job::load(resolved, move |dir| {
+                let session = session::read(dir)?;
+                for source in [&session.source_path, &dir.join("manifest.toml")] {
+                    rthid_io::image::check_not_source(source, &protect)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                }
+                Ok(session)
+            })
         } else {
             Job::Open { path, dir, protect }
         };

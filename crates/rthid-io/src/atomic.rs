@@ -165,8 +165,12 @@ pub fn update<T>(
     Ok(result)
 }
 
-/// Holds an advisory file lock until the returned handle is dropped.
+/// Holds an advisory lock between cooperating callers until the returned handle is dropped.
+/// `path` names a dedicated lock file, which is created if missing and left in place.
 /// Waits up to `wait` using the same bounded retries as configuration updates.
+///
+/// # Errors
+/// Returns `WouldBlock` when the timeout expires, or file opening and locking errors.
 pub fn lock(path: &Path, wait: Duration) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
@@ -196,7 +200,11 @@ pub fn lock(path: &Path, wait: Duration) -> io::Result<File> {
     Ok(lock)
 }
 
-/// Syncs a directory before commit, tolerating filesystems without directory sync.
+/// Flushes directory entries to storage on Unix, tolerating unsupported directory sync.
+/// Does nothing on other platforms.
+///
+/// # Errors
+/// Returns directory opening or sync errors other than unsupported directory sync.
 pub fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return directory_sync_result(File::open(path).and_then(|dir| dir.sync_all()));
