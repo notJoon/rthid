@@ -8,7 +8,10 @@ use ratatui::{
     layout::{Position, Rect},
     style::Style,
     text::Line,
-    widgets::{Block, List, ListState, StatefulWidget},
+    widgets::{
+        Block, List, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+        Widget,
+    },
 };
 
 use crate::{Hint, Outcome, outcome::is_release};
@@ -112,7 +115,7 @@ impl ListPicker {
     /// Pass the same outer area and block as drawing. Returns `None` for an
     /// empty list or a selection outside the visible content area.
     pub fn selected_row(&self, area: Rect, block: Option<&Block<'_>>, len: usize) -> Option<Rect> {
-        let area = block.map_or(area, |block| block.inner(area));
+        let (area, _) = content_area(area, block, len);
         let row = self.selected(len)?.checked_sub(self.offset.get())?;
         (area.width > 0 && row < usize::from(area.height))
             .then(|| Rect::new(area.x, area.y + row as u16, area.width, 1))
@@ -152,8 +155,7 @@ impl ListPicker {
         area: Rect,
         len: usize,
     ) -> Option<usize> {
-        let area = block.map_or(area, |block| block.inner(area));
-        self.row_at(position, area, len)
+        self.row_at(position, content_area(area, block, len).0, len)
     }
 
     fn row_at(&self, position: Position, content: Rect, len: usize) -> Option<usize> {
@@ -321,7 +323,9 @@ impl ListPicker {
     /// needed to keep the selection visible, starting from the retained
     /// offset, and the new offset is stored for the next draw. An index past
     /// the end is drawn on the last item without changing the stored index,
-    /// and an empty list draws no selection.
+    /// and an empty list draws no selection. When the items do not fit, a
+    /// vertical scrollbar is drawn on the block's right border, or in the
+    /// area's last column when there is no block.
     ///
     /// # Examples
     ///
@@ -356,27 +360,57 @@ impl ListPicker {
         highlight_symbol: &'static str,
     ) {
         let items: Vec<_> = items.into_iter().collect();
-        self.area
-            .set(block.as_ref().map_or(area, |block| block.inner(area)));
-        let selected = self.selected(items.len());
+        let len = items.len();
+        let (list_area, scrollbar_area) = content_area(area, block.as_ref(), len);
+        self.area.set(list_area);
+        let selected = self.selected(len);
         let mut state = ListState::default()
             .with_selected(selected)
             .with_offset(self.offset.get());
-        let mut list = List::new(items)
+        let list = List::new(items)
             .highlight_symbol(highlight_symbol)
             .highlight_style(highlight);
         if let Some(block) = block {
-            list = list.block(block);
+            Widget::render(block, area, buf);
         }
-        StatefulWidget::render(list, area, buf, &mut state);
+        StatefulWidget::render(list, list_area, buf, &mut state);
         self.offset.set(state.offset());
+        if let Some(scrollbar_area) = scrollbar_area {
+            let viewport = usize::from(list_area.height);
+            let scroll_positions = len.saturating_sub(viewport).saturating_add(1);
+            let mut scrollbar_state = ScrollbarState::new(scroll_positions)
+                .position(state.offset())
+                .viewport_content_length(viewport);
+            StatefulWidget::render(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                scrollbar_area,
+                buf,
+                &mut scrollbar_state,
+            );
+        }
     }
+}
+
+fn content_area(area: Rect, block: Option<&Block<'_>>, len: usize) -> (Rect, Option<Rect>) {
+    let mut content = block.map_or(area, |block| block.inner(area));
+    let scrollbar = len > usize::from(content.height) && content.height > 2 && area.width > 0;
+    if !scrollbar {
+        return (content, None);
+    }
+    let scrollbar_area = Rect::new(area.right() - 1, content.y, 1, content.height);
+    if content.right() >= area.right() {
+        content.width = content.width.saturating_sub(1);
+    }
+    (content, Some(scrollbar_area))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::KeyModifiers;
+    use ratatui::{
+        Terminal, backend::TestBackend, crossterm::event::KeyModifiers, style::Color,
+        widgets::Borders,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -440,6 +474,155 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_is_absent_when_items_fit() {
+        let area = Rect::new(0, 0, 8, 5);
+        let picker = ListPicker::new(0);
+        let mut plain = Buffer::empty(area);
+        picker.render(
+            ["a", "b"].map(Line::raw),
+            None,
+            Style::default(),
+            area,
+            &mut plain,
+        );
+        assert_eq!(plain[(area.right() - 1, area.y)].symbol(), " ");
+
+        let mut bordered = Buffer::empty(area);
+        picker.render(
+            ["a", "b"].map(Line::raw),
+            Some(Block::bordered()),
+            Style::default(),
+            area,
+            &mut bordered,
+        );
+        assert_eq!(bordered[(area.right() - 1, area.y + 1)].symbol(), "│");
+    }
+
+    #[test]
+    fn scrollbar_tracks_first_and_last_offsets_without_covering_list_text() {
+        let cases = [
+            (None, Rect::new(0, 0, 8, 5), 0, 7),
+            (Some(Block::bordered()), Rect::new(0, 0, 10, 7), 1, 9),
+        ];
+        for (block, area, text_x, scrollbar_x) in cases {
+            let mut picker = ListPicker::new(0);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    picker.render(
+                        (0..8).map(|_| Line::raw("abcd")),
+                        block.clone(),
+                        Style::default().bg(Color::Red),
+                        area,
+                        frame.buffer_mut(),
+                    );
+                })
+                .unwrap();
+            assert_eq!(picker.offset(), 0);
+            let buf = terminal.backend().buffer();
+            let scrollbar_top = area.y + u16::from(block.is_some());
+            let scrollbar_bottom = area.bottom() - u16::from(block.is_some());
+            assert_eq!(
+                buf[(text_x, area.y + u16::from(block.is_some()))].symbol(),
+                ">"
+            );
+            assert_eq!(buf[(scrollbar_x, scrollbar_top + 1)].symbol(), "█");
+            assert_ne!(buf[(scrollbar_x, scrollbar_top + 1)].bg, Color::Red);
+            if block.is_some() {
+                assert_eq!(buf[(scrollbar_x, area.y)].symbol(), "┐");
+                assert_eq!(buf[(scrollbar_x, area.bottom() - 1)].symbol(), "┘");
+            }
+
+            picker.select(7);
+            terminal
+                .draw(|frame| {
+                    picker.render(
+                        (0..8).map(|_| Line::raw("abcd")),
+                        block.clone(),
+                        Style::default().bg(Color::Red),
+                        area,
+                        frame.buffer_mut(),
+                    );
+                })
+                .unwrap();
+            assert_eq!(picker.offset(), 3);
+            let buf = terminal.backend().buffer();
+            assert_eq!(buf[(scrollbar_x, scrollbar_bottom - 2)].symbol(), "█");
+            let selected_y = area.bottom() - 1 - u16::from(block.is_some());
+            assert_eq!(buf[(text_x + 2, selected_y)].symbol(), "a");
+            assert_eq!(buf[(text_x + 2, selected_y)].bg, Color::Red);
+        }
+    }
+
+    #[test]
+    fn scrollbar_reserves_a_non_border_column_for_drawing_and_hit_testing() {
+        let area = Rect::new(0, 0, 8, 6);
+        let block = Block::new().borders(Borders::TOP);
+        let mut picker = ListPicker::new(0);
+        let mut buf = Buffer::empty(area);
+        picker.render(
+            (0..8).map(|_| Line::raw("abcde")),
+            Some(block.clone()),
+            Style::default(),
+            area,
+            &mut buf,
+        );
+
+        let scrollbar = Position::new(area.right() - 1, area.y + 1);
+        assert_eq!(buf[(area.right() - 2, area.y + 1)].symbol(), "e");
+        assert_eq!(buf[(scrollbar.x, scrollbar.y)].symbol(), "▲");
+        assert_eq!(picker.index_at(scrollbar, Some(&block), area, 8), None);
+        assert_eq!(
+            picker.selected_row(area, Some(&block), 8),
+            Some(Rect::new(area.x, area.y + 1, area.width - 1, 1))
+        );
+        assert_eq!(
+            picker.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: scrollbar.x,
+                    row: scrollbar.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                8,
+            ),
+            Outcome::Ignored
+        );
+    }
+
+    #[test]
+    fn scrollbar_tolerates_tiny_areas() {
+        let picker = ListPicker::new(3);
+        for area in [Rect::ZERO, Rect::new(0, 0, 1, 1)] {
+            picker.render(
+                ["a", "b", "c", "d"].map(Line::raw),
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+            picker.render(
+                ["a", "b", "c", "d"].map(Line::raw),
+                Some(Block::bordered()),
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+        }
+
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buf = Buffer::empty(area);
+        ListPicker::new(0).render(
+            ["abcdef", "abcdef", "abcdef"].map(Line::raw),
+            None,
+            Style::default(),
+            area,
+            &mut buf,
+        );
+        assert_eq!(buf[(area.right() - 1, area.y)].symbol(), "d");
+    }
+
+    #[test]
     fn selected_row_uses_last_draw_and_excludes_hidden_selections() {
         let area = Rect::new(2, 3, 10, 4);
         let block = Block::bordered();
@@ -464,7 +647,7 @@ mod tests {
         picker.select(0);
         assert_eq!(
             picker.selected_row(area, None, 5),
-            Some(Rect::new(2, 3, 10, 1))
+            Some(Rect::new(2, 3, 9, 1))
         );
         assert_eq!(picker.selected_row(Rect::ZERO, None, 5), None);
     }
@@ -544,6 +727,8 @@ mod tests {
         assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Consumed);
         assert_eq!(picker.selected(5), Some(2));
         mouse.column = 1;
+        assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Ignored);
+        mouse.column = area.right() - 1;
         assert_eq!(picker.handle_mouse(mouse, 5), Outcome::Ignored);
         mouse.column = 2;
         mouse.row = 5;

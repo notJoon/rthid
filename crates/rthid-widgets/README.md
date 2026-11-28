@@ -66,7 +66,7 @@ open. Validate values on `Submit` before closing the component. An invalid value
 | Component | Purpose |
 | --- | --- |
 | `TextInput` | Single line text editing with a character limit and a cursor position for the caller |
-| `ListPicker` | Cursor over a caller-owned list, with retained scroll and mouse area |
+| `ListPicker` | Cursor over a caller-owned list, with retained scroll, mouse area, and overflow scrollbar |
 | `Outline` | Independently collapsible groups with a shared item indent and selection gutter |
 | `Confirm` | A yes or no question answered by y or any other key |
 | `Dialog` | Centered popup area with a cleared background and a border |
@@ -97,7 +97,7 @@ before the area. `handle_mouse(mouse, len)` uses the content area retained by th
 last render, so borders do not select items and input before the first render is
 ignored. `selected_row(area, block, len)` returns the selected screen row using
 the last draw's offset, or `None` for an empty list or a selection outside the
-visible content area.
+visible content area. Lists that overflow draw a scrollbar on the right edge.
 
 `ListPicker` returns `Ignored` for keys with Ctrl or Alt so the parent can handle
 shortcuts such as Ctrl+k. Shift is allowed. Releases are always consumed.

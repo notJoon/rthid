@@ -552,45 +552,57 @@ impl Modal {
                 ("Preset editor", width, editor.row_count())
             }
         };
-        let dialog = Dialog {
-            title,
-            min_width: 28,
-        }
-        .area(
-            preview,
-            screen,
-            (
-                width.min(u16::MAX as usize) as u16,
-                height.min(u16::MAX as usize) as u16,
-            ),
-        );
-        let inner = Block::bordered().inner(dialog);
-        let (field, list) = match self {
-            Self::OpenFile(_) => {
-                let [field, list] =
-                    Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-                (Some(field), Some(list))
+        let lay_out = |width: usize| {
+            let dialog = Dialog {
+                title,
+                min_width: 28,
             }
-            Self::Templates {
-                prompt: Some(_), ..
-            } => (
-                (inner.width > 2 && inner.height > 0)
-                    .then(|| Rect::new(inner.x + 2, inner.y, inner.width - 2, 1)),
-                None,
-            ),
-            Self::Editor(editor) => {
-                let field = editor.input.as_ref().and_then(|_| {
-                    let row = editor.rows.selected_row(inner, None, editor.row_count())?;
-                    (row.width > 2).then(|| Rect::new(row.x + 2, row.y, row.width - 2, 1))
-                });
-                (field, Some(inner))
+            .area(
+                preview,
+                screen,
+                (
+                    width.min(u16::MAX as usize) as u16,
+                    height.min(u16::MAX as usize) as u16,
+                ),
+            );
+            let inner = Block::bordered().inner(dialog);
+            let (field, list) = match self {
+                Self::OpenFile(_) => {
+                    let [field, list] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+                    (Some(field), Some(list))
+                }
+                Self::Templates {
+                    prompt: Some(_), ..
+                } => (
+                    (inner.width > 2 && inner.height > 0)
+                        .then(|| Rect::new(inner.x + 2, inner.y, inner.width - 2, 1)),
+                    None,
+                ),
+                Self::Editor(editor) => {
+                    let field = editor.input.as_ref().and_then(|_| {
+                        let row = editor.rows.selected_row(inner, None, editor.row_count())?;
+                        (row.width > 2).then(|| Rect::new(row.x + 2, row.y, row.width - 2, 1))
+                    });
+                    (field, Some(inner))
+                }
+                _ => (None, Some(inner)),
+            };
+            ModalLayout {
+                dialog,
+                field,
+                list,
             }
-            _ => (None, Some(inner)),
         };
-        ModalLayout {
-            dialog,
-            field,
-            list,
+        let layout = lay_out(width);
+        // Mirrors ListPicker's scrollbar rule so the scrollbar column does not clip text.
+        if layout
+            .list
+            .is_some_and(|list| self.rows(ctx) > usize::from(list.height) && list.height > 2)
+        {
+            lay_out(width.saturating_add(1))
+        } else {
+            layout
         }
     }
 

@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   collapsed groups summarize how many active settings differ from defaults
 - The parameter panel supports mouse selection and group toggling, including
   before an image is opened
+- Lists show a scrollbar when their rows do not fit
 
 ### Changed
 

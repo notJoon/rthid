@@ -2046,8 +2046,8 @@ mod tests {
             "/images".into(),
             (0..30)
                 .map(|i| Entry {
-                    file_name: format!("folder{i:02}").into(),
-                    name: format!("folder{i:02}"),
+                    file_name: format!("folder{i:02}_with_a_very_long_name").into(),
+                    name: format!("folder{i:02}_with_a_very_long_name"),
                     dir: true,
                 })
                 .collect(),
@@ -2075,7 +2075,7 @@ mod tests {
                 let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
                 assert!(text.contains("Open image"));
                 assert!(text.contains("/images"));
-                assert!(text.contains("folder20/"));
+                assert!(text.contains("folder20_with_a_very_long_name/"));
                 assert!(cursor.y < buffer.area.height);
                 assert_eq!(buffer[(cursor.x - 1, cursor.y)].symbol(), "/");
             }
