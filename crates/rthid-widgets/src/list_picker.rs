@@ -185,8 +185,8 @@ impl ListPicker {
     ///
     /// Uses the content area remembered by the last draw. Before the first draw,
     /// clicks and wheel events are ignored, as are counts changed since drawing.
-    /// Wheel events inside the content area
-    /// move one item. Borders and other events are ignored.
+    /// Wheel events inside the content area move one item.
+    /// Borders and other events are ignored.
     /// Clicking the selected item stands in for a double click in terminals.
     ///
     /// # Examples

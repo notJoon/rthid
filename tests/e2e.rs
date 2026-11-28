@@ -209,7 +209,7 @@ fn terminal_workflow_restores_the_terminal() {
         let contents = screen.contents();
         contents.contains("Dots 569x1024 ")
             && contents.contains("Parameters")
-            && contents.contains("o: open")
+            && contents.contains("?: keys")
             && contents.contains("Fit (sextant)")
             && screen.alternate_screen()
             && screen.bracketed_paste()

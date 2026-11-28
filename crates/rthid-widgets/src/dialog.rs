@@ -77,13 +77,15 @@ impl Dialog<'_> {
         Rect::new(x as u16, y as u16, width, height)
     }
 
-    /// Places a popup below the anchor, or above when it will not fit, within the screen.
+    /// Prefers below, then above, then the side with more room, clamped to the screen.
     pub fn anchored_area(&self, anchor: Rect, screen: Rect, content: (u16, u16)) -> Rect {
         let mut area = self.area(anchor, screen, content);
         area.x = anchor
             .x
             .clamp(screen.x, screen.right().saturating_sub(area.width));
-        let y = if screen.bottom().saturating_sub(anchor.bottom()) >= area.height {
+        let below = screen.bottom().saturating_sub(anchor.bottom());
+        let above = anchor.y.saturating_sub(screen.y);
+        let y = if below >= area.height || (above < area.height && below >= above) {
             anchor.bottom()
         } else {
             anchor.y.saturating_sub(area.height)
@@ -145,6 +147,23 @@ mod tests {
         assert_eq!(
             dialog.anchored_area(Rect::ZERO, Rect::ZERO, (8, 4)),
             Rect::ZERO
+        );
+    }
+
+    #[test]
+    fn anchored_placement_uses_more_room_when_neither_side_fits() {
+        let dialog = Dialog {
+            title: "Choices",
+            min_width: 0,
+        };
+        let screen = Rect::new(5, 3, 30, 20);
+        assert_eq!(
+            dialog.anchored_area(Rect::new(7, 11, 10, 1), screen, (8, 12)),
+            Rect::new(7, 9, 12, 14)
+        );
+        assert_eq!(
+            dialog.anchored_area(Rect::new(7, 14, 10, 1), screen, (8, 12)),
+            Rect::new(7, 3, 12, 14)
         );
     }
 

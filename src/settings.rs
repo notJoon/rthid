@@ -246,6 +246,17 @@ impl Dither {
         Self::Noise,
     ];
 
+    /// Groups adjacent dropdown choices by algorithm family.
+    pub fn section(self) -> &'static str {
+        if self.kernel().is_some() {
+            "Diffusion"
+        } else if self == Self::Noise {
+            "Noise"
+        } else {
+            "Ordered"
+        }
+    }
+
     /// Short label for panels and templates.
     pub fn label(self) -> &'static str {
         match self {
@@ -1147,6 +1158,21 @@ fn wrap(index: usize, dir: i32, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dither_sections_are_contiguous() {
+        let mut seen = Vec::new();
+        let mut previous = None;
+        for dither in Dither::ALL {
+            let section = dither.section();
+            if previous != Some(section) {
+                assert!(!seen.contains(&section), "repeated section: {section}");
+                seen.push(section);
+                previous = Some(section);
+            }
+        }
+        assert_eq!(seen, ["Diffusion", "Ordered", "Noise"]);
+    }
 
     #[test]
     fn fixed_choices_follow_cycling_and_reject_invalid_indices() {

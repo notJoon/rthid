@@ -180,14 +180,7 @@ impl Dropdown {
         let mut previous = None;
         for (index, label) in self.setting.choices().into_iter().enumerate() {
             if self.setting == Setting::Dither {
-                let dither = Dither::ALL[index];
-                let section = if dither.kernel().is_some() {
-                    "Diffusion"
-                } else if dither == Dither::Noise {
-                    "Noise"
-                } else {
-                    "Ordered"
-                };
+                let section = Dither::ALL[index].section();
                 if previous != Some(section) {
                     rows.push((
                         None,
@@ -210,6 +203,7 @@ impl Dropdown {
         before: usize,
         direction: i32,
         mouse_click: bool,
+        settings: &Settings,
     ) -> Step {
         let entries = self.entries();
         let selected = self.list.selected(entries.len()).unwrap();
@@ -230,6 +224,9 @@ impl Dropdown {
         }
         match outcome {
             Outcome::Cancel => Step::close(),
+            Outcome::Submit(index) if entries[index].0 == self.setting.choice(settings) => {
+                Step::close()
+            }
             Outcome::Submit(index) => Step::effect(
                 Next::Close,
                 Effect::Choose(self.setting, entries[index].0.unwrap()),
@@ -792,6 +789,7 @@ impl Modal {
                     mouse.kind,
                     ratatui::crossterm::event::MouseEventKind::Down(_)
                 ),
+                ctx.settings,
             );
         }
         let rows = self.rows(&ctx);
@@ -1057,6 +1055,7 @@ impl Modal {
                         1
                     },
                     false,
+                    ctx.settings,
                 );
             }
             Self::OpenFile(picker) => return picker.handle_key(key),
@@ -1302,6 +1301,47 @@ mod tests {
         };
         assert!(modal.handle_mouse(wheel, context()).effect.is_none());
         assert_eq!(selected(&modal), 4);
+    }
+
+    #[test]
+    fn dropdown_confirming_current_value_closes_without_effect() {
+        use ratatui::{
+            buffer::Buffer,
+            crossterm::event::{MouseButton, MouseEventKind},
+        };
+        let settings = Settings::default();
+        let palettes = Palettes::builtin();
+        let templates = Templates::default();
+        let context = || ctx(&palettes, &templates, &settings);
+        for setting in [Setting::Dither, Setting::Card, Setting::Mode] {
+            let mut modal = Modal::dropdown(setting, &settings).unwrap();
+            let step = modal.handle_key(key(KeyCode::Enter), context());
+            assert!(matches!(step.next, Next::Close));
+            assert!(step.effect.is_none());
+            let Modal::Dropdown(dropdown) = &modal else {
+                unreachable!()
+            };
+            let entries = dropdown.entries();
+            let selected = dropdown.list.selected(entries.len()).unwrap();
+            let area = Rect::new(0, 0, 25, 16);
+            dropdown.list.render(
+                entries.into_iter().map(|(_, line)| line),
+                None,
+                Style::default(),
+                area,
+                &mut Buffer::empty(area),
+            );
+            let step = modal.handle_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    area,
+                    selected as u16,
+                ),
+                context(),
+            );
+            assert!(matches!(step.next, Next::Close));
+            assert!(step.effect.is_none());
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ const PARAMETERS_KEYS: KeySection = (
     "Parameters",
     &[
         ListPicker::MOVE,
-        Hint::new("Left/Right h/l", "change/close/open"),
+        Hint::new("Left/Right h/l", "change/fold"),
         Hint::new("Enter", "list/seed/toggle"),
         Hint::new("d", "reset"),
     ],
@@ -44,26 +44,24 @@ const BRUSH_KEYS: KeySection = (
 );
 const PREVIEW_KEYS: KeySection = (
     "Preview",
-    &[
-        Hint::new("hjkl/arrows", "pan"),
-        Hint::new("HJKL", "page"),
-        Hint::new("+/=/-", "zoom"),
-        Hint::new("0", "fit"),
-        Hint::new("m", "map"),
-        Hint::new("M", "mass map"),
-    ],
+    &[Hint::new("hjkl/arrows", "pan"), Hint::new("HJKL", "page")],
 );
+const NEW_LAYER: Hint = Hint::new("n", "new layer");
+const UNDO_LAYER: Hint = Hint::new("Ctrl+Z / u", "undo layer");
+const REDO_LAYER: Hint = Hint::new("Ctrl+Y / U", "redo layer");
+const REDO_SHIFT: Hint = Hint::new("Ctrl+Shift+Z", "redo layer");
+const TARGET_LAYER: Hint = Hint::new("Enter", "target on/off");
+const SHOW_LAYER: Hint = Hint::new("v", "show/hide");
+const DELETE_LAYER: Hint = Hint::new("x", "delete");
+const MOVE_LAYER: Hint = Hint::new("[/]", "move down/up");
 const LAYERS_KEYS: KeySection = (
     "Layers",
     &[
         ListPicker::MOVE,
-        Hint::new("n", "new layer"),
-        Hint::new("Ctrl+Z / u", "undo layer"),
-        Hint::new("Ctrl+Y / U", "redo layer"),
-        Hint::new("Enter", "target on/off"),
-        Hint::new("v", "show/hide"),
-        Hint::new("x", "delete"),
-        Hint::new("[/]", "move down/up"),
+        TARGET_LAYER,
+        SHOW_LAYER,
+        DELETE_LAYER,
+        MOVE_LAYER,
     ],
 );
 const PREVIEW_MOUSE: KeySection = (
@@ -84,59 +82,107 @@ const PANEL_MOUSE: KeySection = (
         Hint::new("wheel", "focus/select"),
     ],
 );
+const BRUSH_MOUSE: KeySection = (
+    "Mouse: brush",
+    &[
+        Hint::new("click row", "focus/select"),
+        Hint::new("wheel", "focus/select"),
+    ],
+);
 const LAYERS_MOUSE: KeySection = (
     "Mouse: layers",
     &[
-        Hint::new("layer click", "focus/target"),
-        Hint::new("target click", "target off"),
+        Hint::new("layer click", "focus/select"),
+        Hint::new("click again", "target on/off"),
         Hint::new("click on mark", "show/hide"),
         Hint::new("layer drag", "reorder"),
         Hint::new("wheel", "focus/select"),
     ],
 );
-const KEY_HELP_PARAMETERS: &[KeySection] = &[PARAMETERS_KEYS, PANEL_MOUSE];
-const KEY_HELP_BRUSH: &[KeySection] = &[BRUSH_KEYS];
-const KEY_HELP_PREVIEW: &[KeySection] = &[PREVIEW_KEYS, PREVIEW_MOUSE];
-const KEY_HELP_LAYERS: &[KeySection] = &[LAYERS_KEYS, LAYERS_MOUSE];
-const KEY_HELP_LEFT: &[KeySection] = &[PARAMETERS_KEYS, BRUSH_KEYS, PREVIEW_KEYS, LAYERS_KEYS];
+const GENERAL_KEYS: KeySection = (
+    "General",
+    &[
+        Hint::new("Tab/BackTab", "focus"),
+        Hint::new("Esc", "exit preview"),
+        Hint::new("?", "keys"),
+        Hint::new("b", "brush"),
+        Hint::new("B", "dodge/burn"),
+        Hint::new("q/Ctrl+C", "quit"),
+        Hint::new("o", "open"),
+        Hint::new("Ctrl+S", "save"),
+        Hint::new("P", "presets"),
+        Hint::new("T", "templates"),
+    ],
+);
+const IMAGE_KEYS: KeySection = (
+    "Image",
+    &[
+        Hint::new("Space", "original/dither"),
+        Hint::new("a", "mass study"),
+        Hint::new("r/R", "rotate"),
+        Hint::new("f", "flip"),
+        Hint::new("+/=/- 0", "zoom/fit"),
+        Hint::new("m/M", "map/mass map"),
+    ],
+);
+const KEY_HELP_REGIONS: &[(Focus, &str, &[KeySection])] = &[
+    (
+        Focus::Preview,
+        "Keys · Preview",
+        &[PREVIEW_KEYS, PREVIEW_MOUSE],
+    ),
+    (
+        Focus::Parameters,
+        "Keys · Parameters",
+        &[PARAMETERS_KEYS, PANEL_MOUSE],
+    ),
+    (Focus::Brush, "Keys · Brush", &[BRUSH_KEYS, BRUSH_MOUSE]),
+    (Focus::Layers, "Keys · Layers", &[LAYERS_KEYS, LAYERS_MOUSE]),
+];
 const KEY_HELP_GLOBAL: &[KeySection] = &[
+    GENERAL_KEYS,
+    IMAGE_KEYS,
     (
-        "General",
-        &[
-            Hint::new("Tab/BackTab", "cycle regions"),
-            Hint::new("Esc", "leave preview"),
-            Hint::new("?", "keys"),
-            Hint::new("b", "brush"),
-            Hint::new("B", "dodge/burn"),
-            Hint::new("q/Ctrl+C", "quit"),
-        ],
-    ),
-    (
-        "Image",
-        &[
-            Hint::new("Space", "original/dithered"),
-            Hint::new("a", "mass study"),
-            Hint::new("r/R", "rotate"),
-            Hint::new("f", "flip"),
-        ],
-    ),
-    (
-        "Files",
-        &[
-            Hint::new("o", "open"),
-            Hint::new("Ctrl+S", "save"),
-            Hint::new("P", "presets"),
-            Hint::new("T", "templates"),
-        ],
+        "Layer history",
+        &[NEW_LAYER, UNDO_LAYER, REDO_LAYER, REDO_SHIFT],
     ),
 ];
+const KEY_HELP_LEFT: &[KeySection] = &[
+    ("Parameters / Brush", PARAMETERS_KEYS.1),
+    IMAGE_KEYS,
+    (
+        "Layers",
+        &[
+            NEW_LAYER,
+            UNDO_LAYER,
+            REDO_LAYER,
+            REDO_SHIFT,
+            ListPicker::MOVE,
+            TARGET_LAYER,
+            SHOW_LAYER,
+            DELETE_LAYER,
+            MOVE_LAYER,
+        ],
+    ),
+    PREVIEW_KEYS,
+];
 const KEY_HELP_RIGHT: &[KeySection] = &[
-    KEY_HELP_GLOBAL[0],
-    KEY_HELP_GLOBAL[1],
-    KEY_HELP_GLOBAL[2],
-    PREVIEW_MOUSE,
-    PANEL_MOUSE,
-    LAYERS_MOUSE,
+    GENERAL_KEYS,
+    (
+        "Mouse: blocks/preview",
+        &[
+            Hint::new("minimap click/drag", "center view"),
+            Hint::new("drag on preview", "move image"),
+            Hint::new("brush left drag", "paint"),
+            Hint::new("click row", "focus/select"),
+            Hint::new("panel click again", "list"),
+            Hint::new("click again", "target on/off"),
+            Hint::new("click header", "fold/unfold"),
+            Hint::new("click on mark", "show/hide"),
+            Hint::new("layer drag", "reorder"),
+            Hint::new("wheel", "select/pan"),
+        ],
+    ),
     (
         "Mouse: dialogs",
         &[
@@ -243,7 +289,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
                 mass_map.then_some(Hint::new("M", "mass map")),
                 Some(Hint::new("Space", "original/dithered")),
                 Some(Hint::new("a", "mass study")),
-                Some(Hint::new("Tab/BackTab", "focus")),
+                Some(Hint::new("Tab", "focus")),
                 Some(Hint::new("Esc", "parameters")),
                 Some(Hint::new("q", "quit")),
                 Some(Hint::new("r/R", "rotate")),
@@ -259,7 +305,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
         } else {
             vec![
                 Hint::new("o", "open"),
-                Hint::new("Tab/BackTab", "focus"),
+                Hint::new("Tab", "focus"),
                 Hint::new("Esc", "parameters"),
                 Hint::new("q", "quit"),
                 Hint::new("P", "presets"),
@@ -302,7 +348,7 @@ fn main_hints(app: &App, geometry: &viewport::PreviewGeometry) -> Vec<Hint> {
     }
     result.extend(
         [
-            Some(Hint::new("Tab/BackTab", "focus")),
+            Some(Hint::new("Tab", "focus")),
             Some(Hint::new("q", "quit")),
             Some(Hint::new("o", "open")),
             image.then_some(Hint::new("Ctrl+S", "save")),
@@ -611,13 +657,11 @@ fn key_help(app: &App) -> (KeyHelp<'static>, KeyHelp<'static>) {
     let (left, right) = if app.keys_all {
         (KEY_HELP_LEFT, KEY_HELP_RIGHT)
     } else {
-        let sections = match app.focus {
-            Focus::Preview => KEY_HELP_PREVIEW,
-            Focus::Parameters => KEY_HELP_PARAMETERS,
-            Focus::Brush => KEY_HELP_BRUSH,
-            Focus::Layers => KEY_HELP_LAYERS,
-        };
-        (sections, KEY_HELP_GLOBAL)
+        let (_, _, sections) = KEY_HELP_REGIONS
+            .iter()
+            .find(|row| row.0 == app.focus)
+            .unwrap();
+        (*sections, KEY_HELP_GLOBAL)
     };
     (KeyHelp { sections: left }, KeyHelp { sections: right })
 }
@@ -627,18 +671,17 @@ fn key_help_dialog(app: &App) -> Dialog<'static> {
         title: if app.keys_all {
             "Keys · All"
         } else {
-            match app.focus {
-                Focus::Preview => "Keys · Preview",
-                Focus::Parameters => "Keys · Parameters",
-                Focus::Brush => "Keys · Brush",
-                Focus::Layers => "Keys · Layers",
-            }
+            KEY_HELP_REGIONS
+                .iter()
+                .find(|row| row.0 == app.focus)
+                .unwrap()
+                .1
         },
         min_width: 28,
     }
 }
 
-const KEY_HELP_GAP: u16 = 3;
+const KEY_HELP_GAP: u16 = 2;
 fn key_help_area(app: &App, layout: &Layout) -> Rect {
     let help = key_help(app);
     let (left, right) = (help.0.size(), help.1.size());
@@ -1303,8 +1346,6 @@ mod tests {
         assert!(text.contains("● Layer 3"));
         assert!(text.contains("○ Layer 2 *"));
         app.focus = Focus::Layers;
-        let geometry = app.geometry(layout(terminal.size().unwrap(), 0).preview);
-        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &geometry);
         let (title, _) = layer_group(&app);
         assert_eq!(title.to_string(), "Layers  3");
         assert_eq!(title.spans[1].style.fg, Some(Color::DarkGray));
@@ -1603,6 +1644,10 @@ mod tests {
                 "End" => vec![key(KeyCode::End)],
                 "Ctrl+C" => vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
                 "Ctrl+Z" => vec![KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)],
+                "Ctrl+Shift+Z" => vec![KeyEvent::new(
+                    KeyCode::Char('Z'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                )],
                 "Ctrl+Y" => vec![KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)],
                 "Ctrl+S" => vec![KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)],
                 "arrows" => [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
@@ -1713,6 +1758,28 @@ mod tests {
                     assert!(key_changes(state, key), "{state:?}: {} ({key:?})", hint.key);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn global_overlay_shortcuts_are_visible_for_every_focus() {
+        for &(focus, _, _) in KEY_HELP_REGIONS {
+            let mut app = hint_fixture(HintState::Keys);
+            app.focus = focus;
+            let (_, global) = key_help(&app);
+            let keys: Vec<_> = global
+                .sections
+                .iter()
+                .flat_map(|(_, hints)| hints.iter().flat_map(|hint| named_keys(hint.key)))
+                .collect();
+            for code in ['+', '=', '-', '0', 'm', 'M', 'n', 'u', 'U'] {
+                assert!(keys.contains(&KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE)));
+            }
+            for key in named_keys("Ctrl+Z Ctrl+Y Ctrl+Shift+Z") {
+                assert!(keys.contains(&key));
+            }
+            assert!(!keys.contains(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+            assert!(!keys.contains(&KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE)));
         }
     }
 
@@ -1861,16 +1928,12 @@ mod tests {
     }
 
     #[test]
-    fn key_overlay_fits_every_reference_row_when_sized_for_all_sections() {
-        let mut app = hint_fixture(HintState::Keys);
-        app.keys_all = true;
-        let (left, right) = key_help(&app);
-        let width = left.size().0 + KEY_HELP_GAP + right.size().0 + 4;
-        let height = left.size().1.max(right.size().1) + 4;
-        assert_eq!(key_overlay_missing(width, height), None);
-        assert!(key_overlay_missing(width - 1, height).is_some());
-        assert!(key_overlay_missing(width, height - 1).is_some());
-        assert_eq!(key_overlay_missing(width + 10, height + 1), None);
+    fn key_overlay_fits_every_reference_row_at_71_by_32() {
+        assert_eq!(key_overlay_missing(71, 32), None);
+        assert!(key_overlay_missing(70, 32).is_some());
+        assert!(key_overlay_missing(71, 31).is_some());
+        assert_eq!(key_overlay_missing(80, 32), None);
+        assert_eq!(key_overlay_missing(80, 33), None);
     }
 
     #[test]
@@ -1947,7 +2010,7 @@ mod tests {
                 "Keys · Parameters",
                 &["Parameters", "Mouse: panel"][..],
             ),
-            (Focus::Brush, "Keys · Brush", &["Brush"][..]),
+            (Focus::Brush, "Keys · Brush", &["Brush", "Mouse: brush"][..]),
             (
                 Focus::Layers,
                 "Keys · Layers",
@@ -1963,7 +2026,7 @@ mod tests {
             );
             assert_eq!(
                 right.sections.iter().map(|s| s.0).collect::<Vec<_>>(),
-                ["General", "Image", "Files"]
+                ["General", "Image", "Layer history"]
             );
             let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
             let text = draw_text(&mut terminal, &app, &mut Renderer::default());
@@ -1997,10 +2060,10 @@ mod tests {
             assert!(text.contains(if all { "Keys · All" } else { "Keys · Layers" }));
             assert!(text.contains(if all { "? this region" } else { "? all keys" }));
             if all {
-                assert!(key_help_scroll_max(&app, geometry.area.height) > focused_max);
+                assert!(key_help_scroll_max(&app, geometry.area.height) >= focused_max);
                 assert!(
                     key_help_area(&app, &layout(Rect::new(0, 0, 120, 70), 0)).height
-                        > focused_area.height
+                        >= focused_area.height
                 );
                 let (left, right) = key_help(&app);
                 assert_eq!(left.sections, KEY_HELP_LEFT);

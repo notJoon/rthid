@@ -1223,37 +1223,44 @@ impl App {
                 if interacting {
                     self.focus = focus;
                 }
-                let before = self.layers.selected(len);
                 let outcome = match focus {
                     Focus::Parameters => self.panel.handle_mouse(mouse, &GROUP_LENS),
                     Focus::Brush => self.brush_picker.handle_mouse(mouse, BrushRow::ALL.len()),
-                    Focus::Layers => self.layers.handle_mouse(mouse, len),
-                    _ => Outcome::Ignored,
+                    Focus::Layers => {
+                        let before = self.layers.selected(len);
+                        let outcome = self.layers.handle_mouse(mouse, len);
+                        if outcome != Outcome::Ignored
+                            && self.source_path().is_some()
+                            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                            && let Some(index) = hit.and_then(|row| self.layer_index(row))
+                        {
+                            if mouse.column == layout.layers.x + 3 {
+                                self.toggle_layer(index);
+                            } else {
+                                if before != hit {
+                                    self.select_layer(index, false);
+                                }
+                                self.layer_drag = Some(LayerDrag {
+                                    index,
+                                    moved: false,
+                                    toggle: !changed_focus && before == hit,
+                                });
+                            }
+                        }
+                        outcome
+                    }
+                    Focus::Preview => unreachable!(),
+                };
+                let outcome = if changed_focus && matches!(outcome, Outcome::Submit(_)) {
+                    Outcome::Consumed
+                } else {
+                    outcome
                 };
                 if focus == Focus::Parameters
                     && let Outcome::Submit(i) = outcome
                     && let Some(modal) = Modal::dropdown(Setting::ALL[i], &self.settings)
                 {
                     self.show_modal(modal);
-                }
-                if focus == Focus::Layers
-                    && outcome != Outcome::Ignored
-                    && self.source_path().is_some()
-                    && mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && let Some(index) = hit.and_then(|row| self.layer_index(row))
-                {
-                    if mouse.column == layout.layers.x + 3 {
-                        self.toggle_layer(index);
-                    } else {
-                        if before != hit {
-                            self.select_layer(index, false);
-                        }
-                        self.layer_drag = Some(LayerDrag {
-                            index,
-                            moved: false,
-                            toggle: before == hit,
-                        });
-                    }
                 }
                 return was_dragging || changed_focus || outcome != Outcome::Ignored;
             }
@@ -2517,6 +2524,77 @@ mod tests {
     }
 
     #[test]
+    fn focus_click_does_not_submit_selected_dither_or_toggle_selected_layer() {
+        let mut app = app_at(Setting::Dither);
+        let screen = Rect::new(0, 0, 100, 40);
+        let layout = crate::ui::layout(screen, 0);
+        let geometry = app.geometry(layout.preview);
+        render_panel(&app, layout.parameters);
+        let row = app
+            .panel
+            .selected_row(
+                layout.parameters,
+                Some(&ratatui::widgets::Block::bordered()),
+                &GROUP_LENS,
+            )
+            .unwrap();
+        app.focus = Focus::Brush;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(kind, row.x + 5, row.y, &geometry, screen);
+        }
+        assert_eq!(app.focus, Focus::Parameters);
+        assert_eq!(app.selected_setting(), Some(Setting::Dither));
+        assert!(app.modal.is_none());
+        app.mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            row.x + 5,
+            row.y,
+            &geometry,
+            screen,
+        );
+        assert!(matches!(app.modal, Some(Modal::Dropdown(_))));
+        app.modal = None;
+
+        press(&mut app, KeyCode::Char('n'));
+        render_layers(&mut app, screen);
+        let layout = crate::ui::layout(screen, app.document.layers().len());
+        let target = app.document.selected();
+        assert!(target.is_some());
+        app.focus = Focus::Parameters;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(
+                kind,
+                layout.layers.x + 5,
+                layout.layers.y + 1,
+                &geometry,
+                screen,
+            );
+        }
+        assert_eq!(app.focus, Focus::Layers);
+        assert_eq!(app.layers.selected(app.document.layers().len()), Some(0));
+        assert_eq!(app.document.selected(), target);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse_at(
+                kind,
+                layout.layers.x + 5,
+                layout.layers.y + 1,
+                &geometry,
+                screen,
+            );
+        }
+        assert_eq!(app.document.selected(), None);
+    }
+
+    #[test]
     fn mouse_click_and_wheel_focus_each_block_and_keep_other_cursors() {
         let mut app = App::builtin(RgbaImage::new(4, 4), None);
         for _ in 0..12 {
@@ -2549,6 +2627,7 @@ mod tests {
                 screen
             ));
             assert_eq!(app.focus, focus);
+            assert!(app.modal.is_none());
             app.mouse_at(
                 MouseEventKind::Up(MouseButton::Left),
                 area.x + 5,
